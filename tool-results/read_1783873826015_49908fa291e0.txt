@@ -1,0 +1,1092 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useRef, useState, type ReactNode } from "react";
+     4→import { motion, AnimatePresence } from "framer-motion";
+     5→import {
+     6→  Dumbbell,
+     7→  Clock,
+     8→  ChevronLeft,
+     9→  Check,
+    10→  Play,
+    11→  RotateCcw,
+    12→  Timer,
+    13→  Info,
+    14→  Zap,
+    15→  FileText,
+    16→  Image as ImageIcon,
+    17→  Pill,
+    18→  Repeat,
+    19→  Lightbulb,
+    20→} from "lucide-react";
+    21→import { useAppStore } from "@/lib/fitness/store";
+    22→import { Card } from "@/components/ui/card";
+    23→import { Button } from "@/components/ui/button";
+    24→import { Skeleton } from "@/components/ui/skeleton";
+    25→import { Badge } from "@/components/ui/badge";
+    26→import {
+    27→  toPersianDigits,
+    28→  PERSIAN_WEEKDAYS,
+    29→  sortWeekdaysByPersianOrder,
+    30→  canAccess,
+    31→  type WorkoutPlanContent,
+    32→  type PlanExercise,
+    33→} from "@/lib/fitness/types";
+    34→import { toast } from "sonner";
+    35→
+    36→// Track set completion locally
+    37→interface SetState {
+    38→  done: boolean;
+    39→  weight: string;
+    40→}
+    41→
+    42→// ============================================================
+    43→//  Group helper — گروه‌بندی حرکات بر اساس supersetGroup
+    44→//  خروجی: لیستی از آیتم‌ها که هر کدام یا تک‌حرکت است یا یک گروه
+    45→//  (سوپرست / تری‌ست / جاینت‌ست)
+    46→// ============================================================
+    47→export type GroupedExercise =
+    48→  | { type: "single"; exercise: PlanExercise }
+    49→  | {
+    50→      type: "group";
+    51→      group: string;
+    52→      groupType: "superset" | "triset" | "giant";
+    53→      circuitRounds?: number;
+    54→      restBetweenRounds?: number;
+    55→      exercises: PlanExercise[];
+    56→    };
+    57→
+    58→export function groupExercises(exercises: PlanExercise[]): GroupedExercise[] {
+    59→  const result: GroupedExercise[] = [];
+    60→  const seen = new Set<string>();
+    61→  for (const ex of exercises) {
+    62→    if (ex.supersetGroup && ex.supersetType) {
+    63→      if (seen.has(ex.supersetGroup)) continue; // قبلاً به‌عنوان گروه اضافه شده
+    64→      seen.add(ex.supersetGroup);
+    65→      const members = exercises.filter((e) => e.supersetGroup === ex.supersetGroup);
+    66→      const withRounds = members.find((e) => typeof e.circuitRounds === "number");
+    67→      const withRest = members.find((e) => typeof e.restBetweenRounds === "number");
+    68→      result.push({
+    69→        type: "group",
+    70→        group: ex.supersetGroup,
+    71→        groupType: ex.supersetType,
+    72→        circuitRounds: withRounds?.circuitRounds,
+    73→        restBetweenRounds: withRest?.restBetweenRounds,
+    74→        exercises: members,
+    75→      });
+    76→    } else {
+    77→      result.push({ type: "single", exercise: ex });
+    78→    }
+    79→  }
+    80→  return result;
+    81→}
+    82→
+    83→/** برچسب فارسی نوع گروه */
+    84→export function groupTypeLabel(t: "superset" | "triset" | "giant"): string {
+    85→  if (t === "giant") return "جاینت‌ست";
+    86→  if (t === "triset") return "تری‌ست";
+    87→  return "سوپرست";
+    88→}
+    89→
+    90→export function WorkoutsView() {
+    91→  const { workoutPlan, setWorkoutPlan, setOverlay, setExerciseDetailId, startSession, user } = useAppStore();
+    92→  const [loading, setLoading] = useState(!workoutPlan);
+    93→  const [today, setToday] = useState("");
+    94→  const [activeDayIdx, setActiveDayIdx] = useState(0);
+    95→  const [setStates, setSetStates] = useState<Record<string, SetState>>({});
+    96→  const [restTimer, setRestTimer] = useState<{ remaining: number; total: number } | null>(null);
+    97→  const [downloading, setDownloading] = useState<"image" | "pdf" | null>(null);
+    98→  const printableRef = useRef<HTMLDivElement>(null);
+    99→
+   100→  // User plan capabilities — fullExerciseLibrary requires Advanced+ plan
+   101→  const canViewVideos = canAccess(user?.planName ?? null, "fullExerciseLibrary");
+   102→
+   103→  useEffect(() => {
+   104→    const dayIdx = new Date().getDay();
+   105→    const persianIdx = (dayIdx + 1) % 7;
+   106→    const todayName = PERSIAN_WEEKDAYS[persianIdx];
+   107→    setToday(todayName);
+   108→
+   109→    if (!workoutPlan) {
+   110→      (async () => {
+   111→        try {
+   112→          const res = await fetch("/api/coach/plan");
+   113→          const data = await res.json();
+   114→          if (data.workout) setWorkoutPlan(data.workout as WorkoutPlanContent);
+   115→        } catch {
+   116→        } finally {
+   117→          setLoading(false);
+   118→        }
+   119→      })();
+   120→    } else {
+   121→      setLoading(false);
+   122→    }
+   123→    // Set active day to today if exists
+   124→    if (workoutPlan) {
+   125→      const idx = workoutPlan.days.findIndex((d) => d.day === todayName);
+   126→      if (idx >= 0) setActiveDayIdx(idx);
+   127→    }
+   128→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   129→  }, [workoutPlan, today]);
+   130→
+   131→  // Rest timer countdown
+   132→  useEffect(() => {
+   133→    if (!restTimer) return;
+   134→    if (restTimer.remaining <= 0) {
+   135→      const t = setTimeout(() => setRestTimer(null), 500);
+   136→      return () => clearTimeout(t);
+   137→    }
+   138→    const t = setTimeout(() => {
+   139→      setRestTimer((prev) => (prev ? { ...prev, remaining: prev.remaining - 1 } : null));
+   140→    }, 1000);
+   141→    return () => clearTimeout(t);
+   142→  }, [restTimer]);
+   143→
+   144→  const toggleSet = (exerciseId: string, setNumber: number, restSec: number) => {
+   145→    const key = `${exerciseId}_${setNumber}`;
+   146→    const wasDone = setStates[key]?.done;
+   147→    setSetStates((s) => ({
+   148→      ...s,
+   149→      [key]: { ...s[key], done: !wasDone, weight: s[key]?.weight || "" },
+   150→    }));
+   151→    if (!wasDone && restSec > 0) {
+   152→      setRestTimer({ remaining: restSec, total: restSec });
+   153→    }
+   154→  };
+   155→
+   156→  const updateWeight = (exerciseId: string, setNumber: number, weight: string) => {
+   157→    const key = `${exerciseId}_${setNumber}`;
+   158→    setSetStates((s) => ({
+   159→      ...s,
+   160→      [key]: { done: s[key]?.done ?? false, weight },
+   161→    }));
+   162→  };
+   163→
+   164→  // ===== Download handlers (Image + PDF) =====
+   165→  function formatToday(): string {
+   166→    try {
+   167→      const d = new Date();
+   168→      return `${toPersianDigits(d.getDate())}/${toPersianDigits(d.getMonth() + 1)}/${toPersianDigits(d.getFullYear())}`;
+   169→    } catch {
+   170→      return "";
+   171→    }
+   172→  }
+   173→
+   174→  async function downloadAsImage() {
+   175→    if (!printableRef.current || !workoutPlan) return;
+   176→    setDownloading("image");
+   177→    try {
+   178→      const { toPng } = await import("html-to-image");
+   179→      const node = printableRef.current;
+   180→      // ذخیره استایل اصلی + موقتاً visible کردن برای capture
+   181→      const originalStyle = {
+   182→        visibility: node.style.visibility,
+   183→        opacity: node.style.opacity,
+   184→        zIndex: node.style.zIndex,
+   185→      };
+   186→      node.style.visibility = "visible";
+   187→      node.style.opacity = "1";
+   188→      node.style.zIndex = "-9999"; // زیر سایر عناصر ولی visible
+   189→      await new Promise((r) => setTimeout(r, 50));
+   190→
+   191→      let dataUrl: string;
+   192→      try {
+   193→        dataUrl = await toPng(node, {
+   194→          cacheBust: true,
+   195→          pixelRatio: 3,
+   196→          backgroundColor: "#ffffff",
+   197→          width: 800,
+   198→        });
+   199→      } finally {
+   200→        // restore — دوباره مخفی کن
+   201→        node.style.visibility = originalStyle.visibility;
+   202→        node.style.opacity = originalStyle.opacity;
+   203→        node.style.zIndex = originalStyle.zIndex;
+   204→      }
+   205→      const link = document.createElement("a");
+   206→      link.download = `fitup-workout-${Date.now()}.png`;
+   207→      link.href = dataUrl;
+   208→      link.click();
+   209→      toast.success("تصویر برنامه تمرینی دانلود شد ✓");
+   210→    } catch (e) {
+   211→      console.error("[downloadAsImage]", e);
+   212→      toast.error("خطا در ساخت تصویر برنامه");
+   213→    } finally {
+   214→      setDownloading(null);
+   215→    }
+   216→  }
+   217→
+   218→  async function downloadAsPDF() {
+   219→    if (!printableRef.current || !workoutPlan) return;
+   220→    setDownloading("pdf");
+   221→    try {
+   222→      const { toPng } = await import("html-to-image");
+   223→      const { jsPDF } = await import("jspdf");
+   224→      const node = printableRef.current;
+   225→      // ذخیره استایل اصلی + موقتاً visible کردن برای capture
+   226→      const originalStyle = {
+   227→        visibility: node.style.visibility,
+   228→        opacity: node.style.opacity,
+   229→        zIndex: node.style.zIndex,
+   230→      };
+   231→      node.style.visibility = "visible";
+   232→      node.style.opacity = "1";
+   233→      node.style.zIndex = "-9999";
+   234→      await new Promise((r) => setTimeout(r, 50));
+   235→
+   236→      let dataUrl: string;
+   237→      try {
+   238→        dataUrl = await toPng(node, {
+   239→          cacheBust: true,
+   240→          pixelRatio: 3,
+   241→          backgroundColor: "#ffffff",
+   242→          width: 800,
+   243→        });
+   244→      } finally {
+   245→        // restore — دوباره مخفی کن
+   246→        node.style.visibility = originalStyle.visibility;
+   247→        node.style.opacity = originalStyle.opacity;
+   248→        node.style.zIndex = originalStyle.zIndex;
+   249→      }
+   250→      const img = new Image();
+   251→      img.src = dataUrl;
+   252→      await new Promise((res) => {
+   253→        img.onload = res;
+   254→      });
+   255→
+   256→      const pdf = new jsPDF({
+   257→        orientation: "portrait",
+   258→        unit: "pt",
+   259→        format: "a4",
+   260→        compress: false,
+   261→      });
+   262→      const pageWidth = pdf.internal.pageSize.getWidth();
+   263→      const pageHeight = pdf.internal.pageSize.getHeight();
+   264→      const imgRatio = img.height / img.width;
+   265→      const imgWidth = pageWidth - 40;
+   266→      const imgHeight = imgWidth * imgRatio;
+   267→
+   268→      // Single page if it fits, otherwise paginate via canvas slicing
+   269→      if (imgHeight <= pageHeight - 40) {
+   270→        pdf.addImage(dataUrl, "PNG", 20, 20, imgWidth, imgHeight);
+   271→      } else {
+   272→        const canvas = document.createElement("canvas");
+   273→        canvas.width = img.width;
+   274→        canvas.height = img.height;
+   275→        const ctx = canvas.getContext("2d");
+   276→        if (!ctx) throw new Error("Canvas 2D context unavailable");
+   277→        ctx.drawImage(img, 0, 0);
+   278→        const sliceHeightPx = Math.floor((img.width * (pageHeight - 40)) / (pageWidth - 40));
+   279→        let yOff = 0;
+   280→        let page = 0;
+   281→        while (yOff < img.height) {
+   282→          const sliceCanvas = document.createElement("canvas");
+   283→          sliceCanvas.width = img.width;
+   284→          sliceCanvas.height = Math.min(sliceHeightPx, img.height - yOff);
+   285→          const sliceCtx = sliceCanvas.getContext("2d");
+   286→          if (!sliceCtx) throw new Error("Canvas 2D context unavailable");
+   287→          sliceCtx.drawImage(canvas, 0, yOff, img.width, sliceCanvas.height, 0, 0, img.width, sliceCanvas.height);
+   288→          const sliceDataUrl = sliceCanvas.toDataURL("image/png");
+   289→          if (page > 0) pdf.addPage();
+   290→          const sliceImgHeight = (sliceCanvas.height / img.width) * imgWidth;
+   291→          pdf.addImage(sliceDataUrl, "PNG", 20, 20, imgWidth, sliceImgHeight);
+   292→          yOff += sliceHeightPx;
+   293→          page++;
+   294→        }
+   295→      }
+   296→
+   297→      pdf.save(`fitup-workout-${Date.now()}.pdf`);
+   298→      toast.success("PDF برنامه تمرینی دانلود شد ✓");
+   299→    } catch (e) {
+   300→      console.error("[downloadAsPDF]", e);
+   301→      toast.error("خطا در ساخت PDF برنامه");
+   302→    } finally {
+   303→      setDownloading(null);
+   304→    }
+   305→  }
+   306→
+   307→  if (loading) {
+   308→    return (
+   309→      <div className="px-4 py-4 space-y-3 max-w-md mx-auto">
+   310→        <Skeleton className="h-10 rounded-xl" />
+   311→        <Skeleton className="h-32 rounded-2xl" />
+   312→        <Skeleton className="h-48 rounded-2xl" />
+   313→      </div>
+   314→    );
+   315→  }
+   316→
+   317→  if (!workoutPlan || !workoutPlan.days.length) {
+   318→    return (
+   319→      <div className="px-4 py-8 text-center max-w-md mx-auto">
+   320→        <div className="w-20 h-20 rounded-3xl bg-muted flex items-center justify-center mx-auto mb-4">
+   321→          <Dumbbell className="w-10 h-10 text-muted-foreground" />
+   322→        </div>
+   323→        <h2 className="text-xl font-bold mb-2">برنامه تمرینی موجود نیست</h2>
+   324→        <p className="text-muted-foreground text-sm mb-6">
+   325→          برای ساخت برنامه تمرینی شخصی‌سازی‌شده، آنبوردینگ را تکمیل کنید.
+   326→        </p>
+   327→      </div>
+   328→    );
+   329→  }
+   330→
+   331→  // ─── مرتب‌سازی روزهای هفته بر اساس ترتیب استاندارد فارسی (شنبه → جمعه) ───
+   332→  // AI گاهی روزها را نامرتب برمی‌گرداند؛ این تابع آن‌ها را اصلاح می‌کند.
+   333→  const sortedDays = sortWeekdaysByPersianOrder(workoutPlan.days);
+   334→  const activeDay = sortedDays[activeDayIdx];
+   335→  const isToday = activeDay?.day === today;
+   336→  const doneCount = Object.values(setStates).filter((s) => s.done).length;
+   337→  const totalSets = activeDay?.exercises.reduce((s, e) => s + e.sets.length, 0) ?? 0;
+   338→  const progress = totalSets ? (doneCount / totalSets) * 100 : 0;
+   339→
+   340→  return (
+   341→    <div className="px-4 py-4 space-y-4 max-w-md mx-auto">
+   342→      {/* Hidden printable workout plan for image/PDF export — کاملاً مخفی، فقط هنگام capture نمایش داده می‌شود */}
+   343→      <div
+   344→        ref={printableRef}
+   345→        style={{
+   346→          position: "fixed",
+   347→          top: "0",
+   348→          left: "0",
+   349→          width: "800px",
+   350→          background: "#ffffff",
+   351→          padding: "32px",
+   352→          fontFamily: "Vazirmatn, Tahoma, Arial, system-ui, sans-serif",
+   353→          direction: "rtl",
+   354→          zIndex: "-9999",
+   355→          pointerEvents: "none",
+   356→          visibility: "hidden",
+   357→          opacity: 0,
+   358→        }}
+   359→        aria-hidden
+   360→      >
+   361→        <PrintableWorkout plan={workoutPlan} dateStr={formatToday()} />
+   362→      </div>
+   363→
+   364→      {/* Header */}
+   365→      <div className="flex items-center justify-between gap-3">
+   366→        <div className="flex-1 min-w-0">
+   367→          <h2 className="text-2xl font-black mb-1">برنامه تمرینی</h2>
+   368→          <p className="text-sm text-muted-foreground truncate">برنامه تمرینی اختصاصی شما</p>
+   369→        </div>
+   370→        <div className="flex items-center gap-2">
+   371→          <button
+   372→            onClick={downloadAsImage}
+   373→            disabled={downloading !== null}
+   374→            title="دانلود تصویر برنامه"
+   375→            className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-200 text-orange-600 hover:bg-orange-100 transition flex items-center justify-center disabled:opacity-50"
+   376→          >
+   377→            {downloading === "image" ? (
+   378→              <RotateCcw className="w-4 h-4 animate-spin" />
+   379→            ) : (
+   380→              <ImageIcon className="w-4 h-4" />
+   381→            )}
+   382→          </button>
+   383→          <button
+   384→            onClick={downloadAsPDF}
+   385→            disabled={downloading !== null}
+   386→            title="دانلود PDF"
+   387→            className="h-10 px-3 rounded-xl bg-orange-50 border border-orange-200 text-orange-600 hover:bg-orange-100 transition flex items-center justify-center gap-1.5 disabled:opacity-50"
+   388→          >
+   389→            {downloading === "pdf" ? (
+   390→              <RotateCcw className="w-4 h-4 animate-spin" />
+   391→            ) : (
+   392→              <FileText className="w-4 h-4" />
+   393→            )}
+   394→            <span className="text-xs font-bold">PDF</span>
+   395→          </button>
+   396→        </div>
+   397→      </div>
+   398→
+   399→      {/* Day selector */}
+   400→      <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
+   401→        {sortedDays.map((day, i) => {
+   402→          const dayToday = day.day === today;
+   403→          return (
+   404→            <button
+   405→              key={i}
+   406→              onClick={() => setActiveDayIdx(i)}
+   407→              className={`shrink-0 px-4 py-2.5 rounded-2xl border-2 transition-all relative ${
+   408→                activeDayIdx === i
+   409→                  ? "border-primary bg-primary/5"
+   410→                  : "border-border bg-card"
+   411→              }`}
+   412→            >
+   413→              {dayToday && (
+   414→                <span className="absolute -top-1 -left-1 w-3 h-3 rounded-full bg-primary border-2 border-background" />
+   415→              )}
+   416→              <div className="text-xs font-bold">{day.day}</div>
+   417→              <div className="text-[10px] text-muted-foreground whitespace-nowrap">
+   418→                {day.focus}
+   419→              </div>
+   420→            </button>
+   421→          );
+   422→        })}
+   423→      </div>
+   424→
+   425→      {/* Active day card */}
+   426→      {activeDay && (
+   427→        <>
+   428→          <Card className="p-4">
+   429→            <div className="flex items-start justify-between mb-3">
+   430→              <div>
+   431→                <div className="flex items-center gap-2 mb-1">
+   432→                  <h3 className="font-black text-lg">{activeDay.title}</h3>
+   433→                  {isToday && (
+   434→                    <Badge className="bg-primary text-primary-foreground text-[10px]">
+   435→                      امروز
+   436→                    </Badge>
+   437→                  )}
+   438→                </div>
+   439→                <div className="flex items-center gap-3 text-xs text-muted-foreground">
+   440→                  <span className="flex items-center gap-1">
+   441→                    <Clock className="w-3.5 h-3.5" />
+   442→                    {toPersianDigits(activeDay.estimatedMinutes)} دقیقه
+   443→                  </span>
+   444→                  <span className="flex items-center gap-1">
+   445→                    <Zap className="w-3.5 h-3.5" />
+   446→                    {toPersianDigits(activeDay.exercises.length)} حرکت
+   447→                  </span>
+   448→                </div>
+   449→              </div>
+   450→            </div>
+   451→
+   452→            {/* Progress bar */}
+   453→            <div className="mb-1 flex justify-between text-xs">
+   454→              <span className="text-muted-foreground">پیشرفت امروز</span>
+   455→              <span className="font-bold text-primary">
+   456→                {toPersianDigits(doneCount)} / {toPersianDigits(totalSets)} ست
+   457→              </span>
+   458→            </div>
+   459→            <div className="h-2 bg-muted rounded-full overflow-hidden">
+   460→              <motion.div
+   461→                className="h-full bg-gradient-to-l from-primary to-amber-500"
+   462→                animate={{ width: `${progress}%` }}
+   463→                transition={{ type: "spring", stiffness: 200, damping: 20 }}
+   464→              />
+   465→            </div>
+   466→
+   467→            {/* شروع تمرین فعال */}
+   468→            <motion.button
+   469→              whileTap={{ scale: 0.97 }}
+   470→              onClick={() => startSession(activeDay.day)}
+   471→              className="w-full mt-3 relative overflow-hidden rounded-2xl bg-gradient-to-l from-primary to-amber-500 text-primary-foreground font-black py-3 pulse-ring flex items-center justify-center gap-2"
+   472→            >
+   473→              <Play className="w-5 h-5 fill-current" />
+   474→              شروع تمرین (حالت فعال)
+   475→            </motion.button>
+   476→          </Card>
+   477→
+   478→          {/* Exercises — به‌صورت گروه‌بندی‌شده (سوپرست/تری‌ست/جاینت‌ست) یا تک‌حرکت */}
+   479→          <div className="space-y-3">
+   480→            {(() => {
+   481→              const grouped = groupExercises(activeDay.exercises);
+   482→              // محاسبه ایندکس مطلق هر حرکت برای حفظ رفتار auto-expand کارت اول
+   483→              let absIdx = 0;
+   484→              return grouped.map((item, itemIdx) => {
+   485→                if (item.type === "single") {
+   486→                  const ex = item.exercise;
+   487→                  const idx = absIdx++;
+   488→                  return (
+   489→                    <ExerciseCard
+   490→                      key={ex.id}
+   491→                      exercise={ex}
+   492→                      index={idx}
+   493→                      setStates={setStates}
+   494→                      onToggleSet={(sn, rest) => toggleSet(ex.id, sn, rest)}
+   495→                      onUpdateWeight={(sn, w) => updateWeight(ex.id, sn, w)}
+   496→                      onShowDetail={() => {
+   497→                        setExerciseDetailId(ex.id);
+   498→                        setOverlay("exerciseDetail");
+   499→                      }}
+   500→                    />
+   501→                  );
+   502→                }
+   503→                // گروه: سوپرست / تری‌ست / جاینت‌ست
+   504→                return (
+   505→                  <SupersetGroupCard
+   506→                    key={`group-${item.group}-${itemIdx}`}
+   507→                    group={item.group}
+   508→                    groupType={item.groupType}
+   509→                    circuitRounds={item.circuitRounds}
+   510→                    restBetweenRounds={item.restBetweenRounds}
+   511→                  >
+   512→                    {item.exercises.map((ex) => {
+   513→                      const idx = absIdx++;
+   514→                      return (
+   515→                        <ExerciseCard
+   516→                          key={ex.id}
+   517→                          exercise={ex}
+   518→                          index={idx}
+   519→                          hideSupersetBadge
+   520→                          setStates={setStates}
+   521→                          onToggleSet={(sn, rest) => toggleSet(ex.id, sn, rest)}
+   522→                          onUpdateWeight={(sn, w) => updateWeight(ex.id, sn, w)}
+   523→                          onShowDetail={() => {
+   524→                            setExerciseDetailId(ex.id);
+   525→                            setOverlay("exerciseDetail");
+   526→                          }}
+   527→                        />
+   528→                      );
+   529→                    })}
+   530→                  </SupersetGroupCard>
+   531→                );
+   532→              });
+   533→            })()}
+   534→          </div>
+   535→
+   536→          {/* Notes */}
+   537→          {workoutPlan.notes && (
+   538→            <div className="p-4 rounded-2xl bg-orange-50 border border-orange-200">
+   539→              <div className="flex items-start gap-2">
+   540→                <Info className="w-4 h-4 text-orange-500 shrink-0 mt-0.5" />
+   541→                <div>
+   542→                  <p className="text-xs font-bold text-orange-600 mb-1">نکات هفته</p>
+   543→                  <p className="text-xs text-slate-600">{workoutPlan.notes}</p>
+   544→                </div>
+   545→              </div>
+   546→            </div>
+   547→          )}
+   548→
+   549→          {/* Supplements — برنامه مکمل‌ها (Standard+) */}
+   550→          {workoutPlan.supplements && workoutPlan.supplements.length > 0 && (
+   551→            <div className="p-4 rounded-2xl bg-white border-2 border-orange-200">
+   552→              <div className="flex items-center gap-2 mb-3">
+   553→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   554→                  <Pill className="w-4 h-4 text-white" />
+   555→                </div>
+   556→                <h3 className="font-bold text-sm text-slate-900">برنامه مکمل‌های ورزشی</h3>
+   557→              </div>
+   558→              <div className="space-y-2">
+   559→                {workoutPlan.supplements.map((sup, i) => (
+   560→                  <div key={i} className="flex items-start gap-3 p-2.5 rounded-xl bg-orange-50/50 border border-orange-100">
+   561→                    <div className="w-7 h-7 rounded-lg bg-orange-100 flex items-center justify-center text-orange-600 text-xs font-bold shrink-0">
+   562→                      {toPersianDigits(i + 1)}
+   563→                    </div>
+   564→                    <div className="flex-1 min-w-0">
+   565→                      <p className="text-sm font-bold text-slate-900">{sup.name}</p>
+   566→                      <div className="flex items-center gap-3 mt-0.5">
+   567→                        <span className="text-[11px] text-slate-500">دوز: <b className="text-slate-700">{sup.dose}</b></span>
+   568→                        <span className="text-[11px] text-slate-500">زمان: <b className="text-slate-700">{sup.timing}</b></span>
+   569→                      </div>
+   570→                      {sup.note && <p className="text-[10px] text-slate-400 mt-1">{sup.note}</p>}
+   571→                    </div>
+   572→                  </div>
+   573→                ))}
+   574→              </div>
+   575→              <p className="text-[10px] text-slate-400 mt-2 text-center">⚠️ مشاوره با پزشک قبل از مصرف مکمل‌ها ضروری است</p>
+   576→            </div>
+   577→          )}
+   578→        </>
+   579→      )}
+   580→
+   581→      {/* Rest timer overlay */}
+   582→      <AnimatePresence>
+   583→        {restTimer && (
+   584→          <motion.div
+   585→            initial={{ opacity: 0, y: 50 }}
+   586→            animate={{ opacity: 1, y: 0 }}
+   587→            exit={{ opacity: 0, y: 50 }}
+   588→            className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 w-[90%] max-w-sm"
+   589→          >
+   590→            <Card className="p-4 shadow-2xl border-primary/30 bg-card">
+   591→              <div className="flex items-center gap-4">
+   592→                <div className="relative w-14 h-14 shrink-0">
+   593→                  <svg className="w-14 h-14 -rotate-90" viewBox="0 0 36 36">
+   594→                    <circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" strokeWidth="3" className="text-muted/30" />
+   595→                    <circle
+   596→                      cx="18"
+   597→                      cy="18"
+   598→                      r="15"
+   599→                      fill="none"
+   600→                      stroke="#10b981"
+   601→                      strokeWidth="3"
+   602→                      strokeDasharray={`${(restTimer.remaining / restTimer.total) * 94.2} 94.2`}
+   603→                      strokeLinecap="round"
+   604→                    />
+   605→                  </svg>
+   606→                  <div className="absolute inset-0 flex items-center justify-center text-sm font-black">
+   607→                    {toPersianDigits(restTimer.remaining)}
+   608→                  </div>
+   609→                </div>
+   610→                <div className="flex-1">
+   611→                  <p className="font-bold text-sm flex items-center gap-1.5">
+   612→                    <Timer className="w-4 h-4 text-primary" />
+   613→                    زمان استراحت
+   614→                  </p>
+   615→                  <p className="text-xs text-muted-foreground">نفس بکش و آماده ست بعدی شو</p>
+   616→                </div>
+   617→                <Button
+   618→                  size="sm"
+   619→                  variant="outline"
+   620→                  onClick={() => setRestTimer(null)}
+   621→                  className="rounded-xl"
+   622→                >
+   623→                  رد کردن
+   624→                </Button>
+   625→              </div>
+   626→            </Card>
+   627→          </motion.div>
+   628→        )}
+   629→      </AnimatePresence>
+   630→    </div>
+   631→  );
+   632→}
+   633→
+   634→/**
+   635→ * Printable workout plan — formatted nicely for image/PDF export.
+   636→ * Branded with فیتاپ logo + date + all exercises with sets/reps.
+   637→ */
+   638→function PrintableWorkout({ plan, dateStr }: { plan: WorkoutPlanContent; dateStr: string }) {
+   639→  return (
+   640→    <div style={{ color: "#1e293b" }}>
+   641→      {/* Header */}
+   642→      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "3px solid #f59e0b", paddingBottom: "16px", marginBottom: "20px" }}>
+   643→        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+   644→          <div
+   645→            style={{
+   646→              width: "56px",
+   647→              height: "56px",
+   648→              borderRadius: "16px",
+   649→              background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   650→              display: "flex",
+   651→              alignItems: "center",
+   652→              justifyContent: "center",
+   653→              overflow: "hidden",
+   654→            }}
+   655→          >
+   656→            <img src="/fitup-logo.png" alt="فیتاپ" style={{ width: "100%", height: "100%", objectFit: "cover" }} crossOrigin="anonymous" />
+   657→          </div>
+   658→          <div>
+   659→            <h1 style={{ fontSize: "28px", fontWeight: 900, margin: 0, color: "#1e293b" }}>فیتاپ</h1>
+   660→            <p style={{ fontSize: "14px", color: "#64748b", margin: 0 }}>برنامه تمرینی هفتگی</p>
+   661→          </div>
+   662→        </div>
+   663→        <div style={{ textAlign: "left" }}>
+   664→          <p style={{ fontSize: "12px", color: "#64748b", margin: 0 }}>تاریخ</p>
+   665→          <p style={{ fontSize: "16px", fontWeight: 700, color: "#1e293b", margin: 0 }}>{dateStr}</p>
+   666→        </div>
+   667→      </div>
+   668→
+   669→      {/* Days — مرتب‌شده بر اساس ترتیب هفته فارسی */}
+   670→      {sortWeekdaysByPersianOrder(plan.days).map((day, i) => (
+   671→        <div key={i} style={{ marginBottom: "20px", breakInside: "avoid" }}>
+   672→          {/* Day header */}
+   673→          <div
+   674→            style={{
+   675→              display: "flex",
+   676→              alignItems: "center",
+   677→              justifyContent: "space-between",
+   678→              background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   679→              color: "#ffffff",
+   680→              padding: "10px 16px",
+   681→              borderRadius: "12px",
+   682→              marginBottom: "10px",
+   683→            }}
+   684→          >
+   685→            <div>
+   686→              <p style={{ fontSize: "18px", fontWeight: 900, margin: 0 }}>{day.day}</p>
+   687→              <p style={{ fontSize: "12px", margin: 0, opacity: 0.95 }}>{day.title} • {day.focus}</p>
+   688→            </div>
+   689→            <div style={{ textAlign: "left", fontSize: "12px" }}>
+   690→              <p style={{ margin: 0, fontWeight: 700 }}>⏱ {toPersianDigits(day.estimatedMinutes)} دقیقه</p>
+   691→              <p style={{ margin: 0, opacity: 0.95 }}>{toPersianDigits(day.exercises.length)} حرکت</p>
+   692→            </div>
+   693→          </div>
+   694→
+   695→          {/* Exercise list */}
+   696→          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+   697→            <thead>
+   698→              <tr style={{ background: "#fff7ed" }}>
+   699→                <th style={{ padding: "8px 10px", textAlign: "right", borderBottom: "1px solid #fed7aa", width: "30px", color: "#9a3412" }}>#</th>
+   700→                <th style={{ padding: "8px 10px", textAlign: "right", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>حرکت</th>
+   701→                <th style={{ padding: "8px 10px", textAlign: "center", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>ست</th>
+   702→                <th style={{ padding: "8px 10px", textAlign: "center", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>تکرار</th>
+   703→                <th style={{ padding: "8px 10px", textAlign: "center", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>استراحت</th>
+   704→              </tr>
+   705→            </thead>
+   706→            <tbody>
+   707→              {(() => {
+   708→                // گروه‌بندی حرکات برای نمایش بصری حرفه‌ای در PDF
+   709→                const grouped = groupExercises(day.exercises);
+   710→                let counter = 0;
+   711→                const rows: ReactNode[] = [];
+   712→                grouped.forEach((item, gi) => {
+   713→                  if (item.type === "single") {
+   714→                    const num = ++counter;
+   715→                    const ex = item.exercise;
+   716→                    rows.push(
+   717→                      <tr key={`s-${gi}`} style={{ borderBottom: "2px solid #fef3c7" }}>
+   718→                        <td style={{ padding: "10px", textAlign: "right", color: "#9a3412", fontWeight: 700, verticalAlign: "top" }}>{toPersianDigits(num)}</td>
+   719→                        <td style={{ padding: "10px", textAlign: "right", verticalAlign: "top" }}>
+   720→                          <p style={{ margin: 0, fontWeight: 700, color: "#1e293b", fontSize: "14px" }}>{ex.name}</p>
+   721→                          <p style={{ margin: "2px 0 0 0", fontSize: "11px", color: "#94a3b8" }}>{ex.muscle}</p>
+   722→                          {ex.description && (
+   723→                            <p style={{ margin: "4px 0 0 0", fontSize: "11px", color: "#475569", lineHeight: 1.6 }}>{ex.description}</p>
+   724→                          )}
+   725→                          {ex.tips && (
+   726→                            <p style={{ margin: "3px 0 0 0", fontSize: "10px", color: "#b45309", lineHeight: 1.5 }}>💡 {ex.tips}</p>
+   727→                          )}
+   728→                        </td>
+   729→                        <td style={{ padding: "10px", textAlign: "center", fontWeight: 700, color: "#1e293b", verticalAlign: "top" }}>{toPersianDigits(ex.sets.length)}</td>
+   730→                        <td style={{ padding: "10px", textAlign: "center", color: "#1e293b", verticalAlign: "top" }}>
+   731→                          {ex.sets.map((s, k) => (
+   732→                            <span key={k}>
+   733→                              {toPersianDigits(s.reps)}
+   734→                              {k < ex.sets.length - 1 ? " / " : ""}
+   735→                            </span>
+   736→                          ))}
+   737→                        </td>
+   738→                        <td style={{ padding: "10px", textAlign: "center", color: "#1e293b", verticalAlign: "top" }}>
+   739→                          {toPersianDigits(ex.sets[0]?.restSec ?? 0) + "s"}
+   740→                        </td>
+   741→                      </tr>
+   742→                    );
+   743→                  } else {
+   744→                    // گروه: بنر گروه + ردیف‌های حرکات با رنگ تنت
+   745→                    const isGiant = item.groupType === "giant";
+   746→                    const isTriset = item.groupType === "triset";
+   747→                    const label = isGiant ? "جاینت‌ست" : isTriset ? "تری‌ست" : "سوپرست";
+   748→                    // رنگ‌ها: بنفش برای سوپرست/تری‌ست، رز برای جاینت‌ست
+   749→                    const bannerBg = isGiant ? "#ffe4e6" : "#f3e8ff";
+   750→                    const bannerColor = isGiant ? "#9f1239" : "#7e22ce";
+   751→                    const bannerBorder = isGiant ? "#fb7185" : "#d8b4fe";
+   752→                    const tintBg = isGiant ? "#fff1f2" : "#faf5ff";
+   753→                    const numColor = isGiant ? "#9f1239" : "#7e22ce";
+   754→
+   755→                    // ردیف بنر گروه (تمام عرض)
+   756→                    const bannerText = isGiant && item.circuitRounds
+   757→                      ? `${label} ${item.group} — بدون استراحت بین حرکات — ${toPersianDigits(item.circuitRounds)} دور` +
+   758→                        (item.restBetweenRounds ? ` — استراحت بین دورها: ${toPersianDigits(item.restBetweenRounds)} ثانیه` : "")
+   759→                      : `${label} ${item.group} — بدون استراحت بین حرکات`;
+   760→
+   761→                    rows.push(
+   762→                      <tr key={`b-${gi}`}>
+   763→                        <td colSpan={5} style={{
+   764→                          background: bannerBg,
+   765→                          color: bannerColor,
+   766→                          padding: "8px 12px",
+   767→                          fontWeight: 800,
+   768→                          fontSize: "11px",
+   769→                          borderBottom: `2px solid ${bannerBorder}`,
+   770→                          borderTop: `2px solid ${bannerBorder}`,
+   771→                          textAlign: "right",
+   772→                        }}>
+   773→                          {bannerText}
+   774→                        </td>
+   775→                      </tr>
+   776→                    );
+   777→
+   778→                    // ردیف‌های حرکات داخل گروه
+   779→                    item.exercises.forEach((ex, idx) => {
+   780→                      const num = ++counter;
+   781→                      rows.push(
+   782→                        <tr key={`g-${gi}-${idx}`} style={{ borderBottom: `2px solid ${bannerBorder}`, background: tintBg }}>
+   783→                          <td style={{ padding: "10px", textAlign: "right", color: numColor, fontWeight: 800, verticalAlign: "top", fontSize: "12px" }}>
+   784→                            {item.group}{toPersianDigits(idx + 1)}
+   785→                          </td>
+   786→                          <td style={{ padding: "10px", textAlign: "right", verticalAlign: "top" }}>
+   787→                            <p style={{ margin: 0, fontWeight: 700, color: "#1e293b", fontSize: "14px" }}>{ex.name}</p>
+   788→                            <p style={{ margin: "2px 0 0 0", fontSize: "11px", color: "#94a3b8" }}>{ex.muscle}</p>
+   789→                            {ex.description && (
+   790→                              <p style={{ margin: "4px 0 0 0", fontSize: "11px", color: "#475569", lineHeight: 1.6 }}>{ex.description}</p>
+   791→                            )}
+   792→                            {ex.tips && (
+   793→                              <p style={{ margin: "3px 0 0 0", fontSize: "10px", color: "#b45309", lineHeight: 1.5 }}>💡 {ex.tips}</p>
+   794→                            )}
+   795→                          </td>
+   796→                          <td style={{ padding: "10px", textAlign: "center", fontWeight: 700, color: "#1e293b", verticalAlign: "top" }}>{toPersianDigits(ex.sets.length)}</td>
+   797→                          <td style={{ padding: "10px", textAlign: "center", color: "#1e293b", verticalAlign: "top" }}>
+   798→                            {ex.sets.map((s, k) => (
+   799→                              <span key={k}>
+   800→                                {toPersianDigits(s.reps)}
+   801→                                {k < ex.sets.length - 1 ? " / " : ""}
+   802→                              </span>
+   803→                            ))}
+   804→                          </td>
+   805→                          <td style={{ padding: "10px", textAlign: "center", verticalAlign: "top" }}>
+   806→                            {/* در سوپرست/تری‌ست/جاینت‌ست استراحت بین حرکات صفر است */}
+   807→                            <span style={{ fontSize: "10px", color: numColor }}>—</span>
+   808→                          </td>
+   809→                        </tr>
+   810→                      );
+   811→                    });
+   812→                  }
+   813→                });
+   814→                return rows;
+   815→              })()}
+   816→            </tbody>
+   817→          </table>
+   818→        </div>
+   819→      ))}
+   820→
+   821→      {/* Notes */}
+   822→      {plan.notes && (
+   823→        <div
+   824→          style={{
+   825→            background: "#fff7ed",
+   826→            border: "1px dashed #fdba74",
+   827→            borderRadius: "12px",
+   828→            padding: "12px 16px",
+   829→            marginTop: "12px",
+   830→          }}
+   831→        >
+   832→          <p style={{ fontSize: "12px", color: "#ea580c", fontWeight: 700, margin: "0 0 4px 0" }}>📝 نکات هفته</p>
+   833→          <p style={{ fontSize: "12px", color: "#1e293b", margin: 0, lineHeight: 1.6 }}>{plan.notes}</p>
+   834→        </div>
+   835→      )}
+   836→
+   837→      {/* Footer */}
+   838→      <div
+   839→        style={{
+   840→          marginTop: "24px",
+   841→          paddingTop: "14px",
+   842→          borderTop: "2px solid #fed7aa",
+   843→          display: "flex",
+   844→          alignItems: "center",
+   845→          justifyContent: "space-between",
+   846→          fontSize: "11px",
+   847→          color: "#94a3b8",
+   848→        }}
+   849→      >
+   850→        <span>هر بدنی فیتاپ میخواد 💪</span>
+   851→        <span>ساخته‌شده با فیتاپ هوشمند</span>
+   852→      </div>
+   853→    </div>
+   854→  );
+   855→}
+   856→
+   857→function ExerciseCard({
+   858→  exercise,
+   859→  index,
+   860→  setStates,
+   861→  onToggleSet,
+   862→  onUpdateWeight,
+   863→  onShowDetail,
+   864→  hideSupersetBadge = false,
+   865→}: {
+   866→  exercise: PlanExercise;
+   867→  index: number;
+   868→  setStates: Record<string, SetState>;
+   869→  onToggleSet: (setNumber: number, restSec: number) => void;
+   870→  onUpdateWeight: (setNumber: number, weight: string) => void;
+   871→  onShowDetail: () => void;
+   872→  /** اگر داخل SupersetGroupCard رندر می‌شود، بج درون‌کارت مخفی می‌شود */
+   873→  hideSupersetBadge?: boolean;
+   874→}) {
+   875→  const [expanded, setExpanded] = useState(index === 0);
+   876→  const doneSets = exercise.sets.filter((s) => setStates[`${exercise.id}_${s.setNumber}`]?.done).length;
+   877→
+   878→  return (
+   879→    <Card className="overflow-hidden">
+   880→      <button
+   881→        onClick={() => setExpanded((v) => !v)}
+   882→        className="w-full flex items-center gap-3 p-4 text-right"
+   883→      >
+   884→        <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-primary/20 to-emerald-500/20 flex items-center justify-center shrink-0">
+   885→          <Dumbbell className="w-6 h-6 text-primary" />
+   886→        </div>
+   887→        <div className="flex-1 min-w-0">
+   888→          <h4 className="font-bold text-sm truncate">{exercise.name}</h4>
+   889→          <div className="flex items-center gap-2 mt-0.5">
+   890→            <span className="text-[11px] text-muted-foreground">{exercise.muscle}</span>
+   891→            <span className="text-[11px] text-muted-foreground">•</span>
+   892→            <span className="text-[11px] text-muted-foreground">
+   893→              {toPersianDigits(exercise.sets.length)} ست
+   894→            </span>
+   895→            {doneSets === exercise.sets.length && (
+   896→              <Badge className="bg-emerald-500 text-white text-[9px] h-4">کامل ✓</Badge>
+   897→            )}
+   898→          </div>
+   899→        </div>
+   900→        <ChevronLeft
+   901→          className={`w-5 h-5 text-muted-foreground transition-transform ${expanded ? "-rotate-90" : ""}`}
+   902→        />
+   903→      </button>
+   904→
+   905→      <AnimatePresence>
+   906→        {expanded && (
+   907→          <motion.div
+   908→            initial={{ height: 0, opacity: 0 }}
+   909→            animate={{ height: "auto", opacity: 1 }}
+   910→            exit={{ height: 0, opacity: 0 }}
+   911→            className="overflow-hidden"
+   912→          >
+   913→            <div className="px-4 pb-4">
+   914→              {/* Superset badge if applicable (و فقط اگر داخل گروه نیست) */}
+   915→              {!hideSupersetBadge && exercise.supersetGroup && exercise.supersetType && (
+   916→                <div className="mb-2 p-2 rounded-xl bg-purple-50 border border-purple-200 flex items-center gap-2">
+   917→                  <Repeat className="w-3.5 h-3.5 text-purple-500" />
+   918→                  <span className="text-[10px] font-bold text-purple-700">
+   919→                    {groupTypeLabel(exercise.supersetType)} — گروه {exercise.supersetGroup}
+   920→                  </span>
+   921→                  <span className="text-[9px] text-purple-500 mr-auto">بدون استراحت بین حرکات</span>
+   922→                </div>
+   923→              )}
+   924→
+   925→              {/* Description + tips from plan (always visible) */}
+   926→              {exercise.description && (
+   927→                <div className="mb-2 p-2.5 rounded-xl bg-orange-50/50 border border-orange-100">
+   928→                  <p className="text-[11px] text-slate-700 leading-relaxed">{exercise.description}</p>
+   929→                </div>
+   930→              )}
+   931→              {exercise.tips && (
+   932→                <div className="mb-2 flex items-start gap-1.5 p-2 rounded-xl bg-amber-50/50">
+   933→                  <Lightbulb className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+   934→                  <p className="text-[10px] text-amber-700 leading-relaxed">{exercise.tips}</p>
+   935→                </div>
+   936→              )}
+   937→
+   938→              {/* Action buttons: Show exercise detail (internal library) + Show detail */}
+   939→              <div className="flex gap-2 mb-3">
+   940→                <button
+   941→                  onClick={onShowDetail}
+   942→                  className="flex-1 flex items-center gap-2 p-3 rounded-xl bg-orange-50 hover:bg-orange-100 transition text-right border border-orange-200"
+   943→                >
+   944→                  <Dumbbell className="w-4 h-4 text-orange-500 shrink-0" />
+   945→                  <span className="text-xs font-medium text-orange-700 flex-1">توضیح حرکت</span>
+   946→                  <ChevronLeft className="w-4 h-4 text-orange-400" />
+   947→                </button>
+   948→                <button
+   949→                  onClick={onShowDetail}
+   950→                  className="flex items-center gap-2 p-3 rounded-xl bg-muted/50 hover:bg-muted transition text-right"
+   951→                >
+   952→                  <Info className="w-4 h-4 text-primary shrink-0" />
+   953→                  <span className="text-xs text-muted-foreground">جزئیات</span>
+   954→                  <ChevronLeft className="w-4 h-4 text-muted-foreground" />
+   955→                </button>
+   956→              </div>
+   957→
+   958→              {/* Sets */}
+   959→              <div className="space-y-2">
+   960→                <div className="grid grid-cols-12 gap-2 text-[10px] font-bold text-muted-foreground px-2">
+   961→                  <div className="col-span-2 text-center">ست</div>
+   962→                  <div className="col-span-3 text-center">تکرار</div>
+   963→                  <div className="col-span-3 text-center">وزنه (kg)</div>
+   964→                  <div className="col-span-2 text-center">استراحت</div>
+   965→                  <div className="col-span-2 text-center">انجام</div>
+   966→                </div>
+   967→                {exercise.sets.map((set) => {
+   968→                  const state = setStates[`${exercise.id}_${set.setNumber}`];
+   969→                  return (
+   970→                    <div
+   971→                      key={set.setNumber}
+   972→                      className={`grid grid-cols-12 gap-2 items-center p-2.5 rounded-xl border transition ${
+   973→                        state?.done
+   974→                          ? "border-emerald-500/30 bg-emerald-500/5"
+   975→                          : "border-border bg-card"
+   976→                      }`}
+   977→                    >
+   978→                      <div className="col-span-2 text-center text-sm font-bold">
+   979→                        {toPersianDigits(set.setNumber)}
+   980→                      </div>
+   981→                      <div className="col-span-3 text-center text-xs font-medium">
+   982→                        {toPersianDigits(set.reps)}
+   983→                      </div>
+   984→                      <div className="col-span-3">
+   985→                        <input
+   986→                          type="number"
+   987→                          value={state?.weight || ""}
+   988→                          onChange={(e) => onUpdateWeight(set.setNumber, e.target.value)}
+   989→                          placeholder="—"
+   990→                          dir="ltr"
+   991→                          className="w-full h-8 text-center text-xs rounded-lg border bg-background px-1"
+   992→                        />
+   993→                      </div>
+   994→                      <div className="col-span-2 text-center text-[11px] text-muted-foreground">
+   995→                        {toPersianDigits(set.restSec)}s
+   996→                      </div>
+   997→                      <div className="col-span-2 flex justify-center">
+   998→                        <button
+   999→                          onClick={() => onToggleSet(set.setNumber, set.restSec)}
+  1000→                          className={`w-8 h-8 rounded-full flex items-center justify-center transition ${
+  1001→                            state?.done
+  1002→                              ? "bg-emerald-500 text-white"
+  1003→                              : "bg-muted hover:bg-primary hover:text-primary-foreground"
+  1004→                          }`}
+  1005→                        >
+  1006→                          <Check className="w-4 h-4" strokeWidth={3} />
+  1007→                        </button>
+  1008→                      </div>
+  1009→                    </div>
+  1010→                  );
+  1011→                })}
+  1012→              </div>
+  1013→            </div>
+  1014→          </motion.div>
+  1015→        )}
+  1016→      </AnimatePresence>
+  1017→    </Card>
+  1018→  );
+  1019→}
+  1020→
+  1021→// ============================================================
+  1022→//  SupersetGroupCard — نگه‌دارنده بصری برای گروه سوپرست/تری‌ست/جاینت‌ست
+  1023→//  - سوپرست/تری‌ست: بنفش (سازگار با رنگ قبلی)
+  1024→//  - جاینت‌ست: رز/قرمز متمایز
+  1025→// ============================================================
+  1026→function SupersetGroupCard({
+  1027→  group,
+  1028→  groupType,
+  1029→  circuitRounds,
+  1030→  restBetweenRounds,
+  1031→  children,
+  1032→}: {
+  1033→  group: string;
+  1034→  groupType: "superset" | "triset" | "giant";
+  1035→  circuitRounds?: number;
+  1036→  restBetweenRounds?: number;
+  1037→  children: ReactNode;
+  1038→}) {
+  1039→  const isGiant = groupType === "giant";
+  1040→  const label = groupTypeLabel(groupType);
+  1041→
+  1042→  // رنگ‌بندی متمایز: بنفش برای سوپرست/تری‌ست، رز/نارنجی برای جاینت‌ست
+  1043→  const containerCls = isGiant
+  1044→    ? "rounded-2xl border-2 border-rose-300/80 bg-gradient-to-br from-rose-50/70 via-orange-50/30 to-transparent p-2.5 space-y-2.5 shadow-sm"
+  1045→    : "rounded-2xl border-2 border-purple-300/80 bg-gradient-to-br from-purple-50/70 via-orange-50/20 to-transparent p-2.5 space-y-2.5 shadow-sm";
+  1046→
+  1047→  const headerCls = isGiant
+  1048→    ? "bg-gradient-to-l from-rose-500 to-orange-500 text-white"
+  1049→    : "bg-gradient-to-l from-purple-500 to-fuchsia-500 text-white";
+  1050→
+  1051→  const infoCls = isGiant
+  1052→    ? "bg-rose-100/70 border-rose-200 text-rose-700"
+  1053→    : "bg-purple-100/70 border-purple-200 text-purple-700";
+  1054→
+  1055→  return (
+  1056→    <div className={containerCls}>
+  1057→      {/* هدر گروه — نوع + حرف گروه + بدون استراحت بین حرکات */}
+  1058→      <div className={`${headerCls} rounded-xl px-3 py-2 flex items-center gap-2 shadow-sm`}>
+  1059→        <Repeat className="w-4 h-4 shrink-0" />
+  1060→        <span className="text-xs font-black">
+  1061→          {label} {group}
+  1062→        </span>
+  1063→        <span className="text-[10px] opacity-95 mr-auto flex items-center gap-1">
+  1064→          <Zap className="w-3 h-3" />
+  1065→          بدون استراحت بین حرکات
+  1066→        </span>
+  1067→      </div>
+  1068→
+  1069→      {/* اطلاعات ویژه جاینت‌ست: تعداد دورها + استراحت بین دورها */}
+  1070→      {isGiant && (circuitRounds || restBetweenRounds) && (
+  1071→        <div className={`flex items-center flex-wrap gap-x-3 gap-y-1 px-3 py-1.5 rounded-lg border text-[10px] ${infoCls}`}>
+  1072→          {circuitRounds ? (
+  1073→            <span className="flex items-center gap-1 font-bold">
+  1074→              <Repeat className="w-3 h-3" />
+  1075→              {toPersianDigits(circuitRounds)} دور
+  1076→            </span>
+  1077→          ) : null}
+  1078→          {restBetweenRounds ? (
+  1079→            <span className="flex items-center gap-1">
+  1080→              <Clock className="w-3 h-3" />
+  1081→              استراحت بین دورها: {toPersianDigits(restBetweenRounds)} ثانیه
+  1082→            </span>
+  1083→          ) : null}
+  1084→        </div>
+  1085→      )}
+  1086→
+  1087→      {/* کارت‌های حرکات داخل گروه */}
+  1088→      {children}
+  1089→    </div>
+  1090→  );
+  1091→}
+  1092→

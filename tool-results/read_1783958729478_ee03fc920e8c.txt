@@ -1,0 +1,712 @@
+     1→import { NextRequest } from "next/server";
+     2→import { db } from "@/lib/db";
+     3→import { requireAuth, apiError, buildUserDto } from "@/lib/fitness/auth";
+     4→import { SUBSCRIPTION_PLANS, toPersianDigits, type Plan } from "@/lib/fitness/types";
+     5→import { zarinpalVerify, isZarinpalConfigured } from "@/lib/fitness/zarinpal";
+     6→import { processReferralReward } from "@/lib/fitness/referral";
+     7→
+     8→interface VerifyBody {
+     9→  paymentId: string;
+    10→  status: "OK" | "NOK" | "CANCELLED";
+    11→  /** برای callback زرین‌پال: authority واقعی که از URL برمی‌گردد */
+    12→  authority?: string;
+    13→}
+    14→
+    15→export async function POST(req: NextRequest) {
+    16→  try {
+    17→    const user = await requireAuth();
+    18→    const body = (await req.json()) as VerifyBody;
+    19→
+    20→    const payment = await db.payment.findFirst({
+    21→      where: { id: body.paymentId, userId: user.id },
+    22→    });
+    23→    if (!payment) {
+    24→      return Response.json({ error: "پرداخت یافت نشد." }, { status: 404 });
+    25→    }
+    26→    if (payment.status !== "pending") {
+    27→      return Response.json(
+    28→        { error: "این پرداخت قبلاً پردازش شده است." },
+    29→        { status: 400 }
+    30→      );
+    31→    }
+    32→
+    33→    // --- انصراف کاربر ---
+    34→    if (body.status === "CANCELLED") {
+    35→      await db.payment.update({
+    36→        where: { id: payment.id },
+    37→        data: { status: "cancelled", verifiedAt: new Date() },
+    38→      });
+    39→      return Response.json({
+    40→        success: false,
+    41→        status: "cancelled",
+    42→        message: "پرداخت لغو شد.",
+    43→      });
+    44→    }
+    45→
+    46→    // --- پرداخت ناموفق ---
+    47→    if (body.status === "NOK") {
+    48→      await db.payment.update({
+    49→        where: { id: payment.id },
+    50→        data: { status: "failed", verifiedAt: new Date() },
+    51→      });
+    52→      return Response.json({
+    53→        success: false,
+    54→        status: "failed",
+    55→        message: "پرداخت ناموفق بود.",
+    56→      });
+    57→    }
+    58→
+    59→    // --- پرداخت موفق ---
+    60→    const plan = SUBSCRIPTION_PLANS.find((p) => p.id === payment.plan);
+    61→    if (!plan) {
+    62→      return Response.json({ error: "پلن نامعتبر است." }, { status: 400 });
+    63→    }
+    64→
+    65→    // تعیین refId:
+    66→    // - اگر paymentMethod === "wallet" → تایید آنی (نیازی به زرین‌پال نیست)
+    67→    // - اگر gateway → verify API واقعی زرین‌پال را صدا بزن (هیچ شبیه‌سازی‌ای نیست)
+    68→    let refId: string | null = null;
+    69→    let verifyError: string | null = null;
+    70→
+    71→    if (payment.paymentMethod === "gateway") {
+    72→      if (!isZarinpalConfigured()) {
+    73→        await db.payment.update({
+    74→          where: { id: payment.id },
+    75→          data: { status: "failed", verifiedAt: new Date() },
+    76→        });
+    77→        return Response.json({
+    78→          success: false,
+    79→          status: "failed",
+    80→          message: "درگاه پرداخت پیکربندی نشده است.",
+    81→        });
+    82→      }
+    83→
+    84→      const authorityToVerify = body.authority ?? payment.authority;
+    85→      if (!authorityToVerify) {
+    86→        await db.payment.update({
+    87→          where: { id: payment.id },
+    88→          data: { status: "failed", verifiedAt: new Date() },
+    89→        });
+    90→        return Response.json({
+    91→          success: false,
+    92→          status: "failed",
+    93→          message: "کد مرجع پرداخت (authority) یافت نشد.",
+    94→        });
+    95→      }
+    96→
+    97→      const zRes = await zarinpalVerify({
+    98→        authority: authorityToVerify,
+    99→        amount: payment.amount, // Tomans
+   100→      });
+   101→
+   102→      if (zRes.ok) {
+   103→        refId = zRes.refId ?? `${Date.now()}${Math.floor(Math.random() * 10000)}`;
+   104→      } else {
+   105→        // تایید ناموفق — پرداخت واقعاً ناموفق است
+   106→        verifyError = zRes.error ?? "Zarinpal verify failed";
+   107→        await db.payment.update({
+   108→          where: { id: payment.id },
+   109→          data: {
+   110→            status: "failed",
+   111→            verifiedAt: new Date(),
+   112→            refId: zRes.refId ?? null,
+   113→          },
+   114→        });
+   115→        return Response.json({
+   116→          success: false,
+   117→          status: "failed",
+   118→          message: `تأیید پرداخت توسط زرین‌پال ناموفق بود: ${verifyError}`,
+   119→          refId: zRes.refId,
+   120→        });
+   121→      }
+   122→
+   123→      // ذخیره اطلاعات کارت و کارمزد از پاسخ verify (طبق مستندات زرین‌پال)
+   124→      if (zRes.cardPan || zRes.cardHash || zRes.fee != null) {
+   125→        await db.payment.update({
+   126→          where: { id: payment.id },
+   127→          data: {
+   128→            cardPan: zRes.cardPan ?? null,
+   129→            cardHash: zRes.cardHash ?? null,
+   130→            fee: zRes.fee ?? null,
+   131→          },
+   132→        });
+   133→      }
+   134→    } else {
+   135→      // wallet payment — refId محلی
+   136→      refId = `${Date.now()}${Math.floor(Math.random() * 10000)}`;
+   137→    }
+   138→
+   139→    const now = new Date();
+   140→
+   141→    // اگر پرداخت از کیف پول، مبلغ را از موجودی کسر و تراکنش ثبت کن
+   142→    let newBalance = 0;
+   143→    if (payment.paymentMethod === "wallet") {
+   144→      const freshUser = await db.user.findUnique({ where: { id: user.id } });
+   145→      const balance = freshUser?.walletBalance ?? 0;
+   146→      if (balance < payment.amount) {
+   147→        await db.payment.update({
+   148→          where: { id: payment.id },
+   149→          data: { status: "failed", verifiedAt: now },
+   150→        });
+   151→        return Response.json({
+   152→          success: false,
+   153→          status: "failed",
+   154→          message: "موجودی کیف پول در زمان تایید کافی نبود.",
+   155→        });
+   156→      }
+   157→      newBalance = balance - payment.amount;
+   158→      await db.user.update({
+   159→        where: { id: user.id },
+   160→        data: { walletBalance: newBalance },
+   161→      });
+   162→      await db.walletTransaction.create({
+   163→        data: {
+   164→          userId: user.id,
+   165→          type: "purchase",
+   166→          amount: -payment.amount,
+   167→          balance: newBalance,
+   168→          description: `خرید پلن ${plan.label}`,
+   169→          refId: payment.id,
+   170→        },
+   171→      });
+   172→    }
+   173→
+   174→    // آپدیت وضعیت پرداخت به success
+   175→    await db.payment.update({
+   176→      where: { id: payment.id },
+   177→      data: {
+   178→        status: "success",
+   179→        refId,
+   180→        verifiedAt: now,
+   181→      },
+   182→    });
+   183→
+   184→    // محاسبه تاریخ انقضا بر اساس durationDays پلن
+   185→    // در صورت تمدید (خرید همان پلن قبلی)، روزهای باقی‌مانده به اشتراک جدید اضافه می‌شوند.
+   186→    // در صورت ارتقا یا دانگرید (پلن متفاوت)، 45 روز کامل از پلن جدید شروع می‌شود.
+   187→    let remainingDaysPreserved = 0;
+   188→    const oldActiveSub = await db.subscription.findFirst({
+   189→      where: { userId: user.id, status: "active" },
+   190→      orderBy: { endDate: "desc" },
+   191→    });
+   192→    if (oldActiveSub && oldActiveSub.endDate && oldActiveSub.endDate.getTime() > now.getTime()) {
+   193→      // فقط در صورت تمدید همان پلن (same plan)، روزهای باقی‌مانده حفظ می‌شود
+   194→      if (oldActiveSub.plan === plan.id) {
+   195→        const msLeft = oldActiveSub.endDate.getTime() - now.getTime();
+   196→        const daysLeftOld = Math.ceil(msLeft / (1000 * 60 * 60 * 24));
+   197→        if (daysLeftOld > 0) {
+   198→          remainingDaysPreserved = Math.min(daysLeftOld, plan.durationDays);
+   199→        }
+   200→      }
+   201→      // در صورت ارتقا یا دانگرید (پلن متفاوت)، remainingDaysPreserved = 0
+   202→      // یعنی 45 روز کامل از پلن جدید شروع می‌شود
+   203→    }
+   204→
+   205→    const endDate = new Date();
+   206→    endDate.setDate(endDate.getDate() + plan.durationDays + remainingDaysPreserved);
+   207→
+   208→    // غیرفعال کردن اشتراک‌های قبلی فعال
+   209→    await db.subscription.updateMany({
+   210→      where: { userId: user.id, status: "active" },
+   211→      data: { status: "expired" },
+   212→    });
+   213→
+   214→    // ایجاد اشتراک جدید
+   215→    // ─── برای پلن‌های Advanced / Ultimate که نیاز به عکس بدن دارند ───
+   216→    // اشتراک با status="pending" ایجاد می‌شود و startDate/endDate آن null می‌ماند.
+   217→    // این کار تضمین می‌کند که ۴۵ روز از زمان «تکمیل پیش‌نیازها و ساخت برنامه» شروع می‌شود،
+   218→    // نه از زمان خرید. وقتی کاربر عکس بدن/ویدیو/آزمایش خون را آپلود کرد و برنامه ساخته شد،
+   219→    // اشتراک به status="active" تغییر می‌کند و startDate=now, endDate=now+45d تنظیم می‌شود.
+   220→    const needsBodyPhoto = plan.id === "advanced" || plan.id === "ultimate";
+   221→
+   222→    if (needsBodyPhoto) {
+   223→      await db.subscription.create({
+   224→        data: {
+   225→          userId: user.id,
+   226→          plan: plan.id,
+   227→          status: "pending", // ← فعال نیست تا پیش‌نیازها تکمیل شوند
+   228→          startDate: null,   // ← ۴۵ روز هنوز شروع نشده
+   229→          endDate: null,     // ← ۴۵ روز هنوز شروع نشده
+   230→          durationDays: plan.durationDays,
+   231→          pricePaid: payment.amount,
+   232→          discountCode: payment.discountCode,
+   233→        },
+   234→      });
+   235→    } else {
+   236→      // برای پلن‌های Basic / Standard — اشتراک بلافاصله فعال می‌شود
+   237→      await db.subscription.create({
+   238→        data: {
+   239→          userId: user.id,
+   240→          plan: plan.id,
+   241→          status: "active",
+   242→          startDate: now,
+   243→          endDate,
+   244→          durationDays: plan.durationDays,
+   245→          pricePaid: payment.amount,
+   246→          discountCode: payment.discountCode,
+   247→        },
+   248→      });
+   249→    }
+   250→
+   251→    // آپدیت فیلدهای پلن روی User (برای دسترسی سریع)
+   252→    await db.user.update({
+   253→      where: { id: user.id },
+   254→      data: {
+   255→        planName: plan.id,
+   256→        planExpiresAt: endDate,
+   257→        planStartedAt: now,
+   258→        // ریست شمارنده‌های استفاده هوش مصنوعی
+   259→        videoAnalysisUsed: 0,
+   260→        bloodTestUsed: 0,
+   261→        // ریست وضعیت تعیین‌تکلیف ویدیو و آزمایش خون — برای پلن جدید کاربر باید دوباره تصمیم بگیرد.
+   262→        // (اگر کاربر قبلاً ویدیو/آزمایش آپلود کرده باشد، رکوردهای AnalysisResult باقی می‌مانند،
+   263→        // اما تعیین‌تکلیفExplicit برای پلن جدید لازم است تا برنامه‌ی پلن جدید ساخته شود.)
+   264→        videoStatus: null,
+   265→        bloodTestStatus: null,
+   266→      },
+   267→    });
+   268→
+   269→    // ایجاد درخواست برنامه جدید با وضعیت "در حال تولید"
+   270→    const progReq = await db.programRequest.create({
+   271→      data: {
+   272→        userId: user.id,
+   273→        plan: plan.id,
+   274→        billingPeriod: "monthly",
+   275→        status: "generating",
+   276→        paymentId: payment.id,
+   277→      },
+   278→    });
+   279→
+   280→    // اگر کد تخفیف استفاده شده، شمارش استفاده را افزایش بده
+   281→    if (payment.discountCode) {
+   282→      // اول در جدول کدهای اختصاصی کاربر بررسی کن
+   283→      const udc = await db.userDiscountCode.findUnique({ where: { code: payment.discountCode } });
+   284→      if (udc) {
+   285→        await db.userDiscountCode.update({
+   286→          where: { id: udc.id },
+   287→          data: { isUsed: true },
+   288→        });
+   289→      } else {
+   290→        // در غیر این صورت کد عمومی است
+   291→        await db.discountCode.updateMany({
+   292→          where: { code: payment.discountCode },
+   293→          data: { usedCount: { increment: 1 } },
+   294→        });
+   295→      }
+   296→    }
+   297→
+   298→    // --- پردازش تولید برنامه بر اساس پلن ---
+   299→    // • Basic / Standard: تولید خودکار برنامه بلافاصله انجام می‌شود.
+   300→    // • Advanced / Ultimate: نیازمند عکس بدن قبل از تولید برنامه — وضعیت pending_body_photo
+   301→    //   (ویدیو برای Ultimate اختیاری است، نه الزامی. آزمایش خون کاملاً دلبخواه است و
+   302→    //    در بخش جداگانه‌ای از پنل قابل ارسال است و هرگز برای تولید برنامه الزامی نیست.)
+   303→    // needsBodyPhoto قبلاً در بالا تعریف شده است.
+   304→    const canSubmitVideo = plan.id === "ultimate";
+   305→
+   306→    let planGenerationOk = false;
+   307→
+   308→    if (needsBodyPhoto) {
+   309→      // بدون تولید برنامه — منتظر ارسال عکس‌های بدن توسط کاربر
+   310→      // (ویدیو برای Ultimate اختیاری است؛ بنابراین هر دو پلن از pending_body_photo استفاده می‌کنند)
+   311→      await db.programRequest.update({
+   312→        where: { id: progReq.id },
+   313→        data: { status: "pending_body_photo" },
+   314→      });
+   315→
+   316→      const noticeBody = canSubmitVideo
+   317→        ? "برای دریافت برنامه اختصاصی، ارسال عکس‌های بدن (۴ زاویه) الزامی است. ارسال ویدیوی فرم حرکات اختیاری است اما به دقت برنامه کمک می‌کند. همچنین می‌توانید بعداً از بخش «آزمایش خون» در پنل، عکس آزمایش خون خود را برای تحلیل ارسال کنید (دلبخواه)."
+   318→        : "برای دریافت برنامه اختصاصی، عکس‌های بدن خود (۴ زاویه) را ارسال کنید. سپس فیتاپ هوشمند برنامه شما را طراحی می‌کند.";
+   319→
+   320→      await db.notification.create({
+   321→        data: {
+   322→          userId: user.id,
+   323→          type: "system",
+   324→          title: "ارسال عکس بدن الزامی است 📸",
+   325→          body: noticeBody,
+   326→          link: "?tab=dashboard",
+   327→          read: false,
+   328→        },
+   329→      });
+   330→
+   331→      // ─── NEW (FIX-FLICKER-CARDS-SCROLL-BLOODTEST): نوتیفیکیشن جداگانه برای
+   332→      // آزمایش خون — فقط برای پلن Ultimate. کاربر می‌تواند فرم آزمایش را دانلود
+   333→      // کند، یا آزمایش بدهد و منتظر جواب بماند، یا اصلاً آپلود نکند. ───
+   334→      if (canSubmitVideo) {
+   335→        await db.notification.create({
+   336→          data: {
+   337→            userId: user.id,
+   338→            type: "system",
+   339→            title: "آزمایش خون خود را ارسال کنید (اختیاری) 🩸",
+   340→            body:
+   341→              "برای داشتن یک برنامه ورزشی و تغذیه‌ای کاملاً شخصی‌سازی‌شده، می‌توانید آزمایش خون خود را به فیتاپ بسپارید. " +
+   342→              "از بخش «آزمایش خون» در پنل، ابتدا فرم آزمایش را دانلود کرده و به آزمایشگاه ببرید. " +
+   343→              "سپس یکی از گزینه‌ها را انتخاب کنید: «آزمایش دادم و منتظر جوابم» (تا آپلود نتایج، تولید برنامه متوقف می‌ماند) یا «آپلود نمی‌کنم» (برنامه بدون آزمایش خون طراحی می‌شود).",
+   344→            link: "?tab=dashboard",
+   345→            read: false,
+   346→          },
+   347→        });
+   348→
+   349→        // ─── NEW (VIDEO-PREREQUISITE): نوتیفیکیشن جداگانه برای ویدیوی فرم حرکات
+   350→        // (اختیاری) — فقط برای پلن Ultimate. کاربر باید حداقل یک تصمیم بگیرد:
+   351→        // یا ویدیو را آپلود کند (همراه با عکس‌های بدن در همان فرم) یا "آپلود نمی‌کنم"
+   352→        // را بزند. تا زمان تعیین‌تکلیف، تولید برنامه متوقف می‌ماند. ───
+   353→        await db.notification.create({
+   354→          data: {
+   355→            userId: user.id,
+   356→            type: "system",
+   357→            title: "ارسال ویدیوی فرم حرکات (اختیاری) 🎥",
+   358→            body:
+   359→              "برای دقت بالاتر در طراحی برنامه، می‌توانید ویدیویی از فرم اجرای حرکات خود ارسال کنید. این مرحله اختیاری است اما به مربی هوشمند کمک می‌کند نقاط ضعف فرم بدن شما را شناسایی کند. " +
+   360→              "از بخش داشبورد می‌توانید ویدیو را آپلود کنید یا «آپلود نمی‌کنم» را انتخاب کنید. " +
+   361→              "تا زمان تعیین تکلیف این مرحله، ساخت برنامه شما متوقف می‌ماند.",
+   362→            link: "?tab=dashboard",
+   363→            read: false,
+   364→          },
+   365→        });
+   366→      }
+   367→
+   368→      // ─── NEW (BODY-COMPOSITION-PRO): اگر کاربر هنوز اندازه‌های بدنی ندارد،
+   369→      // نوتیفیکیشن جداگانه برای تشویق به وارد کردن اندازه‌ها ارسال می‌کنیم. ───
+   370→      const baselineCheckup = await db.checkup.findFirst({
+   371→        where: { userId: user.id, phaseNumber: 0 },
+   372→        orderBy: { createdAt: "desc" },
+   373→      });
+   374→      const hasMeasurements =
+   375→        !!baselineCheckup?.waistMeasurement && !!baselineCheckup?.neckMeasurement;
+   376→      if (!hasMeasurements) {
+   377→        await db.notification.create({
+   378→          data: {
+   379→            userId: user.id,
+   380→            type: "system",
+   381→            title: "برای برنامه دقیق‌تر، اندازه‌های بدنی خود را وارد کنید 📏",
+   382→            body: "با وارد کردن دور کمر، گردن و سایر اندازه‌ها، فیتاپ هوشمند درصد چربی بدن شما را با فرمول علمی US Navy محاسبه می‌کند و برنامه دقیق‌تری طراحی می‌کند. می‌توانید این مرحله را رد کنید.",
+   383→            link: "?tab=progress",
+   384→            read: false,
+   385→          },
+   386→        });
+   387→      }
+   388→    } else {
+   389→      // --- تولید برنامه در پس‌زمینه (BACKGROUND) ---
+   390→      // IMPORTANT: برنامه‌سازی توسط AI حدود ۲۰ ثانیه طول می‌کشد.
+   391→      // اگر اینجا صبر کنیم، کاربر ۲۰ ثانیه صفحه لودینگ می‌بیند و پنل فعال نمی‌شود.
+   392→      // راه‌حل: تولید برنامه را در پس‌زمینه (fire-and-forget) انجام می‌دهیم و
+   393→      // فوری پاسخ موفقیت برمی‌گردانیم تا کاربر پنل را ببیند.
+   394→      // وقتی برنامه آماده شد، نوتیفیکیشن «برنامه آماده شد» ارسال می‌شود.
+   395→      // کاربر در صفحه برنامه‌ها وضعیت «در حال تولید...» را می‌بیند.
+   396→      try {
+   397→        const profile = await db.onboardingProfile.findUnique({ where: { userId: user.id } });
+   398→        if (profile) {
+   399→          // ساخت OnboardingData از پروفایل ذخیره‌شده
+   400→          const { generateWorkoutPlan, generateMealPlan } = await import("@/lib/fitness/ai");
+   401→
+   402→          // local parsers (same as in onboarding route)
+   403→          const parseEquip = (raw: string | null | undefined): string[] => {
+   404→            if (!raw) return [];
+   405→            const t = raw.trim();
+   406→            if (!t) return [];
+   407→            try {
+   408→              const p = JSON.parse(t);
+   409→              if (Array.isArray(p)) return p.map((x) => String(x));
+   410→              if (typeof p === "string") return p.split(",").map((s) => s.trim()).filter(Boolean);
+   411→              return [];
+   412→            } catch {
+   413→              return t.split(",").map((s) => s.trim()).filter(Boolean);
+   414→            }
+   415→          };
+   416→          const parseList = (raw: string | null | undefined): string[] => {
+   417→            if (!raw) return [];
+   418→            const t = raw.trim();
+   419→            if (!t) return [];
+   420→            try {
+   421→              const p = JSON.parse(t);
+   422→              return Array.isArray(p) ? p.map((x) => String(x)) : [];
+   423→            } catch {
+   424→              return t.split(",").map((s) => s.trim()).filter(Boolean);
+   425→            }
+   426→          };
+   427→
+   428→          // ─── Get the LATEST weight from WeightLog (not the original onboarding weight) ───
+   429→          // این برای تمدید مهم است: اگر کاربر در طول ۴۵ روز وزن کم/زیاد کرده،
+   430→          // برنامه جدید باید بر اساس وزن فعلی ساخته شود نه وزن اولیه.
+   431→          const latestWeightLog = await db.weightLog.findFirst({
+   432→            where: { userId: user.id },
+   433→            orderBy: { loggedAt: "desc" },
+   434→            select: { weight: true },
+   435→          });
+   436→          const currentWeight = latestWeightLog?.weight ?? profile.weight;
+   437→
+   438→          // ─── Get the latest checkup data for body measurements ───
+   439→          const latestCheckup = await db.checkup.findFirst({
+   440→            where: { userId: user.id, phaseCompleted: true },
+   441→            orderBy: { createdAt: "desc" },
+   442→            select: { bodyFatPercent: true, waistMeasurement: true, fatigueLevel: true, sleepQuality: true,
+   443→                      weight: true, armMeasurement: true, chestMeasurement: true, hipMeasurement: true,
+   444→                      thighMeasurement: true, neckMeasurement: true, dietAdherence: true, workoutAdherence: true,
+   445→                      phaseNumber: true, isFinalCheckup: true },
+   446→          });
+   447→
+   448→          // ─── تمدید هوشمند: اگر کاربر دوره قبلی را کامل کرده، پیشرفت او را به AI می‌گویم ───
+   449→          const previousSub = oldActiveSub || await db.subscription.findFirst({
+   450→            where: { userId: user.id, status: "expired" },
+   451→            orderBy: { endDate: "desc" },
+   452→          });
+   453→
+   454→          let renewalContext = "";
+   455→          if (previousSub && latestCheckup) {
+   456→            const oldWeight = profile.weight;
+   457→            const newWeight = currentWeight;
+   458→            const weightChange = newWeight - oldWeight;
+   459→            const oldBodyFat = latestCheckup.bodyFatPercent;
+   460→            renewalContext = `\n\n[سیستم - تمدید اشتراک]: این کاربر قبلاً پلن ${previousSub.plan} را برای ${previousSub.durationDays} روز استفاده کرده است.
+   461→پیشرفت کاربر:
+   462→- وزن اولیه: ${oldWeight} کیلو → وزن فعلی: ${newWeight} کیلو (تغییر: ${weightChange > 0 ? "+" : ""}${weightChange.toFixed(1)} کیلو)
+   463→${oldBodyFat ? `- درصد چربی بدن در آخرین چکاپ: ${oldBodyFat.toFixed(1)}٪` : ""}
+   464→- سطح انرژی: ${latestCheckup.fatigueLevel}/5
+   465→- کیفیت خواب: ${latestCheckup.sleepQuality}/5
+   466→- رعایت رژیم: ${latestCheckup.dietAdherence}/5
+   467→- رعایت تمرین: ${latestCheckup.workoutAdherence}/5
+   468→- فاز تکمیل‌شده: ${latestCheckup.phaseNumber}${latestCheckup.isFinalCheckup ? " (چکاپ نهایی)" : ""}
+   469→
+   470→برنامه جدید را بر اساس این پیشرفت طراحی کن:
+   471→${weightChange < 0 ? "✅ کاربر وزن کم کرده — برنامه را با شدت مناسب ادامه بده" : weightChange > 0 ? "⚠️ کاربر وزن اضافه کرده — برنامه را با تمرکز بر چربی‌سوزی تنظیم کن" : "→ وزن ثابت — برنامه را متنوع‌تر و پیشرفته‌تر کن"}
+   472→${latestCheckup.fatigueLevel <= 2 ? "⚠️ خستگی بالا — حجم تمرین را کمی کم کن" : ""}
+   473→${latestCheckup.sleepQuality <= 2 ? "⚠️ خواب ضعیف — ریکاوری را در نظر بگیر" : ""}
+   474→${latestCheckup.workoutAdherence >= 4 ? "✅ رعایت تمرین عالی — می‌توانی شدت را افزایش دهی" : ""}`;
+   475→          }
+   476→
+   477→          const planData = {
+   478→            gender: profile.gender as any,
+   479→            age: profile.age,
+   480→            height: profile.height,
+   481→            weight: currentWeight, // ← وزن فعلی، نه وزن اولیه
+   482→            targetWeight: profile.targetWeight ?? undefined,
+   483→            goal: profile.goal as any,
+   484→            activityLevel: profile.activityLevel as any,
+   485→            workoutDays: profile.workoutDays,
+   486→            workoutDaysList: parseList(profile.workoutDaysList),
+   487→            workoutPlace: profile.workoutPlace as any,
+   488→            equipment: parseEquip(profile.equipment),
+   489→            diseases: profile.diseases,
+   490→            injuries: profile.injuries,
+   491→            allergies: profile.allergies,
+   492→            dietType: profile.dietType as any,
+   493→            trainingExperience: (profile.trainingExperience ?? undefined) as any,
+   494→            previousTrainingType: profile.previousTrainingType ?? undefined,
+   495→            drugAllergies: profile.drugAllergies ?? undefined,
+   496→            currentMedications: profile.currentMedications ?? undefined,
+   497→            maxLifts: profile.maxLifts ?? undefined,
+   498→            // NEW: comprehensive professional fields
+   499→            bodyFrame: (profile.bodyFrame ?? undefined) as any,
+   500→            sleepHours: profile.sleepHours ?? undefined,
+   501→            stressLevel: profile.stressLevel ?? undefined,
+   502→            waterHabit: profile.waterHabit ?? undefined,
+   503→            targetDate: profile.targetDate ?? undefined,
+   504→            workoutTime: (profile.workoutTime ?? undefined) as any,
+   505→            medicalConditions: parseList(profile.medicalConditions) as any,
+   506→            currentSupplements: profile.currentSupplements ?? undefined,
+   507→            dislikedFoods: profile.dislikedFoods ?? undefined,
+   508→            preferredCuisine: (profile.preferredCuisine ?? undefined) as any,
+   509→            // Auto-calculated water goal from weight × 35 ml + activity adjustment
+   510→            waterGoalMl: (() => {
+   511→              const w = currentWeight || 70;
+   512→              const baseMl = Math.round(w * 35);
+   513→              let adj = 0;
+   514→              const al = profile.activityLevel;
+   515→              if (al === "active" || al === "very_active") adj = 500;
+   516→              else if (al === "moderate") adj = 250;
+   517→              return baseMl + adj;
+   518→            })(),
+   519→          };
+   520→
+   521→          // غیرفعال‌سازی برنامه‌های قبلی
+   522→          await db.workoutPlan.updateMany({ where: { userId: user.id }, data: { active: false } });
+   523→          await db.mealPlan.updateMany({ where: { userId: user.id }, data: { active: false } });
+   524→
+   525→          // تولید موازی — با context تمدید (اگر وجود دارد)
+   526→          // (FULL-PROFILE-AI-CONTEXT-WORKOUT) آخرین آزمایش خون و تحلیل عکس بدن
+   527→          // هم در صورت وجود به AI تزریق می‌شود تا برنامه دقیق‌تر شود.
+   528→          const extras: {
+   529→            renewalContext?: string;
+   530→            bloodTestReport?: string;
+   531→            bodyPhotoAnalysis?: string;
+   532→          } = {};
+   533→          if (renewalContext) extras.renewalContext = renewalContext;
+   534→
+   535→          // ─── آخرین آزمایش خون (در صورت وجود) ───
+   536→          try {
+   537→            const latestBloodTest = await db.analysisResult.findFirst({
+   538→              where: { userId: user.id, type: "blood_test" },
+   539→              orderBy: { createdAt: "desc" },
+   540→              select: { result: true, createdAt: true },
+   541→            });
+   542→            if (latestBloodTest?.result) {
+   543→              try {
+   544→                const parsed = JSON.parse(latestBloodTest.result);
+   545→                const summaryParts: string[] = [];
+   546→                if (parsed.summary) summaryParts.push(String(parsed.summary));
+   547→                if (parsed.abnormalities && Array.isArray(parsed.abnormalities) && parsed.abnormalities.length > 0) {
+   548→                  summaryParts.push(`ناهنجاری‌ها: ${parsed.abnormalities.map((a: any) => typeof a === "string" ? a : (a?.name || a?.test || JSON.stringify(a))).join("، ")}`);
+   549→                }
+   550→                if (parsed.recommendations && Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0) {
+   551→                  summaryParts.push(`توصیه‌ها: ${parsed.recommendations.slice(0, 3).join("، ")}`);
+   552→                }
+   553→                if (summaryParts.length > 0) {
+   554→                  extras.bloodTestReport = `آخرین آزمایش خون کاربر (تاریخ: ${new Date(latestBloodTest.createdAt).toLocaleDateString("fa-IR")}):\n${summaryParts.join("\n")}`;
+   555→                }
+   556→              } catch {
+   557→                extras.bloodTestReport = `آخرین آزمایش خون کاربر:\n${latestBloodTest.result.slice(0, 800)}`;
+   558→              }
+   559→            }
+   560→          } catch (btErr) {
+   561→            console.error("[payment/verify] failed to load blood test:", btErr);
+   562→          }
+   563→
+   564→          // ─── آخرین تحلیل عکس بدن (در صورت وجود) ───
+   565→          try {
+   566→            const latestBodyPhoto = await db.analysisResult.findFirst({
+   567→              where: { userId: user.id, type: "body_photo" },
+   568→              orderBy: { createdAt: "desc" },
+   569→              select: { result: true, createdAt: true },
+   570→            });
+   571→            if (latestBodyPhoto?.result) {
+   572→              try {
+   573→                const parsed = JSON.parse(latestBodyPhoto.result);
+   574→                const summaryParts: string[] = [];
+   575→                if (parsed.analysis) summaryParts.push(String(parsed.analysis));
+   576→                if (parsed.recommendations && Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0) {
+   577→                  summaryParts.push(`توصیه‌ها: ${parsed.recommendations.slice(0, 3).join("، ")}`);
+   578→                }
+   579→                if (parsed.bodyScore != null) summaryParts.push(`امتیاز فرم بدن: ${parsed.bodyScore} از ۱۰۰`);
+   580→                if (summaryParts.length > 0) {
+   581→                  extras.bodyPhotoAnalysis = `آخرین تحلیل عکس بدن کاربر (تاریخ: ${new Date(latestBodyPhoto.createdAt).toLocaleDateString("fa-IR")}):\n${summaryParts.join("\n")}`;
+   582→                }
+   583→              } catch {
+   584→                extras.bodyPhotoAnalysis = `آخرین تحلیل عکس بدن کاربر:\n${latestBodyPhoto.result.slice(0, 800)}`;
+   585→              }
+   586→            }
+   587→          } catch (bpErr) {
+   588→            console.error("[payment/verify] failed to load body photo analysis:", bpErr);
+   589→          }
+   590→
+   591→          // ─── تولید برنامه در پس‌زمینه (BACKGROUND — fire and forget) ───
+   592→          // صبر نمی‌کنیم تا پاسخ فوری برگردد. کاربر پنل را می‌بیند و وقتی
+   593→          // برنامه آماده شد، نوتیفیکیشن دریافت می‌کند.
+   594→          const userIdBg = user.id;
+   595→          const progReqIdBg = progReq.id;
+   596→          const planIdBg = plan.id;
+   597→          const oldSubBg = oldActiveSub;
+   598→
+   599→          void (async () => {
+   600→            try {
+   601→              const [workout, meal] = await Promise.all([
+   602→                generateWorkoutPlan(planData, planIdBg as any, extras),
+   603→                generateMealPlan(planData, planIdBg as any, extras),
+   604→              ]);
+   605→
+   606→              await db.workoutPlan.create({
+   607→                data: { userId: userIdBg, content: JSON.stringify(workout), active: true },
+   608→              });
+   609→              await db.mealPlan.create({
+   610→                data: { userId: userIdBg, content: JSON.stringify(meal), totalCal: meal.totalCalories, active: true },
+   611→              });
+   612→
+   613→              // به‌روزرسانی وضعیت درخواست برنامه به "ready"
+   614→              await db.programRequest.update({
+   615→                where: { id: progReqIdBg },
+   616→                data: { status: "ready" },
+   617→              });
+   618→
+   619→              // نوتیفیکیشن آماده شدن برنامه
+   620→              await db.notification.create({
+   621→                data: {
+   622→                  userId: userIdBg,
+   623→                  type: "achievement",
+   624→                  title: "برنامه شما آماده شد! 🎯",
+   625→                  body: "برنامه تمرینی و غذایی شخصی‌سازی‌شده شما توسط فیتاپ هوشمند ساخته شد. از بخش «تمرینات» و «تغذیه» مشاهده کنید.",
+   626→                  link: "?tab=programs",
+   627→                  read: false,
+   628→                },
+   629→              });
+   630→              console.log("[payment/verify] background plan generation completed for user:", userIdBg);
+   631→            } catch (genErr) {
+   632→              console.error("[payment/verify] background plan generation failed:", genErr);
+   633→              // علامت‌گذاری درخواست به عنوان ناموفق
+   634→              try {
+   635→                await db.programRequest.update({
+   636→                  where: { id: progReqIdBg },
+   637→                  data: { status: "failed" },
+   638→                });
+   639→              } catch {}
+   640→            }
+   641→          })();
+   642→
+   643→          // برنامه در حال تولید است — پاسخ فوری برمی‌گردد
+   644→          planGenerationOk = false; // یعنی «در حال تولید» (نه شکست)
+   645→        }
+   646→      } catch (prepErr) {
+   647→        console.error("[payment/verify] plan generation prep failed:", prepErr);
+   648→        // علامت‌گذاری درخواست به عنوان ناموفق ولی خرید موفق است
+   649→        await db.programRequest.update({
+   650→          where: { id: progReq.id },
+   651→          data: { status: "failed" },
+   652→        });
+   653→      }
+   654→    }
+   655→
+   656→    // نوتیفیکیشن خرید موفق
+   657→    const preservedNote =
+   658→      remainingDaysPreserved > 0
+   659→        ? ` ${toPersianDigits(remainingDaysPreserved)} روز از اشتراک قبلی شما به اشتراک جدید اضافه شد 🎁`
+   660→        : "";
+   661→    await db.notification.create({
+   662→      data: {
+   663→        userId: user.id,
+   664→        type: "subscription",
+   665→        title: "پلن شما فعال شد! ✅",
+   666→        body: needsBodyPhoto
+   667→          ? `پلن ${plan.label} با موفقیت خریداری شد. ⏱ دوره ۴۵ روزه شما از زمانی که عکس‌های بدن (و در صورت ارسال، ویدیو/آزمایش خون) را تکمیل کنید و برنامه‌تان ساخته شود آغاز می‌شود — نه از همین حالا. لطفاً پیش‌نیازها را در داشبورد تکمیل کنید.${preservedNote}`
+   668→          : `پلن ${plan.label} با موفقیت خریداری شد. تا ${endDate.toLocaleDateString("fa-IR")} فعال است.${preservedNote} برنامه شما در حال تولید توسط فیتاپ هوشمند است — به‌زودی آماده می‌شود.`,
+   669→        link: "?tab=dashboard",
+   670→        meta: JSON.stringify({ planId: plan.id, refId, remainingDaysPreserved }),
+   671→        read: false,
+   672→      },
+   673→    });
+   674→
+   675→    // --- پردازش پاداش معرفی به دوست‌دار ---
+   676→    // اگر کاربر با کد معرفی ثبت‌نام کرده و این اولین خرید پلن اوست،
+   677→    // به هر دو طرف (خریدار + معرف) ۱۵۰,۰۰۰ تومان پاداش داده می‌شود.
+   678→    try {
+   679→      await processReferralReward({
+   680→        buyerUserId: user.id,
+   681→        paymentId: payment.id,
+   682→      });
+   683→    } catch (refErr) {
+   684→      // خطا در پردازش پاداش نباید جلوی موفقیت خرید را بگیرد
+   685→      console.error("[payment/verify] referral reward failed:", refErr);
+   686→    }
+   687→
+   688→    const updatedDto = await buildUserDto(user.id);
+   689→
+   690→    return Response.json({
+   691→      success: true,
+   692→      status: "success",
+   693→      message: "پرداخت با موفقیت انجام شد.",
+   694→      refId,
+   695→      amount: payment.amount,
+   696→      originalAmount: payment.originalAmount,
+   697→      plan: plan.label,
+   698→      planId: plan.id,
+   699→      // برای پلن‌های پیشرفته/حرفه‌ای، تاریخ پایان فعلاً null است (تا پیش‌نیازها تکمیل شوند).
+   700→      // برای پلن‌های پایه/استاندارد، endDate تنظیم شده است.
+   701→      subscriptionEnd: needsBodyPhoto ? null : endDate.toISOString(),
+   702→      // برای پلن‌های پیشرفته/حرفه‌ای، اشتراک pending است تا پیش‌نیازها تکمیل شوند
+   703→      subscriptionStatus: needsBodyPhoto ? "pending" : "active",
+   704→      remainingDaysPreserved,
+   705→      walletBalance: newBalance,
+   706→      user: updatedDto,
+   707→    });
+   708→  } catch (e) {
+   709→    return apiError(e);
+   710→  }
+   711→}
+   712→

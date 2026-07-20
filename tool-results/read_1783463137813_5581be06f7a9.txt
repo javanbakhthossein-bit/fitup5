@@ -1,0 +1,812 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState } from "react";
+     4→import { motion } from "framer-motion";
+     5→import {
+     6→  Flame,
+     7→  ListChecks,
+     8→  Trophy,
+     9→  Zap,
+    10→  Clock,
+    11→  ChevronLeft,
+    12→  Dumbbell,
+    13→  Target,
+    14→  Lock,
+    15→  Music,
+    16→  TestTube,
+    17→  Video,
+    18→  Salad,
+    19→  Crown,
+    20→  Calendar,
+    21→  History,
+    22→  Sparkles,
+    23→  Loader2,
+    24→  ClipboardList,
+    25→  type LucideIcon,
+    26→} from "lucide-react";
+    27→import { useAppStore } from "@/lib/fitness/store";
+    28→import { Card } from "@/components/ui/card";
+    29→import { Button } from "@/components/ui/button";
+    30→import { Skeleton } from "@/components/ui/skeleton";
+    31→import {
+    32→  toPersianDigits,
+    33→  PERSIAN_WEEKDAYS,
+    34→  PLAN_LABELS,
+    35→  canAccess,
+    36→  type WorkoutPlanContent,
+    37→  type MealPlanContent,
+    38→} from "@/lib/fitness/types";
+    39→import { SmartNotificationsWidget } from "./smart-notifications-widget";
+    40→import { BodyAnalysisBanner } from "./body-analysis-banner";
+    41→
+    42→const goldGradient = "linear-gradient(135deg, #f59e0b, #f97316)";
+    43→
+    44→/** Format a JS Date as a Persian (Jalali) string with day-of-week + date + time */
+    45→function formatPersianDateTime(d: Date): string {
+    46→  try {
+    47→    const weekdayNames = ["یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه"];
+    48→    // Intl supports islamic-civil but for Persian (Jalali) use fa-IR with persian calendar
+    49→    const parts = new Intl.DateTimeFormat("fa-IR-u-ca-persian", {
+    50→      weekday: "long",
+    51→      day: "numeric",
+    52→      month: "long",
+    53→      year: "numeric",
+    54→    }).formatToParts(d);
+    55→    // Extract parts
+    56→    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    57→    const day = get("weekday");
+    58→    const date = `${get("day")} ${get("month")} ${get("year")}`;
+    59→    // Time
+    60→    const hh = String(d.getHours()).padStart(2, "0");
+    61→    const mm = String(d.getMinutes()).padStart(2, "0");
+    62→    return `${day}، ${date} - ${toPersianDigits(hh)}:${toPersianDigits(mm)}`;
+    63→  } catch {
+    64→    // Fallback if Intl calendar is unavailable
+    65→    const dayIdx = (d.getDay() + 1) % 7;
+    66→    const wd = PERSIAN_WEEKDAYS[dayIdx];
+    67→    const hh = String(d.getHours()).padStart(2, "0");
+    68→    const mm = String(d.getMinutes()).padStart(2, "0");
+    69→    return `${wd} - ${toPersianDigits(hh)}:${toPersianDigits(mm)}`;
+    70→  }
+    71→}
+    72→
+    73→/** Estimate calories burned during a workout using MET × weight × hours */
+    74→function estimateCaloriesBurned(
+    75→  minutes: number,
+    76→  userWeightKg: number,
+    77→  metValue = 6.5
+    78→): number {
+    79→  const hours = minutes / 60;
+    80→  return Math.round(metValue * userWeightKg * hours);
+    81→}
+    82→
+    83→export function DashboardView() {
+    84→  const {
+    85→    user,
+    86→    setMainTab,
+    87→    setOverlay,
+    88→    workoutPlan,
+    89→    setWorkoutPlan,
+    90→    mealPlan,
+    91→    setMealPlan,
+    92→  } = useAppStore();
+    93→  const [loading, setLoading] = useState(true);
+    94→  const [today, setToday] = useState("");
+    95→  const [now, setNow] = useState<string>("");
+    96→
+    97→  // Live clock — update every second
+    98→  useEffect(() => {
+    99→    const tick = () => {
+   100→      const d = new Date();
+   101→      setNow(formatPersianDateTime(d));
+   102→    };
+   103→    tick();
+   104→    const id = setInterval(tick, 1000);
+   105→    return () => clearInterval(id);
+   106→  }, []);
+   107→
+   108→  useEffect(() => {
+   109→    const dayIdx = new Date().getDay();
+   110→    const persianIdx = (dayIdx + 1) % 7;
+   111→    setToday(PERSIAN_WEEKDAYS[persianIdx]);
+   112→
+   113→    (async () => {
+   114→      setLoading(true);
+   115→      try {
+   116→        const res = await fetch("/api/coach/plan");
+   117→        const data = await res.json();
+   118→        if (data.workout) setWorkoutPlan(data.workout as WorkoutPlanContent);
+   119→        if (data.meal) setMealPlan(data.meal as MealPlanContent);
+   120→      } catch {
+   121→      } finally {
+   122→        setLoading(false);
+   123→      }
+   124→    })();
+   125→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   126→  }, []);
+   127→
+   128→  const todayWorkout = workoutPlan?.days.find((d) => d.day === today);
+   129→
+   130→  // Estimated calories to burn during today's workout (MET-based)
+   131→  const userWeight = 75; // fallback if no profile
+   132→  const estimatedBurnCal = todayWorkout
+   133→    ? estimateCaloriesBurned(todayWorkout.estimatedMinutes, userWeight)
+   134→    : 0;
+   135→
+   136→  const gymModeUnlocked = canAccess(user?.planName, "gymMode");
+   137→
+   138→  return (
+   139→    <div className="px-4 py-4 space-y-4 max-w-5xl mx-auto lg:px-6">
+   140→      {/* Hero greeting with live date/time */}
+   141→      <motion.div
+   142→        initial={{ opacity: 0, y: 10 }}
+   143→        animate={{ opacity: 1, y: 0 }}
+   144→        className="relative overflow-hidden rounded-3xl p-5 bg-white border-2 border-orange-200 shadow-sm"
+   145→      >
+   146→        <div className="absolute -left-8 -top-8 w-40 h-40 rounded-full bg-orange-100 blur-3xl opacity-60" />
+   147→        <div className="relative flex items-center justify-between gap-3">
+   148→          <div className="flex-1 min-w-0">
+   149→            {/* Live date/time */}
+   150→            <div className="flex items-center gap-1.5 text-[11px] text-slate-500 mb-1.5">
+   151→              <Calendar className="w-3.5 h-3.5 text-orange-500" />
+   152→              <span className="font-stat truncate">{now || "در حال بارگذاری..."}</span>
+   153→            </div>
+   154→            <h2 className="text-lg font-bold mb-1 truncate">
+   155→              {getGreeting()}، {user?.name || "ورزشکار"}!{" "}
+   156→              <span
+   157→                style={{
+   158→                  background: goldGradient,
+   159→                  WebkitBackgroundClip: "text",
+   160→                  backgroundClip: "text",
+   161→                  WebkitTextFillColor: "transparent",
+   162→                }}
+   163→              >
+   164→                🔥
+   165→              </span>
+   166→            </h2>
+   167→            <p className="text-sm text-slate-500">
+   168→              {user?.planName
+   169→                ? `پلن ${PLAN_LABELS[user.planName]} فعال — امروز رو بترکون!`
+   170→                : "برای دسترسی کامل، پلن خودت رو فعال کن"}
+   171→            </p>
+   172→          </div>
+   173→          <motion.div
+   174→            animate={{ rotate: [0, 10, -10, 0] }}
+   175→            transition={{ duration: 3, repeat: Infinity }}
+   176→            className="text-5xl shrink-0"
+   177→          >
+   178→            💪
+   179→          </motion.div>
+   180→        </div>
+   181→      </motion.div>
+   182→
+   183→      {/* Body analysis pending banner (Advanced/Ultimate) */}
+   184→      <BodyAnalysisBanner />
+   185→
+   186→      {/* Today's workout + Quick actions */}
+   187→      <div className="grid grid-cols-1 gap-4">
+   188→        {/* Today's workout — Simple/Gym Mode split */}
+   189→        <Card className="p-5 bg-white border-2 border-orange-200 shadow-sm">
+   190→          <div className="flex items-center justify-between mb-3">
+   191→            <div className="flex items-center gap-2">
+   192→              <div
+   193→                className="w-8 h-8 rounded-lg flex items-center justify-center"
+   194→                style={{ background: "rgba(245,158,11,0.15)" }}
+   195→              >
+   196→                <Dumbbell className="w-4 h-4 text-orange-500" />
+   197→              </div>
+   198→              <h3 className="font-bold text-slate-900">مشاهده برنامه</h3>
+   199→            </div>
+   200→            <Button
+   201→              variant="ghost"
+   202→              size="sm"
+   203→              className="text-orange-600 text-xs"
+   204→              onClick={() => setMainTab("workouts")}
+   205→            >
+   206→              جزئیات
+   207→              <ChevronLeft className="w-4 h-4" />
+   208→            </Button>
+   209→          </div>
+   210→          {loading ? (
+   211→            <Skeleton className="h-20 rounded-xl" />
+   212→          ) : (
+   213→            <div>
+   214→              {/* Two buttons: Simple Mode + Gym Mode */}
+   215→              <div className="grid grid-cols-2 gap-2">
+   216→                <motion.button
+   217→                  whileTap={{ scale: 0.97 }}
+   218→                  onClick={() => setMainTab("workouts")}
+   219→                  className="relative overflow-hidden rounded-2xl text-white font-bold py-4 px-3 flex items-center justify-center gap-2 shadow-md hover:shadow-lg transition-shadow"
+   220→                  style={{ background: goldGradient }}
+   221→                >
+   222→                  <ListChecks className="w-5 h-5" />
+   223→                  <span className="text-sm">حالت ساده</span>
+   224→                </motion.button>
+   225→                <motion.button
+   226→                  whileTap={{ scale: 0.97 }}
+   227→                  onClick={() => {
+   228→                    if (gymModeUnlocked) {
+   229→                      setMainTab("workouts");
+   230→                      setTimeout(() => setOverlay("gymMode"), 200);
+   231→                    } else {
+   232→                      toastInfo("حالت باشگاه نیازمند پلن پیشرفته است");
+   233→                      setMainTab("plans");
+   234→                    }
+   235→                  }}
+   236→                  className={`relative overflow-hidden rounded-2xl font-bold py-3.5 px-3 flex items-center justify-center gap-2 transition ${
+   237→                    gymModeUnlocked
+   238→                      ? "bg-white border-2 border-orange-300 text-orange-600 hover:bg-orange-50"
+   239→                      : "bg-slate-50 border-2 border-slate-200 text-slate-500"
+   240→                  }`}
+   241→                >
+   242→                  {!gymModeUnlocked && <Lock className="w-4 h-4" />}
+   243→                  <Dumbbell className="w-4 h-4" />
+   244→                  <span className="text-sm">حالت باشگاه</span>
+   245→                  {!gymModeUnlocked && (
+   246→                    <span className="absolute top-1.5 left-1.5 text-[9px] px-1.5 py-0.5 rounded-full bg-slate-200 text-slate-600 font-bold">
+   247→                      قفل
+   248→                    </span>
+   249→                  )}
+   250→                </motion.button>
+   251→              </div>
+   252→            </div>
+   253→          )}
+   254→        </Card>
+   255→      </div>
+   256→
+   257→      {/* Smart Notifications Widget */}
+   258→      <SmartNotificationsWidget />
+   259→
+   260→      {/* Quick actions */}
+   261→      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+   262→        <QuickAction icon={Dumbbell} label="مشاهده برنامه" onClick={() => setMainTab("workouts")} />
+   263→        <QuickAction icon={ClipboardList} label="برنامه‌ها" onClick={() => setMainTab("programs")} />
+   264→        <QuickAction icon={Target} label="تغذیه" onClick={() => setMainTab("nutrition")} />
+   265→        <QuickAction icon={Trophy} label="پیشرفت" onClick={() => setMainTab("progress")} />
+   266→      </div>
+   267→
+   268→      {/* امکانات ویژه پلن — همه فعال */}
+   269→      <div>
+   270→        <div className="flex items-center justify-between mb-2.5">
+   271→          <h3 className="font-bold text-sm text-slate-900">امکانات ویژه پلن شما</h3>
+   272→          {user?.planName ? (
+   273→            <span className="text-[11px] px-2 py-0.5 rounded-full text-orange-600 flex items-center gap-1" style={{ background: "rgba(245,158,11,0.12)" }}>
+   274→              <Crown className="w-3 h-3" /> پلن {PLAN_LABELS[user.planName]}
+   275→            </span>
+   276→          ) : (
+   277→            <button onClick={() => setMainTab("plans")} className="text-[11px] text-orange-600">خرید پلن ←</button>
+   278→          )}
+   279→        </div>
+   280→        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+   281→          <GatedFeature
+   282→            icon={Music}
+   283→            label="حالت باشگاه"
+   284→            sub="موزیک + تمرین"
+   285→            unlocked={canAccess(user?.planName, "gymMode")}
+   286→            onClick={() => {
+   287→              if (canAccess(user?.planName, "gymMode")) setOverlay("gymMode");
+   288→              else { toastInfo("حالت باشگاه نیازمند پلن پیشرفته است"); setMainTab("plans"); }
+   289→            }}
+   290→          />
+   291→          <GatedFeature
+   292→            icon={Salad}
+   293→            label="دستیار تغذیه"
+   294→            sub="برنامه غذایی و مکمل اختصاصی"
+   295→            unlocked={canAccess(user?.planName, "nutritionCompanion")}
+   296→            onClick={() => {
+   297→              if (canAccess(user?.planName, "nutritionCompanion")) setMainTab("nutrition");
+   298→              else { toastInfo("دستیار تغذیه نیازمند پلن پیشرفته است"); setMainTab("plans"); }
+   299→            }}
+   300→          />
+   301→          <GatedFeature
+   302→            icon={Video}
+   303→            label="آنالیز ویدیویی"
+   304→            sub="بررسی فرم بدن"
+   305→            unlocked={canAccess(user?.planName, "videoBodyAnalysis")}
+   306→            onClick={() => {
+   307→              if (canAccess(user?.planName, "videoBodyAnalysis")) setOverlay("videoAnalysis");
+   308→              else { toastInfo("آنالیز ویدیویی نیازمند پلن حرفه‌ای است"); setMainTab("plans"); }
+   309→            }}
+   310→          />
+   311→          <GatedFeature
+   312→            icon={TestTube}
+   313→            label="آزمایش خون"
+   314→            sub="تحلیل تخصصی"
+   315→            unlocked={canAccess(user?.planName, "bloodTestAnalysis")}
+   316→            onClick={() => {
+   317→              if (canAccess(user?.planName, "bloodTestAnalysis")) setOverlay("bloodTest");
+   318→              else { toastInfo("تحلیل آزمایش خون نیازمند پلن حرفه‌ای است"); setMainTab("plans"); }
+   319→            }}
+   320→          />
+   321→        </div>
+   322→      </div>
+   323→    </div>
+   324→  );
+   325→}
+   326→
+   327→/** کارت قابلیت با گیت پلن */
+   328→function GatedFeature({
+   329→  icon: Icon,
+   330→  label,
+   331→  sub,
+   332→  unlocked,
+   333→  onClick,
+   334→}: {
+   335→  icon: LucideIcon;
+   336→  label: string;
+   337→  sub: string;
+   338→  unlocked: boolean;
+   339→  onClick: () => void;
+   340→}) {
+   341→  return (
+   342→    <button
+   343→      onClick={onClick}
+   344→      className={`relative flex flex-col items-center gap-1.5 p-4 rounded-2xl border-2 transition text-center ${
+   345→        unlocked
+   346→          ? "bg-white border-orange-200 hover:border-orange-300 hover:shadow-md"
+   347→          : "bg-slate-50 border-slate-200 border-dashed opacity-70 hover:opacity-100"
+   348→      }`}
+   349→    >
+   350→      {!unlocked && (
+   351→        <div className="absolute top-2 left-2 w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center">
+   352→          <Lock className="w-3 h-3 text-slate-500" />
+   353→        </div>
+   354→      )}
+   355→      <div
+   356→        className={`w-11 h-11 rounded-xl flex items-center justify-center`}
+   357→        style={unlocked ? { background: "rgba(245,158,11,0.15)" } : undefined}
+   358→      >
+   359→        <Icon className={`w-5 h-5 ${unlocked ? "text-orange-500" : "text-slate-400"}`} />
+   360→      </div>
+   361→      <span className={`text-xs font-bold ${unlocked ? "text-slate-900" : "text-slate-500"}`}>{label}</span>
+   362→      <span className="text-[10px] text-slate-500">{unlocked ? sub : "قفل"}</span>
+   363→    </button>
+   364→  );
+   365→}
+   366→
+   367→function toastInfo(msg: string) {
+   368→  import("sonner").then(({ toast }) => toast.info(msg));
+   369→}
+   370→
+   371→/* ============ ACTIVITY RINGS (Apple-style SVG) ============ */
+   372→function ActivityRings({
+   373→  workout,
+   374→  calories,
+   375→  water,
+   376→}: {
+   377→  workout: number;
+   378→  calories: number;
+   379→  water: number;
+   380→}) {
+   381→  const rings = [
+   382→    { progress: workout, color: "#F4C542", radius: 52, label: "تمرین" },
+   383→    { progress: calories, color: "#10b981", radius: 40, label: "کالری" },
+   384→    { progress: water, color: "#06b6d4", radius: 28, label: "آب" },
+   385→  ];
+   386→  return (
+   387→    <div className="relative w-44 h-44 shrink-0">
+   388→      <svg viewBox="0 0 120 120" className="w-full h-full -rotate-90">
+   389→        {rings.map((ring, i) => {
+   390→          const c = 2 * Math.PI * ring.radius;
+   391→          return (
+   392→            <g key={i}>
+   393→              <circle
+   394→                cx="60"
+   395→                cy="60"
+   396→                r={ring.radius}
+   397→                fill="none"
+   398→                stroke={ring.color}
+   399→                strokeWidth="9"
+   400→                strokeOpacity="0.15"
+   401→              />
+   402→              <motion.circle
+   403→                cx="60"
+   404→                cy="60"
+   405→                r={ring.radius}
+   406→                fill="none"
+   407→                stroke={ring.color}
+   408→                strokeWidth="9"
+   409→                strokeLinecap="round"
+   410→                strokeDasharray={c}
+   411→                initial={{ strokeDashoffset: c }}
+   412→                animate={{ strokeDashoffset: c * (1 - ring.progress) }}
+   413→                transition={{ duration: 1.2, delay: i * 0.15, ease: "easeOut" }}
+   414→                style={{ filter: `drop-shadow(0 0 4px ${ring.color}80)` }}
+   415→              />
+   416→            </g>
+   417→          );
+   418→        })}
+   419→      </svg>
+   420→      <div className="absolute inset-0 flex items-center justify-center">
+   421→        <div className="text-center">
+   422→          <Flame className="w-6 h-6 text-orange-500 mx-auto mb-0.5" />
+   423→          <p className="text-[10px] text-slate-500">امروز</p>
+   424→        </div>
+   425→      </div>
+   426→    </div>
+   427→  );
+   428→}
+   429→
+   430→function RingLegend({ color, label, value, sub }: { color: string; label: string; value: string; sub: string }) {
+   431→  return (
+   432→    <div className="flex items-center gap-3">
+   433→      <div className="w-3 h-3 rounded-full shrink-0" style={{ background: color, boxShadow: `0 0 8px ${color}80` }} />
+   434→      <div className="flex-1">
+   435→        <p className="text-xs text-slate-500">{label}</p>
+   436→        <p className="text-sm font-bold font-stat text-slate-900">{value} <span className="text-[10px] text-slate-500 font-normal">{sub}</span></p>
+   437→      </div>
+   438→    </div>
+   439→  );
+   440→}
+   441→
+   442→/* ============ WATER GLASS — animated fill ============ */
+   443→function WaterGlass({ percentage, amount, goal }: { percentage: number; amount: number; goal: number }) {
+   444→  const glasses = Math.min(8, Math.floor(amount / 200));
+   445→  return (
+   446→    <div className="flex flex-col items-center">
+   447→      {/* Glass visual */}
+   448→      <div className="relative w-24 h-32 mx-auto mb-2">
+   449→        {/* Glass outline (trapezoid) */}
+   450→        <svg viewBox="0 0 80 110" className="w-full h-full" preserveAspectRatio="none">
+   451→          {/* Glass body — slightly tapered */}
+   452→          <defs>
+   453→            <clipPath id="glass-clip">
+   454→              <path d="M 12 6 L 68 6 L 62 104 L 18 104 Z" />
+   455→            </clipPath>
+   456→            <linearGradient id="water-grad" x1="0" y1="0" x2="0" y2="1">
+   457→              <stop offset="0%" stopColor="#67e8f9" />
+   458→              <stop offset="100%" stopColor="#0891b2" />
+   459→            </linearGradient>
+   460→          </defs>
+   461→          {/* Water fill */}
+   462→          <g clipPath="url(#glass-clip)">
+   463→            <motion.rect
+   464→              x="0"
+   465→              y={110 - 98 * percentage}
+   466→              width="80"
+   467→              height="110"
+   468→              fill="url(#water-grad)"
+   469→              initial={{ y: 110 }}
+   470→              animate={{ y: 110 - 98 * percentage }}
+   471→              transition={{ type: "spring", stiffness: 120, damping: 20 }}
+   472→            />
+   473→            {/* Wavy surface */}
+   474→            <motion.g
+   475→              animate={{ x: [0, -20, 0] }}
+   476→              transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
+   477→            >
+   478→              <svg
+   479→                x="-10"
+   480→                y={110 - 98 * percentage - 4}
+   481→                width="100"
+   482→                height="8"
+   483→                viewBox="0 0 100 8"
+   484→                preserveAspectRatio="none"
+   485→              >
+   486→                <path d="M0,4 Q25,0 50,4 T100,4 L100,8 L0,8 Z" fill="white" fillOpacity="0.5" />
+   487→              </svg>
+   488→            </motion.g>
+   489→          </g>
+   490→          {/* Glass outline on top */}
+   491→          <path
+   492→            d="M 12 6 L 68 6 L 62 104 L 18 104 Z"
+   493→            fill="none"
+   494→            stroke="#06b6d4"
+   495→            strokeWidth="2"
+   496→            strokeLinejoin="round"
+   497→            opacity="0.6"
+   498→          />
+   499→          {/* Glass shine */}
+   500→          <path d="M 18 12 L 22 12 L 26 96 L 22 96 Z" fill="white" fillOpacity="0.3" />
+   501→        </svg>
+   502→        {/* Amount text overlay */}
+   503→        <div className="absolute inset-0 flex flex-col items-center justify-center text-white font-bold pointer-events-none">
+   504→          <span className="text-base drop-shadow font-stat">{toPersianDigits(amount)}</span>
+   505→          <span className="text-[10px] opacity-90">سی‌سی</span>
+   506→        </div>
+   507→      </div>
+   508→
+   509→      {/* Glasses row — 8 small glass icons for visual progress */}
+   510→      <div className="flex gap-1 flex-wrap justify-center max-w-[160px]">
+   511→        {Array.from({ length: 8 }, (_, i) => (
+   512→          <motion.div
+   513→            key={i}
+   514→            initial={false}
+   515→            animate={{ scale: i < glasses ? 1 : 0.85, opacity: i < glasses ? 1 : 0.4 }}
+   516→            className={`text-sm ${i < glasses ? "" : "grayscale"}`}
+   517→          >
+   518→            🥛
+   519→          </motion.div>
+   520→        ))}
+   521→      </div>
+   522→      <p className="text-[10px] text-slate-500 mt-1">
+   523→        {toPersianDigits(glasses)} از {toPersianDigits(8)} لیوان
+   524→      </p>
+   525→    </div>
+   526→  );
+   527→}
+   528→
+   529→/* ============ CALORIE FORMULA BAR ============ */
+   530→function CalorieFormulaBar({ target, consumed, burned, remaining }: { target: number; consumed: number; burned: number; remaining: number }) {
+   531→  const total = target + burned;
+   532→  const consumedPct = total > 0 ? (consumed / total) * 100 : 0;
+   533→  const burnedPct = total > 0 ? (burned / total) * 100 : 0;
+   534→  return (
+   535→    <div>
+   536→      <div className="flex flex-wrap items-center justify-center gap-2 text-xs mb-3">
+   537→        <span className="px-2.5 py-1 rounded-lg bg-slate-100"><b className="text-cyan-600">{toPersianDigits(target)}</b> <span className="text-slate-600">هدف</span></span>
+   538→        <span className="text-slate-400">−</span>
+   539→        <span className="px-2.5 py-1 rounded-lg bg-slate-100"><b className="text-orange-500">{toPersianDigits(consumed)}</b> <span className="text-slate-600">مصرف</span></span>
+   540→        <span className="text-slate-400">+</span>
+   541→        <span className="px-2.5 py-1 rounded-lg bg-slate-100"><b className="text-emerald-500">{toPersianDigits(burned)}</b> <span className="text-slate-600">سوزانده</span></span>
+   542→        <span className="text-slate-400">=</span>
+   543→        <span className="px-2.5 py-1 rounded-lg" style={{ background: "rgba(245,158,11,0.12)" }}><b className="text-orange-600">{toPersianDigits(remaining)}</b> <span className="text-slate-600">باقی‌مانده</span></span>
+   544→      </div>
+   545→      <div className="h-3 rounded-full bg-slate-100 overflow-hidden flex">
+   546→        <motion.div
+   547→          className="h-full bg-orange-400"
+   548→          initial={{ width: 0 }}
+   549→          animate={{ width: `${consumedPct}%` }}
+   550→          transition={{ duration: 0.8 }}
+   551→        />
+   552→        <motion.div
+   553→          className="h-full bg-emerald-400"
+   554→          initial={{ width: 0 }}
+   555→          animate={{ width: `${burnedPct}%` }}
+   556→          transition={{ duration: 0.8, delay: 0.2 }}
+   557→        />
+   558→      </div>
+   559→    </div>
+   560→  );
+   561→}
+   562→
+   563→function QuickAction({ icon: Icon, label, onClick }: { icon: LucideIcon; label: string; onClick: () => void }) {
+   564→  return (
+   565→    <button
+   566→      onClick={onClick}
+   567→      className="flex items-center gap-3 p-4 rounded-2xl bg-white border-2 border-orange-200 hover:border-orange-300 hover:shadow-md transition text-right"
+   568→    >
+   569→      <div
+   570→        className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+   571→        style={{ background: "rgba(245,158,11,0.15)" }}
+   572→      >
+   573→        <Icon className="w-5 h-5 text-orange-500" />
+   574→      </div>
+   575→      <span className="text-sm font-medium text-slate-900">{label}</span>
+   576→    </button>
+   577→  );
+   578→}
+   579→
+   580→function getGreeting(): string {
+   581→  const h = new Date().getHours();
+   582→  if (h < 12) return "صبح بخیر";
+   583→  if (h < 18) return "بعد از ظهر بخیر";
+   584→  return "شب بخیر";
+   585→}
+   586→
+   587→/**
+   588→ * کارت مهم‌ترین رویداد نزدیک — بر اساس وضعیت کاربر، مهم‌ترین اقدام را نشان می‌دهد
+   589→ * - بدون پلن: «پلن خود را فعال کن» → خرید پلن
+   590→ * - پلن فعال، امروز تمرین دارد: «مشاهده برنامه» → تمرینات
+   591→ * - پلن فعال، امروز استراحت: «چکاپ دوره‌ای» یا «ثبت وزن»
+   592→ * - پلن منقضی‌شده: «اشتراک خود را تمدید کن» → اشتراک‌ها
+   593→ */
+   594→function PriorityActionCard() {
+   595→  const { user, setMainTab, setOverlay, workoutPlan } = useAppStore();
+   596→
+   597→  // Determine the most important action
+   598→  let config: {
+   599→    icon: LucideIcon;
+   600→    title: string;
+   601→    subtitle: string;
+   602→    buttonText: string;
+   603→    onClick: () => void;
+   604→    gradient: string;
+   605→  };
+   606→
+   607→  const now = new Date();
+   608→  const planExpires = user?.planExpiresAt ? new Date(user.planExpiresAt) : null;
+   609→  const daysLeft = planExpires ? Math.ceil((planExpires.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+   610→
+   611→  if (!user?.planName || !user?.hasActiveSubscription) {
+   612→    // No active plan → buy plan
+   613→    config = {
+   614→      icon: Crown,
+   615→      title: "پلن خود را فعال کن!",
+   616→      subtitle: "برای دریافت برنامه اختصاصی و چت با فیتاپ هوشمند، پلن مناسب خود را انتخاب کنید",
+   617→      buttonText: "انتخاب و خرید پلن",
+   618→      onClick: () => setMainTab("plans"),
+   619→      gradient: "linear-gradient(135deg, #f59e0b, #f97316)",
+   620→    };
+   621→  } else if (daysLeft > 0 && daysLeft <= 5) {
+   622→    // Plan expiring soon → renew
+   623→    config = {
+   624→      icon: Calendar,
+   625→      title: `اشتراک شما ${toPersianDigits(daysLeft)} روز دیگر منقضی می‌شود!`,
+   626→      subtitle: "برای تداوم برنامه تمرینی و دسترسی به امکانات، اشتراک خود را تمدید کنید",
+   627→      buttonText: "تمدید اشتراک",
+   628→      onClick: () => setMainTab("plans"),
+   629→      gradient: "linear-gradient(135deg, #ef4444, #f97316)",
+   630→    };
+   631→  } else {
+   632→    // Has active plan → check today's workout
+   633→    const dayIdx = new Date().getDay();
+   634→    const persianIdx = (dayIdx + 1) % 7;
+   635→    const todayName = PERSIAN_WEEKDAYS[persianIdx];
+   636→    const todayWorkout = workoutPlan?.days.find((d) => d.day === todayName);
+   637→
+   638→    if (todayWorkout) {
+   639→      config = {
+   640→        icon: Dumbbell,
+   641→        title: `مشاهده برنامه: ${todayWorkout.title}`,
+   642→        subtitle: `${toPersianDigits(todayWorkout.exercises.length)} حرکت • ${toPersianDigits(todayWorkout.estimatedMinutes)} دقیقه`,
+   643→        buttonText: "شروع تمرین",
+   644→        onClick: () => setMainTab("workouts"),
+   645→        gradient: "linear-gradient(135deg, #10b981, #059669)",
+   646→      };
+   647→    } else {
+   648→      // Rest day → log weight or check progress
+   649→      config = {
+   650→        icon: Trophy,
+   651→        title: "امروز روز استراحت شماست",
+   652→        subtitle: "از بدن خود مراقبت کنید! وزن خود را ثبت کنید یا پیشرفت را بررسی کنید",
+   653→        buttonText: "ثبت وزن و پیشرفت",
+   654→        onClick: () => setMainTab("progress"),
+   655→        gradient: "linear-gradient(135deg, #6366f1, #8b5cf6)",
+   656→      };
+   657→    }
+   658→  }
+   659→
+   660→  const Icon = config.icon;
+   661→
+   662→  return (
+   663→    <motion.div
+   664→      initial={{ opacity: 0, y: 10 }}
+   665→      animate={{ opacity: 1, y: 0 }}
+   666→      className="rounded-2xl p-5 text-white shadow-lg relative overflow-hidden"
+   667→      style={{ background: config.gradient }}
+   668→    >
+   669→      <div className="absolute -left-6 -top-6 w-24 h-24 rounded-full bg-white/10" />
+   670→      <div className="absolute -left-2 bottom-0 w-16 h-16 rounded-full bg-white/10" />
+   671→
+   672→      <div className="relative flex items-center gap-4">
+   673→        <div className="w-14 h-14 rounded-2xl bg-white/20 flex items-center justify-center shrink-0 backdrop-blur-sm">
+   674→          <Icon className="w-7 h-7 text-white" />
+   675→        </div>
+   676→        <div className="flex-1 min-w-0">
+   677→          <h3 className="font-black text-base mb-0.5">{config.title}</h3>
+   678→          <p className="text-xs text-white/80 leading-snug">{config.subtitle}</p>
+   679→        </div>
+   680→      </div>
+   681→
+   682→      <button
+   683→        onClick={config.onClick}
+   684→        className="w-full mt-4 py-3 rounded-xl bg-white/20 backdrop-blur-sm text-white font-bold text-sm hover:bg-white/30 transition flex items-center justify-center gap-2"
+   685→      >
+   686→        {config.buttonText}
+   687→        <ChevronLeft className="w-4 h-4" />
+   688→      </button>
+   689→    </motion.div>
+   690→  );
+   691→}
+   692→
+   693→/**
+   694→ * کارت تاریخچه برنامه‌های قبلی — برنامه‌های خریداری‌شده + تحلیل فیتاپ هوشمند
+   695→ */
+   696→function ProgramHistoryCard() {
+   697→  const { user } = useAppStore();
+   698→  const [history, setHistory] = useState<any>(null);
+   699→  const [loading, setLoading] = useState(true);
+   700→  const [analyzing, setAnalyzing] = useState(false);
+   701→
+   702→  useEffect(() => {
+   703→    (async () => {
+   704→      try {
+   705→        const res = await fetch("/api/coach/program-history");
+   706→        const data = await res.json();
+   707→        setHistory(data);
+   708→      } catch {}
+   709→      finally { setLoading(false); }
+   710→    })();
+   711→  }, []);
+   712→
+   713→  async function generateAnalysis() {
+   714→    setAnalyzing(true);
+   715→    try {
+   716→      const res = await fetch("/api/coach/program-history?analyze=1");
+   717→      const data = await res.json();
+   718→      setHistory(data);
+   719→    } catch {}
+   720→    finally { setAnalyzing(false); }
+   721→  }
+   722→
+   723→  if (loading) return null;
+   724→
+   725→  if (!history || !history.programs || history.totalPrograms === 0) {
+   726→    // کاربر بدون برنامه قبلی
+   727→    if (!user?.planName) {
+   728→      return (
+   729→        <Card className="p-5 border-2 border-orange-100 bg-white">
+   730→          <div className="flex items-center gap-2 mb-2">
+   731→            <History className="w-5 h-5 text-orange-500" />
+   732→            <h3 className="font-bold text-sm text-slate-900">تاریخچه برنامه‌ها</h3>
+   733→          </div>
+   734→          <p className="text-xs text-slate-500">هنوز برنامه‌ای خریداری نکرده‌اید. با خرید پلن، اولین برنامه اختصاصی شما توسط فیتاپ هوشمند ساخته می‌شود.</p>
+   735→        </Card>
+   736→      );
+   737→    }
+   738→    return null; // کاربر پلن دارد ولی برنامه هنوز ساخته نشده
+   739→  }
+   740→
+   741→  return (
+   742→    <Card className="p-5 border-2 border-orange-100 bg-white">
+   743→      <div className="flex items-center justify-between mb-3">
+   744→        <div className="flex items-center gap-2">
+   745→          <History className="w-5 h-5 text-orange-500" />
+   746→          <h3 className="font-bold text-sm text-slate-900">تاریخچه برنامه‌های شما</h3>
+   747→        </div>
+   748→        <span className="text-[11px] px-2 py-0.5 rounded-full text-orange-600" style={{ background: "rgba(245,158,11,0.12)" }}>
+   749→          {toPersianDigits(history.totalPrograms)} برنامه
+   750→        </span>
+   751→      </div>
+   752→
+   753→      {/* لیست برنامه‌های قبلی */}
+   754→      <div className="space-y-2 mb-3">
+   755→        {(history.programs || []).slice(0, 3).map((p: any, i: number) => (
+   756→          <div key={p.id} className="flex items-center justify-between p-2.5 rounded-xl bg-orange-50/50 border border-orange-100">
+   757→            <div className="flex items-center gap-2">
+   758→              <div className="w-8 h-8 rounded-lg flex items-center justify-center text-white text-xs font-bold shrink-0" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   759→                {toPersianDigits(i + 1)}
+   760→              </div>
+   761→              <div>
+   762→                <p className="text-xs font-bold text-slate-900">
+   763→                  برنامه {toPersianDigits(i + 1)}
+   764→                  {p.active && <span className="text-emerald-500 mr-1">● فعال</span>}
+   765→                </p>
+   766→                <p className="text-[10px] text-slate-500">
+   767→                  {toPersianDigits(p.days)} روز • {toPersianDigits(p.exercises)} حرکت • {toPersianDigits(p.totalCalories)} کالری
+   768→                </p>
+   769→              </div>
+   770→            </div>
+   771→            <span className="text-[10px] text-slate-400">{new Date(p.createdAt).toLocaleDateString("fa-IR")}</span>
+   772→          </div>
+   773→        ))}
+   774→      </div>
+   775→
+   776→      {/* تحلیل فیتاپ هوشمند */}
+   777→      {history.aiAnalysis ? (
+   778→        <div className="p-3 rounded-xl border border-orange-200 bg-orange-50/30 mb-3">
+   779→          <div className="flex items-center gap-2 mb-2">
+   780→            <Sparkles className="w-4 h-4 text-orange-500" />
+   781→            <p className="text-xs font-bold text-orange-600">تحلیل فیتاپ هوشمند</p>
+   782→          </div>
+   783→          <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap">{history.aiAnalysis}</p>
+   784→        </div>
+   785→      ) : (
+   786→        <button
+   787→          onClick={generateAnalysis}
+   788→          disabled={analyzing}
+   789→          className="w-full py-2.5 rounded-xl text-white text-xs font-bold transition hover:scale-[1.02] flex items-center justify-center gap-2 mb-3"
+   790→          style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   791→        >
+   792→          {analyzing ? (
+   793→            <><Loader2 className="w-4 h-4 animate-spin" /> فیتاپ هوشمند در حال تحلیل...</>
+   794→          ) : (
+   795→            <><Sparkles className="w-4 h-4" /> تحلیل پیشرفت توسط فیتاپ هوشمند</>
+   796→          )}
+   797→        </button>
+   798→      )}
+   799→
+   800→      {/* خلاصه آماری */}
+   801→      {history.weightLogs?.length > 0 && (
+   802→        <div className="flex items-center justify-between p-2.5 rounded-xl bg-slate-50">
+   803→          <span className="text-[11px] text-slate-500">تغییر وزن کل:</span>
+   804→          <span className="text-xs font-bold text-slate-900">
+   805→            {history.weightLogs[0].weight} → {history.weightLogs[history.weightLogs.length - 1].weight} کیلوگرم
+   806→          </span>
+   807→        </div>
+   808→      )}
+   809→    </Card>
+   810→  );
+   811→}
+   812→

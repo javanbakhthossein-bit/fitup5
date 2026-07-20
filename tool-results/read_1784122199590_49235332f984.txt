@@ -1,0 +1,1039 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useRef, useState } from "react";
+     4→import { motion, AnimatePresence } from "framer-motion";
+     5→import { Camera, Video, Upload, X, Loader2, AlertCircle, Ruler, Sparkles, CheckCircle2 } from "lucide-react";
+     6→import { useAppStore } from "@/lib/fitness/store";
+     7→import { Button } from "@/components/ui/button";
+     8→import { Input } from "@/components/ui/input";
+     9→import { Label } from "@/components/ui/label";
+    10→import { toPersianDigits } from "@/lib/fitness/types";
+    11→import { toast } from "sonner";
+    12→
+    13→interface BodyAnalysisState {
+    14→  needsBodyPhoto: boolean;
+    15→  canSubmitVideo: boolean;
+    16→  pendingStatus: string | null;
+    17→  hasWorkoutPlan: boolean;
+    18→  awaitingMedia: boolean;
+    19→  // NEW (وظیفه ۱۰): اطلاعات دانه‌دانه پیش‌نیازها
+    20→  prerequisites?: {
+    21→    id: string;
+    22→    type: "body_photo" | "video_body" | "blood_test" | "body_measurements";
+    23→    label: string;
+    24→    description: string;
+    25→    required: boolean;
+    26→    status: "completed" | "pending" | "pending_decision" | "incomplete";
+    27→    statusLabel: string;
+    28→    tab: string;
+    29→    actionLabel: string;
+    30→  }[];
+    31→  canGenerateProgram?: boolean;
+    32→  blockingReason?: string | null;
+    33→}
+    34→
+    35→interface MeasurementsForm {
+    36→  waist: string;
+    37→  neck: string;
+    38→  hip: string;
+    39→  chest: string;
+    40→  arm: string;
+    41→  thigh: string;
+    42→  shoulder: string;
+    43→  calf: string;
+    44→}
+    45→
+    46→/**
+    47→ * بنر هشدار برای کاربران پلن Advanced / Ultimate که هنوز عکس/ویدیو بدن
+    48→ * خود را ارسال نکرده‌اند. کاربر بدون این مدیاها برنامه‌ای دریافت نمی‌کند.
+    49→ *
+    50→ * NEW (BODY-COMPOSITION-PRO): قبل از آپلود عکس، فرم اندازه‌های بدنی (اختیاری)
+    51→ * نمایش داده می‌شود تا درصد چربی بدن با فرمول US Navy محاسبه شود.
+    52→ */
+    53→export function BodyAnalysisBanner() {
+    54→  const { user, setWorkoutPlan, setMealPlan, bodyAnalysisOpen, setBodyAnalysisOpen } = useAppStore();
+    55→  const [state, setState] = useState<BodyAnalysisState | null>(null);
+    56→  const [open, setOpen] = useState(false);
+    57→  const [photos, setPhotos] = useState<File[]>([]);
+    58→  const [video, setVideo] = useState<File | null>(null);
+    59→  const [submitting, setSubmitting] = useState(false);
+    60→  // مرحله‌بندی مجزای ارسال عکس بدن (وظیفه ۱ FOOD-ANALYSIS-LOGGING)
+    61→  const [submitStage, setSubmitStage] = useState<
+    62→    "idle" | "uploading" | "analyzing" | "generating" | "done" | "error"
+    63→  >("idle");
+    64→  const [submitError, setSubmitError] = useState<string>("");
+    65→  const [skippingVideo, setSkippingVideo] = useState(false);
+    66→  const photoInputRef = useRef<HTMLInputElement>(null);
+    67→  const videoInputRef = useRef<HTMLInputElement>(null);
+    68→
+    69→  // NEW: post-purchase measurements step
+    70→  const [measurementsStep, setMeasurementsStep] = useState<"prompt" | "form" | "skip" | "done">("prompt");
+    71→  const [measurements, setMeasurements] = useState<MeasurementsForm>({
+    72→    waist: "", neck: "", hip: "", chest: "", arm: "", thigh: "", shoulder: "", calf: "",
+    73→  });
+    74→  const [savingMeasurements, setSavingMeasurements] = useState(false);
+    75→
+    76→  useEffect(() => {
+    77→    // فقط اگر کاربر قابلیت bodyPhotoAnalysis داشت چک کن
+    78→    if (!user?.planName || (user.planName !== "advanced" && user.planName !== "ultimate")) {
+    79→      return;
+    80→    }
+    81→    let cancelled = false;
+    82→    (async () => {
+    83→      try {
+    84→        const res = await fetch("/api/coach/submit-body-analysis", { cache: "no-store" });
+    85→        if (!res.ok) return;
+    86→        const data = await res.json();
+    87→        if (!cancelled) setState(data);
+    88→      } catch {}
+    89→    })();
+    90→    return () => {
+    91→      cancelled = true;
+    92→    };
+    93→  }, [user?.planName]);
+    94→
+    95→  // ─── Global open trigger: هر view دیگری (مثل programs-view) می‌تواند با
+    96→  // setBodyAnalysisOpen(true) درخواست باز کردن modal آپلود کند. این useEffect
+    97→  // فلگ را می‌خواند و در صورت true بودن، modal را باز می‌کند و فلگ را ریست می‌کند. ───
+    98→  useEffect(() => {
+    99→    if (bodyAnalysisOpen && state && state.awaitingMedia) {
+   100→      setMeasurementsStep("prompt");
+   101→      setOpen(true);
+   102→      setBodyAnalysisOpen(false);
+   103→    } else if (bodyAnalysisOpen) {
+   104→      // اگر awaitingMedia نبود ولی کاربر اصرار داشت modal باز شود، بازش کن
+   105→      // (مثلاً برای آپلود مجدد عکس بعد از تکمیل اولیه)
+   106→      setMeasurementsStep("prompt");
+   107→      setOpen(true);
+   108→      setBodyAnalysisOpen(false);
+   109→    }
+   110→  }, [bodyAnalysisOpen, state, setBodyAnalysisOpen]);
+   111→
+   112→  async function skipVideo() {
+   113→    setSkippingVideo(true);
+   114→    try {
+   115→      const res = await fetch("/api/video-status", {
+   116→        method: "PATCH",
+   117→        headers: { "Content-Type": "application/json" },
+   118→        body: JSON.stringify({ status: "skipped" }),
+   119→      });
+   120→      if (!res.ok) throw new Error("خطا در رد کردن ویدیو");
+   121→      toast.success("باشه! برنامه بدون تحلیل ویدیو طراحی می‌شود.");
+   122→      // refetch state
+   123→      const r = await fetch("/api/coach/submit-body-analysis", { cache: "no-store" });
+   124→      if (r.ok) setState(await r.json());
+   125→    } catch (e) {
+   126→      toast.error(e instanceof Error ? e.message : "خطا");
+   127→    } finally {
+   128→      setSkippingVideo(false);
+   129→    }
+   130→  }
+   131→
+   132→  if (!state) return null;
+   133→  // بنر اصلی (آپلود عکس بدن) فقط وقتی awaitingMedia=true نمایش داده می‌شود.
+   134→  // بنر تصمیمات (تعیین تکلیف ویدیو/آزمایش خون) در کامپوننت جداگانه رندر می‌شود.
+   135→  if (!state.awaitingMedia) {
+   136→    // اگر برنامه ساخته شده، چیزی نمایش نده
+   137→    if (state.hasWorkoutPlan) return null;
+   138→    // اگر عکس‌ها آپلود شده ولی پیش‌نیازهای اختیاری تعیین تکلیف نشده، بنر تصمیمات را نشان بده
+   139→    if (!state.canGenerateProgram) {
+   140→      return <PendingDecisionsBanner state={state} onRefresh={() => {
+   141→        // refetch
+   142→        (async () => {
+   143→          try {
+   144→            const res = await fetch("/api/coach/submit-body-analysis", { cache: "no-store" });
+   145→            if (!res.ok) return;
+   146→            const data = await res.json();
+   147→            setState(data);
+   148→          } catch {}
+   149→        })();
+   150→      }} />;
+   151→    }
+   152→    return null;
+   153→  }
+   154→
+   155→  function handlePhotos(e: React.ChangeEvent<HTMLInputElement>) {
+   156→    const files = Array.from(e.target.files || []).filter((f) => f.type.startsWith("image/"));
+   157→    if (files.length === 0) return;
+   158→    if (photos.length + files.length > 4) {
+   159→      toast.error("حداکثر ۴ عکس مجاز است");
+   160→      e.target.value = "";
+   161→      return;
+   162→    }
+   163→    setPhotos((prev) => [...prev, ...files]);
+   164→    e.target.value = "";
+   165→  }
+   166→
+   167→  function handleVideo(e: React.ChangeEvent<HTMLInputElement>) {
+   168→    const f = e.target.files?.[0];
+   169→    if (!f) return;
+   170→    if (!f.type.startsWith("video/")) {
+   171→      toast.error("فقط فایل ویدیویی مجاز است");
+   172→      e.target.value = "";
+   173→      return;
+   174→    }
+   175→    // محدودیت حجم افزایش یافت — تا ۵۰ مگابایت
+   176→    if (f.size > 50 * 1024 * 1024) {
+   177→      toast.error("حجم ویدیو باید کمتر از ۵۰ مگابایت باشد");
+   178→      e.target.value = "";
+   179→      return;
+   180→    }
+   181→    setVideo(f);
+   182→    e.target.value = "";
+   183→  }
+   184→
+   185→  function removePhoto(idx: number) {
+   186→    setPhotos((prev) => prev.filter((_, i) => i !== idx));
+   187→  }
+   188→
+   189→  async function saveMeasurements() {
+   190→    setSavingMeasurements(true);
+   191→    try {
+   192→      const payload: Record<string, number | undefined> = {};
+   193→      const fields: { key: keyof MeasurementsForm; api: string }[] = [
+   194→        { key: "waist", api: "waistMeasurement" },
+   195→        { key: "neck", api: "neckMeasurement" },
+   196→        { key: "hip", api: "hipMeasurement" },
+   197→        { key: "chest", api: "chestMeasurement" },
+   198→        { key: "arm", api: "armMeasurement" },
+   199→        { key: "thigh", api: "thighMeasurement" },
+   200→        { key: "shoulder", api: "shoulderMeasurement" },
+   201→        { key: "calf", api: "calfMeasurement" },
+   202→      ];
+   203→      for (const f of fields) {
+   204→        const v = measurements[f.key];
+   205→        if (v && Number(v) > 0) payload[f.api] = Number(v);
+   206→      }
+   207→      if (Object.keys(payload).length > 0) {
+   208→        const res = await fetch("/api/checkup/baseline-measurements", {
+   209→          method: "POST",
+   210→          headers: { "Content-Type": "application/json" },
+   211→          body: JSON.stringify(payload),
+   212→        });
+   213→        if (!res.ok) {
+   214→          const e = await res.json().catch(() => ({}));
+   215→          throw new Error(e.error || "خطا در ذخیره اندازه‌ها");
+   216→        }
+   217→        toast.success("اندازه‌های شما ذخیره شد ✅");
+   218→      }
+   219→      setMeasurementsStep("done");
+   220→    } catch (e) {
+   221→      toast.error(e instanceof Error ? e.message : "خطا در ذخیره اندازه‌ها");
+   222→    } finally {
+   223→      setSavingMeasurements(false);
+   224→    }
+   225→  }
+   226→
+   227→  async function submit() {
+   228→    if (photos.length === 0) {
+   229→      toast.error("حداقل یک عکس بدن ارسال کنید");
+   230→      return;
+   231→    }
+   232→    // ویدیو اختیاری است — حتی برای پلن Ultimate — نیازی به بررسی الزامی بودن نیست
+   233→    setSubmitting(true);
+   234→    setSubmitError("");
+   235→    setSubmitStage("uploading");
+   236→    // تایمرهای مرحله‌بندی: به‌کاربر نشان می‌دهیم در کدام مرحله است.
+   237→    // سرور همه‌چیز را در یک درخواست انجام می‌دهد، ولی ما با تایمر مرحله را شبیه‌سازی می‌کنیم
+   238→    // تا تجربه کاربری بهتر شود (وظیفه ۱: نمایش مراحل مجزا).
+   239→    const stageTimers: ReturnType<typeof setTimeout>[] = [];
+   240→    stageTimers.push(setTimeout(() => setSubmitStage("analyzing"), 1500));
+   241→    stageTimers.push(setTimeout(() => setSubmitStage("generating"), 5000));
+   242→    try {
+   243→      const fd = new FormData();
+   244→      photos.forEach((p) => fd.append("bodyPhotos", p));
+   245→      if (video) fd.append("bodyVideo", video);
+   246→
+   247→      const res = await fetch("/api/coach/submit-body-analysis", {
+   248→        method: "POST",
+   249→        body: fd,
+   250→        // keepalive: اگر کاربر از صفحه خارج شد، آپلود/تحلیل در پس‌زمینه ادامه می‌یابد
+   251→        keepalive: true,
+   252→      });
+   253→      let data: any = null;
+   254→      try {
+   255→        data = await res.json();
+   256→      } catch {
+   257→        throw new Error("پاسخ سرور نامعتبر است. لطفاً دوباره تلاش کنید.");
+   258→      }
+   259→      if (!res.ok) throw new Error(data.error || "خطا در ارسال مدیا");
+   260→
+   261→      setSubmitStage("done");
+   262→      toast.success("برنامه شما ساخته شد! 🎯");
+   263→      // پاک کردن فرم
+   264→      setPhotos([]);
+   265→      setVideo(null);
+   266→      setOpen(false);
+   267→
+   268→      // به‌روزرسانی state و دریافت برنامه جدید
+   269→      setState({
+   270→        needsBodyPhoto: state?.needsBodyPhoto ?? false,
+   271→        canSubmitVideo: state?.canSubmitVideo ?? false,
+   272→        pendingStatus: "ready",
+   273→        hasWorkoutPlan: true,
+   274→        awaitingMedia: false,
+   275→      });
+   276→
+   277→      // بارگذاری برنامه جدید
+   278→      const planRes = await fetch("/api/coach/plan", { cache: "no-store" });
+   279→      const planData = await planRes.json();
+   280→      if (planData.workout) setWorkoutPlan(planData.workout);
+   281→      if (planData.meal) setMealPlan(planData.meal);
+   282→    } catch (e) {
+   283→      const msg = e instanceof Error ? e.message : "خطا در ارسال مدیا";
+   284→      setSubmitError(msg);
+   285→      setSubmitStage("error");
+   286→      toast.error(msg);
+   287→    } finally {
+   288→      for (const t of stageTimers) clearTimeout(t);
+   289→      setSubmitting(false);
+   290→      // ریست مرحله بعد از ۳ ثانیه (مگر خطا)
+   291→      setTimeout(() => {
+   292→        setSubmitStage((s) => (s === "error" ? s : "idle"));
+   293→      }, 3000);
+   294→    }
+   295→  }
+   296→
+   297→  const measurementFields: { key: keyof MeasurementsForm; label: string; required?: boolean }[] = [
+   298→    { key: "waist", label: "دور کمر", required: true },
+   299→    { key: "neck", label: "دور گردن", required: true },
+   300→    { key: "hip", label: "دور باسن" },
+   301→    { key: "chest", label: "دور سینه" },
+   302→    { key: "arm", label: "دور بازو" },
+   303→    { key: "thigh", label: "دور ران" },
+   304→    { key: "shoulder", label: "دور شانه" },
+   305→    { key: "calf", label: "دور ساق پا" },
+   306→  ];
+   307→
+   308→  return (
+   309→    <>
+   310→      <motion.div
+   311→        initial={{ opacity: 0, y: -8 }}
+   312→        animate={{ opacity: 1, y: 0 }}
+   313→        className="rounded-2xl border-2 border-amber-300 bg-gradient-to-br from-amber-50 via-orange-50 to-amber-100 p-4 shadow-sm relative overflow-hidden"
+   314→      >
+   315→        {/* subtle decorative glow */}
+   316→        <div
+   317→          className="absolute -top-12 -left-12 w-32 h-32 rounded-full opacity-30 blur-3xl pointer-events-none"
+   318→          style={{ background: "radial-gradient(circle, #f97316, transparent)" }}
+   319→        />
+   320→        <div className="flex items-start gap-3 relative">
+   321→          <div
+   322→            className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 text-white shadow-md"
+   323→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   324→          >
+   325→            <Camera className="w-6 h-6" />
+   326→          </div>
+   327→          <div className="flex-1 min-w-0">
+   328→            <div className="flex items-center gap-2 mb-1 flex-wrap">
+   329→              <h4 className="font-black text-sm text-amber-900 dark:text-amber-200">
+   330→                برای دریافت برنامه، عکس بدن خود را ارسال کنید
+   331→              </h4>
+   332→              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 border border-rose-200">
+   333→                الزامی
+   334→              </span>
+   335→            </div>
+   336→            <p className="text-[11px] text-amber-700 dark:text-amber-300 mt-1 leading-relaxed">
+   337→              {state.canSubmitVideo
+   338→                ? "۴ عکس از زوایای جلو، پهلو، پشت و سه‌چهارم بدن خود ارسال کنید تا فیتاپ هوشمند بر اساس فرم بدن شما برنامه اختصاصی طراحی کند. ارسال ویدیوی فرم حرکات اختیاری است اما به دقت برنامه کمک می‌کند."
+   339→                : "۴ عکس از زوایای جلو، پهلو، پشت و سه‌چهارم بدن خود ارسال کنید تا فیتاپ هوشمند بر اساس فرم بدن شما برنامه اختصاصی طراحی کند."}
+   340→            </p>
+   341→            {/* Action buttons — prominent + clear */}
+   342→            <div className="mt-3 flex items-center gap-2 flex-wrap">
+   343→              <Button
+   344→                size="sm"
+   345→                className="rounded-xl text-white font-bold shadow-md hover:shadow-lg transition-all gap-1.5"
+   346→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   347→                onClick={() => {
+   348→                  setMeasurementsStep("prompt");
+   349→                  setOpen(true);
+   350→                }}
+   351→              >
+   352→                <Camera className="w-4 h-4" />
+   353→                آپلود عکس بدن
+   354→              </Button>
+   355→              {state.canSubmitVideo && (
+   356→                <>
+   357→                  <Button
+   358→                    size="sm"
+   359→                    variant="outline"
+   360→                    className="rounded-xl border-2 border-orange-300 text-orange-700 bg-white/70 hover:bg-orange-50 gap-1.5"
+   361→                    onClick={() => {
+   362→                      setMeasurementsStep("prompt");
+   363→                      setOpen(true);
+   364→                    }}
+   365→                  >
+   366→                    <Video className="w-4 h-4" />
+   367→                    آپلود ویدیو (اختیاری)
+   368→                  </Button>
+   369→                  <button
+   370→                    type="button"
+   371→                    disabled={skippingVideo}
+   372→                    onClick={skipVideo}
+   373→                    className="text-[11px] text-amber-700 hover:text-amber-900 underline underline-offset-2 disabled:opacity-50"
+   374→                  >
+   375→                    {skippingVideo ? "..." : "رد کردن ویدیو"}
+   376→                  </button>
+   377→                </>
+   378→              )}
+   379→              <span className="text-[10px] text-amber-600 dark:text-amber-400 ms-auto">
+   380→                {toPersianDigits(photos.length)}/۴ عکس
+   381→                {state.canSubmitVideo ? ` • ${video ? "۱" : "۰"}/۱ ویدیو` : ""}
+   382→              </span>
+   383→            </div>
+   384→            {/* Mini steps hint */}
+   385→            <div className="mt-2.5 flex items-center gap-1.5 text-[10px] text-amber-700/80 dark:text-amber-400/80">
+   386→              <Sparkles className="w-3 h-3" />
+   387→              <span>آپلود عکس → تحلیل هوش مصنوعی → ساخت برنامه اختصاصی</span>
+   388→            </div>
+   389→          </div>
+   390→        </div>
+   391→      </motion.div>
+   392→
+   393→      {/* Modal upload — including measurements step */}
+   394→      <AnimatePresence>
+   395→        {open && (
+   396→          <motion.div
+   397→            initial={{ opacity: 0 }}
+   398→            animate={{ opacity: 1 }}
+   399→            exit={{ opacity: 0 }}
+   400→            className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm p-0 sm:p-4"
+   401→            onClick={() => !submitting && !savingMeasurements && setOpen(false)}
+   402→          >
+   403→            <motion.div
+   404→              initial={{ y: 60, opacity: 0 }}
+   405→              animate={{ y: 0, opacity: 1 }}
+   406→              exit={{ y: 60, opacity: 0 }}
+   407→              transition={{ type: "spring", stiffness: 280, damping: 28 }}
+   408→              onClick={(e) => e.stopPropagation()}
+   409→              className="bg-white w-full sm:max-w-md sm:rounded-3xl rounded-t-3xl max-h-[90vh] overflow-y-auto custom-scrollbar"
+   410→              dir="rtl"
+   411→            >
+   412→              {/* Header */}
+   413→              <div className="sticky top-0 bg-white border-b border-orange-100 p-4 flex items-center justify-between z-10">
+   414→                <div className="flex items-center gap-2">
+   415→                  {measurementsStep === "done" ? (
+   416→                    <>
+   417→                      <Camera className="w-5 h-5 text-orange-500" />
+   418→                      <h3 className="font-bold text-slate-900">
+   419→                        {state.canSubmitVideo ? "ارسال عکس بدن (ویدیو اختیاری)" : "ارسال عکس بدن"}
+   420→                      </h3>
+   421→                    </>
+   422→                  ) : (
+   423→                    <>
+   424→                      <Ruler className="w-5 h-5 text-orange-500" />
+   425→                      <h3 className="font-bold text-slate-900">اندازه‌های بدنی (اختیاری)</h3>
+   426→                    </>
+   427→                  )}
+   428→                </div>
+   429→                <button
+   430→                  type="button"
+   431→                  onClick={() => !submitting && !savingMeasurements && setOpen(false)}
+   432→                  className="p-1.5 rounded-full hover:bg-orange-50 text-slate-500"
+   433→                  aria-label="بستن"
+   434→                >
+   435→                  <X className="w-5 h-5" />
+   436→                </button>
+   437→              </div>
+   438→
+   439→              {/* ─── NEW: Post-purchase measurements prompt ─── */}
+   440→              {measurementsStep === "prompt" && (
+   441→                <div className="p-5 space-y-4">
+   442→                  <div className="rounded-2xl bg-gradient-to-br from-amber-50 to-orange-50 border border-amber-200 p-4">
+   443→                    <div className="flex items-start gap-3">
+   444→                      <div
+   445→                        className="w-10 h-10 rounded-xl flex items-center justify-center text-white shrink-0"
+   446→                        style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   447→                      >
+   448→                        <Ruler className="w-5 h-5" />
+   449→                      </div>
+   450→                      <div className="flex-1">
+   451→                        <p className="text-sm font-bold text-amber-900 mb-1">
+   452→                          برای برنامه دقیق‌تر، اندازه‌های بدنی خود را وارد کنید
+   453→                        </p>
+   454→                        <p className="text-[11px] text-amber-700 leading-relaxed">
+   455→                          با وارد کردن دور کمر و گردن، فیتاپ هوشمند درصد چربی بدن شما را با فرمول علمی US Navy محاسبه می‌کند و برنامه تمرینی و غذایی دقیق‌تری طراحی می‌کند. این مرحله کاملاً اختیاری است.
+   456→                        </p>
+   457→                      </div>
+   458→                    </div>
+   459→                  </div>
+   460→
+   461→                  <div className="flex gap-2">
+   462→                    <Button
+   463→                      className="flex-1 rounded-xl text-white"
+   464→                      style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   465→                      onClick={() => setMeasurementsStep("form")}
+   466→                    >
+   467→                      وارد می‌کنم
+   468→                    </Button>
+   469→                    <Button
+   470→                      variant="outline"
+   471→                      className="flex-1 rounded-xl"
+   472→                      onClick={() => setMeasurementsStep("done")}
+   473→                    >
+   474→                      رد کردن
+   475→                    </Button>
+   476→                  </div>
+   477→                </div>
+   478→              )}
+   479→
+   480→              {/* ─── Measurements form ─── */}
+   481→              {measurementsStep === "form" && (
+   482→                <div className="p-4 space-y-4">
+   483→                  <div className="rounded-xl bg-amber-50 border border-amber-200 p-3 flex items-start gap-2">
+   484→                    <AlertCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+   485→                    <p className="text-[11px] text-amber-800 leading-relaxed">
+   486→                      اندازه‌ها را با متر نرم و در حالت ایستاده و عادی وارد کنید. دور کمر و گردن برای محاسبه درصد چربی الزامی هستند.
+   487→                    </p>
+   488→                  </div>
+   489→
+   490→                  <div className="grid grid-cols-2 gap-2.5">
+   491→                    {measurementFields.map((f) => (
+   492→                      <div key={f.key}>
+   493→                        <Label className="mb-1 block text-[11px] text-slate-700 flex items-center gap-1">
+   494→                          {f.label}
+   495→                          {f.required ? (
+   496→                            <span className="text-amber-600 font-bold">*</span>
+   497→                          ) : (
+   498→                            <span className="text-slate-400 text-[10px]">(اختیاری)</span>
+   499→                          )}
+   500→                          <span className="text-slate-400 text-[10px]">(cm)</span>
+   501→                        </Label>
+   502→                        <Input
+   503→                          dir="ltr"
+   504→                          type="number"
+   505→                          inputMode="numeric"
+   506→                          value={measurements[f.key]}
+   507→                          onChange={(e) =>
+   508→                            setMeasurements((m) => ({ ...m, [f.key]: e.target.value }))
+   509→                          }
+   510→                          placeholder="مثلاً ۹۰"
+   511→                          className="h-10 rounded-xl text-center text-sm"
+   512→                        />
+   513→                      </div>
+   514→                    ))}
+   515→                  </div>
+   516→
+   517→                  <div className="flex gap-2">
+   518→                    <Button
+   519→                      variant="outline"
+   520→                      className="flex-1 rounded-xl"
+   521→                      disabled={savingMeasurements}
+   522→                      onClick={() => setMeasurementsStep("prompt")}
+   523→                    >
+   524→                      بازگشت
+   525→                    </Button>
+   526→                    <Button
+   527→                      className="flex-1 rounded-xl text-white"
+   528→                      style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   529→                      disabled={savingMeasurements}
+   530→                      onClick={saveMeasurements}
+   531→                    >
+   532→                      {savingMeasurements ? (
+   533→                        <span className="flex items-center gap-2">
+   534→                          <Loader2 className="w-4 h-4 animate-spin" /> در حال ذخیره...
+   535→                        </span>
+   536→                      ) : (
+   537→                        "ذخیره و ادامه"
+   538→                      )}
+   539→                    </Button>
+   540→                  </div>
+   541→                </div>
+   542→              )}
+   543→
+   544→              {/* ─── Photo upload step ─── */}
+   545→              {measurementsStep === "done" && (
+   546→                <div className="p-4 space-y-4">
+   547→                  {/* توضیح */}
+   548→                  <div className="rounded-xl bg-amber-50 border border-amber-200 p-3 flex items-start gap-2">
+   549→                    <AlertCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+   550→                    <p className="text-[11px] text-amber-800 leading-relaxed">
+   551→                      عکس‌ها را با نور کافی، لباس تنگ یا ورزشی و در ۴ زوایای جلو، پهلو، پشت و سه‌چهارم بگیرید.
+   552→                      {state.canSubmitVideo && " ارسال ویدیوی کوتاه (۲۰ ثانیه) از یک حرکت اساسی مثل اسکوات بدون وزنه اختیاری است اما به دقت برنامه کمک می‌کند."}
+   553→                    </p>
+   554→                  </div>
+   555→
+   556→                  {/* Photos */}
+   557→                  <div>
+   558→                    <label className="text-sm font-bold text-slate-700 mb-2 block">
+   559→                      عکس‌های بدن (حداکثر ۴)
+   560→                    </label>
+   561→                    {photos.length > 0 && (
+   562→                      <div className="grid grid-cols-3 gap-2 mb-2">
+   563→                        {photos.map((p, i) => (
+   564→                          <div key={i} className="relative rounded-xl overflow-hidden border-2 border-orange-200 aspect-square">
+   565→                            {/* eslint-disable-next-line @next/next/no-img-element */}
+   566→                            <img src={URL.createObjectURL(p)} alt={`عکس ${i + 1}`} className="w-full h-full object-cover" />
+   567→                            <button
+   568→                              type="button"
+   569→                              onClick={() => removePhoto(i)}
+   570→                              className="absolute top-1 left-1 w-6 h-6 rounded-full bg-white/90 backdrop-blur flex items-center justify-center text-red-500 shadow"
+   571→                              aria-label="حذف"
+   572→                            >
+   573→                              <X className="w-3 h-3" />
+   574→                            </button>
+   575→                            <span className="absolute bottom-1 right-1 text-[9px] bg-black/60 text-white px-1.5 py-0.5 rounded">
+   576→                              {toPersianDigits(i + 1)}
+   577→                            </span>
+   578→                          </div>
+   579→                        ))}
+   580→                      </div>
+   581→                    )}
+   582→                    {photos.length < 4 && (
+   583→                      <button
+   584→                        type="button"
+   585→                        onClick={() => photoInputRef.current?.click()}
+   586→                        className="w-full rounded-2xl border-2 border-dashed border-orange-200 bg-orange-50/30 hover:bg-orange-50/60 hover:border-orange-400 transition p-5 text-center"
+   587→                      >
+   588→                        <Camera className="w-7 h-7 text-orange-500 mx-auto mb-1.5" />
+   589→                        <p className="text-sm font-medium text-slate-900">افزودن عکس بدن</p>
+   590→                        <p className="text-[11px] text-slate-500 mt-0.5">{toPersianDigits(photos.length)}/۴ عکس — حداکثر ۵ مگابایت</p>
+   591→                      </button>
+   592→                    )}
+   593→                    <input
+   594→                      ref={photoInputRef}
+   595→                      type="file"
+   596→                      accept="image/*"
+   597→                      multiple
+   598→                      className="hidden"
+   599→                      onChange={handlePhotos}
+   600→                    />
+   601→                  </div>
+   602→
+   603→                  {/* Video (Ultimate only — optional) */}
+   604→                  {state.canSubmitVideo && (
+   605→                    <div>
+   606→                      <label className="text-sm font-bold text-slate-700 mb-2 block flex items-center gap-1.5">
+   607→                        <Video className="w-4 h-4 text-orange-500" />
+   608→                        ویدیوی فرم بدن (اختیاری)
+   609→                      </label>
+   610→                      {video ? (
+   611→                        <div className="rounded-2xl border-2 border-orange-200 p-3 flex items-center gap-3 bg-white">
+   612→                          <div className="w-12 h-12 rounded-xl bg-orange-500/15 flex items-center justify-center shrink-0">
+   613→                            <Video className="w-6 h-6 text-orange-500" />
+   614→                          </div>
+   615→                          <div className="flex-1 min-w-0">
+   616→                            <p className="text-sm font-medium text-slate-900 truncate">{video.name}</p>
+   617→                            <p className="text-[11px] text-slate-500 font-stat">{toPersianDigits(Math.round(video.size / 1024))} KB</p>
+   618→                          </div>
+   619→                          <button
+   620→                            type="button"
+   621→                            onClick={() => setVideo(null)}
+   622→                            className="p-2 rounded-lg hover:bg-red-50 text-red-500 transition"
+   623→                            aria-label="حذف ویدیو"
+   624→                          >
+   625→                            <X className="w-4 h-4" />
+   626→                          </button>
+   627→                        </div>
+   628→                      ) : (
+   629→                        <button
+   630→                          type="button"
+   631→                          onClick={() => videoInputRef.current?.click()}
+   632→                          className="w-full rounded-2xl border-2 border-dashed border-orange-200 bg-orange-50/30 hover:bg-orange-50/60 hover:border-orange-400 transition p-5 text-center"
+   633→                        >
+   634→                          <Video className="w-7 h-7 text-orange-500 mx-auto mb-1.5" />
+   635→                          <p className="text-sm font-medium text-slate-900">افزودن ویدیو (اختیاری)</p>
+   636→                          <p className="text-[11px] text-slate-500 mt-0.5">حداکثر ۲۰ مگابایت — MP4/WebM/MOV</p>
+   637→                        </button>
+   638→                      )}
+   639→                      <input
+   640→                        ref={videoInputRef}
+   641→                        type="file"
+   642→                        accept="video/*"
+   643→                        className="hidden"
+   644→                        onChange={handleVideo}
+   645→                      />
+   646→                      <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">
+   647→                        💡 ارسال ویدیو اختیاری است اما به دقت برنامه کمک می‌کند.
+   648→                        برای تحلیل آزمایش خون (دلبخواه)، بعد از ساخت برنامه از بخش «آزمایش خون» در پنل اقدام کنید.
+   649→                      </p>
+   650→                    </div>
+   651→                  )}
+   652→
+   653→                  {/* Back to measurements button */}
+   654→                  <button
+   655→                    type="button"
+   656→                    onClick={() => setMeasurementsStep("prompt")}
+   657→                    className="w-full text-[11px] text-orange-600 hover:text-orange-700 transition flex items-center justify-center gap-1"
+   658→                  >
+   659→                    <Ruler className="w-3 h-3" />
+   660→                    ویرایش اندازه‌های بدنی
+   661→                  </button>
+   662→                </div>
+   663→              )}
+   664→
+   665→              {/* Footer — only show on photo upload step */}
+   666→              {measurementsStep === "done" && (
+   667→                <>
+   668→                  {/* نمایش مراحل مجزا هنگام ارسال (وظیفه ۱) */}
+   669→                  {submitting && (
+   670→                    <div className="p-3 border-t border-orange-100 bg-orange-50/40 space-y-2">
+   671→                      <SubmitStageDisplay stage={submitStage} photoCount={photos.length} />
+   672→                    </div>
+   673→                  )}
+   674→                  {/* نمایش خطا */}
+   675→                  {submitStage === "error" && submitError && (
+   676→                    <div className="p-3 border-t border-orange-100 bg-red-50/60 flex items-start gap-2">
+   677→                      <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+   678→                      <p className="text-[11px] text-red-700">{submitError}</p>
+   679→                    </div>
+   680→                  )}
+   681→                <div className="sticky bottom-0 bg-white border-t border-orange-100 p-3 flex gap-2">
+   682→                  <Button
+   683→                    variant="outline"
+   684→                    className="flex-1 rounded-xl"
+   685→                    disabled={submitting}
+   686→                    onClick={() => setOpen(false)}
+   687→                  >
+   688→                    انصراف
+   689→                  </Button>
+   690→                  <Button
+   691→                    className="flex-1 rounded-xl text-white"
+   692→                    style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   693→                    disabled={submitting || photos.length === 0}
+   694→                    onClick={submit}
+   695→                  >
+   696→                    {submitting ? (
+   697→                      <span className="flex items-center gap-2">
+   698→                        <Loader2 className="w-4 h-4 animate-spin" />
+   699→                        در حال پردازش...
+   700→                      </span>
+   701→                    ) : (
+   702→                      <span className="flex items-center gap-2">
+   703→                        <Upload className="w-4 h-4" />
+   704→                        ارسال و ساخت برنامه
+   705→                      </span>
+   706→                    )}
+   707→                  </Button>
+   708→                </div>
+   709→                </>
+   710→              )}
+   711→            </motion.div>
+   712→          </motion.div>
+   713→        )}
+   714→      </AnimatePresence>
+   715→    </>
+   716→  );
+   717→}
+   718→
+   719→/**
+   720→ * بنر تصمیمات — وقتی عکس‌های بدن آپلود شده اما پیش‌نیازهای اختیاری
+   721→ * (ویدیو، آزمایش خون) هنوز تعیین تکلیف نشده‌اند.
+   722→ *
+   723→ * این بنر به کاربر کمک می‌کند تا:
+   724→ *  - ویدیو را آپلود یا «آپلود نمی‌کنم» بزند
+   725→ *  - آزمایش خون را آپلود، «منتظر جوابم»، یا «آپلود نمی‌کنم» بزند
+   726→ *  - وقتی همه تصمیمات گرفته شد، دکمه «ساخت برنامه» بزند
+   727→ */
+   728→function PendingDecisionsBanner({
+   729→  state,
+   730→  onRefresh,
+   731→}: {
+   732→  state: BodyAnalysisState;
+   733→  onRefresh: () => void;
+   734→}) {
+   735→  const { setWorkoutPlan, setMealPlan } = useAppStore();
+   736→  const [busy, setBusy] = useState(false);
+   737→  const [generating, setGenerating] = useState(false);
+   738→
+   739→  const prerequisites = state.prerequisites || [];
+   740→  // فقط مواردی که هنوز تصمیم نشده‌اند (نه body_measurements)
+   741→  const pendingItems = prerequisites.filter(
+   742→    (p) =>
+   743→      p.type !== "body_measurements" &&
+   744→      p.status !== "completed"
+   745→  );
+   746→
+   747→  if (pendingItems.length === 0 && !state.canGenerateProgram) return null;
+   748→
+   749→  async function setVideoStatus(status: "skipped" | null) {
+   750→    setBusy(true);
+   751→    try {
+   752→      const res = await fetch("/api/video-status", {
+   753→        method: "PATCH",
+   754→        headers: { "Content-Type": "application/json" },
+   755→        body: JSON.stringify({ status }),
+   756→      });
+   757→      if (!res.ok) throw new Error("خطا در به‌روزرسانی وضعیت ویدیو");
+   758→      toast.success(
+   759→        status === "skipped"
+   760→          ? "باشه! برنامه بدون تحلیل ویدیو طراحی می‌شود."
+   761→          : "وضعیت ویدیو بازنشانی شد."
+   762→      );
+   763→      onRefresh();
+   764→    } catch (e) {
+   765→      toast.error(e instanceof Error ? e.message : "خطا");
+   766→    } finally {
+   767→      setBusy(false);
+   768→    }
+   769→  }
+   770→
+   771→  async function setBloodTestStatus(status: "declined" | "pending_blood_test" | null) {
+   772→    setBusy(true);
+   773→    try {
+   774→      const res = await fetch("/api/blood-test-status", {
+   775→        method: "PATCH",
+   776→        headers: { "Content-Type": "application/json" },
+   777→        body: JSON.stringify({ status }),
+   778→      });
+   779→      if (!res.ok) throw new Error("خطا در به‌روزرسانی وضعیت آزمایش خون");
+   780→      toast.success(
+   781→        status === "declined"
+   782→          ? "باشه! برنامه بدون آزمایش خون طراحی می‌شود."
+   783→          : status === "pending_blood_test"
+   784→          ? "باشه! تا زمان آپلود نتایج، تولید برنامه متوقف می‌ماند."
+   785→          : "وضعیت آزمایش خون بازنشانی شد."
+   786→      );
+   787→      onRefresh();
+   788→    } catch (e) {
+   789→      toast.error(e instanceof Error ? e.message : "خطا");
+   790→    } finally {
+   791→      setBusy(false);
+   792→    }
+   793→  }
+   794→
+   795→  async function generateProgram() {
+   796→    setGenerating(true);
+   797→    try {
+   798→      const res = await fetch("/api/coach/plan", { method: "PUT" });
+   799→      const data = await res.json();
+   800→      if (!res.ok) throw new Error(data.error || "خطا در ساخت برنامه");
+   801→      toast.success("برنامه شما ساخته شد! 🎯");
+   802→      // بارگذاری برنامه جدید
+   803→      const planRes = await fetch("/api/coach/plan", { cache: "no-store" });
+   804→      const planData = await planRes.json();
+   805→      if (planData.workout) setWorkoutPlan(planData.workout);
+   806→      if (planData.meal) setMealPlan(planData.meal);
+   807→      onRefresh();
+   808→    } catch (e) {
+   809→      toast.error(e instanceof Error ? e.message : "خطا در ساخت برنامه");
+   810→    } finally {
+   811→      setGenerating(false);
+   812→    }
+   813→  }
+   814→
+   815→  return (
+   816→    <motion.div
+   817→      initial={{ opacity: 0, y: -8 }}
+   818→      animate={{ opacity: 1, y: 0 }}
+   819→      className="rounded-2xl border-2 border-violet-300 bg-gradient-to-br from-violet-50 to-purple-50 p-4 shadow-sm"
+   820→    >
+   821→      <div className="flex items-start gap-3 mb-3">
+   822→        <div className="w-10 h-10 rounded-xl bg-violet-500/15 flex items-center justify-center shrink-0">
+   823→          <AlertCircle className="w-5 h-5 text-violet-600" />
+   824→        </div>
+   825→        <div className="flex-1 min-w-0">
+   826→          <h4 className="font-bold text-sm text-violet-900 dark:text-violet-200">
+   827→            مراحل نهایی برای ساخت برنامه
+   828→          </h4>
+   829→          <p className="text-[11px] text-violet-700 dark:text-violet-300 mt-1 leading-relaxed">
+   830→            عکس‌های بدن شما ذخیره شد. برای ساخت برنامه، باید موارد اختیاری زیر را تعیین تکلیف کنید (آپلود یا «رد کردن»).
+   831→          </p>
+   832→        </div>
+   833→      </div>
+   834→
+   835→      {/* لیست موارد در انتظار تصمیم */}
+   836→      <div className="space-y-2.5 mb-3">
+   837→        {pendingItems.map((pre) => (
+   838→          <div
+   839→            key={pre.id}
+   840→            className="rounded-xl bg-white/70 border border-violet-200 p-3"
+   841→          >
+   842→            <div className="flex items-start justify-between gap-2 mb-1.5">
+   843→              <p className="text-xs font-bold text-slate-900">{pre.label}</p>
+   844→              <span
+   845→                className={`text-[10px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${
+   846→                  pre.status === "pending_decision"
+   847→                    ? "bg-amber-100 text-amber-700 border-amber-200"
+   848→                    : pre.status === "pending"
+   849→                    ? "bg-blue-100 text-blue-700 border-blue-200"
+   850→                    : "bg-rose-100 text-rose-700 border-rose-200"
+   851→                }`}
+   852→              >
+   853→                {pre.statusLabel}
+   854→              </span>
+   855→            </div>
+   856→            <p className="text-[11px] text-slate-500 leading-relaxed mb-2">
+   857→              {pre.description}
+   858→            </p>
+   859→
+   860→            {/* دکمه‌های تصمیم برای ویدیو */}
+   861→            {pre.type === "video_body" && pre.status === "pending_decision" && (
+   862→              <div className="flex gap-1.5 flex-wrap">
+   863→                <Button
+   864→                  size="sm"
+   865→                  variant="outline"
+   866→                  disabled={busy}
+   867→                  onClick={() => setVideoStatus("skipped")}
+   868→                  className="rounded-lg text-[11px] h-8 border-violet-300 text-violet-700 hover:bg-violet-50"
+   869→                >
+   870→                  ❌ آپلود نمی‌کنم
+   871→                </Button>
+   872→                <span className="text-[10px] text-slate-500 self-center">
+   873→                  💡 برای آپلود ویدیو، دوباره روی «ارسال عکس بدن» بزنید و ویدیو را اضافه کنید.
+   874→                </span>
+   875→              </div>
+   876→            )}
+   877→
+   878→            {/* دکمه‌های تصمیم برای آزمایش خون */}
+   879→            {pre.type === "blood_test" && pre.status === "pending_decision" && (
+   880→              <div className="flex gap-1.5 flex-wrap">
+   881→                <Button
+   882→                  size="sm"
+   883→                  variant="outline"
+   884→                  disabled={busy}
+   885→                  onClick={() => setBloodTestStatus("pending_blood_test")}
+   886→                  className="rounded-lg text-[11px] h-8 border-violet-300 text-violet-700 hover:bg-violet-50"
+   887→                >
+   888→                  🔄 آزمایش دادم، منتظر جوابم
+   889→                </Button>
+   890→                <Button
+   891→                  size="sm"
+   892→                  variant="outline"
+   893→                  disabled={busy}
+   894→                  onClick={() => setBloodTestStatus("declined")}
+   895→                  className="rounded-lg text-[11px] h-8 border-violet-300 text-violet-700 hover:bg-violet-50"
+   896→                >
+   897→                  ❌ آپلود نمی‌کنم
+   898→                </Button>
+   899→              </div>
+   900→            )}
+   901→
+   902→            {/* پیام در انتظار نتایج آزمایش */}
+   903→            {pre.type === "blood_test" && pre.status === "pending" && (
+   904→              <div className="text-[11px] text-blue-700 bg-blue-50 rounded-lg p-2 border border-blue-200">
+   905→                ⏳ در انتظار نتایج آزمایش خون. وقتی جواب آماده شد، از بخش «آزمایش خون» آپلود کنید.
+   906→                <button
+   907→                  type="button"
+   908→                  disabled={busy}
+   909→                  onClick={() => setBloodTestStatus("declined")}
+   910→                  className="block mt-1.5 text-[10px] text-rose-600 hover:text-rose-700 underline"
+   911→                >
+   912→                  تغییر تصمیم: آپلود نمی‌کنم
+   913→                </button>
+   914→              </div>
+   915→            )}
+   916→          </div>
+   917→        ))}
+   918→      </div>
+   919→
+   920→      {/* دکمه ساخت برنامه — وقتی همه پیش‌نیازها تعیین تکلیف شد */}
+   921→      {state.canGenerateProgram && (
+   922→        <div className="pt-2 border-t border-violet-200">
+   923→          <Button
+   924→            size="sm"
+   925→            disabled={generating}
+   926→            onClick={generateProgram}
+   927→            className="w-full rounded-xl text-white font-bold"
+   928→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   929→          >
+   930→            {generating ? (
+   931→              <span className="flex items-center gap-2">
+   932→                <Loader2 className="w-4 h-4 animate-spin" /> در حال ساخت برنامه...
+   933→              </span>
+   934→            ) : (
+   935→              <span className="flex items-center gap-2">
+   936→                <Sparkles className="w-4 h-4" /> ساخت برنامه با فیتاپ هوشمند
+   937→              </span>
+   938→            )}
+   939→          </Button>
+   940→        </div>
+   941→      )}
+   942→
+   943→      {/* پیام بلاکر */}
+   944→      {state.blockingReason && !state.canGenerateProgram && (
+   945→        <div className="p-2 rounded-lg bg-rose-50 border border-rose-200 text-center">
+   946→          <p className="text-[11px] text-rose-700 leading-relaxed font-medium">
+   947→            ⚠️ {state.blockingReason}
+   948→          </p>
+   949→        </div>
+   950→      )}
+   951→    </motion.div>
+   952→  );
+   953→}
+   954→
+   955→/**
+   956→ * نمایش مراحل مجزای ارسال عکس بدن (وظیفه ۱ FOOD-ANALYSIS-LOGGING).
+   957→ * سه مرحله: آپلود → تحلیل توسط هوش مصنوعی → ساخت برنامه
+   958→ */
+   959→function SubmitStageDisplay({
+   960→  stage,
+   961→  photoCount,
+   962→}: {
+   963→  stage: "idle" | "uploading" | "analyzing" | "generating" | "done" | "error";
+   964→  photoCount: number;
+   965→}) {
+   966→  const stages: { key: typeof stage; label: string; desc: string }[] = [
+   967→    {
+   968→      key: "uploading",
+   969→      label: "در حال آپلود عکس‌ها",
+   970→      desc: `${toPersianDigits(photoCount)} عکس در حال ارسال به سرور`,
+   971→    },
+   972→    {
+   973→      key: "analyzing",
+   974→      label: "در حال تحلیل توسط هوش مصنوعی",
+   975→      desc: "فرم بدن و تعادل عضلانی تحلیل می‌شود",
+   976→    },
+   977→    {
+   978→      key: "generating",
+   979→      label: "در حال ساخت برنامه",
+   980→      desc: "برنامه تمرینی و غذایی شخصی‌سازی‌شده ساخته می‌شود",
+   981→    },
+   982→  ];
+   983→  const activeIdx = stages.findIndex((s) => s.key === stage);
+   984→
+   985→  return (
+   986→    <div className="space-y-1.5">
+   987→      {stages.map((s, i) => {
+   988→        const isDone = stage === "done" || i < activeIdx;
+   989→        const isActive = i === activeIdx && stage !== "done";
+   990→        return (
+   991→          <div key={s.key} className="flex items-center gap-2">
+   992→            <div
+   993→              className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 text-[10px] ${
+   994→                isDone
+   995→                  ? "bg-emerald-500 text-white"
+   996→                  : isActive
+   997→                    ? "bg-orange-500 text-white"
+   998→                    : "bg-muted text-muted-foreground"
+   999→              }`}
+  1000→            >
+  1001→              {isDone ? (
+  1002→                <CheckCircle2 className="w-3 h-3" />
+  1003→              ) : isActive ? (
+  1004→                <Loader2 className="w-3 h-3 animate-spin" />
+  1005→              ) : (
+  1006→                toPersianDigits(i + 1)
+  1007→              )}
+  1008→            </div>
+  1009→            <div className="flex-1 min-w-0">
+  1010→              <p
+  1011→                className={`text-[11px] font-bold ${
+  1012→                  isDone
+  1013→                    ? "text-emerald-700"
+  1014→                    : isActive
+  1015→                      ? "text-slate-900"
+  1016→                      : "text-muted-foreground"
+  1017→                }`}
+  1018→              >
+  1019→                {s.label}
+  1020→              </p>
+  1021→              {(isActive || isDone) && (
+  1022→                <p className="text-[10px] text-slate-500">{s.desc}</p>
+  1023→              )}
+  1024→            </div>
+  1025→          </div>
+  1026→        );
+  1027→      })}
+  1028→      {stage === "done" && (
+  1029→        <div className="flex items-center gap-2 pt-1">
+  1030→          <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+  1031→          <p className="text-[11px] font-bold text-emerald-700">
+  1032→            برنامه شما ساخته شد! در حال بارگذاری...
+  1033→          </p>
+  1034→        </div>
+  1035→      )}
+  1036→    </div>
+  1037→  );
+  1038→}
+  1039→

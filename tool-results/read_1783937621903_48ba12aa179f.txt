@@ -1,0 +1,747 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useEffect, useRef, useState } from "react";
+     4→     4→import { motion, AnimatePresence } from "framer-motion";
+     5→     5→import {
+     6→     6→  X,
+     7→     7→  Play,
+     8→     8→  Pause,
+     9→     9→  SkipForward,
+    10→    10→  SkipBack,
+    11→    11→  Music,
+    12→    12→  Plus,
+    13→    13→  Check,
+    14→    14→  Dumbbell,
+    15→    15→  Clock,
+    16→    16→  Zap,
+    17→    17→  ChevronLeft,
+    18→    18→  Volume2,
+    19→    19→  ListMusic,
+    20→    20→  Trash2,
+    21→    21→  Bot,
+    22→    22→} from "lucide-react";
+    23→    23→import { useAppStore, type GymTrack } from "@/lib/fitness/store";
+    24→    24→import { Button } from "@/components/ui/button";
+    25→    25→import { toPersianDigits, PERSIAN_WEEKDAYS } from "@/lib/fitness/types";
+    26→    26→import { toast } from "sonner";
+    27→    27→import {
+    28→    28→  saveTrackToDB,
+    29→    29→  loadTracksFromDB,
+    30→    30→  deleteTrackFromDB,
+    31→    31→} from "@/lib/fitness/gym-playlist-db";
+    32→    32→import { SmartCoachChatView } from "./smart-coach-chat-view";
+    33→    33→
+    34→    34→export function GymModeView() {
+    35→    35→  const {
+    36→    36→    setOverlay,
+    37→    37→    workoutPlan,
+    38→    38→    gymPlaylist,
+    39→    39→    setGymPlaylist,
+    40→    40→    activeSession,
+    41→    41→    startSession,
+    42→    42→    logSet,
+    43→    43→  } = useAppStore();
+    44→    44→  const fileInputRef = useRef<HTMLInputElement>(null);
+    45→    45→  const audioRef = useRef<HTMLAudioElement>(null);
+    46→    46→  const progressBarRef = useRef<HTMLDivElement>(null);
+    47→    47→
+    48→    48→  const [currentTrackIdx, setCurrentTrackIdx] = useState(0);
+    49→    49→  const currentTrack = gymPlaylist[currentTrackIdx];
+    50→    50→  const [isPlaying, setIsPlaying] = useState(false);
+    51→    51→  const [progress, setProgress] = useState(0);
+    52→    52→  const [duration, setDuration] = useState(0);
+    53→    53→  const [volume, setVolume] = useState(0.8);
+    54→    54→  const [selectedDayIdx, setSelectedDayIdx] = useState(0);
+    55→    55→  const [setWeights, setSetWeights] = useState<Record<string, string>>({});
+    56→    56→  const [setReps, setSetReps] = useState<Record<string, string>>({});
+    57→    57→  const [doneSets, setDoneSets] = useState<Record<string, boolean>>({});
+    58→    58→  const [chatOpen, setChatOpen] = useState(false);
+    59→    59→
+    60→    60→  // --- Ref برای ردیابی «قصد پخش» هنگام تغییر ترک ---
+    61→    61→  // وقتی کاربر روی ترک جدید کلیک می‌کند یا next/prev را می‌زند، این ref روی true
+    62→    62→  // قرار می‌گیرد تا رویداد onPause (که هنگام تعویض src صادر می‌شود) باعث توقف
+    63→    63→  // نمایش حالت «در حال پخش» نشود. سپس هنگام بارگذاری metadata ترک جدید،
+    64→    64→  // play() صدا زده می‌شود.
+    65→    65→  const pendingPlayRef = useRef(false);
+    66→    66→
+    67→    67→  // Default to today's day
+    68→    68→  useEffect(() => {
+    69→    69→    if (workoutPlan) {
+    70→    70→      const dayIdx = new Date().getDay();
+    71→    71→      const persianIdx = (dayIdx + 1) % 7;
+    72→    72→      const todayName = PERSIAN_WEEKDAYS[persianIdx];
+    73→    73→      const idx = workoutPlan.days.findIndex((d) => d.day === todayName);
+    74→    74→      if (idx >= 0) setSelectedDayIdx(idx);
+    75→    75→    }
+    76→    76→  }, [workoutPlan]);
+    77→    77→
+    78→    78→  // ─── Hydrate playlist from IndexedDB on every mount ───
+    79→    79→  // Object URLs are session-specific, so we always rebuild them from the
+    80→    80→  // persisted Blobs stored in IndexedDB. Any stale URLs in the store are
+    81→    81→  // revoked first to avoid memory leaks.
+    82→    82→  useEffect(() => {
+    83→    83→    let cancelled = false;
+    84→    84→    (async () => {
+    85→    85→      const stored = await loadTracksFromDB();
+    86→    86→      if (cancelled) return;
+    87→    87→      // Revoke any stale URLs from a previous mount
+    88→    88→      const stale = useAppStore.getState().gymPlaylist;
+    89→    89→      stale.forEach((t) => {
+    90→    90→        try { URL.revokeObjectURL(t.url); } catch {}
+    91→    91→      });
+    92→    92→      const tracks: GymTrack[] = stored.map((s) => ({
+    93→    93→        id: s.id,
+    94→    94→        name: s.name,
+    95→    95→        url: URL.createObjectURL(s.blob),
+    96→    96→        blob: s.blob,
+    97→    97→      }));
+    98→    98→      setGymPlaylist(tracks);
+    99→    99→    })();
+   100→   100→    return () => {
+   101→   101→      cancelled = true;
+   102→   102→    };
+   103→   103→  }, []);
+   104→   104→
+   105→   105→  // ─── Revoke object URLs on unmount to avoid memory leaks ───
+   106→   106→  // (the playlist itself persists in IndexedDB; URLs are re-created next mount)
+   107→   107→  useEffect(() => {
+   108→   108→    return () => {
+   109→   109→      const tracks = useAppStore.getState().gymPlaylist;
+   110→   110→      tracks.forEach((t) => {
+   111→   111→        try {
+   112→   112→          URL.revokeObjectURL(t.url);
+   113→   113→        } catch {}
+   114→   114→      });
+   115→   115→    };
+   116→   116→  }, []);
+   117→   117→
+   118→   118→  // Audio events
+   119→   119→  useEffect(() => {
+   120→   120→    const audio = audioRef.current;
+   121→   121→    if (!audio) return;
+   122→   122→    const onTime = () => setProgress(audio.currentTime);
+   123→   123→    const onMeta = () => {
+   124→   124→      setDuration(audio.duration || 0);
+   125→   125→      // When a new track's metadata is loaded and we intend to play, start playback.
+   126→   126→      // This is the reliable path: play() after metadata is loaded won't be blocked
+   127→   127→      // by the browser's autoplay policy because it's triggered by user interaction.
+   128→   128→      if (pendingPlayRef.current) {
+   129→   129→        audio.play().catch(() => {});
+   130→   130→      }
+   131→   131→    };
+   132→   132→    const onEnd = () => next();
+   133→   133→    audio.addEventListener("timeupdate", onTime);
+   134→   134→    audio.addEventListener("loadedmetadata", onMeta);
+   135→   135→    audio.addEventListener("ended", onEnd);
+   136→   136→    return () => {
+   137→   137→      audio.removeEventListener("timeupdate", onTime);
+   138→   138→      audio.removeEventListener("loadedmetadata", onMeta);
+   139→   139→      audio.removeEventListener("ended", onEnd);
+   140→   140→    };
+   141→   141→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   142→   142→  }, [currentTrackIdx, gymPlaylist]);
+   143→   143→
+   144→   144→  // ─── Explicitly start playback whenever the active track URL changes ───
+   145→   145→  // changing `src` doesn't always honor the `autoPlay` attribute, especially
+   146→   146→  // when the audio element was previously paused. So when isPlaying is true
+   147→   147→  // and the current track URL changes (e.g. user clicked a different track),
+   148→   148→  // we explicitly call play(). This effect also serves as a fallback for the
+   149→   149→  // onLoadedMetadata handler below.
+   150→   150→  useEffect(() => {
+   151→   151→    if (!currentTrack?.url) return;
+   152→   152→    // If we're switching tracks with intent to play, mark the ref so the
+   153→   153→    // pause event fired during src reload doesn't reset isPlaying.
+   154→   154→    // The actual play() call happens in onLoadedMetadata (when the new src
+   155→   155→    // is ready) — but we also try play() here as a fallback.
+   156→   156→    const audio = audioRef.current;
+   157→   157→    if (!audio) return;
+   158→   158→    if (pendingPlayRef.current) {
+   159→   159→      // Try to play immediately; if it fails (src still loading), the
+   160→   160→      // onLoadedMetadata handler will retry.
+   161→   161→      audio.play().catch(() => {});
+   162→   162→    }
+   163→   163→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   164→   164→  }, [currentTrack?.url]);
+   165→   165→
+   166→   166→  useEffect(() => {
+   167→   167→    if (audioRef.current) audioRef.current.volume = volume;
+   168→   168→  }, [volume]);
+   169→   169→
+   170→   170→  async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+   171→   171→    const files = e.target.files;
+   172→   172→    if (!files) return;
+   173→   173→    const fileArr = Array.from(files).filter((f) => f.type.startsWith("audio/"));
+   174→   174→    if (fileArr.length === 0) {
+   175→   175→      toast.error("فقط فایل‌های صوتی پخش می‌شوند");
+   176→   176→      return;
+   177→   177→    }
+   178→   178→    const tracks: GymTrack[] = fileArr.map((f) => ({
+   179→   179→      id: `track_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+   180→   180→      name: f.name.replace(/\.[^/.]+$/, ""),
+   181→   181→      url: URL.createObjectURL(f),
+   182→   182→      blob: f,
+   183→   183→    }));
+   184→   184→    setGymPlaylist([...gymPlaylist, ...tracks]);
+   185→   185→    toast.success(`${toPersianDigits(tracks.length)} آهنگ به لیست اضافه شد 🎵`);
+   186→   186→    e.target.value = "";
+   187→   187→    // Persist to IndexedDB (fire-and-forget)
+   188→   188→    await Promise.all(
+   189→   189→      tracks.map((t) =>
+   190→   190→        t.blob
+   191→   191→          ? saveTrackToDB({ id: t.id, name: t.name, blob: t.blob })
+   192→   192→          : Promise.resolve()
+   193→   193→      )
+   194→   194→    );
+   195→   195→  }
+   196→   196→
+   197→   197→  function togglePlay() {
+   198→   198→    if (gymPlaylist.length === 0) {
+   199→   199→      fileInputRef.current?.click();
+   200→   200→      return;
+   201→   201→    }
+   202→   202→    const audio = audioRef.current;
+   203→   203→    if (!audio) return;
+   204→   204→    if (isPlaying) {
+   205→   205→      pendingPlayRef.current = false;
+   206→   206→      audio.pause();
+   207→   207→      setIsPlaying(false);
+   208→   208→    } else {
+   209→   209→      pendingPlayRef.current = true;
+   210→   210→      audio.play().catch(() => {
+   211→   211→        // If play() fails (e.g., src not loaded yet), onLoadedMetadata will retry.
+   212→   212→      });
+   213→   213→      setIsPlaying(true);
+   214→   214→    }
+   215→   215→  }
+   216→   216→
+   217→   217→  function next() {
+   218→   218→    if (gymPlaylist.length === 0) return;
+   219→   219→    const idx = (currentTrackIdx + 1) % gymPlaylist.length;
+   220→   220→    pendingPlayRef.current = true;
+   221→   221→    setCurrentTrackIdx(idx);
+   222→   222→    setProgress(0);
+   223→   223→    setIsPlaying(true);
+   224→   224→  }
+   225→   225→
+   226→   226→  function prev() {
+   227→   227→    if (gymPlaylist.length === 0) return;
+   228→   228→    const idx = (currentTrackIdx - 1 + gymPlaylist.length) % gymPlaylist.length;
+   229→   229→    pendingPlayRef.current = true;
+   230→   230→    setCurrentTrackIdx(idx);
+   231→   231→    setProgress(0);
+   232→   232→    setIsPlaying(true);
+   233→   233→  }
+   234→   234→
+   235→   235→  function playTrack(idx: number) {
+   236→   236→    if (idx === currentTrackIdx) {
+   237→   237→      // کلیک روی ترک در حال پخش → toggle
+   238→   238→      togglePlay();
+   239→   239→      return;
+   240→   240→    }
+   241→   241→    // کلیک روی ترک متفاوت → آن را پخش کن
+   242→   242→    pendingPlayRef.current = true;
+   243→   243→    setCurrentTrackIdx(idx);
+   244→   244→    setProgress(0);
+   245→   245→    setIsPlaying(true);
+   246→   246→  }
+   247→   247→
+   248→   248→  function removeTrack(id: string) {
+   249→   249→    const track = gymPlaylist.find((t) => t.id === id);
+   250→   250→    if (track) URL.revokeObjectURL(track.url);
+   251→   251→    const filtered = gymPlaylist.filter((t) => t.id !== id);
+   252→   252→    setGymPlaylist(filtered);
+   253→   253→    if (currentTrackIdx >= filtered.length) setCurrentTrackIdx(0);
+   254→   254→    // Also delete from IndexedDB
+   255→   255→    void deleteTrackFromDB(id);
+   256→   256→  }
+   257→   257→
+   258→   258→  // ─── Seek bar (mouse + touch) ───
+   259→   259→  function seekFromClientX(clientX: number) {
+   260→   260→    const el = progressBarRef.current;
+   261→   261→    if (!el || !duration || !audioRef.current) return;
+   262→   262→    const rect = el.getBoundingClientRect();
+   263→   263→    // RTL-aware: in RTL the bar fills from right to left visually,
+   264→   264→    // but the audio currentTime is always 0→duration left-to-right logically.
+   265→   265→    // We compute the fraction from the left edge for both LTR and RTL.
+   266→   266→    const pct = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+   267→   267→    audioRef.current.currentTime = pct * duration;
+   268→   268→    setProgress(pct * duration);
+   269→   269→  }
+   270→   270→
+   271→   271→  function seek(e: React.MouseEvent<HTMLDivElement>) {
+   272→   272→    seekFromClientX(e.clientX);
+   273→   273→  }
+   274→   274→
+   275→   275→  function handleTouchSeek(e: React.TouchEvent<HTMLDivElement>) {
+   276→   276→    const touch = e.touches[0];
+   277→   277→    if (!touch) return;
+   278→   278→    seekFromClientX(touch.clientX);
+   279→   279→    // Prevent the browser from scrolling while dragging the seek bar
+   280→   280→    e.preventDefault();
+   281→   281→  }
+   282→   282→
+   283→   283→  function completeSet(exerciseId: string, setNumber: number) {
+   284→   284→    const key = `${exerciseId}_${setNumber}`;
+   285→   285→    setDoneSets((s) => ({ ...s, [key]: true }));
+   286→   286→    const w = Number(setWeights[key] || 0);
+   287→   287→    const r = Number(setReps[key] || 0);
+   288→   288→    if (activeSession) {
+   289→   289→      logSet(exerciseId, setNumber, w, r);
+   290→   290→    } else {
+   291→   291→      // auto-start session if not active
+   292→   292→      if (workoutPlan) startSession(workoutPlan.days[selectedDayIdx].day);
+   293→   293→      setTimeout(() => logSet(exerciseId, setNumber, w, r), 50);
+   294→   294→    }
+   295→   295→    toast.success(`ست ${toPersianDigits(setNumber)} انجام شد! 💪`);
+   296→   296→  }
+   297→   297→
+   298→   298→  const activeDay = workoutPlan?.days[selectedDayIdx];
+   299→   299→
+   300→   300→  function fmt(s: number) {
+   301→   301→    const m = Math.floor(s / 60);
+   302→   302→    const sec = Math.floor(s % 60);
+   303→   303→    return `${toPersianDigits(m.toString().padStart(2, "0"))}:${toPersianDigits(sec.toString().padStart(2, "0"))}`;
+   304→   304→  }
+   305→   305→
+   306→   306→  return (
+   307→   307→    <div
+   308→   308→      className="flex flex-col h-full relative bg-gradient-to-b from-orange-50/40 via-white to-white"
+   309→   309→      dir="rtl"
+   310→   310→    >
+   311→   311→      <input ref={fileInputRef} type="file" accept="audio/*" multiple className="hidden" onChange={handleFileSelect} />
+   312→   312→      <audio
+   313→   313→        ref={audioRef}
+   314→   314→        data-gym-music="true"
+   315→   315→        src={currentTrack?.url}
+   316→   316→        onPlay={() => {
+   317→   317→          pendingPlayRef.current = false;
+   318→   318→          setIsPlaying(true);
+   319→   319→        }}
+   320→   320→        onPause={() => {
+   321→   321→          // هنگام تعویض src، رویداد pause به‌طور خودکار صادر می‌شود.
+   322→   322→          // در این حالت نباید isPlaying را false کنیم چون قصد پخش داریم.
+   323→   323→          if (!pendingPlayRef.current) {
+   324→   324→            setIsPlaying(false);
+   325→   325→          }
+   326→   326→        }}
+   327→   327→        onLoadedMetadata={() => {
+   328→   328→          const audio = audioRef.current;
+   329→   329→          if (!audio) return;
+   330→   330→          setDuration(audio.duration || 0);
+   331→   331→          // وقتی ترک جدید بارگذاری شد و قصد پخش داریم، پخش را شروع کن.
+   332→   332→          // این زمانی critical است که play() در useEffect قبلی به‌دلیل
+   333→   333→          // آماده‌نبودن src ناموفق بوده است.
+   334→   334→          if (pendingPlayRef.current) {
+   335→   335→            audio.play().catch(() => {
+   336→   336→              pendingPlayRef.current = false;
+   337→   337→            });
+   338→   338→          }
+   339→   339→        }}
+   340→   340→      />
+   341→   341→
+   342→   342→      {/* Header — clean white with orange accent */}
+   343→   343→      <div className="flex items-center justify-between p-4 border-b border-orange-100 bg-white/95 backdrop-blur-md sticky top-0 z-20">
+   344→   344→        <div className="flex items-center gap-2.5">
+   345→   345→          <div
+   346→   346→            className="w-10 h-10 rounded-2xl flex items-center justify-center shadow-md shrink-0 overflow-hidden"
+   347→   347→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   348→   348→          >
+   349→   349→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   350→   350→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   351→   351→          </div>
+   352→   352→          <div>
+   353→   353→            <h2 className="font-bold text-sm text-slate-900">حالت باشگاه</h2>
+   354→   354→            <p className="text-[10px] text-slate-500 flex items-center gap-1">
+   355→   355→              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+   356→   356→              موزیک + برنامه تمرین روز
+   357→   357→            </p>
+   358→   358→          </div>
+   359→   359→        </div>
+   360→   360→        <Button
+   361→   361→          variant="ghost"
+   362→   362→          size="icon"
+   363→   363→          onClick={() => setOverlay(null)}
+   364→   364→          className="rounded-full hover:bg-orange-50 text-slate-500 hover:text-orange-600"
+   365→   365→        >
+   366→   366→          <X className="w-5 h-5" />
+   367→   367→        </Button>
+   368→   368→      </div>
+   369→   369→
+   370→   370→      {/* Body: two columns on desktop (workout + chat), single column on mobile */}
+   371→   371→      <div className="flex-1 flex min-h-0">
+   372→   372→        {/* Main content: music player + workout program */}
+   373→   373→        <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4 max-w-5xl mx-auto w-full">
+   374→   374→        {/* MUSIC PLAYER */}
+   375→   375→        <div className="bg-white rounded-3xl overflow-hidden border border-orange-100 shadow-sm">
+   376→   376→          {/* Now playing visualizer */}
+   377→   377→          <div className="relative h-32 bg-gradient-to-br from-orange-100 via-amber-50 to-orange-50 flex items-center justify-center overflow-hidden">
+   378→   378→            <div className="absolute inset-0 opacity-30">
+   379→   379→              <div className="absolute top-2 right-4 w-24 h-24 rounded-full bg-orange-300/50 blur-3xl" />
+   380→   380→              <div className="absolute bottom-2 left-4 w-20 h-20 rounded-full bg-amber-300/50 blur-3xl" />
+   381→   381→            </div>
+   382→   382→            <motion.div
+   383→   383→              animate={isPlaying ? { scale: [1, 1.08, 1], rotate: [0, 4, -4, 0] } : {}}
+   384→   384→              transition={{ duration: 0.8, repeat: Infinity }}
+   385→   385→              className="relative z-10"
+   386→   386→            >
+   387→   387→              <div
+   388→   388→                className="w-16 h-16 rounded-full flex items-center justify-center shadow-xl"
+   389→   389→                style={{
+   390→   390→                  background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   391→   391→                  boxShadow: "0 10px 25px -5px rgba(249, 115, 22, 0.5)",
+   392→   392→                }}
+   393→   393→              >
+   394→   394→                <Music className="w-8 h-8 text-white" strokeWidth={2.5} />
+   395→   395→              </div>
+   396→   396→            </motion.div>
+   397→   397→            {/* Equalizer bars */}
+   398→   398→            {isPlaying && (
+   399→   399→              <div className="absolute bottom-3 left-4 flex items-end gap-0.5 h-6">
+   400→   400→                {[0, 1, 2, 3, 4].map((i) => (
+   401→   401→                  <motion.div
+   402→   402→                    key={i}
+   403→   403→                    className="w-1 rounded-full"
+   404→   404→                    style={{ background: "linear-gradient(180deg, #f59e0b, #f97316)" }}
+   405→   405→                    animate={{ height: [6, 18, 10, 22, 8] }}
+   406→   406→                    transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.1 }}
+   407→   407→                  />
+   408→   408→                ))}
+   409→   409→              </div>
+   410→   410→            )}
+   411→   411→          </div>
+   412→   412→
+   413→   413→          {/* Track info + controls */}
+   414→   414→          <div className="p-4">
+   415→   415→            <div className="text-center mb-3">
+   416→   416→              <p className="font-bold text-sm truncate text-slate-900">{currentTrack?.name || "هیچ آهنگی انتخاب نشده"}</p>
+   417→   417→              <p className="text-[11px] text-slate-500">
+   418→   418→                {gymPlaylist.length > 0
+   419→   419→                  ? `آهنگ ${toPersianDigits(currentTrackIdx + 1)} از ${toPersianDigits(gymPlaylist.length)}`
+   420→   420→                  : "از موسیقی‌های گوشیت اضافه کن"}
+   421→   421→              </p>
+   422→   422→            </div>
+   423→   423→
+   424→   424→            {/* Progress bar (larger, touch-friendly, LTR-explicit for predictable seeking) */}
+   425→   425→            <div className="flex items-center gap-2 mb-3">
+   426→   426→              <span className="text-[10px] text-slate-500 font-mono shrink-0 w-10 text-center">{fmt(progress)}</span>
+   427→   427→              <div
+   428→   428→                ref={progressBarRef}
+   429→   429→                dir="ltr"
+   430→   430→                role="slider"
+   431→   431→                aria-label="پیشرفت پخش"
+   432→   432→                aria-valuemin={0}
+   433→   433→                aria-valuemax={Math.floor(duration) || 0}
+   434→   434→                aria-valuenow={Math.floor(progress) || 0}
+   435→   435→                tabIndex={0}
+   436→   436→                className="flex-1 h-3 bg-slate-100 rounded-full cursor-pointer relative touch-none select-none group"
+   437→   437→                onClick={seek}
+   438→   438→                onTouchStart={handleTouchSeek}
+   439→   439→                onTouchMove={handleTouchSeek}
+   440→   440→                onKeyDown={(e) => {
+   441→   441→                  if (!duration || !audioRef.current) return;
+   442→   442→                  if (e.key === "ArrowLeft") {
+   443→   443→                    audioRef.current.currentTime = Math.max(0, audioRef.current.currentTime - 5);
+   444→   444→                  } else if (e.key === "ArrowRight") {
+   445→   445→                    audioRef.current.currentTime = Math.min(duration, audioRef.current.currentTime + 5);
+   446→   446→                  }
+   447→   447→                }}
+   448→   448→              >
+   449→   449→                {/* Filled portion (LTR: grows from left to right) */}
+   450→   450→                <div
+   451→   451→                  className="absolute inset-y-0 left-0 rounded-full pointer-events-none"
+   452→   452→                  style={{
+   453→   453→                    width: `${duration ? (progress / duration) * 100 : 0}%`,
+   454→   454→                    background: "linear-gradient(90deg, #f59e0b, #f97316)",
+   455→   455→                  }}
+   456→   456→                />
+   457→   457→                {/* Draggable thumb */}
+   458→   458→                <div
+   459→   459→                  className="absolute top-1/2 -translate-y-1/2 -ml-2 w-4 h-4 rounded-full bg-white shadow-md border-2 border-orange-500 pointer-events-none opacity-90 group-hover:scale-110 transition"
+   460→   460→                  style={{ left: `${duration ? (progress / duration) * 100 : 0}%` }}
+   461→   461→                />
+   462→   462→              </div>
+   463→   463→              <span className="text-[10px] text-slate-500 font-mono shrink-0 w-10 text-center">{fmt(duration)}</span>
+   464→   464→            </div>
+   465→   465→
+   466→   466→            {/* Controls */}
+   467→   467→            <div className="flex items-center justify-center gap-4 mb-3">
+   468→   468→              <button onClick={prev} disabled={gymPlaylist.length === 0} className="p-2 rounded-full hover:bg-orange-50 text-slate-700 transition disabled:opacity-30">
+   469→   469→                <SkipBack className="w-5 h-5" />
+   470→   470→              </button>
+   471→   471→              <button
+   472→   472→                onClick={togglePlay}
+   473→   473→                className="w-14 h-14 rounded-full flex items-center justify-center text-white shadow-lg hover:scale-105 transition"
+   474→   474→                style={{
+   475→   475→                  background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   476→   476→                  boxShadow: "0 10px 25px -5px rgba(249, 115, 22, 0.5)",
+   477→   477→                }}
+   478→   478→              >
+   479→   479→                {isPlaying ? <Pause className="w-6 h-6 fill-current" /> : <Play className="w-6 h-6 fill-current mr-0.5" />}
+   480→   480→              </button>
+   481→   481→              <button onClick={next} disabled={gymPlaylist.length === 0} className="p-2 rounded-full hover:bg-orange-50 text-slate-700 transition disabled:opacity-30">
+   482→   482→                <SkipForward className="w-5 h-5" />
+   483→   483→              </button>
+   484→   484→            </div>
+   485→   485→
+   486→   486→            {/* Volume + add music */}
+   487→   487→            <div className="flex items-center gap-2">
+   488→   488→              <Volume2 className="w-4 h-4 text-slate-500" />
+   489→   489→              <input
+   490→   490→                type="range"
+   491→   491→                dir="ltr"
+   492→   492→                min="0"
+   493→   493→                max="1"
+   494→   494→                step="0.05"
+   495→   495→                value={volume}
+   496→   496→                onChange={(e) => setVolume(Number(e.target.value))}
+   497→   497→                aria-label="صدا"
+   498→   498→                className="flex-1 accent-orange-500 h-1"
+   499→   499→              />
+   500→   500→              <Button size="sm" variant="outline" className="rounded-xl text-xs shrink-0 border-orange-200 text-orange-600 hover:bg-orange-50 hover:text-orange-700" onClick={() => fileInputRef.current?.click()}>
+   501→   501→                <Plus className="w-4 h-4" />
+   502→   502→                افزودن موزیک
+   503→   503→              </Button>
+   504→   504→            </div>
+   505→   505→          </div>
+   506→   506→
+   507→   507→          {/* Playlist */}
+   508→   508→          {gymPlaylist.length > 0 && (
+   509→   509→            <div className="border-t border-orange-100 max-h-44 overflow-y-auto custom-scrollbar">
+   510→   510→              <div className="flex items-center gap-1.5 px-4 py-2 text-[11px] text-slate-500 sticky top-0 bg-white/85 backdrop-blur">
+   511→   511→                <ListMusic className="w-3.5 h-3.5" />
+   512→   512→                لیست پخش ({toPersianDigits(gymPlaylist.length)})
+   513→   513→              </div>
+   514→   514→              {gymPlaylist.map((track, i) => (
+   515→   515→                <div
+   516→   516→                  key={track.id}
+   517→   517→                  role="button"
+   518→   518→                  tabIndex={0}
+   519→   519→                  onClick={() => playTrack(i)}
+   520→   520→                  onKeyDown={(e) => {
+   521→   521→                    if (e.key === "Enter" || e.key === " ") {
+   522→   522→                      e.preventDefault();
+   523→   523→                      playTrack(i);
+   524→   524→                    }
+   525→   525→                  }}
+   526→   526→                  className={`w-full flex items-center gap-3 px-4 py-2.5 hover:bg-orange-50/60 transition text-right group cursor-pointer ${
+   527→   527→                    i === currentTrackIdx ? "bg-orange-50" : ""
+   528→   528→                  }`}
+   529→   529→                >
+   530→   530→                  <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${i === currentTrackIdx ? "text-white" : "bg-slate-100 text-slate-600"}`} style={i === currentTrackIdx ? { background: "linear-gradient(135deg, #f59e0b, #f97316)" } : undefined}>
+   531→   531→                    {i === currentTrackIdx && isPlaying ? (
+   532→   532→                      <div className="flex items-end gap-0.5 h-3">
+   533→   533→                        {[0, 1, 2].map((j) => (
+   534→   534→                          <motion.div key={j} className="w-0.5 bg-current rounded-full" animate={{ height: [3, 8, 3] }} transition={{ duration: 0.5, repeat: Infinity, delay: j * 0.1 }} />
+   535→   535→                        ))}
+   536→   536→                      </div>
+   537→   537→                    ) : (
+   538→   538→                      <span className="text-[10px] font-bold">{toPersianDigits(i + 1)}</span>
+   539→   539→                    )}
+   540→   540→                  </div>
+   541→   541→                  <span className={`flex-1 text-xs truncate ${i === currentTrackIdx ? "text-orange-600 font-bold" : "text-slate-700"}`}>{track.name}</span>
+   542→   542→                  <button
+   543→   543→                    type="button"
+   544→   544→                    onClick={(e) => { e.stopPropagation(); removeTrack(track.id); }}
+   545→   545→                    className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-100 text-slate-500 hover:text-red-500 transition"
+   546→   546→                    aria-label="حذف آهنگ"
+   547→   547→                  >
+   548→   548→                    <Trash2 className="w-3.5 h-3.5" />
+   549→   549→                  </button>
+   550→   550→                </div>
+   551→   551→              ))}
+   552→   552→            </div>
+   553→   553→          )}
+   554→   554→        </div>
+   555→   555→
+   556→   556→        {/* DAY SELECTOR + WORKOUT PROGRAM */}
+   557→   557→        <div className="bg-white rounded-3xl p-4 border border-orange-100 shadow-sm">
+   558→   558→          <div className="flex items-center justify-between mb-3">
+   559→   559→            <h3 className="font-bold text-sm flex items-center gap-2 text-slate-900">
+   560→   560→              <Dumbbell className="w-4 h-4 text-orange-500" />
+   561→   561→              برنامه تمرین
+   562→   562→            </h3>
+   563→   563→            <span className="text-[11px] text-slate-500">روز را انتخاب کن</span>
+   564→   564→          </div>
+   565→   565→
+   566→   566→          {/* Day selector */}
+   567→   567→          {workoutPlan && (
+   568→   568→            <div className="flex gap-2 overflow-x-auto no-scrollbar pb-2 mb-3">
+   569→   569→              {workoutPlan.days.map((day, i) => (
+   570→   570→                <button
+   571→   571→                  key={i}
+   572→   572→                  onClick={() => setSelectedDayIdx(i)}
+   573→   573→                  className={`shrink-0 px-3 py-2 rounded-2xl border-2 transition text-center min-w-[80px] ${
+   574→   574→                    selectedDayIdx === i
+   575→   575→                      ? "border-orange-500 bg-orange-50"
+   576→   576→                      : "border-slate-200 bg-white hover:border-orange-200"
+   577→   577→                  }`}
+   578→   578→                >
+   579→   579→                  <div className="text-xs font-bold text-slate-900">{day.day}</div>
+   580→   580→                  <div className="text-[9px] text-slate-500 truncate">{day.focus}</div>
+   581→   581→                </button>
+   582→   582→              ))}
+   583→   583→            </div>
+   584→   584→          )}
+   585→   585→
+   586→   586→          {/* Active day info */}
+   587→   587→          {activeDay ? (
+   588→   588→            <>
+   589→   589→              <div className="flex items-center justify-between mb-3 p-3 rounded-xl bg-orange-50/60 border border-orange-100">
+   590→   590→                <div>
+   591→   591→                  <p className="font-bold text-sm text-slate-900">{activeDay.title}</p>
+   592→   592→                  <div className="flex items-center gap-3 text-[10px] text-slate-500 mt-0.5">
+   593→   593→                    <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{toPersianDigits(activeDay.estimatedMinutes)} دقیقه</span>
+   594→   594→                    <span className="flex items-center gap-1"><Zap className="w-3 h-3" />{toPersianDigits(activeDay.exercises.length)} حرکت</span>
+   595→   595→                  </div>
+   596→   596→                </div>
+   597→   597→              </div>
+   598→   598→
+   599→   599→              {/* Exercises with quick log */}
+   600→   600→              <div className="space-y-2.5">
+   601→   601→                {activeDay.exercises.map((ex, ei) => (
+   602→   602→                  <div key={ex.id} className="rounded-2xl border border-orange-100 bg-orange-50/30 p-3">
+   603→   603→                    <div className="flex items-center gap-2 mb-2">
+   604→   604→                      <span className="w-6 h-6 rounded-lg bg-orange-100 text-orange-600 text-[10px] font-bold flex items-center justify-center">{toPersianDigits(ei + 1)}</span>
+   605→   605→                      <div className="flex-1">
+   606→   606→                        <p className="font-bold text-sm text-slate-900">{ex.name}</p>
+   607→   607→                        <p className="text-[10px] text-slate-500">{ex.muscle} • {toPersianDigits(ex.sets.length)} ست</p>
+   608→   608→                      </div>
+   609→   609→                    </div>
+   610→   610→                    <div className="space-y-1.5">
+   611→   611→                      {ex.sets.map((set) => {
+   612→   612→                        const key = `${ex.id}_${set.setNumber}`;
+   613→   613→                        const done = doneSets[key];
+   614→   614→                        return (
+   615→   615→                          <div key={set.setNumber} className={`flex items-center gap-2 p-2 rounded-lg transition ${done ? "bg-orange-50" : "bg-slate-50"}`}>
+   616→   616→                            <span className="text-[10px] text-slate-500 w-6">ست {toPersianDigits(set.setNumber)}</span>
+   617→   617→                            <span className="text-[10px] text-slate-500 flex-1">هدف: {toPersianDigits(set.reps)}</span>
+   618→   618→                            <input
+   619→   619→                              type="number"
+   620→   620→                              dir="ltr"
+   621→   621→                              placeholder="kg"
+   622→   622→                              value={setWeights[key] ?? ""}
+   623→   623→                              onChange={(e) => setSetWeights((w) => ({ ...w, [key]: e.target.value }))}
+   624→   624→                              disabled={done}
+   625→   625→                              className="w-12 h-7 text-center text-[11px] rounded-md border border-slate-200 bg-white text-slate-700"
+   626→   626→                            />
+   627→   627→                            <input
+   628→   628→                              type="number"
+   629→   629→                              dir="ltr"
+   630→   630→                              placeholder="rep"
+   631→   631→                              value={setReps[key] ?? ""}
+   632→   632→                              onChange={(e) => setSetReps((r) => ({ ...r, [key]: e.target.value }))}
+   633→   633→                              disabled={done}
+   634→   634→                              className="w-12 h-7 text-center text-[11px] rounded-md border border-slate-200 bg-white text-slate-700"
+   635→   635→                            />
+   636→   636→                            <button
+   637→   637→                              onClick={() => completeSet(ex.id, set.setNumber)}
+   638→   638→                              disabled={done}
+   639→   639→                              className={`w-7 h-7 rounded-full flex items-center justify-center transition shrink-0 ${
+   640→   640→                                done ? "text-white" : "bg-slate-200 text-slate-600 hover:text-white"
+   641→   641→                              }`}
+   642→   642→                              style={done ? { background: "linear-gradient(135deg, #f59e0b, #f97316)" } : undefined}
+   643→   643→                            >
+   644→   644→                              <Check className="w-3.5 h-3.5" strokeWidth={3} />
+   645→   645→                            </button>
+   646→   646→                          </div>
+   647→   647→                        );
+   648→   648→                      })}
+   649→   649→                    </div>
+   650→   650→                  </div>
+   651→   651→                ))}
+   652→   652→              </div>
+   653→   653→            </>
+   654→   654→          ) : (
+   655→   655→            <div className="text-center py-6 text-slate-500 text-sm">
+   656→   656→              برنامه تمرینی موجود نیست
+   657→   657→            </div>
+   658→   658→          )}
+   659→   659→        </div>
+   660→   660→        </div>
+   661→   661→
+   662→   662→        {/* Desktop chat side panel حذف شد — چت به‌صورت modal باز می‌شود */}
+   663→   663→      </div>
+   664→   664→
+   665→   665→      {/* Chat modal — روی همه دستگاه‌ها (موبایل + دسکتاپ) به‌صورت modal باز می‌شود */}
+   666→   666→      <AnimatePresence>
+   667→   667→        {chatOpen && (
+   668→   668→          <motion.div
+   669→   669→            initial={{ opacity: 0 }}
+   670→   670→            animate={{ opacity: 1 }}
+   671→   671→            exit={{ opacity: 0 }}
+   672→   672→            transition={{ duration: 0.2 }}
+   673→   673→            className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4"
+   674→   674→            dir="rtl"
+   675→   675→            onClick={() => setChatOpen(false)}
+   676→   676→          >
+   677→   677→            {/* Backdrop */}
+   678→   678→            <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+   679→   679→            {/* Modal container — روی موبایل full-screen، روی دسکتاپ centered modal */}
+   680→   680→            <motion.div
+   681→   681→              initial={{ scale: 0.9, y: 20 }}
+   682→   682→              animate={{ scale: 1, y: 0 }}
+   683→   683→              exit={{ scale: 0.9, y: 20 }}
+   684→   684→              transition={{ type: "tween", duration: 0.25, ease: [0.4, 0, 0.2, 1] }}
+   685→   685→              className="relative bg-white w-full h-full sm:w-[440px] sm:h-[85vh] sm:max-h-[85vh] sm:rounded-3xl shadow-2xl overflow-hidden flex flex-col"
+   686→   686→              onClick={(e) => e.stopPropagation()}
+   687→   687→            >
+   688→   688→              {/* Top bar with close button */}
+   689→   689→              <div className="flex items-center justify-between px-4 py-3 border-b border-orange-100 bg-white shrink-0">
+   690→   690→                <button
+   691→   691→                  onClick={() => setChatOpen(false)}
+   692→   692→                  className="flex items-center gap-1 text-orange-600 active:scale-95 transition font-medium"
+   693→   693→                  aria-label="بستن چت"
+   694→   694→                >
+   695→   695→                  <ChevronLeft className="w-5 h-5 rotate-180" />
+   696→   696→                  <span className="text-sm">بازگشت به تمرین</span>
+   697→   697→                </button>
+   698→   698→                <span className="text-[11px] text-slate-500 flex items-center gap-1.5">
+   699→   699→                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+   700→   700→                  فیتاپ
+   701→   701→                </span>
+   702→   702→              </div>
+   703→   703→              {/* Chat fills remaining space */}
+   704→   704→              <div className="flex-1 min-h-0">
+   705→   705→                <SmartCoachChatView variant="panel" />
+   706→   706→              </div>
+   707→   707→            </motion.div>
+   708→   708→          </motion.div>
+   709→   709→        )}
+   710→   710→      </AnimatePresence>
+   711→   711→
+   712→   712→      {/* FAB to open chat — روی همه دستگاه‌ها (موبایل + دسکتاپ) */}
+   713→   713→      {!chatOpen && (
+   714→   714→        <motion.button
+   715→   715→          initial={{ scale: 0, opacity: 0 }}
+   716→   716→          animate={{ scale: 1, opacity: 1 }}
+   717→   717→          whileTap={{ scale: 0.9 }}
+   718→   718→          onClick={() => setChatOpen(true)}
+   719→   719→          className="absolute bottom-5 left-5 z-30 flex items-center gap-2 pr-4 pl-2 py-2 rounded-full shadow-2xl text-white"
+   720→   720→          style={{
+   721→   721→            background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   722→   722→            boxShadow: "0 12px 30px -8px rgba(249, 115, 22, 0.5)",
+   723→   723→          }}
+   724→   724→          aria-label="باز کردن چت با فیتاپ"
+   725→   725→        >
+   726→   726→          {/* Pulse ring animation */}
+   727→   727→          <span
+   728→   728→            className="absolute inset-0 rounded-full animate-ping"
+   729→   729→            style={{
+   730→   730→              background: "rgba(249, 115, 22, 0.4)",
+   731→   731→              animationDuration: "2s",
+   732→   732→              animationIterationCount: "infinite",
+   733→   733→            }}
+   734→   734→          />
+   735→   735→          <span className="relative flex items-center gap-2">
+   736→   736→            <span className="text-xs font-bold whitespace-nowrap">چت با فیتاپ</span>
+   737→   737→            <span className="relative w-10 h-10 rounded-full bg-white/20 flex items-center justify-center">
+   738→   738→              <Bot className="w-5 h-5" />
+   739→   739→              <span className="absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-emerald-500 border-2 border-white" />
+   740→   740→            </span>
+   741→   741→          </span>
+   742→   742→        </motion.button>
+   743→   743→      )}
+   744→   744→    </div>
+   745→   745→  );
+   746→   746→}
+   747→   747→

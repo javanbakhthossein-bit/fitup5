@@ -1,0 +1,825 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState } from "react";
+     4→import {
+     5→  X,
+     6→  Crown,
+     7→  Shield,
+     8→  LogOut,
+     9→  ChevronLeft,
+    10→  CreditCard,
+    11→  Settings,
+    12→  Dumbbell,
+    13→  Activity,
+    14→  Wallet,
+    15→  Ruler,
+    16→  HeartPulse,
+    17→  Salad,
+    18→  Trophy,
+    19→  Camera,
+    20→  TestTube,
+    21→  Video,
+    22→  Loader2,
+    23→} from "lucide-react";
+    24→import { useAppStore } from "@/lib/fitness/store";
+    25→import { Button } from "@/components/ui/button";
+    26→import { Card } from "@/components/ui/card";
+    27→import { Skeleton } from "@/components/ui/skeleton";
+    28→import {
+    29→  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+    30→} from "@/components/ui/dialog";
+    31→import { Input } from "@/components/ui/input";
+    32→import { Label } from "@/components/ui/label";
+    33→import {
+    34→  toPersianDigits, formatToman,
+    35→  PLAN_LABELS,
+    36→} from "@/lib/fitness/types";
+    37→import { toast } from "sonner";
+    38→
+    39→interface OnboardingProfileDto {
+    40→  gender: string;
+    41→  genderLabel: string;
+    42→  age: number;
+    43→  height: number;
+    44→  weight: number;
+    45→  targetWeight: number | null;
+    46→  goal: string;
+    47→  goalLabel: string;
+    48→  activityLevel: string;
+    49→  activityLabel: string;
+    50→  workoutDays: number;
+    51→  workoutDaysList: string[];
+    52→  workoutPlace: string;
+    53→  workoutPlaceLabel: string;
+    54→  dietType: string;
+    55→  dietLabel: string;
+    56→  allergies: string;
+    57→  injuries: string;
+    58→  diseases: string;
+    59→  equipment: string[];
+    60→  trainingExperience: string | null;
+    61→  trainingExperienceLabel: string | null;
+    62→  previousTrainingType: string | null;
+    63→  drugAllergies: string | null;
+    64→  currentMedications: string | null;
+    65→  maxLifts: string | null;
+    66→  bodyFrame?: string;
+    67→  bodyFrameLabel?: string;
+    68→  sleepHours?: number;
+    69→  stressLevel?: number;
+    70→  waterHabit?: number;
+    71→  targetDate?: string;
+    72→  workoutTime?: string;
+    73→  workoutTimeLabel?: string;
+    74→  dislikedFoods?: string;
+    75→  preferredCuisine?: string;
+    76→  preferredCuisineLabel?: string;
+    77→  waterGoalMl?: number;
+    78→  medicalConditions?: string[];
+    79→}
+    80→
+    81→interface BaselineDto {
+    82→  weight: number;
+    83→  chestMeasurement: number | null;
+    84→  armMeasurement: number | null;
+    85→  waistMeasurement: number | null;
+    86→  hipMeasurement: number | null;
+    87→  thighMeasurement: number | null;
+    88→  createdAt: string;
+    89→}
+    90→
+    91→export function ProfileOverlay() {
+    92→  const { user, setOverlay, reset } = useAppStore();
+    93→  const [profile, setProfile] = useState<any>(null);
+    94→  const [onboarding, setOnboarding] = useState<{
+    95→    analysis?: string;
+    96→    bmi?: number;
+    97→    bmr?: number;
+    98→    tdee?: number;
+    99→    profile?: OnboardingProfileDto;
+   100→    baseline?: BaselineDto | null;
+   101→  } | null>(null);
+   102→  const [loading, setLoading] = useState(true);
+   103→  const [walletOpen, setWalletOpen] = useState(false);
+   104→  const [chargeAmount, setChargeAmount] = useState("");
+   105→  const [progressPhotos, setProgressPhotos] = useState<any[]>([]);
+   106→  const [userMedia, setUserMedia] = useState<{
+   107→    bodyPhotos: any[];
+   108→    bloodTests: any[];
+   109→    videoAnalysis: any[];
+   110→    bodyAnalysis: any[];
+   111→  }>({ bodyPhotos: [], bloodTests: [], videoAnalysis: [], bodyAnalysis: [] });
+   112→  const [editing, setEditing] = useState(false);
+   113→  const [saving, setSaving] = useState(false);
+   114→  const [editData, setEditData] = useState<Record<string, string>>({});
+   115→  const [loggingOut, setLoggingOut] = useState(false);
+   116→
+   117→  useEffect(() => {
+   118→    (async () => {
+   119→      try {
+   120→        const [progressRes, onboardingRes, mediaRes] = await Promise.all([
+   121→          fetch("/api/progress"),
+   122→          fetch("/api/onboarding/analysis"),
+   123→          fetch("/api/user-media"),
+   124→        ]);
+   125→        const progressData = await progressRes.json();
+   126→        let onboardingData: any = null;
+   127→        try { onboardingData = await onboardingRes.json(); } catch {}
+   128→        let mediaData: any = null;
+   129→        try { mediaData = await mediaRes.json(); } catch {}
+   130→        setProfile({
+   131→          startWeight: progressData.startWeight,
+   132→          targetWeight: progressData.targetWeight,
+   133→          bmi: onboardingData?.bmi,
+   134→          bmr: onboardingData?.bmr,
+   135→          tdee: onboardingData?.tdee,
+   136→          gender: (onboardingData?.profile?.genderLabel || "").includes("آقا") ? "male" : (onboardingData?.profile?.genderLabel || "").includes("خانم") ? "female" : null,
+   137→        });
+   138→        if (onboardingData) setOnboarding(onboardingData);
+   139→        if (progressData?.progressPhotos) setProgressPhotos(progressData.progressPhotos);
+   140→        if (mediaData) setUserMedia(mediaData);
+   141→      } catch {
+   142→      } finally {
+   143→        setLoading(false);
+   144→      }
+   145→    })();
+   146→  }, []);
+   147→
+   148→  async function handleLogout() {
+   149→    if (loggingOut) return; // جلوگیری از دوبار کلیک
+   150→    setLoggingOut(true);
+   151→    try {
+   152→      // ۱. ابتدا API logout را صدا بزن تا cookie پاک شود
+   153→      await fetch("/api/auth/logout", { method: "POST" });
+   154→      // ۲. state را پاک کن
+   155→      reset();
+   156→      // ۳. صبر کن تا state پاک شود
+   157→      await new Promise(r => setTimeout(r, 100));
+   158→      // ۴. reload کامل صفحه با URL خالی
+   159→      window.location.href = "/";
+   160→      window.location.reload();
+   161→    } catch {
+   162→      toast.error("خطا در خروج");
+   163→      setLoggingOut(false);
+   164→      // حتی در صورت خطا، صفحه را reload کن
+   165→      window.location.href = "/";
+   166→    }
+   167→  }
+   168→
+   169→  function startEditing() {
+   170→    if (!onboarding?.profile) return;
+   171→    const p = onboarding.profile;
+   172→    setEditData({
+   173→      weight: String(p.weight || ""),
+   174→      targetWeight: String(p.targetWeight || ""),
+   175→      age: String(p.age || ""),
+   176→      height: String(p.height || ""),
+   177→      injuries: p.injuries || "",
+   178→      diseases: p.diseases || "",
+   179→      allergies: p.allergies || "",
+   180→      drugAllergies: p.drugAllergies || "",
+   181→      currentMedications: p.currentMedications || "",
+   182→      sleepHours: String(p.sleepHours || ""),
+   183→      stressLevel: String(p.stressLevel || ""),
+   184→      waterHabit: String(p.waterHabit || ""),
+   185→      dislikedFoods: p.dislikedFoods || "",
+   186→      maxLifts: p.maxLifts || "",
+   187→    });
+   188→    setEditing(true);
+   189→  }
+   190→
+   191→  async function saveProfile() {
+   192→    setSaving(true);
+   193→    try {
+   194→      const res = await fetch("/api/onboarding/profile", {
+   195→        method: "PATCH",
+   196→        headers: { "Content-Type": "application/json" },
+   197→        body: JSON.stringify(editData),
+   198→      });
+   199→      if (!res.ok) throw new Error();
+   200→      const data = await res.json();
+   201→      toast.success("پروفایل و پرونده پزشکی به‌روزرسانی شد ✅");
+   202→      setEditing(false);
+   203→      // Reload profile data
+   204→      const [progressRes, onboardingRes] = await Promise.all([
+   205→        fetch("/api/progress"),
+   206→        fetch("/api/onboarding/analysis"),
+   207→      ]);
+   208→      const progressData = await progressRes.json();
+   209→      let onboardingData: any = null;
+   210→      try { onboardingData = await onboardingRes.json(); } catch {}
+   211→      setProfile({
+   212→        startWeight: progressData.startWeight,
+   213→        targetWeight: progressData.targetWeight,
+   214→        bmi: onboardingData?.bmi,
+   215→        bmr: onboardingData?.bmr,
+   216→        tdee: onboardingData?.tdee,
+   217→        gender: (onboardingData?.profile?.genderLabel || "").includes("آقا") ? "male" : "female",
+   218→      });
+   219→      if (onboardingData) setOnboarding(onboardingData);
+   220→      if (progressData?.progressPhotos) setProgressPhotos(progressData.progressPhotos);
+   221→    } catch {
+   222→      toast.error("خطا در ذخیره پروفایل");
+   223→    } finally {
+   224→      setSaving(false);
+   225→    }
+   226→  }
+   227→
+   228→  const subEndDate = user?.subscriptionEnd ? new Date(user.subscriptionEnd) : null;
+   229→  const daysLeft = subEndDate ? Math.ceil((subEndDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)) : 0;
+   230→
+   231→  const p = onboarding?.profile;
+   232→  const baseline = onboarding?.baseline;
+   233→
+   234→  return (
+   235→    <div className="flex flex-col h-full">
+   236→      {/* Header */}
+   237→      <div className="flex items-center justify-between p-4 border-b">
+   238→        <h2 className="font-bold">پروفایل</h2>
+   239→        <Button variant="ghost" size="icon" onClick={() => setOverlay(null)} className="rounded-full">
+   240→          <X className="w-5 h-5" />
+   241→        </Button>
+   242→      </div>
+   243→
+   244→      <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4">
+   245→        {/* User card */}
+   246→        <Card className="p-5 relative overflow-hidden">
+   247→          <div className="absolute -left-8 -top-8 w-32 h-32 rounded-full bg-primary/10" />
+   248→          <div className="relative flex items-center gap-4">
+   249→            <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary to-emerald-600 flex items-center justify-center text-white text-2xl font-black shadow-lg">
+   250→              {user?.name?.[0] || "ک"}
+   251→            </div>
+   252→            <div className="flex-1">
+   253→              <h3 className="font-black text-lg">{user?.name || "ورزشکار"}</h3>
+   254→              <p className="text-sm text-muted-foreground" dir="ltr">{user?.mobile}</p>
+   255→              <div className="flex items-center gap-1.5 flex-wrap mt-1">
+   256→                {user?.role === "ADMIN" && (
+   257→                  <span className="inline-flex items-center gap-1 text-[11px] bg-primary/10 text-primary px-2 py-0.5 rounded-full">
+   258→                    <Shield className="w-3 h-3" /> مدیر سیستم
+   259→                  </span>
+   260→                )}
+   261→                {user?.planName && (
+   262→                  <span className="inline-flex items-center gap-1 text-[11px] bg-amber-500/15 text-amber-600 dark:text-amber-400 px-2 py-0.5 rounded-full">
+   263→                    <Crown className="w-3 h-3" /> پلن {PLAN_LABELS[user.planName as keyof typeof PLAN_LABELS] ?? user.planName}
+   264→                  </span>
+   265→                )}
+   266→              </div>
+   267→            </div>
+   268→          </div>
+   269→        </Card>
+   270→
+   271→        {/* Subscription status */}
+   272→        <Card className="p-4">
+   273→          <div className="flex items-center justify-between mb-3">
+   274→            <div className="flex items-center gap-2">
+   275→              <Crown className="w-5 h-5 text-amber-500" />
+   276→              <h3 className="font-bold text-sm">وضعیت اشتراک</h3>
+   277→            </div>
+   278→          </div>
+   279→          {user?.hasActiveSubscription ? (
+   280→            <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+   281→              <div className="flex items-center justify-between">
+   282→                <div>
+   283→                  <p className="font-bold text-sm text-emerald-600 dark:text-emerald-400">اشتراک فعال ✓</p>
+   284→                  <p className="text-xs text-muted-foreground mt-0.5">
+   285→                    {toPersianDigits(daysLeft)} روز باقی‌مانده
+   286→                  </p>
+   287→                </div>
+   288→                <div className="text-left">
+   289→                  <p className="text-[11px] text-muted-foreground">تاریخ پایان</p>
+   290→                  <p className="text-xs font-medium">{subEndDate?.toLocaleDateString("fa-IR")}</p>
+   291→                </div>
+   292→              </div>
+   293→            </div>
+   294→          ) : (
+   295→            <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
+   296→              <p className="text-sm font-medium text-amber-600 dark:text-amber-400 mb-2">اشتراک فعال نیست</p>
+   297→              <Button
+   298→                size="sm"
+   299→                className="w-full rounded-xl"
+   300→                onClick={() => setOverlay("subscription")}
+   301→              >
+   302→                <Crown className="w-4 h-4" />
+   303→                خرید پلن
+   304→              </Button>
+   305→            </div>
+   306→          )}
+   307→        </Card>
+   308→
+   309→        {/* Wallet */}
+   310→        <Card className="p-4">
+   311→          <div className="flex items-center justify-between mb-3">
+   312→            <div className="flex items-center gap-2">
+   313→              <Wallet className="w-5 h-5 text-cyan-500" />
+   314→              <h3 className="font-bold text-sm">کیف پول</h3>
+   315→            </div>
+   316→          </div>
+   317→          <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/20">
+   318→            <div className="flex items-center justify-between mb-2">
+   319→              <div>
+   320→                <p className="text-[11px] text-muted-foreground">موجودی فعلی</p>
+   321→                <p className="font-black text-lg text-cyan-600 dark:text-cyan-400">
+   322→                  {toPersianDigits((user?.walletBalance ?? 0).toLocaleString("en-US"))} <span className="text-xs font-normal">تومان</span>
+   323→                </p>
+   324→              </div>
+   325→              <Wallet className="w-8 h-8 text-cyan-500/40" />
+   326→            </div>
+   327→            <Button
+   328→              size="sm"
+   329→              variant="outline"
+   330→              className="w-full rounded-xl"
+   331→              onClick={() => setWalletOpen(true)}
+   332→            >
+   333→              شارژ کیف پول
+   334→            </Button>
+   335→          </div>
+   336→        </Card>
+   337→
+   338→        {/* Physical info / metrics */}
+   339→        {loading ? (
+   340→          <Skeleton className="h-32 rounded-2xl" />
+   341→        ) : (
+   342→          profile && (
+   343→            <Card className="p-4">
+   344→              <div className="flex items-center gap-2 mb-3">
+   345→                <Activity className="w-5 h-5 text-primary" />
+   346→                <h3 className="font-bold text-sm">اطلاعات فیزیکی</h3>
+   347→              </div>
+   348→              <div className="grid grid-cols-2 gap-2 text-sm">
+   349→                <InfoRow label="وزن شروع" value={profile.startWeight ? `${toPersianDigits(profile.startWeight)} kg` : "—"} />
+   350→                <InfoRow label="وزن هدف" value={profile.targetWeight ? `${toPersianDigits(profile.targetWeight)} kg` : "—"} />
+   351→                {profile.bmi && <InfoRow label="شاخص BMI" value={toPersianDigits(profile.bmi)} />}
+   352→                {profile.bmr && <InfoRow label="متابولیسم (BMR)" value={`${toPersianDigits(profile.bmr)} کالری`} />}
+   353→                {profile.tdee && <InfoRow label="کالری روزانه (TDEE)" value={`${toPersianDigits(profile.tdee)} کالری`} />}
+   354→              </div>
+   355→            </Card>
+   356→          )
+   357→        )}
+   358→
+   359→        {/* Onboarding profile — اطلاعات آنبوردینگ + پرونده پزشکی */}
+   360→        {loading ? (
+   361→          <Skeleton className="h-64 rounded-2xl" />
+   362→        ) : p ? (
+   363→          <Card className="p-4 space-y-4">
+   364→            <div className="flex items-center justify-between">
+   365→              <div className="flex items-center gap-2">
+   366→                <Dumbbell className="w-5 h-5 text-primary" />
+   367→                <h3 className="font-bold text-sm">پرونده ورزشی و پزشکی</h3>
+   368→              </div>
+   369→              {!editing ? (
+   370→                <Button size="sm" variant="outline" className="rounded-lg text-xs gap-1" onClick={startEditing}>
+   371→                  ویرایش
+   372→                </Button>
+   373→              ) : (
+   374→                <div className="flex gap-2">
+   375→                  <Button size="sm" variant="outline" className="rounded-lg text-xs" onClick={() => setEditing(false)} disabled={saving}>
+   376→                    انصراف
+   377→                  </Button>
+   378→                  <Button size="sm" className="rounded-lg text-xs" onClick={saveProfile} disabled={saving}>
+   379→                    {saving ? "در حال ذخیره..." : "ذخیره"}
+   380→                  </Button>
+   381→                </div>
+   382→              )}
+   383→            </div>
+   384→
+   385→            {/* Basic physical info */}
+   386→            <Section title="مشخصات پایه">
+   387→              <div className="grid grid-cols-2 gap-2">
+   388→                <InfoRow label="جنسیت" value={p.genderLabel || "—"} />
+   389→                {editing ? (
+   390→                  <EditField label="سن" value={editData.age || ""} onChange={(v) => setEditData({...editData, age: v})} />
+   391→                ) : (
+   392→                  <InfoRow label="سن" value={`${toPersianDigits(p.age)} سال`} />
+   393→                )}
+   394→                {editing ? (
+   395→                  <EditField label="قد (cm)" value={editData.height || ""} onChange={(v) => setEditData({...editData, height: v})} />
+   396→                ) : (
+   397→                  <InfoRow label="قد" value={`${toPersianDigits(p.height)} cm`} />
+   398→                )}
+   399→                {editing ? (
+   400→                  <EditField label="وزن (kg)" value={editData.weight || ""} onChange={(v) => setEditData({...editData, weight: v})} />
+   401→                ) : (
+   402→                  <InfoRow label="وزن فعلی" value={`${toPersianDigits(p.weight)} kg`} />
+   403→                )}
+   404→                {editing ? (
+   405→                  <EditField label="وزن هدف (kg)" value={editData.targetWeight || ""} onChange={(v) => setEditData({...editData, targetWeight: v})} />
+   406→                ) : (
+   407→                  p.targetWeight != null && <InfoRow label="وزن هدف" value={`${toPersianDigits(p.targetWeight)} kg`} />
+   408→                )}
+   409→              </div>
+   410→            </Section>
+   411→
+   412→            {/* Goal & activity */}
+   413→            <Section title="هدف و فعالیت">
+   414→              <div className="grid grid-cols-1 gap-2">
+   415→                <InfoRow label="هدف اصلی" value={p.goalLabel} />
+   416→                <InfoRow label="سطح فعالیت" value={p.activityLabel} />
+   417→                <InfoRow label="روزهای تمرین" value={`${toPersianDigits(p.workoutDays)} روز در هفته`} />
+   418→                {p.workoutDaysList && p.workoutDaysList.length > 0 && (
+   419→                  <InfoRow label="روزهای انتخابی" value={p.workoutDaysList.join("، ")} />
+   420→                )}
+   421→                <InfoRow label="محیط تمرین" value={p.workoutPlaceLabel} />
+   422→              </div>
+   423→            </Section>
+   424→
+   425→            {/* Diet */}
+   426→            <Section title="تغذیه و سبک زندگی" icon={<Salad className="w-4 h-4 text-emerald-500" />}>
+   427→              <div className="grid grid-cols-1 gap-2">
+   428→                <InfoRow label="نوع رژیم" value={p.dietLabel} />
+   429→                <InfoRow label="آلرژی غذایی" value={p.allergies?.trim() ? p.allergies : "ندارد"} />
+   430→                {p.dislikedFoods?.trim() && <InfoRow label="غذاهای دوست‌نداشته" value={p.dislikedFoods} />}
+   431→                {p.preferredCuisineLabel && <InfoRow label="سبک آشپزی موردنظر" value={p.preferredCuisineLabel} />}
+   432→                {p.waterHabit != null && <InfoRow label="مصرف آب فعلی" value={`${toPersianDigits(p.waterHabit)} لیوان در روز`} />}
+   433→                {p.waterGoalMl != null && <InfoRow label="هدف آب روزانه" value={`${toPersianDigits(Math.round(p.waterGoalMl / 250))} لیوان`} />}
+   434→              </div>
+   435→            </Section>
+   436→
+   437→            {/* سبک زندگی */}
+   438→            <Section title="سبک زندگی و سلامت">
+   439→              <div className="grid grid-cols-2 gap-2">
+   440→                {p.sleepHours != null && <InfoRow label="ساعت خواب" value={`${toPersianDigits(p.sleepHours)} ساعت`} />}
+   441→                {p.stressLevel != null && (
+   442→                  <InfoRow label="سطح استرس" value={p.stressLevel <= 2 ? "کم" : p.stressLevel <= 3 ? "متوسط" : "زیاد"} />
+   443→                )}
+   444→                {p.bodyFrameLabel && <InfoRow label="فرم بدن" value={p.bodyFrameLabel} />}
+   445→                {p.workoutTimeLabel && <InfoRow label="زمان ترجیحی تمرین" value={p.workoutTimeLabel} />}
+   446→                {p.targetDate && (
+   447→                  <InfoRow label="تاریخ هدف" value={new Date(p.targetDate).toLocaleDateString("fa-IR")} />
+   448→                )}
+   449→              </div>
+   450→            </Section>
+   451→
+   452→            {/* Medical — قابل ویرایش */}
+   453→            <Section title="پزشکی" icon={<HeartPulse className="w-4 h-4 text-rose-500" />}>
+   454→              <div className="grid grid-cols-1 gap-2">
+   455→                {editing ? (
+   456→                  <EditField label="آسیب‌دیدگی" value={editData.injuries || ""} onChange={(v) => setEditData({...editData, injuries: v})} />
+   457→                ) : (
+   458→                  <InfoRow label="آسیب‌دیدگی" value={p.injuries?.trim() ? p.injuries : "ندارد"} />
+   459→                )}
+   460→                {editing ? (
+   461→                  <EditField label="بیماری‌ها" value={editData.diseases || ""} onChange={(v) => setEditData({...editData, diseases: v})} />
+   462→                ) : (
+   463→                  <InfoRow label="بیماری‌ها" value={p.diseases?.trim() ? p.diseases : "ندارد"} />
+   464→                )}
+   465→                {editing ? (
+   466→                  <EditField label="آلرژی دارویی" value={editData.drugAllergies || ""} onChange={(v) => setEditData({...editData, drugAllergies: v})} />
+   467→                ) : (
+   468→                  p.drugAllergies && <InfoRow label="آلرژی دارویی" value={p.drugAllergies} />
+   469→                )}
+   470→                {editing ? (
+   471→                  <EditField label="داروهای مصرفی" value={editData.currentMedications || ""} onChange={(v) => setEditData({...editData, currentMedications: v})} />
+   472→                ) : (
+   473→                  p.currentMedications && <InfoRow label="داروهای مصرفی" value={p.currentMedications} />
+   474→                )}
+   475→              </div>
+   476→            </Section>
+   477→
+   478→            {/* Training experience */}
+   479→            {(p.trainingExperienceLabel || p.previousTrainingType || p.maxLifts) && (
+   480→              <Section title="تجربه ورزشی" icon={<Trophy className="w-4 h-4 text-amber-500" />}>
+   481→                <div className="grid grid-cols-1 gap-2">
+   482→                  {p.trainingExperienceLabel && <InfoRow label="سابقه ورزشی" value={p.trainingExperienceLabel} />}
+   483→                  {p.previousTrainingType && <InfoRow label="نوع تمرین قبلی" value={p.previousTrainingType} />}
+   484→                  {p.maxLifts && <InfoRow label="حداکثر وزنه‌ها" value={p.maxLifts} />}
+   485→                </div>
+   486→              </Section>
+   487→            )}
+   488→
+   489→            {/* Equipment */}
+   490→            {p.equipment && p.equipment.length > 0 && (
+   491→              <Section title="تجهیزات در دسترس">
+   492→                <div className="flex flex-wrap gap-1.5">
+   493→                  {p.equipment.map((eq) => (
+   494→                    <span key={eq} className="text-[11px] px-2 py-1 rounded-lg bg-muted/60 text-foreground">
+   495→                      {eq}
+   496→                    </span>
+   497→                  ))}
+   498→                </div>
+   499→              </Section>
+   500→            )}
+   501→
+   502→            {/* Baseline measurements */}
+   503→            {baseline && (
+   504→              <Section title="اندازه‌های اولیه بدن (Baseline)" icon={<Ruler className="w-4 h-4 text-violet-500" />}>
+   505→                <div className="grid grid-cols-2 gap-2">
+   506→                  <InfoRow label="وزن اولیه" value={`${toPersianDigits(baseline.weight)} kg`} />
+   507→                  {baseline.chestMeasurement != null && (
+   508→                    <InfoRow label="دور سینه" value={`${toPersianDigits(baseline.chestMeasurement)} cm`} />
+   509→                  )}
+   510→                  {baseline.armMeasurement != null && (
+   511→                    <InfoRow label="دور بازو" value={`${toPersianDigits(baseline.armMeasurement)} cm`} />
+   512→                  )}
+   513→                  {baseline.waistMeasurement != null && (
+   514→                    <InfoRow label="دور کمر" value={`${toPersianDigits(baseline.waistMeasurement)} cm`} />
+   515→                  )}
+   516→                  {baseline.hipMeasurement != null && (
+   517→                    <InfoRow label="دور باسن" value={`${toPersianDigits(baseline.hipMeasurement)} cm`} />
+   518→                  )}
+   519→                  {baseline.thighMeasurement != null && (
+   520→                    <InfoRow label="دور ران" value={`${toPersianDigits(baseline.thighMeasurement)} cm`} />
+   521→                  )}
+   522→                </div>
+   523→                {baseline.createdAt && (
+   524→                  <p className="text-[10px] text-muted-foreground mt-1.5">
+   525→                    ثبت شده در: {new Date(baseline.createdAt).toLocaleDateString("fa-IR")}
+   526→                  </p>
+   527→                )}
+   528→              </Section>
+   529→            )}
+   530→          </Card>
+   531→        ) : null}
+   532→
+   533→        {/* AI analysis snippet */}
+   534→        {onboarding?.analysis && (
+   535→          <Card className="p-4">
+   536→            <div className="flex items-center gap-2 mb-2">
+   537→              <Activity className="w-4 h-4 text-amber-500" />
+   538→              <h3 className="font-bold text-sm">تحلیل فیتاپ هوشمند</h3>
+   539→            </div>
+   540→            <p className="text-xs text-muted-foreground leading-relaxed whitespace-pre-line">
+   541→              {onboarding.analysis}
+   542→            </p>
+   543→          </Card>
+   544→        )}
+   545→
+   546→        {/* ─── عکس‌های پیشرفت بدن ─── */}
+   547→        <Card className="p-4">
+   548→          <div className="flex items-center gap-2 mb-3">
+   549→            <Camera className="w-5 h-5 text-violet-500" />
+   550→            <h3 className="font-bold text-sm">عکس‌های پیشرفت بدن</h3>
+   551→          </div>
+   552→          {progressPhotos.length > 0 ? (
+   553→            <div className="grid grid-cols-3 gap-2">
+   554→              {progressPhotos.slice(0, 9).map((photo: any) => (
+   555→                <div key={photo.id} className="relative group rounded-xl overflow-hidden">
+   556→                  {/* eslint-disable-next-line @next/next/no-img-element */}
+   557→                  <img src={photo.imageUrl} alt={photo.type || "عکس"} className="w-full h-24 object-cover" loading="lazy" />
+   558→                  <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition flex flex-col justify-end p-1.5">
+   559→                    <p className="text-[9px] text-white font-medium">{photo.takenAt ? new Date(photo.takenAt).toLocaleDateString("fa-IR") : ""}</p>
+   560→                    {photo.type && <p className="text-[8px] text-white/80">{photo.type === "front" ? "جلو" : photo.type === "side" ? "پهلو" : photo.type === "back" ? "پشت" : "سایر"}</p>}
+   561→                  </div>
+   562→                </div>
+   563→              ))}
+   564→            </div>
+   565→          ) : (
+   566→            <p className="text-xs text-muted-foreground text-center py-4">هنوز عکس پیشرفتی ثبت نشده است</p>
+   567→          )}
+   568→        </Card>
+   569→
+   570→        {/* ─── تحلیل عکس بدن ─── */}
+   571→        {userMedia.bodyAnalysis.length > 0 && (
+   572→          <Card className="p-4">
+   573→            <div className="flex items-center gap-2 mb-3">
+   574→              <Activity className="w-5 h-5 text-orange-500" />
+   575→              <h3 className="font-bold text-sm">تحلیل عکس بدن ({toPersianDigits(userMedia.bodyAnalysis.length)})</h3>
+   576→            </div>
+   577→            <div className="space-y-3">
+   578→              {userMedia.bodyAnalysis.map((item: any) => (
+   579→                <div key={item.id} className="p-3 rounded-xl bg-orange-50/50 border border-orange-100">
+   580→                  <div className="flex items-center justify-between mb-2">
+   581→                    <span className="text-[11px] text-muted-foreground">{new Date(item.createdAt).toLocaleDateString("fa-IR")}</span>
+   582→                  </div>
+   583→                  {item.mediaUrl && (
+   584→                    <div className="mb-2">
+   585→                      {/* eslint-disable-next-line @next/next/no-img-element */}
+   586→                      <img src={item.mediaUrl} alt="عکس بدن" className="w-full h-32 object-cover rounded-lg" loading="lazy" />
+   587→                    </div>
+   588→                  )}
+   589→                  {item.result?.analysis && (
+   590→                    <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap">{item.result.analysis}</p>
+   591→                  )}
+   592→                </div>
+   593→              ))}
+   594→            </div>
+   595→          </Card>
+   596→        )}
+   597→
+   598→        {/* ─── تحلیل آزمایش خون ─── */}
+   599→        {userMedia.bloodTests.length > 0 && (
+   600→          <Card className="p-4">
+   601→            <div className="flex items-center gap-2 mb-3">
+   602→              <TestTube className="w-5 h-5 text-rose-500" />
+   603→              <h3 className="font-bold text-sm">تحلیل آزمایش خون ({toPersianDigits(userMedia.bloodTests.length)})</h3>
+   604→            </div>
+   605→            <div className="space-y-3">
+   606→              {userMedia.bloodTests.map((item: any) => (
+   607→                <div key={item.id} className="p-3 rounded-xl bg-rose-50/50 border border-rose-100">
+   608→                  <div className="flex items-center justify-between mb-2">
+   609→                    <span className="text-[11px] text-muted-foreground">{new Date(item.createdAt).toLocaleDateString("fa-IR")}</span>
+   610→                  </div>
+   611→                  {item.result?.summary && (
+   612→                    <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap">{item.result.summary}</p>
+   613→                  )}
+   614→                </div>
+   615→              ))}
+   616→            </div>
+   617→          </Card>
+   618→        )}
+   619→
+   620→        {/* ─── تحلیل ویدیویی بدن ─── */}
+   621→        {userMedia.videoAnalysis.length > 0 && (
+   622→          <Card className="p-4">
+   623→            <div className="flex items-center gap-2 mb-3">
+   624→              <Video className="w-5 h-5 text-cyan-500" />
+   625→              <h3 className="font-bold text-sm">تحلیل ویدیویی بدن ({toPersianDigits(userMedia.videoAnalysis.length)})</h3>
+   626→            </div>
+   627→            <div className="space-y-3">
+   628→              {userMedia.videoAnalysis.map((item: any) => (
+   629→                <div key={item.id} className="p-3 rounded-xl bg-cyan-50/50 border border-cyan-100">
+   630→                  <div className="flex items-center justify-between mb-2">
+   631→                    <span className="text-[11px] text-muted-foreground">{new Date(item.createdAt).toLocaleDateString("fa-IR")}</span>
+   632→                  </div>
+   633→                  {item.mediaUrl && (
+   634→                    <div className="mb-2">
+   635→                      <video src={item.mediaUrl} controls className="w-full h-32 object-cover rounded-lg" />
+   636→                    </div>
+   637→                  )}
+   638→                  {item.result?.analysis && (
+   639→                    <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap">{item.result.analysis}</p>
+   640→                  )}
+   641→                </div>
+   642→              ))}
+   643→            </div>
+   644→          </Card>
+   645→        )}
+   646→
+   647→        {/* Settings list */}
+   648→        <div className="space-y-1">
+   649→          <SettingsRow
+   650→            icon={CreditCard}
+   651→            label="مدیریت اشتراک"
+   652→            onClick={() => setOverlay("subscription")}
+   653→            chevron
+   654→          />
+   655→          {user?.role === "ADMIN" && (
+   656→            <SettingsRow
+   657→              icon={Settings}
+   658→              label="پنل مدیریت"
+   659→              onClick={() => setOverlay("admin")}
+   660→              chevron
+   661→              highlight
+   662→            />
+   663→          )}
+   664→        </div>
+   665→
+   666→        {/* Logout */}
+   667→        <Button
+   668→          variant="outline"
+   669→          onClick={handleLogout}
+   670→          disabled={loggingOut}
+   671→          className="w-full rounded-xl text-destructive hover:text-destructive hover:bg-destructive/5"
+   672→        >
+   673→          {loggingOut ? (
+   674→            <>
+   675→              <Loader2 className="w-4 h-4 animate-spin" />
+   676→              در حال خروج...
+   677→            </>
+   678→          ) : (
+   679→            <>
+   680→              <LogOut className="w-4 h-4" />
+   681→              خروج از حساب
+   682→            </>
+   683→          )}
+   684→        </Button>
+   685→
+   686→        <p className="text-center text-[11px] text-muted-foreground pt-2">
+   687→          فیتاپ — نسخه ۱.۰.۰
+   688→        </p>
+   689→      </div>
+   690→
+   691→      {/* Wallet Charge Modal */}
+   692→      <Dialog open={walletOpen} onOpenChange={setWalletOpen}>
+   693→        <DialogContent dir="rtl" className="max-w-sm">
+   694→          <DialogHeader><DialogTitle>شارژ کیف پول</DialogTitle></DialogHeader>
+   695→          <div className="space-y-3">
+   696→            <div className="p-2 rounded-lg bg-orange-50 text-xs text-center">موجودی فعلی: <b className="font-stat">{toPersianDigits(formatToman(user?.walletBalance || 0))} ت</b></div>
+   697→            <div>
+   698→              <Label className="mb-1 block">مبلغ (تومان)</Label>
+   699→              <Input type="number" dir="ltr" value={chargeAmount} onChange={(e) => setChargeAmount(e.target.value)} placeholder="مثلاً ۵۰۰۰۰۰" className="rounded-xl text-center font-stat" />
+   700→            </div>
+   701→            <div className="flex gap-2 flex-wrap">
+   702→              {[100000, 500000, 1000000].map(v => (
+   703→                <button key={v} onClick={() => setChargeAmount(String(v))} className="text-xs px-3 py-1.5 rounded-lg bg-orange-50 hover:bg-orange-100 text-orange-600 font-stat transition">
+   704→                  {toPersianDigits(formatToman(v))}
+   705→                </button>
+   706→              ))}
+   707→            </div>
+   708→          </div>
+   709→          <DialogFooter>
+   710→            <Button variant="outline" onClick={() => setWalletOpen(false)} className="rounded-xl">انصراف</Button>
+   711→            <Button
+   712→              onClick={async () => {
+   713→                if (!chargeAmount || Number(chargeAmount) <= 0) return;
+   714→                try {
+   715→                  const res = await fetch("/api/wallet", {
+   716→                    method: "POST", headers: { "Content-Type": "application/json" },
+   717→                    body: JSON.stringify({ amount: Number(chargeAmount) }),
+   718→                  });
+   719→                  if (!res.ok) throw new Error();
+   720→                  const data = await res.json();
+   721→                  toast.success(`کیف پول ${toPersianDigits(formatToman(Number(chargeAmount)))} ت شارژ شد ✓`);
+   722→                  setWalletOpen(false);
+   723→                  setChargeAmount("");
+   724→                  // Update user in store
+   725→                  if (data.user) useAppStore.getState().setUser(data.user);
+   726→                } catch { toast.error("خطا در شارژ کیف پول"); }
+   727→              }}
+   728→              className="rounded-xl text-white"
+   729→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   730→            >
+   731→              شارژ کیف پول
+   732→            </Button>
+   733→          </DialogFooter>
+   734→        </DialogContent>
+   735→      </Dialog>
+   736→    </div>
+   737→  );
+   738→}
+   739→
+   740→function Sparkles({ className }: { className?: string }) {
+   741→  return (
+   742→    <svg
+   743→      className={className}
+   744→      width="24"
+   745→      height="24"
+   746→      viewBox="0 0 24 24"
+   747→      fill="none"
+   748→      stroke="currentColor"
+   749→      strokeWidth="2"
+   750→      strokeLinecap="round"
+   751→      strokeLinejoin="round"
+   752→      aria-hidden="true"
+   753→    >
+   754→      <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+   755→      <path d="M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15z" />
+   756→      <path d="M5 4l.6 1.4L7 6l-1.4.6L5 8l-.6-1.4L3 6l1.4-.6L5 4z" />
+   757→    </svg>
+   758→  );
+   759→}
+   760→
+   761→function Section({ title, icon, children }: { title: string; icon?: React.ReactNode; children: React.ReactNode }) {
+   762→  return (
+   763→    <div>
+   764→      <div className="flex items-center gap-1.5 mb-2">
+   765→        {icon}
+   766→        <h4 className="text-xs font-bold text-muted-foreground">{title}</h4>
+   767→      </div>
+   768→      {children}
+   769→    </div>
+   770→  );
+   771→}
+   772→
+   773→function InfoRow({ label, value }: { label: string; value: string }) {
+   774→  return (
+   775→    <div className="flex items-center justify-between p-2.5 rounded-xl bg-muted/40 gap-2">
+   776→      <span className="text-xs text-muted-foreground shrink-0">{label}</span>
+   777→      <span className="text-sm font-medium text-left" dir="auto">{value}</span>
+   778→    </div>
+   779→  );
+   780→}
+   781→
+   782→function SettingsRow({
+   783→  icon: Icon,
+   784→  label,
+   785→  action,
+   786→  onClick,
+   787→  chevron,
+   788→  highlight,
+   789→}: {
+   790→  icon: any;
+   791→  label: string;
+   792→  action?: React.ReactNode;
+   793→  onClick?: () => void;
+   794→  chevron?: boolean;
+   795→  highlight?: boolean;
+   796→}) {
+   797→  return (
+   798→    <button
+   799→      onClick={onClick}
+   800→      className={`w-full flex items-center gap-3 p-3.5 rounded-2xl transition text-right ${
+   801→        highlight ? "bg-primary/5 hover:bg-primary/10" : "hover:bg-muted"
+   802→      }`}
+   803→    >
+   804→      <Icon className={`w-5 h-5 ${highlight ? "text-primary" : "text-muted-foreground"}`} />
+   805→      <span className="flex-1 text-sm font-medium">{label}</span>
+   806→      {action}
+   807→      {chevron && <ChevronLeft className="w-4 h-4 text-muted-foreground" />}
+   808→    </button>
+   809→  );
+   810→}
+   811→
+   812→function EditField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+   813→  return (
+   814→    <div className="flex flex-col gap-0.5">
+   815→      <span className="text-[10px] text-muted-foreground">{label}</span>
+   816→      <Input
+   817→        value={value}
+   818→        onChange={(e) => onChange(e.target.value)}
+   819→        className="h-9 rounded-lg text-sm"
+   820→        dir="ltr"
+   821→      />
+   822→    </div>
+   823→  );
+   824→}
+   825→

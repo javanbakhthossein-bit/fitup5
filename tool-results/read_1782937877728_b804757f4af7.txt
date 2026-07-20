@@ -1,0 +1,765 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useRef, useState } from "react";
+     4→import { motion, AnimatePresence } from "framer-motion";
+     5→import {
+     6→  Dumbbell,
+     7→  Clock,
+     8→  ChevronLeft,
+     9→  Check,
+    10→  Play,
+    11→  RotateCcw,
+    12→  Timer,
+    13→  Info,
+    14→  Zap,
+    15→  FileText,
+    16→  Image as ImageIcon,
+    17→  Lock,
+    18→  Video,
+    19→} from "lucide-react";
+    20→import { useAppStore } from "@/lib/fitness/store";
+    21→import { Card } from "@/components/ui/card";
+    22→import { Button } from "@/components/ui/button";
+    23→import { Skeleton } from "@/components/ui/skeleton";
+    24→import { Badge } from "@/components/ui/badge";
+    25→import {
+    26→  toPersianDigits,
+    27→  PERSIAN_WEEKDAYS,
+    28→  canAccess,
+    29→  type WorkoutPlanContent,
+    30→  type PlanExercise,
+    31→} from "@/lib/fitness/types";
+    32→import { toast } from "sonner";
+    33→
+    34→// Track set completion locally
+    35→interface SetState {
+    36→  done: boolean;
+    37→  weight: string;
+    38→}
+    39→
+    40→export function WorkoutsView() {
+    41→  const { workoutPlan, setWorkoutPlan, setOverlay, setExerciseDetailId, startSession, user } = useAppStore();
+    42→  const [loading, setLoading] = useState(!workoutPlan);
+    43→  const [today, setToday] = useState("");
+    44→  const [activeDayIdx, setActiveDayIdx] = useState(0);
+    45→  const [setStates, setSetStates] = useState<Record<string, SetState>>({});
+    46→  const [restTimer, setRestTimer] = useState<{ remaining: number; total: number } | null>(null);
+    47→  const [downloading, setDownloading] = useState<"image" | "pdf" | null>(null);
+    48→  const printableRef = useRef<HTMLDivElement>(null);
+    49→
+    50→  // User plan capabilities — fullExerciseLibrary requires Advanced+ plan
+    51→  const canViewVideos = canAccess(user?.planName ?? null, "fullExerciseLibrary");
+    52→
+    53→  useEffect(() => {
+    54→    const dayIdx = new Date().getDay();
+    55→    const persianIdx = (dayIdx + 1) % 7;
+    56→    const todayName = PERSIAN_WEEKDAYS[persianIdx];
+    57→    setToday(todayName);
+    58→
+    59→    if (!workoutPlan) {
+    60→      (async () => {
+    61→        try {
+    62→          const res = await fetch("/api/coach/plan");
+    63→          const data = await res.json();
+    64→          if (data.workout) setWorkoutPlan(data.workout as WorkoutPlanContent);
+    65→        } catch {
+    66→        } finally {
+    67→          setLoading(false);
+    68→        }
+    69→      })();
+    70→    } else {
+    71→      setLoading(false);
+    72→    }
+    73→    // Set active day to today if exists
+    74→    if (workoutPlan) {
+    75→      const idx = workoutPlan.days.findIndex((d) => d.day === todayName);
+    76→      if (idx >= 0) setActiveDayIdx(idx);
+    77→    }
+    78→    // eslint-disable-next-line react-hooks/exhaustive-deps
+    79→  }, [workoutPlan, today]);
+    80→
+    81→  // Rest timer countdown
+    82→  useEffect(() => {
+    83→    if (!restTimer) return;
+    84→    if (restTimer.remaining <= 0) {
+    85→      const t = setTimeout(() => setRestTimer(null), 500);
+    86→      return () => clearTimeout(t);
+    87→    }
+    88→    const t = setTimeout(() => {
+    89→      setRestTimer((prev) => (prev ? { ...prev, remaining: prev.remaining - 1 } : null));
+    90→    }, 1000);
+    91→    return () => clearTimeout(t);
+    92→  }, [restTimer]);
+    93→
+    94→  const toggleSet = (exerciseId: string, setNumber: number, restSec: number) => {
+    95→    const key = `${exerciseId}_${setNumber}`;
+    96→    const wasDone = setStates[key]?.done;
+    97→    setSetStates((s) => ({
+    98→      ...s,
+    99→      [key]: { ...s[key], done: !wasDone, weight: s[key]?.weight || "" },
+   100→    }));
+   101→    if (!wasDone && restSec > 0) {
+   102→      setRestTimer({ remaining: restSec, total: restSec });
+   103→    }
+   104→  };
+   105→
+   106→  const updateWeight = (exerciseId: string, setNumber: number, weight: string) => {
+   107→    const key = `${exerciseId}_${setNumber}`;
+   108→    setSetStates((s) => ({
+   109→      ...s,
+   110→      [key]: { done: s[key]?.done ?? false, weight },
+   111→    }));
+   112→  };
+   113→
+   114→  // ===== Download handlers (Image + PDF) =====
+   115→  function formatToday(): string {
+   116→    try {
+   117→      const d = new Date();
+   118→      return `${toPersianDigits(d.getDate())}/${toPersianDigits(d.getMonth() + 1)}/${toPersianDigits(d.getFullYear())}`;
+   119→    } catch {
+   120→      return "";
+   121→    }
+   122→  }
+   123→
+   124→  async function downloadAsImage() {
+   125→    if (!printableRef.current || !workoutPlan) return;
+   126→    setDownloading("image");
+   127→    try {
+   128→      const { toPng } = await import("html-to-image");
+   129→      const dataUrl = await toPng(printableRef.current, {
+   130→        cacheBust: true,
+   131→        pixelRatio: 2,
+   132→        backgroundColor: "#ffffff",
+   133→      });
+   134→      const link = document.createElement("a");
+   135→      link.download = `fitap-workout-${Date.now()}.png`;
+   136→      link.href = dataUrl;
+   137→      link.click();
+   138→      toast.success("تصویر برنامه تمرینی دانلود شد ✓");
+   139→    } catch (e) {
+   140→      console.error("[downloadAsImage]", e);
+   141→      toast.error("خطا در ساخت تصویر برنامه");
+   142→    } finally {
+   143→      setDownloading(null);
+   144→    }
+   145→  }
+   146→
+   147→  async function downloadAsPDF() {
+   148→    if (!printableRef.current || !workoutPlan) return;
+   149→    setDownloading("pdf");
+   150→    try {
+   151→      const { toPng } = await import("html-to-image");
+   152→      const { jsPDF } = await import("jspdf");
+   153→      const dataUrl = await toPng(printableRef.current, {
+   154→        cacheBust: true,
+   155→        pixelRatio: 2,
+   156→        backgroundColor: "#ffffff",
+   157→      });
+   158→      const img = new Image();
+   159→      img.src = dataUrl;
+   160→      await new Promise((res) => {
+   161→        img.onload = res;
+   162→      });
+   163→
+   164→      const pdf = new jsPDF({
+   165→        orientation: "portrait",
+   166→        unit: "pt",
+   167→        format: "a4",
+   168→      });
+   169→      const pageWidth = pdf.internal.pageSize.getWidth();
+   170→      const pageHeight = pdf.internal.pageSize.getHeight();
+   171→      const imgRatio = img.height / img.width;
+   172→      const imgWidth = pageWidth - 40;
+   173→      const imgHeight = imgWidth * imgRatio;
+   174→
+   175→      // Single page if it fits, otherwise paginate via canvas slicing
+   176→      if (imgHeight <= pageHeight - 40) {
+   177→        pdf.addImage(dataUrl, "PNG", 20, 20, imgWidth, imgHeight);
+   178→      } else {
+   179→        const canvas = document.createElement("canvas");
+   180→        canvas.width = img.width;
+   181→        canvas.height = img.height;
+   182→        const ctx = canvas.getContext("2d");
+   183→        if (!ctx) throw new Error("Canvas 2D context unavailable");
+   184→        ctx.drawImage(img, 0, 0);
+   185→        const sliceHeightPx = Math.floor((img.width * (pageHeight - 40)) / (pageWidth - 40));
+   186→        let yOff = 0;
+   187→        let page = 0;
+   188→        while (yOff < img.height) {
+   189→          const sliceCanvas = document.createElement("canvas");
+   190→          sliceCanvas.width = img.width;
+   191→          sliceCanvas.height = Math.min(sliceHeightPx, img.height - yOff);
+   192→          const sliceCtx = sliceCanvas.getContext("2d");
+   193→          if (!sliceCtx) throw new Error("Canvas 2D context unavailable");
+   194→          sliceCtx.drawImage(canvas, 0, yOff, img.width, sliceCanvas.height, 0, 0, img.width, sliceCanvas.height);
+   195→          const sliceDataUrl = sliceCanvas.toDataURL("image/png");
+   196→          if (page > 0) pdf.addPage();
+   197→          const sliceImgHeight = (sliceCanvas.height / img.width) * imgWidth;
+   198→          pdf.addImage(sliceDataUrl, "PNG", 20, 20, imgWidth, sliceImgHeight);
+   199→          yOff += sliceHeightPx;
+   200→          page++;
+   201→        }
+   202→      }
+   203→
+   204→      pdf.save(`fitap-workout-${Date.now()}.pdf`);
+   205→      toast.success("PDF برنامه تمرینی دانلود شد ✓");
+   206→    } catch (e) {
+   207→      console.error("[downloadAsPDF]", e);
+   208→      toast.error("خطا در ساخت PDF برنامه");
+   209→    } finally {
+   210→      setDownloading(null);
+   211→    }
+   212→  }
+   213→
+   214→  if (loading) {
+   215→    return (
+   216→      <div className="px-4 py-4 space-y-3 max-w-md mx-auto">
+   217→        <Skeleton className="h-10 rounded-xl" />
+   218→        <Skeleton className="h-32 rounded-2xl" />
+   219→        <Skeleton className="h-48 rounded-2xl" />
+   220→      </div>
+   221→    );
+   222→  }
+   223→
+   224→  if (!workoutPlan || !workoutPlan.days.length) {
+   225→    return (
+   226→      <div className="px-4 py-8 text-center max-w-md mx-auto">
+   227→        <div className="w-20 h-20 rounded-3xl bg-muted flex items-center justify-center mx-auto mb-4">
+   228→          <Dumbbell className="w-10 h-10 text-muted-foreground" />
+   229→        </div>
+   230→        <h2 className="text-xl font-bold mb-2">برنامه تمرینی موجود نیست</h2>
+   231→        <p className="text-muted-foreground text-sm mb-6">
+   232→          برای ساخت برنامه تمرینی شخصی‌سازی‌شده، آنبوردینگ را تکمیل کنید.
+   233→        </p>
+   234→      </div>
+   235→    );
+   236→  }
+   237→
+   238→  const activeDay = workoutPlan.days[activeDayIdx];
+   239→  const isToday = activeDay?.day === today;
+   240→  const doneCount = Object.values(setStates).filter((s) => s.done).length;
+   241→  const totalSets = activeDay?.exercises.reduce((s, e) => s + e.sets.length, 0) ?? 0;
+   242→  const progress = totalSets ? (doneCount / totalSets) * 100 : 0;
+   243→
+   244→  return (
+   245→    <div className="px-4 py-4 space-y-4 max-w-md mx-auto">
+   246→      {/* Hidden printable workout plan for image/PDF export */}
+   247→      <div
+   248→        ref={printableRef}
+   249→        style={{
+   250→          position: "fixed",
+   251→          top: 0,
+   252→          left: "-9999px",
+   253→          width: "800px",
+   254→          background: "#ffffff",
+   255→          padding: "32px",
+   256→          fontFamily: "Vazirmatn, system-ui, sans-serif",
+   257→          direction: "rtl",
+   258→        }}
+   259→        aria-hidden
+   260→      >
+   261→        <PrintableWorkout plan={workoutPlan} dateStr={formatToday()} />
+   262→      </div>
+   263→
+   264→      {/* Header */}
+   265→      <div className="flex items-center justify-between gap-3">
+   266→        <div className="flex-1 min-w-0">
+   267→          <h2 className="text-2xl font-black mb-1">برنامه تمرینی</h2>
+   268→          <p className="text-sm text-muted-foreground truncate">هفته اول - {workoutPlan.weeklyGoal}</p>
+   269→        </div>
+   270→        <div className="flex items-center gap-2">
+   271→          <button
+   272→            onClick={downloadAsImage}
+   273→            disabled={downloading !== null}
+   274→            title="دانلود تصویر برنامه"
+   275→            className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-200 text-orange-600 hover:bg-orange-100 transition flex items-center justify-center disabled:opacity-50"
+   276→          >
+   277→            {downloading === "image" ? (
+   278→              <RotateCcw className="w-4 h-4 animate-spin" />
+   279→            ) : (
+   280→              <ImageIcon className="w-4 h-4" />
+   281→            )}
+   282→          </button>
+   283→          <button
+   284→            onClick={downloadAsPDF}
+   285→            disabled={downloading !== null}
+   286→            title="دانلود PDF"
+   287→            className="h-10 px-3 rounded-xl bg-orange-50 border border-orange-200 text-orange-600 hover:bg-orange-100 transition flex items-center justify-center gap-1.5 disabled:opacity-50"
+   288→          >
+   289→            {downloading === "pdf" ? (
+   290→              <RotateCcw className="w-4 h-4 animate-spin" />
+   291→            ) : (
+   292→              <FileText className="w-4 h-4" />
+   293→            )}
+   294→            <span className="text-xs font-bold">PDF</span>
+   295→          </button>
+   296→        </div>
+   297→      </div>
+   298→
+   299→      {/* Day selector */}
+   300→      <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
+   301→        {workoutPlan.days.map((day, i) => {
+   302→          const dayToday = day.day === today;
+   303→          return (
+   304→            <button
+   305→              key={i}
+   306→              onClick={() => setActiveDayIdx(i)}
+   307→              className={`shrink-0 px-4 py-2.5 rounded-2xl border-2 transition-all relative ${
+   308→                activeDayIdx === i
+   309→                  ? "border-primary bg-primary/5"
+   310→                  : "border-border bg-card"
+   311→              }`}
+   312→            >
+   313→              {dayToday && (
+   314→                <span className="absolute -top-1 -left-1 w-3 h-3 rounded-full bg-primary border-2 border-background" />
+   315→              )}
+   316→              <div className="text-xs font-bold">{day.day}</div>
+   317→              <div className="text-[10px] text-muted-foreground whitespace-nowrap">
+   318→                {day.focus}
+   319→              </div>
+   320→            </button>
+   321→          );
+   322→        })}
+   323→      </div>
+   324→
+   325→      {/* Active day card */}
+   326→      {activeDay && (
+   327→        <>
+   328→          <Card className="p-4">
+   329→            <div className="flex items-start justify-between mb-3">
+   330→              <div>
+   331→                <div className="flex items-center gap-2 mb-1">
+   332→                  <h3 className="font-black text-lg">{activeDay.title}</h3>
+   333→                  {isToday && (
+   334→                    <Badge className="bg-primary text-primary-foreground text-[10px]">
+   335→                      امروز
+   336→                    </Badge>
+   337→                  )}
+   338→                </div>
+   339→                <div className="flex items-center gap-3 text-xs text-muted-foreground">
+   340→                  <span className="flex items-center gap-1">
+   341→                    <Clock className="w-3.5 h-3.5" />
+   342→                    {toPersianDigits(activeDay.estimatedMinutes)} دقیقه
+   343→                  </span>
+   344→                  <span className="flex items-center gap-1">
+   345→                    <Zap className="w-3.5 h-3.5" />
+   346→                    {toPersianDigits(activeDay.exercises.length)} حرکت
+   347→                  </span>
+   348→                </div>
+   349→              </div>
+   350→            </div>
+   351→
+   352→            {/* Progress bar */}
+   353→            <div className="mb-1 flex justify-between text-xs">
+   354→              <span className="text-muted-foreground">پیشرفت امروز</span>
+   355→              <span className="font-bold text-primary">
+   356→                {toPersianDigits(doneCount)} / {toPersianDigits(totalSets)} ست
+   357→              </span>
+   358→            </div>
+   359→            <div className="h-2 bg-muted rounded-full overflow-hidden">
+   360→              <motion.div
+   361→                className="h-full bg-gradient-to-l from-primary to-amber-500"
+   362→                animate={{ width: `${progress}%` }}
+   363→                transition={{ type: "spring", stiffness: 200, damping: 20 }}
+   364→              />
+   365→            </div>
+   366→
+   367→            {/* شروع تمرین فعال */}
+   368→            <motion.button
+   369→              whileTap={{ scale: 0.97 }}
+   370→              onClick={() => startSession(activeDay.day)}
+   371→              className="w-full mt-3 relative overflow-hidden rounded-2xl bg-gradient-to-l from-primary to-amber-500 text-primary-foreground font-black py-3 pulse-ring flex items-center justify-center gap-2"
+   372→            >
+   373→              <Play className="w-5 h-5 fill-current" />
+   374→              شروع تمرین (حالت فعال)
+   375→            </motion.button>
+   376→          </Card>
+   377→
+   378→          {/* Exercises */}
+   379→          <div className="space-y-3">
+   380→            {activeDay.exercises.map((ex, ei) => (
+   381→              <ExerciseCard
+   382→                key={ex.id}
+   383→                exercise={ex}
+   384→                index={ei}
+   385→                setStates={setStates}
+   386→                canViewVideos={canViewVideos}
+   387→                onToggleSet={(sn, rest) => toggleSet(ex.id, sn, rest)}
+   388→                onUpdateWeight={(sn, w) => updateWeight(ex.id, sn, w)}
+   389→                onShowDetail={() => {
+   390→                  setExerciseDetailId(ex.id);
+   391→                  setOverlay("exerciseDetail");
+   392→                }}
+   393→              />
+   394→            ))}
+   395→          </div>
+   396→
+   397→          {/* Notes */}
+   398→          {workoutPlan.notes && (
+   399→            <div className="p-4 rounded-2xl bg-primary/5 border border-primary/20">
+   400→              <div className="flex items-start gap-2">
+   401→                <Info className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+   402→                <div>
+   403→                  <p className="text-xs font-bold text-primary mb-1">نکات هفته</p>
+   404→                  <p className="text-xs text-muted-foreground">{workoutPlan.notes}</p>
+   405→                </div>
+   406→              </div>
+   407→            </div>
+   408→          )}
+   409→        </>
+   410→      )}
+   411→
+   412→      {/* Rest timer overlay */}
+   413→      <AnimatePresence>
+   414→        {restTimer && (
+   415→          <motion.div
+   416→            initial={{ opacity: 0, y: 50 }}
+   417→            animate={{ opacity: 1, y: 0 }}
+   418→            exit={{ opacity: 0, y: 50 }}
+   419→            className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 w-[90%] max-w-sm"
+   420→          >
+   421→            <Card className="p-4 shadow-2xl border-primary/30 bg-card">
+   422→              <div className="flex items-center gap-4">
+   423→                <div className="relative w-14 h-14 shrink-0">
+   424→                  <svg className="w-14 h-14 -rotate-90" viewBox="0 0 36 36">
+   425→                    <circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" strokeWidth="3" className="text-muted/30" />
+   426→                    <circle
+   427→                      cx="18"
+   428→                      cy="18"
+   429→                      r="15"
+   430→                      fill="none"
+   431→                      stroke="#10b981"
+   432→                      strokeWidth="3"
+   433→                      strokeDasharray={`${(restTimer.remaining / restTimer.total) * 94.2} 94.2`}
+   434→                      strokeLinecap="round"
+   435→                    />
+   436→                  </svg>
+   437→                  <div className="absolute inset-0 flex items-center justify-center text-sm font-black">
+   438→                    {toPersianDigits(restTimer.remaining)}
+   439→                  </div>
+   440→                </div>
+   441→                <div className="flex-1">
+   442→                  <p className="font-bold text-sm flex items-center gap-1.5">
+   443→                    <Timer className="w-4 h-4 text-primary" />
+   444→                    زمان استراحت
+   445→                  </p>
+   446→                  <p className="text-xs text-muted-foreground">نفس بکش و آماده ست بعدی شو</p>
+   447→                </div>
+   448→                <Button
+   449→                  size="sm"
+   450→                  variant="outline"
+   451→                  onClick={() => setRestTimer(null)}
+   452→                  className="rounded-xl"
+   453→                >
+   454→                  رد کردن
+   455→                </Button>
+   456→              </div>
+   457→            </Card>
+   458→          </motion.div>
+   459→        )}
+   460→      </AnimatePresence>
+   461→    </div>
+   462→  );
+   463→}
+   464→
+   465→/**
+   466→ * Printable workout plan — formatted nicely for image/PDF export.
+   467→ * Branded with فیتاپ logo + date + all exercises with sets/reps.
+   468→ */
+   469→function PrintableWorkout({ plan, dateStr }: { plan: WorkoutPlanContent; dateStr: string }) {
+   470→  return (
+   471→    <div style={{ color: "#1e293b" }}>
+   472→      {/* Header */}
+   473→      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "3px solid #f59e0b", paddingBottom: "16px", marginBottom: "20px" }}>
+   474→        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+   475→          <div
+   476→            style={{
+   477→              width: "56px",
+   478→              height: "56px",
+   479→              borderRadius: "16px",
+   480→              background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   481→              display: "flex",
+   482→              alignItems: "center",
+   483→              justifyContent: "center",
+   484→              color: "#ffffff",
+   485→              fontWeight: 900,
+   486→              fontSize: "24px",
+   487→            }}
+   488→          >
+   489→            ف
+   490→          </div>
+   491→          <div>
+   492→            <h1 style={{ fontSize: "28px", fontWeight: 900, margin: 0, color: "#1e293b" }}>فیتاپ</h1>
+   493→            <p style={{ fontSize: "14px", color: "#64748b", margin: 0 }}>برنامه تمرینی هفتگی</p>
+   494→          </div>
+   495→        </div>
+   496→        <div style={{ textAlign: "left" }}>
+   497→          <p style={{ fontSize: "12px", color: "#64748b", margin: 0 }}>تاریخ</p>
+   498→          <p style={{ fontSize: "16px", fontWeight: 700, color: "#1e293b", margin: 0 }}>{dateStr}</p>
+   499→        </div>
+   500→      </div>
+   501→
+   502→      {/* Weekly goal banner */}
+   503→      <div
+   504→        style={{
+   505→          background: "linear-gradient(135deg, #fff7ed, #ffedd5)",
+   506→          border: "1px solid #fed7aa",
+   507→          borderRadius: "16px",
+   508→          padding: "14px 18px",
+   509→          marginBottom: "20px",
+   510→        }}
+   511→      >
+   512→        <p style={{ fontSize: "12px", color: "#ea580c", fontWeight: 700, margin: "0 0 4px 0" }}>🎯 هدف هفته</p>
+   513→        <p style={{ fontSize: "14px", color: "#1e293b", margin: 0, fontWeight: 600 }}>{plan.weeklyGoal}</p>
+   514→      </div>
+   515→
+   516→      {/* Days */}
+   517→      {plan.days.map((day, i) => (
+   518→        <div key={i} style={{ marginBottom: "20px", breakInside: "avoid" }}>
+   519→          {/* Day header */}
+   520→          <div
+   521→            style={{
+   522→              display: "flex",
+   523→              alignItems: "center",
+   524→              justifyContent: "space-between",
+   525→              background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   526→              color: "#ffffff",
+   527→              padding: "10px 16px",
+   528→              borderRadius: "12px",
+   529→              marginBottom: "10px",
+   530→            }}
+   531→          >
+   532→            <div>
+   533→              <p style={{ fontSize: "18px", fontWeight: 900, margin: 0 }}>{day.day}</p>
+   534→              <p style={{ fontSize: "12px", margin: 0, opacity: 0.95 }}>{day.title} • {day.focus}</p>
+   535→            </div>
+   536→            <div style={{ textAlign: "left", fontSize: "12px" }}>
+   537→              <p style={{ margin: 0, fontWeight: 700 }}>⏱ {toPersianDigits(day.estimatedMinutes)} دقیقه</p>
+   538→              <p style={{ margin: 0, opacity: 0.95 }}>{toPersianDigits(day.exercises.length)} حرکت</p>
+   539→            </div>
+   540→          </div>
+   541→
+   542→          {/* Exercise list */}
+   543→          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+   544→            <thead>
+   545→              <tr style={{ background: "#fff7ed" }}>
+   546→                <th style={{ padding: "8px 10px", textAlign: "right", borderBottom: "1px solid #fed7aa", width: "30px", color: "#9a3412" }}>#</th>
+   547→                <th style={{ padding: "8px 10px", textAlign: "right", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>حرکت</th>
+   548→                <th style={{ padding: "8px 10px", textAlign: "center", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>ست</th>
+   549→                <th style={{ padding: "8px 10px", textAlign: "center", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>تکرار</th>
+   550→                <th style={{ padding: "8px 10px", textAlign: "center", borderBottom: "1px solid #fed7aa", color: "#9a3412" }}>استراحت</th>
+   551→              </tr>
+   552→            </thead>
+   553→            <tbody>
+   554→              {day.exercises.map((ex, j) => (
+   555→                <tr key={j} style={{ borderBottom: "1px solid #fef3c7" }}>
+   556→                  <td style={{ padding: "8px 10px", textAlign: "right", color: "#9a3412", fontWeight: 700 }}>{toPersianDigits(j + 1)}</td>
+   557→                  <td style={{ padding: "8px 10px", textAlign: "right" }}>
+   558→                    <p style={{ margin: 0, fontWeight: 700, color: "#1e293b" }}>{ex.name}</p>
+   559→                    <p style={{ margin: 0, fontSize: "11px", color: "#94a3b8" }}>{ex.muscle}</p>
+   560→                  </td>
+   561→                  <td style={{ padding: "8px 10px", textAlign: "center", fontWeight: 700, color: "#1e293b" }}>{toPersianDigits(ex.sets.length)}</td>
+   562→                  <td style={{ padding: "8px 10px", textAlign: "center", color: "#1e293b" }}>
+   563→                    {ex.sets.map((s, k) => (
+   564→                      <span key={k}>
+   565→                        {toPersianDigits(s.reps)}
+   566→                        {k < ex.sets.length - 1 ? " / " : ""}
+   567→                      </span>
+   568→                    ))}
+   569→                  </td>
+   570→                  <td style={{ padding: "8px 10px", textAlign: "center", color: "#1e293b" }}>
+   571→                    {toPersianDigits(ex.sets[0]?.restSec ?? 0)}s
+   572→                  </td>
+   573→                </tr>
+   574→              ))}
+   575→            </tbody>
+   576→          </table>
+   577→        </div>
+   578→      ))}
+   579→
+   580→      {/* Notes */}
+   581→      {plan.notes && (
+   582→        <div
+   583→          style={{
+   584→            background: "#fff7ed",
+   585→            border: "1px dashed #fdba74",
+   586→            borderRadius: "12px",
+   587→            padding: "12px 16px",
+   588→            marginTop: "12px",
+   589→          }}
+   590→        >
+   591→          <p style={{ fontSize: "12px", color: "#ea580c", fontWeight: 700, margin: "0 0 4px 0" }}>📝 نکات هفته</p>
+   592→          <p style={{ fontSize: "12px", color: "#1e293b", margin: 0, lineHeight: 1.6 }}>{plan.notes}</p>
+   593→        </div>
+   594→      )}
+   595→
+   596→      {/* Footer */}
+   597→      <div
+   598→        style={{
+   599→          marginTop: "24px",
+   600→          paddingTop: "14px",
+   601→          borderTop: "2px solid #fed7aa",
+   602→          display: "flex",
+   603→          alignItems: "center",
+   604→          justifyContent: "space-between",
+   605→          fontSize: "11px",
+   606→          color: "#94a3b8",
+   607→        }}
+   608→      >
+   609→        <span>هر بدنی فیتاپ میخواد 💪</span>
+   610→        <span>ساخته‌شده با فیتاپ هوشمند</span>
+   611→      </div>
+   612→    </div>
+   613→  );
+   614→}
+   615→
+   616→function ExerciseCard({
+   617→  exercise,
+   618→  index,
+   619→  setStates,
+   620→  canViewVideos,
+   621→  onToggleSet,
+   622→  onUpdateWeight,
+   623→  onShowDetail,
+   624→}: {
+   625→  exercise: PlanExercise;
+   626→  index: number;
+   627→  setStates: Record<string, SetState>;
+   628→  canViewVideos: boolean;
+   629→  onToggleSet: (setNumber: number, restSec: number) => void;
+   630→  onUpdateWeight: (setNumber: number, weight: string) => void;
+   631→  onShowDetail: () => void;
+   632→}) {
+   633→  const [expanded, setExpanded] = useState(index === 0);
+   634→  const doneSets = exercise.sets.filter((s) => setStates[`${exercise.id}_${s.setNumber}`]?.done).length;
+   635→
+   636→  return (
+   637→    <Card className="overflow-hidden">
+   638→      <button
+   639→        onClick={() => setExpanded((v) => !v)}
+   640→        className="w-full flex items-center gap-3 p-4 text-right"
+   641→      >
+   642→        <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-primary/20 to-emerald-500/20 flex items-center justify-center shrink-0">
+   643→          <Dumbbell className="w-6 h-6 text-primary" />
+   644→        </div>
+   645→        <div className="flex-1 min-w-0">
+   646→          <h4 className="font-bold text-sm truncate">{exercise.name}</h4>
+   647→          <div className="flex items-center gap-2 mt-0.5">
+   648→            <span className="text-[11px] text-muted-foreground">{exercise.muscle}</span>
+   649→            <span className="text-[11px] text-muted-foreground">•</span>
+   650→            <span className="text-[11px] text-muted-foreground">
+   651→              {toPersianDigits(exercise.sets.length)} ست
+   652→            </span>
+   653→            {doneSets === exercise.sets.length && (
+   654→              <Badge className="bg-emerald-500 text-white text-[9px] h-4">کامل ✓</Badge>
+   655→            )}
+   656→          </div>
+   657→        </div>
+   658→        <ChevronLeft
+   659→          className={`w-5 h-5 text-muted-foreground transition-transform ${expanded ? "-rotate-90" : ""}`}
+   660→        />
+   661→      </button>
+   662→
+   663→      <AnimatePresence>
+   664→        {expanded && (
+   665→          <motion.div
+   666→            initial={{ height: 0, opacity: 0 }}
+   667→            animate={{ height: "auto", opacity: 1 }}
+   668→            exit={{ height: 0, opacity: 0 }}
+   669→            className="overflow-hidden"
+   670→          >
+   671→            <div className="px-4 pb-4">
+   672→              {/* Action buttons: Show video + Show detail */}
+   673→              <div className="flex gap-2 mb-3">
+   674→                {canViewVideos ? (
+   675→                  <button
+   676→                    onClick={onShowDetail}
+   677→                    className="flex-1 flex items-center gap-2 p-3 rounded-xl bg-orange-50 hover:bg-orange-100 transition text-right border border-orange-200"
+   678→                  >
+   679→                    <Video className="w-4 h-4 text-orange-500 shrink-0" />
+   680→                    <span className="text-xs font-medium text-orange-700 flex-1">نمایش ویدیو حرکت</span>
+   681→                    <ChevronLeft className="w-4 h-4 text-orange-400" />
+   682→                  </button>
+   683→                ) : (
+   684→                  <button
+   685→                    disabled
+   686→                    title="برای مشاهده ویدیو حرکات، پلن پیشرفته یا حرفه‌ای تهیه کنید"
+   687→                    className="flex-1 flex items-center gap-2 p-3 rounded-xl bg-slate-50 text-right border border-slate-200 opacity-70 cursor-not-allowed"
+   688→                  >
+   689→                    <Lock className="w-4 h-4 text-slate-400 shrink-0" />
+   690→                    <span className="text-xs font-medium text-slate-500 flex-1">ویدیو حرکت (قفل)</span>
+   691→                  </button>
+   692→                )}
+   693→                <button
+   694→                  onClick={onShowDetail}
+   695→                  className="flex items-center gap-2 p-3 rounded-xl bg-muted/50 hover:bg-muted transition text-right"
+   696→                >
+   697→                  <Info className="w-4 h-4 text-primary shrink-0" />
+   698→                  <span className="text-xs text-muted-foreground">جزئیات</span>
+   699→                  <ChevronLeft className="w-4 h-4 text-muted-foreground" />
+   700→                </button>
+   701→              </div>
+   702→
+   703→              {/* Sets */}
+   704→              <div className="space-y-2">
+   705→                <div className="grid grid-cols-12 gap-2 text-[10px] font-bold text-muted-foreground px-2">
+   706→                  <div className="col-span-2 text-center">ست</div>
+   707→                  <div className="col-span-3 text-center">تکرار</div>
+   708→                  <div className="col-span-3 text-center">وزنه (kg)</div>
+   709→                  <div className="col-span-2 text-center">استراحت</div>
+   710→                  <div className="col-span-2 text-center">انجام</div>
+   711→                </div>
+   712→                {exercise.sets.map((set) => {
+   713→                  const state = setStates[`${exercise.id}_${set.setNumber}`];
+   714→                  return (
+   715→                    <div
+   716→                      key={set.setNumber}
+   717→                      className={`grid grid-cols-12 gap-2 items-center p-2.5 rounded-xl border transition ${
+   718→                        state?.done
+   719→                          ? "border-emerald-500/30 bg-emerald-500/5"
+   720→                          : "border-border bg-card"
+   721→                      }`}
+   722→                    >
+   723→                      <div className="col-span-2 text-center text-sm font-bold">
+   724→                        {toPersianDigits(set.setNumber)}
+   725→                      </div>
+   726→                      <div className="col-span-3 text-center text-xs font-medium">
+   727→                        {toPersianDigits(set.reps)}
+   728→                      </div>
+   729→                      <div className="col-span-3">
+   730→                        <input
+   731→                          type="number"
+   732→                          value={state?.weight || ""}
+   733→                          onChange={(e) => onUpdateWeight(set.setNumber, e.target.value)}
+   734→                          placeholder="—"
+   735→                          dir="ltr"
+   736→                          className="w-full h-8 text-center text-xs rounded-lg border bg-background px-1"
+   737→                        />
+   738→                      </div>
+   739→                      <div className="col-span-2 text-center text-[11px] text-muted-foreground">
+   740→                        {toPersianDigits(set.restSec)}s
+   741→                      </div>
+   742→                      <div className="col-span-2 flex justify-center">
+   743→                        <button
+   744→                          onClick={() => onToggleSet(set.setNumber, set.restSec)}
+   745→                          className={`w-8 h-8 rounded-full flex items-center justify-center transition ${
+   746→                            state?.done
+   747→                              ? "bg-emerald-500 text-white"
+   748→                              : "bg-muted hover:bg-primary hover:text-primary-foreground"
+   749→                          }`}
+   750→                        >
+   751→                          <Check className="w-4 h-4" strokeWidth={3} />
+   752→                        </button>
+   753→                      </div>
+   754→                    </div>
+   755→                  );
+   756→                })}
+   757→              </div>
+   758→            </div>
+   759→          </motion.div>
+   760→        )}
+   761→      </AnimatePresence>
+   762→    </Card>
+   763→  );
+   764→}
+   765→

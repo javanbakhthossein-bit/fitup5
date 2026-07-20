@@ -1,0 +1,820 @@
+     1→     1→import { NextRequest } from "next/server";
+     2→     2→import { db } from "@/lib/db";
+     3→     3→import { requireAdmin, apiError } from "@/lib/fitness/auth";
+     4→     4→import { createNotification } from "@/lib/fitness/notifications";
+     5→     5→import { SUBSCRIPTION_PLANS, toPersianDigits } from "@/lib/fitness/types";
+     6→     6→
+     7→     7→/**
+     8→     8→ * POST /api/admin/users/[id]/manage-subscription
+     9→     9→ *
+    10→    10→ * مدیریت اشتراک کاربر توسط ادمین. ۵ اکشن پشتیبانی می‌شود:
+    11→    11→ *
+    12→    12→ * ۱. action: "remove"
+    13→    13→ *    - اشتراک فعال فعلی را به "expired" تغییر می‌دهد.
+    14→    14→ *    - planName/planExpiresAt/planStartedAt روی User را null می‌کند.
+    15→    15→ *    - نوتیف به کاربر ارسال می‌شود.
+    16→    16→ *
+    17→    17→ * ۲. action: "activate"
+    18→    18→ *    - پلن جدید را فعال می‌کند (با تمام اتفاقات زمان خرید: اشتراک فعال، ProgramRequest، نوتیف).
+    19→    19→ *    - پلن قبلی فعال را expire می‌کند.
+    20→    20→ *    - body: { plan: "ultimate", days?: 45 }
+    21→    21→ *    - اگر days ارسال نشود، از durationDays پلن استفاده می‌شود.
+    22→    22→ *
+    23→    23→ * ۳. action: "extend"
+    24→    24→ *    - تعداد روز مشخص‌شده (days) را به اشتراک فعال فعلی اضافه می‌کند.
+    25→    25→ *    - body: { days: 20 }
+    26→    26→ *
+    27→    27→ * ۴. action: "reduce"
+    28→    28→ *    - تعداد روز مشخص‌شده (days) را از اشتراک فعال فعلی کم می‌کند.
+    29→    29→ *    - body: { days: 20 }
+    30→    30→ *
+    31→    31→ * ۵. action: "activate_days"
+    32→    32→ *    - یک پلن جدید را برای مدت مشخص (days) از الان فعال می‌کند.
+    33→    33→ *    - body: { plan: "ultimate", days: 20 }
+    34→    34→ *    - این اکشن برای آزمایش یا پاداش استفاده می‌شود.
+    35→    35→ */
+    36→    36→interface ManageBody {
+    37→    37→  action: "remove" | "activate" | "extend" | "reduce" | "activate_days";
+    38→    38→  plan?: string; // basic | standard | advanced | ultimate
+    39→    39→  days?: number;
+    40→    40→}
+    41→    41→
+    42→    42→const VALID_PLANS = ["basic", "standard", "advanced", "ultimate"];
+    43→    43→
+    44→    44→export async function POST(
+    45→    45→  req: NextRequest,
+    46→    46→  { params }: { params: Promise<{ id: string }> }
+    47→    47→) {
+    48→    48→  try {
+    49→    49→    await requireAdmin();
+    50→    50→    const { id } = await params;
+    51→    51→    const body = (await req.json()) as ManageBody;
+    52→    52→    const action = body.action;
+    53→    53→
+    54→    54→    // بررسی وجود کاربر
+    55→    55→    const user = await db.user.findUnique({ where: { id } });
+    56→    56→    if (!user) {
+    57→    57→      return Response.json({ error: "کاربر یافت نشد." }, { status: 404 });
+    58→    58→    }
+    59→    59→
+    60→    60→    const now = new Date();
+    61→    61→
+    62→    62→    // ─── اکشن ۱: حذف پلن فعلی ───
+    63→    63→    if (action === "remove") {
+    64→    64→      // همه اشتراک‌های active/pending کاربر را expire کن
+    65→    65→      await db.subscription.updateMany({
+    66→    66→        where: { userId: id, status: { in: ["active", "pending"] } },
+    67→    67→        data: { status: "expired" },
+    68→    68→      });
+    69→    69→      // پاک‌سازی فیلدهای پلن روی User
+    70→    70→      await db.user.update({
+    71→    71→        where: { id },
+    72→    72→        data: {
+    73→    73→          planName: null,
+    74→    74→          planExpiresAt: null,
+    75→    75→          planStartedAt: null,
+    76→    76→        },
+    77→    77→      });
+    78→    78→      await createNotification(
+    79→    79→        id,
+    80→    80→        "system",
+    81→    81→        "اشتراک شما توسط ادمین لغو شد ⚠️",
+    82→    82→        "اشتراک فعلی شما توسط ادمین غیرفعال شد. در صورت سوال، با پشتیبانی در ارتباط باشید.",
+    83→    83→        "?tab=plans",
+    84→    84→        { from: "admin", action: "remove" }
+    85→    85→      );
+    86→    86→      return Response.json({ ok: true, action: "remove" });
+    87→    87→    }
+    88→    88→
+    89→    89→    // ─── اکشن ۲: فعال‌سازی پلن جدید ───
+    90→    90→    // این اکشن دقیقاً همان روال خرید موفق در /api/payment/verify را طی می‌کند:
+    91→    91→    //   • اشتراک قبلی expire می‌شود.
+    92→    92→    //   • اشتراک جدید ساخته می‌شود:
+    93→    93→    //       - basic/standard → status="active" با startDate=now و endDate=now+durationDays.
+    94→    94→    //       - advanced/ultimate → status="pending" با startDate/endDate=null (۴۵ روز از
+    95→    95→    //         زمان تکمیل پیش‌نیازها شروع می‌شود — یعنی ارسال عکس بدن).
+    96→    96→    //   • ProgramRequest ساخته می‌شود:
+    97→    97→    //       - basic/standard → status="generating" و برنامه در پس‌زمینه تولید می‌شود.
+    98→    98→    //       - advanced/ultimate → status="pending_body_photo" (تا زمان تکمیل پیش‌نیازها).
+    99→    99→    //   • فیلدهای planName/planStartedAt/planExpiresAt روی User آپدیت می‌شود
+   100→   100→    //     (برای advanced/ultimate مقدار null می‌شود تا در submit-body-analysis ست شود).
+   101→   101→    //   • شمارنده‌های AI (videoAnalysisUsed, bloodTestUsed) و وضعیت‌های videoStatus/
+   102→   102→    //     bloodTestStatus ریست می‌شوند.
+   103→   103→    //   • نوتیف‌های لازم ارسال می‌شود (شامل نوتیف‌های پیش‌نیاز عکس بدن، آزمایش خون
+   104→   104→    //     و ویدیو برای پلن ultimate — دقیقاً مثل خرید).
+   105→   105→    if (action === "activate") {
+   106→   106→      const planId = body.plan;
+   107→   107→      if (!planId || !VALID_PLANS.includes(planId)) {
+   108→   108→        return Response.json({ error: "پلن نامعتبر است." }, { status: 400 });
+   109→   109→      }
+   110→   110→      const planMeta = SUBSCRIPTION_PLANS.find((p) => p.id === planId);
+   111→   111→      if (!planMeta) {
+   112→   112→        return Response.json({ error: "پلن یافت نشد." }, { status: 400 });
+   113→   113→      }
+   114→   114→      const durationDays =
+   115→   115→        body.days && body.days > 0 ? Math.floor(body.days) : planMeta.durationDays;
+   116→   116→
+   117→   117→      // بررسی پلن قبلی فعال (برای حفظ روزهای باقی‌مانده در صورت تمدید همان پلن)
+   118→   118→      const oldActiveSub = await db.subscription.findFirst({
+   119→   119→        where: { userId: id, status: "active" },
+   120→   120→        orderBy: { endDate: "desc" },
+   121→   121→      });
+   122→   122→      let remainingDaysPreserved = 0;
+   123→   123→      if (
+   124→   124→        oldActiveSub?.endDate &&
+   125→   125→        oldActiveSub.endDate.getTime() > now.getTime() &&
+   126→   126→        oldActiveSub.plan === planId
+   127→   127→      ) {
+   128→   128→        const msLeft = oldActiveSub.endDate.getTime() - now.getTime();
+   129→   129→        const daysLeft = Math.ceil(msLeft / (1000 * 60 * 60 * 24));
+   130→   130→        if (daysLeft > 0) remainingDaysPreserved = Math.min(daysLeft, durationDays);
+   131→   131→      }
+   132→   132→
+   133→   133→      // غیرفعال‌سازی اشتراک‌های قبلی (مثل خرید)
+   134→   134→      await db.subscription.updateMany({
+   135→   135→        where: { userId: id, status: "active" },
+   136→   136→        data: { status: "expired" },
+   137→   137→      });
+   138→   138→      await db.subscription.updateMany({
+   139→   139→        where: { userId: id, status: "pending" },
+   140→   140→        data: { status: "cancelled" },
+   141→   141→      });
+   142→   142→
+   143→   143→      // آیا پلن نیاز به عکس بدن دارد؟
+   144→   144→      const needsBodyPhoto = planId === "advanced" || planId === "ultimate";
+   145→   145→      const canSubmitVideo = planId === "ultimate";
+   146→   146→
+   147→   147→      const endDate = new Date();
+   148→   148→      endDate.setDate(endDate.getDate() + durationDays + remainingDaysPreserved);
+   149→   149→
+   150→   150→      // ایجاد اشتراک جدید — منطق دقیقاً مثل /api/payment/verify
+   151→   151→      if (needsBodyPhoto) {
+   152→   152→        // پلن‌های advanced/ultimate: اشتراک pending — ۴۵ روز از زمان تکمیل پیش‌نیازها
+   153→   153→        await db.subscription.create({
+   154→   154→          data: {
+   155→   155→            userId: id,
+   156→   156→            plan: planId,
+   157→   157→            status: "pending",
+   158→   158→            startDate: null,
+   159→   159→            endDate: null,
+   160→   160→            durationDays,
+   161→   161→            pricePaid: 0, // ادمین فعال کرده — پرداخت نداشت
+   162→   162→            discountCode: null,
+   163→   163→          },
+   164→   164→        });
+   165→   165→      } else {
+   166→   166→        // پلن‌های basic/standard: اشتراک فعال بلافاصله شروع می‌شود (پیش‌نیاز ندارد)
+   167→   167→        await db.subscription.create({
+   168→   168→          data: {
+   169→   169→            userId: id,
+   170→   170→            plan: planId,
+   171→   171→            status: "active",
+   172→   172→            startDate: now,
+   173→   173→            endDate,
+   174→   174→            durationDays,
+   175→   175→            pricePaid: 0, // ادمین فعال کرده — پرداخت نداشت
+   176→   176→            discountCode: null,
+   177→   177→          },
+   178→   178→        });
+   179→   179→      }
+   180→   180→
+   181→   181→      // آپدیت فیلدهای پلن روی User (مثل خرید موفق)
+   182→   182→      // برای پلن‌های advanced/ultimate: planExpiresAt=null و planStartedAt=null (هنوز شروع نشده).
+   183→   183→      // وقتی کاربر پیش‌نیازها را در submit-body-analysis تکمیل کند، این فیلدها ست می‌شوند.
+   184→   184→      await db.user.update({
+   185→   185→        where: { id },
+   186→   186→        data: {
+   187→   187→          planName: planId,
+   188→   188→          planExpiresAt: needsBodyPhoto ? null : endDate,
+   189→   189→          planStartedAt: needsBodyPhoto ? null : now,
+   190→   190→          // ریست شمارنده‌های استفاده هوش مصنوعی
+   191→   191→          videoAnalysisUsed: 0,
+   192→   192→          bloodTestUsed: 0,
+   193→   193→          // ریست وضعیت تعیین‌تکلیف ویدیو و آزمایش خون — برای پلن جدید کاربر باید دوباره تصمیم بگیرد
+   194→   194→          videoStatus: null,
+   195→   195→          bloodTestStatus: null,
+   196→   196→        },
+   197→   197→      });
+   198→   198→
+   199→   199→      // ایجاد ProgramRequest جدید (مثل خرید موفق)
+   200→   200→      const progReq = await db.programRequest.create({
+   201→   201→        data: {
+   202→   202→          userId: id,
+   203→   203→          plan: planId,
+   204→   204→          billingPeriod: "monthly",
+   205→   205→          status: needsBodyPhoto ? "pending_body_photo" : "generating",
+   206→   206→        },
+   207→   207→      });
+   208→   208→
+   209→   209→      // --- تولید برنامه بر اساس نوع پلن (دقیقاً مثل /api/payment/verify) ---
+   210→   210→      if (needsBodyPhoto) {
+   211→   211→        // بدون تولید برنامه — منتظر ارسال عکس‌های بدن توسط کاربر
+   212→   212→        const noticeBody = canSubmitVideo
+   213→   213→          ? "برای دریافت برنامه اختصاصی، ارسال عکس‌های بدن (۴ زاویه) الزامی است. ارسال ویدیوی فرم حرکات اختیاری است اما به دقت برنامه کمک می‌کند. همچنین می‌توانید بعداً از بخش «آزمایش خون» در پنل، عکس آزمایش خون خود را برای تحلیل ارسال کنید (دلبخواه)."
+   214→   214→          : "برای دریافت برنامه اختصاصی، عکس‌های بدن خود (۴ زاویه) را ارسال کنید. سپس فیتاپ هوشمند برنامه شما را طراحی می‌کند.";
+   215→   215→        await createNotification(
+   216→   216→          id,
+   217→   217→          "system",
+   218→   218→          "ارسال عکس بدن الزامی است 📸",
+   219→   219→          noticeBody,
+   220→   220→          "?tab=dashboard",
+   221→   221→          { from: "admin", action: "activate_body_photo_required", plan: planId }
+   222→   222→        );
+   223→   223→
+   224→   224→        // نوتیف جداگانه برای آزمایش خون — فقط برای پلن Ultimate (اختیاری)
+   225→   225→        if (canSubmitVideo) {
+   226→   226→          await createNotification(
+   227→   227→            id,
+   228→   228→            "system",
+   229→   229→            "آزمایش خون خود را ارسال کنید (اختیاری) 🩸",
+   230→   230→            "برای داشتن یک برنامه ورزشی و تغذیه‌ای کاملاً شخصی‌سازی‌شده، می‌توانید آزمایش خون خود را به فیتاپ بسپارید. از بخش «آزمایش خون» در پنل، ابتدا فرم آزمایش را دانلود کرده و به آزمایشگاه ببرید. سپس یکی از گزینه‌ها را انتخاب کنید: «آزمایش دادم و منتظر جوابم» یا «آپلود نمی‌کنم».",
+   231→   231→            "?tab=dashboard",
+   232→   232→            { from: "admin", action: "activate_blood_test_optional", plan: planId }
+   233→   233→          );
+   234→   234→
+   235→   235→          // نوتیف جداگانه برای ویدیوی فرم حرکات (اختیاری) — فقط Ultimate
+   236→   236→          await createNotification(
+   237→   237→            id,
+   238→   238→            "system",
+   239→   239→            "ارسال ویدیوی فرم حرکات (اختیاری) 🎥",
+   240→   240→            "برای دقت بالاتر در طراحی برنامه، می‌توانید ویدیویی از فرم اجرای حرکات خود ارسال کنید. این مرحله اختیاری است اما به مربی هوشمند کمک می‌کند نقاط ضعف فرم بدن شما را شناسایی کند. از بخش داشبورد می‌توانید ویدیو را آپلود کنید یا «آپلود نمی‌کنم» را انتخاب کنید. تا زمان تعیین تکلیف این مرحله، ساخت برنامه شما متوقف می‌ماند.",
+   241→   241→            "?tab=dashboard",
+   242→   242→            { from: "admin", action: "activate_video_optional", plan: planId }
+   243→   243→          );
+   244→   244→        }
+   245→   245→
+   246→   246→        // نوتیف تشویقی برای اندازه‌های بدنی (اگر کاربر هنوز ندارد)
+   247→   247→        try {
+   248→   248→          const baselineCheckup = await db.checkup.findFirst({
+   249→   249→            where: { userId: id, phaseNumber: 0 },
+   250→   250→            orderBy: { createdAt: "desc" },
+   251→   251→          });
+   252→   252→          const hasMeasurements =
+   253→   253→            !!baselineCheckup?.waistMeasurement &&
+   254→   254→            !!baselineCheckup?.neckMeasurement;
+   255→   255→          if (!hasMeasurements) {
+   256→   256→            await createNotification(
+   257→   257→              id,
+   258→   258→              "system",
+   259→   259→              "برای برنامه دقیق‌تر، اندازه‌های بدنی خود را وارد کنید 📏",
+   260→   260→              "با وارد کردن دور کمر، گردن و سایر اندازه‌ها، فیتاپ هوشمند درصد چربی بدن شما را با فرمول علمی US Navy محاسبه می‌کند و برنامه دقیق‌تری طراحی می‌کند. می‌توانید این مرحله را رد کنید.",
+   261→   261→              "?tab=progress",
+   262→   262→              { from: "admin", action: "activate_measurements_tip", plan: planId }
+   263→   263→            );
+   264→   264→          }
+   265→   265→        } catch (checkErr) {
+   266→   266→          console.error(
+   267→   267→            "[manage-subscription] baseline checkup lookup failed:",
+   268→   268→            checkErr
+   269→   269→          );
+   270→   270→        }
+   271→   271→      } else {
+   272→   272→        // پلن‌های basic/standard — تولید برنامه در پس‌زمینه (fire-and-forget)
+   273→   273→        const userIdBg = id;
+   274→   274→        const progReqIdBg = progReq.id;
+   275→   275→        const planIdBg = planId;
+   276→   276→        const oldSubBg = oldActiveSub;
+   277→   277→
+   278→   278→        void (async () => {
+   279→   279→          try {
+   280→   280→            const profile = await db.onboardingProfile.findUnique({
+   281→   281→              where: { userId: userIdBg },
+   282→   282→            });
+   283→   283→            if (!profile) {
+   284→   284→              // پروفایل آنبوردینگ موجود نیست — نمی‌توان برنامه ساخت
+   285→   285→              await db.programRequest.update({
+   286→   286→                where: { id: progReqIdBg },
+   287→   287→                data: { status: "failed" },
+   288→   288→              });
+   289→   289→              return;
+   290→   290→            }
+   291→   291→
+   292→   292→            const { generateWorkoutPlan, generateMealPlan } = await import(
+   293→   293→              "@/lib/fitness/ai"
+   294→   294→            );
+   295→   295→
+   296→   296→            const parseEquip = (raw: string | null | undefined): string[] => {
+   297→   297→              if (!raw) return [];
+   298→   298→              const t = raw.trim();
+   299→   299→              if (!t) return [];
+   300→   300→              try {
+   301→   301→                const p = JSON.parse(t);
+   302→   302→                if (Array.isArray(p)) return p.map((x) => String(x));
+   303→   303→                if (typeof p === "string")
+   304→   304→                  return p
+   305→   305→                    .split(",")
+   306→   306→                    .map((s) => s.trim())
+   307→   307→                    .filter(Boolean);
+   308→   308→                return [];
+   309→   309→              } catch {
+   310→   310→                return t
+   311→   311→                  .split(",")
+   312→   312→                  .map((s) => s.trim())
+   313→   313→                  .filter(Boolean);
+   314→   314→              }
+   315→   315→            };
+   316→   316→            const parseList = (raw: string | null | undefined): string[] => {
+   317→   317→              if (!raw) return [];
+   318→   318→              const t = raw.trim();
+   319→   319→              if (!t) return [];
+   320→   320→              try {
+   321→   321→                const p = JSON.parse(t);
+   322→   322→                return Array.isArray(p) ? p.map((x) => String(x)) : [];
+   323→   323→              } catch {
+   324→   324→                return t
+   325→   325→                  .split(",")
+   326→   326→                  .map((s) => s.trim())
+   327→   327→                  .filter(Boolean);
+   328→   328→              }
+   329→   329→            };
+   330→   330→
+   331→   331→            // آخرین وزن ثبت‌شده (نه وزن اولیه) — برای تمدید هوشمند
+   332→   332→            const latestWeightLog = await db.weightLog.findFirst({
+   333→   333→              where: { userId: userIdBg },
+   334→   334→              orderBy: { loggedAt: "desc" },
+   335→   335→              select: { weight: true },
+   336→   336→            });
+   337→   337→            const currentWeight = latestWeightLog?.weight ?? profile.weight;
+   338→   338→
+   339→   339→            // آخرین چکاپ برای اندازه‌های بدنی
+   340→   340→            const latestCheckup = await db.checkup.findFirst({
+   341→   341→              where: { userId: userIdBg, phaseCompleted: true },
+   342→   342→              orderBy: { createdAt: "desc" },
+   343→   343→              select: {
+   344→   344→                bodyFatPercent: true,
+   345→   345→                waistMeasurement: true,
+   346→   346→                fatigueLevel: true,
+   347→   347→                sleepQuality: true,
+   348→   348→                weight: true,
+   349→   349→                armMeasurement: true,
+   350→   350→                chestMeasurement: true,
+   351→   351→                hipMeasurement: true,
+   352→   352→                thighMeasurement: true,
+   353→   353→                neckMeasurement: true,
+   354→   354→                dietAdherence: true,
+   355→   355→                workoutAdherence: true,
+   356→   356→                phaseNumber: true,
+   357→   357→                isFinalCheckup: true,
+   358→   358→              },
+   359→   359→            });
+   360→   360→
+   361→   361→            // تمدید هوشمند: اگر کاربر دوره قبلی را کامل کرده، پیشرفت او را به AI می‌دهیم
+   362→   362→            const previousSub =
+   363→   363→              oldSubBg ||
+   364→   364→              (await db.subscription.findFirst({
+   365→   365→                where: { userId: userIdBg, status: "expired" },
+   366→   366→                orderBy: { endDate: "desc" },
+   367→   367→              }));
+   368→   368→
+   369→   369→            let renewalContext = "";
+   370→   370→            if (previousSub && latestCheckup) {
+   371→   371→              const oldWeight = profile.weight;
+   372→   372→              const newWeight = currentWeight;
+   373→   373→              const weightChange = newWeight - oldWeight;
+   374→   374→              const oldBodyFat = latestCheckup.bodyFatPercent;
+   375→   375→              renewalContext = `\n\n[سیستم - فعال‌سازی توسط ادمین]: این کاربر قبلاً پلن ${previousSub.plan} را برای ${previousSub.durationDays} روز استفاده کرده است.
+   376→   376→پیشرفت کاربر:
+   377→   377→- وزن اولیه: ${oldWeight} کیلو → وزن فعلی: ${newWeight} کیلو (تغییر: ${weightChange > 0 ? "+" : ""}${weightChange.toFixed(1)} کیلو)
+   378→   378→${oldBodyFat ? `- درصد چربی بدن در آخرین چکاپ: ${oldBodyFat.toFixed(1)}٪` : ""}
+   379→   379→- سطح انرژی: ${latestCheckup.fatigueLevel}/5
+   380→   380→- کیفیت خواب: ${latestCheckup.sleepQuality}/5
+   381→   381→- رعایت رژیم: ${latestCheckup.dietAdherence}/5
+   382→   382→- رعایت تمرین: ${latestCheckup.workoutAdherence}/5
+   383→   383→- فاز تکمیل‌شده: ${latestCheckup.phaseNumber}${latestCheckup.isFinalCheckup ? " (چکاپ نهایی)" : ""}
+   384→   384→
+   385→   385→برنامه جدید را بر اساس این پیشرفت طراحی کن:
+   386→   386→${weightChange < 0 ? "✅ کاربر وزن کم کرده — برنامه را با شدت مناسب ادامه بده" : weightChange > 0 ? "⚠️ کاربر وزن اضافه کرده — برنامه را با تمرکز بر چربی‌سوزی تنظیم کن" : "→ وزن ثابت — برنامه را متنوع‌تر و پیشرفته‌تر کن"}
+   387→   387→${latestCheckup.fatigueLevel <= 2 ? "⚠️ خستگی بالا — حجم تمرین را کمی کم کن" : ""}
+   388→   388→${latestCheckup.sleepQuality <= 2 ? "⚠️ خواب ضعیف — ریکاوری را در نظر بگیر" : ""}
+   389→   389→${latestCheckup.workoutAdherence >= 4 ? "✅ رعایت تمرین عالی — می‌توانی شدت را افزایش دهی" : ""}`;
+   390→   390→            }
+   391→   391→
+   392→   392→            const planData = {
+   393→   393→              gender: profile.gender as any,
+   394→   394→              age: profile.age,
+   395→   395→              height: profile.height,
+   396→   396→              weight: currentWeight,
+   397→   397→              targetWeight: profile.targetWeight ?? undefined,
+   398→   398→              goal: profile.goal as any,
+   399→   399→              activityLevel: profile.activityLevel as any,
+   400→   400→              workoutDays: profile.workoutDays,
+   401→   401→              workoutDaysList: parseList(profile.workoutDaysList),
+   402→   402→              workoutPlace: profile.workoutPlace as any,
+   403→   403→              equipment: parseEquip(profile.equipment),
+   404→   404→              diseases: profile.diseases,
+   405→   405→              injuries: profile.injuries,
+   406→   406→              allergies: profile.allergies,
+   407→   407→              dietType: profile.dietType as any,
+   408→   408→              trainingExperience: (profile.trainingExperience ?? undefined) as any,
+   409→   409→              previousTrainingType: profile.previousTrainingType ?? undefined,
+   410→   410→              drugAllergies: profile.drugAllergies ?? undefined,
+   411→   411→              currentMedications: profile.currentMedications ?? undefined,
+   412→   412→              maxLifts: profile.maxLifts ?? undefined,
+   413→   413→              bodyFrame: (profile.bodyFrame ?? undefined) as any,
+   414→   414→              sleepHours: profile.sleepHours ?? undefined,
+   415→   415→              stressLevel: profile.stressLevel ?? undefined,
+   416→   416→              waterHabit: profile.waterHabit ?? undefined,
+   417→   417→              targetDate: profile.targetDate ?? undefined,
+   418→   418→              workoutTime: (profile.workoutTime ?? undefined) as any,
+   419→   419→              medicalConditions: parseList(profile.medicalConditions) as any,
+   420→   420→              currentSupplements: profile.currentSupplements ?? undefined,
+   421→   421→              dislikedFoods: profile.dislikedFoods ?? undefined,
+   422→   422→              preferredCuisine: (profile.preferredCuisine ?? undefined) as any,
+   423→   423→              waterGoalMl: (() => {
+   424→   424→                const w = currentWeight || 70;
+   425→   425→                const baseMl = Math.round(w * 35);
+   426→   426→                let adj = 0;
+   427→   427→                const al = profile.activityLevel;
+   428→   428→                if (al === "active" || al === "very_active") adj = 500;
+   429→   429→                else if (al === "moderate") adj = 250;
+   430→   430→                return baseMl + adj;
+   431→   431→              })(),
+   432→   432→            };
+   433→   433→
+   434→   434→            // غیرفعال‌سازی برنامه‌های قبلی
+   435→   435→            await db.workoutPlan.updateMany({
+   436→   436→              where: { userId: userIdBg },
+   437→   437→              data: { active: false },
+   438→   438→            });
+   439→   439→            await db.mealPlan.updateMany({
+   440→   440→              where: { userId: userIdBg },
+   441→   441→              data: { active: false },
+   442→   442→            });
+   443→   443→
+   444→   444→            const extras: {
+   445→   445→              renewalContext?: string;
+   446→   446→              bloodTestReport?: string;
+   447→   447→              bodyPhotoAnalysis?: string;
+   448→   448→            } = {};
+   449→   449→            if (renewalContext) extras.renewalContext = renewalContext;
+   450→   450→
+   451→   451→            // آخرین آزمایش خون (در صورت وجود) — تزریق به AI
+   452→   452→            try {
+   453→   453→              const latestBloodTest = await db.analysisResult.findFirst({
+   454→   454→                where: { userId: userIdBg, type: "blood_test" },
+   455→   455→                orderBy: { createdAt: "desc" },
+   456→   456→                select: { result: true, createdAt: true },
+   457→   457→              });
+   458→   458→              if (latestBloodTest?.result) {
+   459→   459→                try {
+   460→   460→                  const parsed = JSON.parse(latestBloodTest.result);
+   461→   461→                  const summaryParts: string[] = [];
+   462→   462→                  if (parsed.summary) summaryParts.push(String(parsed.summary));
+   463→   463→                  if (
+   464→   464→                    parsed.abnormalities &&
+   465→   465→                    Array.isArray(parsed.abnormalities) &&
+   466→   466→                    parsed.abnormalities.length > 0
+   467→   467→                  ) {
+   468→   468→                    summaryParts.push(
+   469→   469→                      `ناهنجاری‌ها: ${parsed.abnormalities
+   470→   470→                        .map((a: any) =>
+   471→   471→                          typeof a === "string"
+   472→   472→                            ? a
+   473→   473→                            : a?.name || a?.test || JSON.stringify(a)
+   474→   474→                        )
+   475→   475→                        .join("، ")}`
+   476→   476→                    );
+   477→   477→                  }
+   478→   478→                  if (
+   479→   479→                    parsed.recommendations &&
+   480→   480→                    Array.isArray(parsed.recommendations) &&
+   481→   481→                    parsed.recommendations.length > 0
+   482→   482→                  ) {
+   483→   483→                    summaryParts.push(
+   484→   484→                      `توصیه‌ها: ${parsed.recommendations.slice(0, 3).join("، ")}`
+   485→   485→                    );
+   486→   486→                  }
+   487→   487→                  if (summaryParts.length > 0) {
+   488→   488→                    extras.bloodTestReport = `آخرین آزمایش خون کاربر (تاریخ: ${new Date(
+   489→   489→                      latestBloodTest.createdAt
+   490→   490→                    ).toLocaleDateString("fa-IR")}):\n${summaryParts.join("\n")}`;
+   491→   491→                  }
+   492→   492→                } catch {
+   493→   493→                  extras.bloodTestReport = `آخرین آزمایش خون کاربر:\n${latestBloodTest.result.slice(
+   494→   494→                    0,
+   495→   495→                    800
+   496→   496→                  )}`;
+   497→   497→                }
+   498→   498→              }
+   499→   499→            } catch (btErr) {
+   500→   500→              console.error(
+   501→   501→                "[manage-subscription] failed to load blood test:",
+   502→   502→                btErr
+   503→   503→              );
+   504→   504→            }
+   505→   505→
+   506→   506→            // آخرین تحلیل عکس بدن (در صورت وجود)
+   507→   507→            try {
+   508→   508→              const latestBodyPhoto = await db.analysisResult.findFirst({
+   509→   509→                where: { userId: userIdBg, type: "body_photo" },
+   510→   510→                orderBy: { createdAt: "desc" },
+   511→   511→                select: { result: true, createdAt: true },
+   512→   512→              });
+   513→   513→              if (latestBodyPhoto?.result) {
+   514→   514→                try {
+   515→   515→                  const parsed = JSON.parse(latestBodyPhoto.result);
+   516→   516→                  const summaryParts: string[] = [];
+   517→   517→                  if (parsed.analysis) summaryParts.push(String(parsed.analysis));
+   518→   518→                  if (
+   519→   519→                    parsed.recommendations &&
+   520→   520→                    Array.isArray(parsed.recommendations) &&
+   521→   521→                    parsed.recommendations.length > 0
+   522→   522→                  ) {
+   523→   523→                    summaryParts.push(
+   524→   524→                      `توصیه‌ها: ${parsed.recommendations.slice(0, 3).join("، ")}`
+   525→   525→                    );
+   526→   526→                  }
+   527→   527→                  if (parsed.bodyScore != null)
+   528→   528→                    summaryParts.push(`امتیاز فرم بدن: ${parsed.bodyScore} از ۱۰۰`);
+   529→   529→                  if (summaryParts.length > 0) {
+   530→   530→                    extras.bodyPhotoAnalysis = `آخرین تحلیل عکس بدن کاربر (تاریخ: ${new Date(
+   531→   531→                      latestBodyPhoto.createdAt
+   532→   532→                    ).toLocaleDateString("fa-IR")}):\n${summaryParts.join("\n")}`;
+   533→   533→                  }
+   534→   534→                } catch {
+   535→   535→                  extras.bodyPhotoAnalysis = `آخرین تحلیل عکس بدن کاربر:\n${latestBodyPhoto.result.slice(
+   536→   536→                    0,
+   537→   537→                    800
+   538→   538→                  )}`;
+   539→   539→                }
+   540→   540→              }
+   541→   541→            } catch (bpErr) {
+   542→   542→              console.error(
+   543→   543→                "[manage-subscription] failed to load body photo analysis:",
+   544→   544→                bpErr
+   545→   545→              );
+   546→   546→            }
+   547→   547→
+   548→   548→            // تولید موازی برنامه در پس‌زمینه
+   549→   549→            const [workout, meal] = await Promise.all([
+   550→   550→              generateWorkoutPlan(planData, planIdBg as any, extras),
+   551→   551→              generateMealPlan(planData, planIdBg as any, extras),
+   552→   552→            ]);
+   553→   553→
+   554→   554→            await db.workoutPlan.create({
+   555→   555→              data: {
+   556→   556→                userId: userIdBg,
+   557→   557→                content: JSON.stringify(workout),
+   558→   558→                active: true,
+   559→   559→              },
+   560→   560→            });
+   561→   561→            await db.mealPlan.create({
+   562→   562→              data: {
+   563→   563→                userId: userIdBg,
+   564→   564→                content: JSON.stringify(meal),
+   565→   565→                totalCal: meal.totalCalories,
+   566→   566→                active: true,
+   567→   567→              },
+   568→   568→            });
+   569→   569→
+   570→   570→            // به‌روزرسانی وضعیت درخواست برنامه به "ready"
+   571→   571→            await db.programRequest.update({
+   572→   572→              where: { id: progReqIdBg },
+   573→   573→              data: { status: "ready" },
+   574→   574→            });
+   575→   575→
+   576→   576→            // نوتیفیکیشن آماده شدن برنامه
+   577→   577→            await db.notification.create({
+   578→   578→              data: {
+   579→   579→                userId: userIdBg,
+   580→   580→                type: "achievement",
+   581→   581→                title: "برنامه شما آماده شد! 🎯",
+   582→   582→                body: "برنامه تمرینی و غذایی شخصی‌سازی‌شده شما توسط فیتاپ هوشمند ساخته شد. از بخش «تمرینات» و «تغذیه» مشاهده کنید.",
+   583→   583→                link: "?tab=programs",
+   584→   584→                read: false,
+   585→   585→              },
+   586→   586→            });
+   587→   587→            console.log(
+   588→   588→              "[manage-subscription] background plan generation completed for user:",
+   589→   589→              userIdBg
+   590→   590→            );
+   591→   591→          } catch (genErr) {
+   592→   592→            console.error(
+   593→   593→              "[manage-subscription] background plan generation failed:",
+   594→   594→              genErr
+   595→   595→            );
+   596→   596→            try {
+   597→   597→              await db.programRequest.update({
+   598→   598→                where: { id: progReqIdBg },
+   599→   599→                data: { status: "failed" },
+   600→   600→              });
+   601→   601→            } catch {}
+   602→   602→          }
+   603→   603→        })();
+   604→   604→      }
+   605→   605→
+   606→   606→      // نوتیفیکیشن اصلی فعال‌سازی (دقیقاً مثل خرید موفق)
+   607→   607→      const preservedNote =
+   608→   608→        remainingDaysPreserved > 0
+   609→   609→          ? ` ${toPersianDigits(remainingDaysPreserved)} روز از اشتراک قبلی شما به اشتراک جدید اضافه شد 🎁`
+   610→   610→          : "";
+   611→   611→      const bodyText = needsBodyPhoto
+   612→   612→        ? `پلن ${planMeta.label} توسط ادمین برای شما فعال شد. برای شروع دوره ${toPersianDigits(
+   613→   613→            durationDays
+   614→   614→          )} روزه، عکس‌های بدن خود را ارسال کنید.${preservedNote}`
+   615→   615→        : `پلن ${planMeta.label} توسط ادمین برای شما فعال شد. تا ${endDate.toLocaleDateString(
+   616→   616→            "fa-IR"
+   617→   617→          )} فعال است.${preservedNote} برنامه شما در حال تولید توسط فیتاپ هوشمند است — به‌زودی آماده می‌شود.`;
+   618→   618→
+   619→   619→      await createNotification(
+   620→   620→        id,
+   621→   621→        "subscription",
+   622→   622→        needsBodyPhoto ? "پلن شما ثبت شد! ✅" : "پلن شما فعال شد! ✅",
+   623→   623→        bodyText,
+   624→   624→        "?tab=dashboard",
+   625→   625→        {
+   626→   626→          from: "admin",
+   627→   627→          action: "activate",
+   628→   628→          plan: planId,
+   629→   629→          endDate: needsBodyPhoto ? null : endDate.toISOString(),
+   630→   630→          remainingDaysPreserved,
+   631→   631→        }
+   632→   632→      );
+   633→   633→
+   634→   634→      return Response.json({
+   635→   635→        ok: true,
+   636→   636→        action: "activate",
+   637→   637→        plan: planId,
+   638→   638→        endDate: needsBodyPhoto ? null : endDate.toISOString(),
+   639→   639→        remainingDaysPreserved,
+   640→   640→        needsBodyPhoto,
+   641→   641→      });
+   642→   642→    }
+   643→   643→
+   644→   644→    // ─── اکشن ۳: تمدید (افزودن روز) ───
+   645→   645→    if (action === "extend") {
+   646→   646→      const days = Math.floor(Number(body.days));
+   647→   647→      if (!Number.isFinite(days) || days <= 0) {
+   648→   648→        return Response.json({ error: "تعداد روز باید عددی مثبت باشد." }, { status: 400 });
+   649→   649→      }
+   650→   650→      const activeSub = await db.subscription.findFirst({
+   651→   651→        where: { userId: id, status: "active" },
+   652→   652→        orderBy: { endDate: "desc" },
+   653→   653→      });
+   654→   654→      if (!activeSub || !activeSub.endDate) {
+   655→   655→        return Response.json({ error: "اشتراک فعالی برای تمدید وجود ندارد." }, { status: 400 });
+   656→   656→      }
+   657→   657→      const newEndDate = new Date(activeSub.endDate.getTime() + days * 24 * 60 * 60 * 1000);
+   658→   658→      await db.subscription.update({
+   659→   659→        where: { id: activeSub.id },
+   660→   660→        data: { endDate: newEndDate },
+   661→   661→      });
+   662→   662→      await db.user.update({
+   663→   663→        where: { id },
+   664→   664→        data: { planExpiresAt: newEndDate },
+   665→   665→      });
+   666→   666→      await createNotification(
+   667→   667→        id,
+   668→   668→        "subscription",
+   669→   669→        `اشتراک شما ${days} روز تمدید شد 🎁`,
+   670→   670→        `اشتراک ${activeSub.plan} شما ${days} روز توسط ادمین تمدید شد. تاریخ انقضای جدید: ${newEndDate.toLocaleDateString("fa-IR")}.`,
+   671→   671→        "?tab=dashboard",
+   672→   672→        { from: "admin", action: "extend", days, newEndDate: newEndDate.toISOString() }
+   673→   673→      );
+   674→   674→      return Response.json({
+   675→   675→        ok: true,
+   676→   676→        action: "extend",
+   677→   677→        days,
+   678→   678→        newEndDate: newEndDate.toISOString(),
+   679→   679→      });
+   680→   680→    }
+   681→   681→
+   682→   682→    // ─── اکشن ۴: کاهش (کم کردن روز) ───
+   683→   683→    if (action === "reduce") {
+   684→   684→      const days = Math.floor(Number(body.days));
+   685→   685→      if (!Number.isFinite(days) || days <= 0) {
+   686→   686→        return Response.json({ error: "تعداد روز باید عددی مثبت باشد." }, { status: 400 });
+   687→   687→      }
+   688→   688→      const activeSub = await db.subscription.findFirst({
+   689→   689→        where: { userId: id, status: "active" },
+   690→   690→        orderBy: { endDate: "desc" },
+   691→   691→      });
+   692→   692→      if (!activeSub || !activeSub.endDate) {
+   693→   693→        return Response.json({ error: "اشتراک فعالی برای کاهش وجود ندارد." }, { status: 400 });
+   694→   694→      }
+   695→   695→      const newEndDate = new Date(activeSub.endDate.getTime() - days * 24 * 60 * 60 * 1000);
+   696→   696→      // اگر تاریخ جدید به قبل از الان رسید، اشتراک را expire کن
+   697→   697→      if (newEndDate.getTime() <= now.getTime()) {
+   698→   698→        await db.subscription.update({
+   699→   699→          where: { id: activeSub.id },
+   700→   700→          data: { status: "expired", endDate: now },
+   701→   701→        });
+   702→   702→        await db.user.update({
+   703→   703→          where: { id },
+   704→   704→          data: { planExpiresAt: now, planName: null },
+   705→   705→        });
+   706→   706→        await createNotification(
+   707→   707→          id,
+   708→   708→          "system",
+   709→   709→          "اشتراک شما توسط ادمین کوتاه شد ⚠️",
+   710→   710→          `اشتراک شما ${days} روز کوتاه شد و چون زمان باقی‌مانده کمتر بود، منقضی شد.`,
+   711→   711→          "?tab=plans",
+   712→   712→          { from: "admin", action: "reduce", days, expired: true }
+   713→   713→        );
+   714→   714→        return Response.json({
+   715→   715→          ok: true,
+   716→   716→          action: "reduce",
+   717→   717→          days,
+   718→   718→          expired: true,
+   719→   719→        });
+   720→   720→      }
+   721→   721→      await db.subscription.update({
+   722→   722→        where: { id: activeSub.id },
+   723→   723→        data: { endDate: newEndDate },
+   724→   724→      });
+   725→   725→      await db.user.update({
+   726→   726→        where: { id },
+   727→   727→        data: { planExpiresAt: newEndDate },
+   728→   728→      });
+   729→   729→      await createNotification(
+   730→   730→        id,
+   731→   731→        "system",
+   732→   732→        `اشتراک شما ${days} روز کوتاه شد ⚠️`,
+   733→   733→        `اشتراک ${activeSub.plan} شما ${days} روز توسط ادمین کوتاه شد. تاریخ انقضای جدید: ${newEndDate.toLocaleDateString("fa-IR")}.`,
+   734→   734→        "?tab=dashboard",
+   735→   735→        { from: "admin", action: "reduce", days, newEndDate: newEndDate.toISOString() }
+   736→   736→      );
+   737→   737→      return Response.json({
+   738→   738→        ok: true,
+   739→   739→        action: "reduce",
+   740→   740→        days,
+   741→   741→        newEndDate: newEndDate.toISOString(),
+   742→   742→      });
+   743→   743→    }
+   744→   744→
+   745→   745→    // ─── اکشن ۵: فعال‌سازی پلن برای مدت مشخص ───
+   746→   746→    if (action === "activate_days") {
+   747→   747→      const planId = body.plan;
+   748→   748→      if (!planId || !VALID_PLANS.includes(planId)) {
+   749→   749→        return Response.json({ error: "پلن نامعتبر است." }, { status: 400 });
+   750→   750→      }
+   751→   751→      const days = Math.floor(Number(body.days));
+   752→   752→      if (!Number.isFinite(days) || days <= 0) {
+   753→   753→        return Response.json({ error: "تعداد روز باید عددی مثبت باشد." }, { status: 400 });
+   754→   754→      }
+   755→   755→      const planMeta = SUBSCRIPTION_PLANS.find((p) => p.id === planId);
+   756→   756→
+   757→   757→      // غیرفعال‌سازی اشتراک‌های قبلی
+   758→   758→      await db.subscription.updateMany({
+   759→   759→        where: { userId: id, status: "active" },
+   760→   760→        data: { status: "expired" },
+   761→   761→      });
+   762→   762→      await db.subscription.updateMany({
+   763→   763→        where: { userId: id, status: "pending" },
+   764→   764→        data: { status: "cancelled" },
+   765→   765→      });
+   766→   766→
+   767→   767→      const endDate = new Date();
+   768→   768→      endDate.setDate(endDate.getDate() + days);
+   769→   769→
+   770→   770→      await db.subscription.create({
+   771→   771→        data: {
+   772→   772→          userId: id,
+   773→   773→          plan: planId,
+   774→   774→          status: "active",
+   775→   775→          startDate: now,
+   776→   776→          endDate,
+   777→   777→          durationDays: days,
+   778→   778→          pricePaid: 0,
+   779→   779→          discountCode: null,
+   780→   780→        },
+   781→   781→      });
+   782→   782→      await db.user.update({
+   783→   783→        where: { id },
+   784→   784→        data: {
+   785→   785→          planName: planId,
+   786→   786→          planStartedAt: now,
+   787→   787→          planExpiresAt: endDate,
+   788→   788→        },
+   789→   789→      });
+   790→   790→      await db.programRequest.create({
+   791→   791→        data: {
+   792→   792→          userId: id,
+   793→   793→          plan: planId,
+   794→   794→          billingPeriod: "monthly",
+   795→   795→          status: "generating",
+   796→   796→        },
+   797→   797→      });
+   798→   798→      await createNotification(
+   799→   799→        id,
+   800→   800→        "subscription",
+   801→   801→        `پلن ${planMeta?.label ?? planId} برای ${days} روز فعال شد ✅`,
+   802→   802→        `پلن ${planMeta?.label ?? planId} توسط ادمین برای ${days} روز فعال شد. تا ${endDate.toLocaleDateString("fa-IR")} فعال است.`,
+   803→   803→        "?tab=dashboard",
+   804→   804→        { from: "admin", action: "activate_days", plan: planId, days, endDate: endDate.toISOString() }
+   805→   805→      );
+   806→   806→      return Response.json({
+   807→   807→        ok: true,
+   808→   808→        action: "activate_days",
+   809→   809→        plan: planId,
+   810→   810→        days,
+   811→   811→        endDate: endDate.toISOString(),
+   812→   812→      });
+   813→   813→    }
+   814→   814→
+   815→   815→    return Response.json({ error: "اکشن نامعتبر است." }, { status: 400 });
+   816→   816→  } catch (e) {
+   817→   817→    return apiError(e);
+   818→   818→  }
+   819→   819→}
+   820→   820→

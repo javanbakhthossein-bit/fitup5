@@ -1,0 +1,1064 @@
+     1→import OpenAI from "openai";
+     2→import { db } from "@/lib/db";
+     3→import type {
+     4→  OnboardingData,
+     5→  WorkoutPlanContent,
+     6→  MealPlanContent,
+     7→  Plan,
+     8→} from "./types";
+     9→import { GOAL_LABELS, ACTIVITY_LABELS, GENDER_LABELS, WORKOUT_PLACE_LABELS, DIET_LABELS, PERSIAN_WEEKDAYS, PLAN_LABELS, getCapabilities, TRAINING_EXPERIENCE_LABELS } from "./types";
+    10→import { bloodTestPromptSummary } from "./blood-tests";
+    11→
+    12→// AvalAI OpenAI-compatible client singleton
+    13→export const avalaiClient = new OpenAI({
+    14→  apiKey: process.env.AVALAI_API_KEY,
+    15→  baseURL: process.env.AVALAI_BASE_URL || "https://api.avalai.ir/v1",
+    16→});
+    17→
+    18→export const TEXT_MODEL = process.env.AVALAI_TEXT_MODEL || "deepseek-v4-flash";
+    19→export const VISION_MODEL = process.env.AVALAI_VISION_MODEL || "gemini-3.5-flash";
+    20→
+    21→// Get AI config from DB (admin-configurable system prompts)
+    22→export async function getAiConfig(key: string, fallback: string): Promise<string> {
+    23→  const cfg = await db.aiConfig.findUnique({ where: { key } });
+    24→  return cfg?.value || fallback;
+    25→}
+    26→
+    27→// Default system prompts (used if admin hasn't configured)
+    28→export const DEFAULT_COACH_PROMPT = `تو مربی هوشمند فیتاپ هستی — یک مربی متخصص و تمام‌عیار ورزشی، رژیدرمانی و مکمل‌ها. کاملاً به زبان فارسی و با لحنی حرفه‌ای، علمی، جدی و انگیزشی پاسخ می‌دهی. تو به تمام داده‌های آنبوردینگ ورزشکار (سن، قد، وزن، هدف، سطح فعالیت، آسیب‌دیدگی‌ها، رژیم غذایی، آلرژی‌ها، آزمایش خون) دسترسی کامل داری و بر اساس آن‌ها صحبت می‌کنی. قابلیت‌های تو: ارائه برنامه‌های تمرینی هفتگی، تجویز دقیق کالری و درشت‌مغذی‌ها، معرفی مکمل‌ها با دوز مصرف، و پاسخ به سوالات فنی تمرینات. همیشه نکات ایمنی را رعایت کن و در صورت نیاز هشدار پزشکی بده.
+    29→
+    30→قوانین علمی مکمل‌ها (بسیار مهم):
+    31→- مکمل‌ها باید بر اساس آخرین تحقیقات علمی و ایمن باشند.
+    32→- دوز مکمل‌ها باید در محدوده ایمن و توصیه‌شده باشد. هرگز دوز بالا تجویز نکن.
+    33→- ویتامین D: حداکثر ۱۰۰۰-۲۰۰۰ واحد بین‌المللی در روز (نه ۲۰۰۰ واحد ۳ بار در روز!). دوز بالای ویتامین D سم‌زا است.
+    34→- ویتامین D soluble در چربی است و در بدن ذخیره می‌شود — نیازی به دوز بالا نیست.
+    35→- کراتین مونوهیدرات: ۳-۵ گرم در روز (بدون فاز بارگیری ضروری نیست).
+    36→- پروتئین وی: ۲۵-۳۰ گرم در وعده (نه بیشتر از ۵۰ گرم).
+    37→- امگا ۳: ۱-۲ گرم در روز.
+    38→- مولتی‌ویتامین: ۱ قرص در روز.
+    39→- از تجویز مکمل‌های خطرناک یا هورمونی به‌شدت پرهیز کن.
+    40→- همیشه در بخش note بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."
+    41→
+    42→قوانین نکات هفته (notes):
+    43→- نکات هفته باید انگیزشی، علمی و کاربردی باشند.
+    44→- شامل ۳-۴ نکته کوتاه و جذاب درباره پیشرفت، تغذیه، استراحت و انگیزه باشد.
+    45→- از ایموجی‌های مرتبط استفاده کن (🔥💪🎯⚡).
+    46→- لحن مثبت و تشویق‌کننده داشته باش.`;
+    47→
+    48→export const DEFAULT_CHAT_PROMPT = `تو مربی هوشمند فیتاپ هستی — یک مربی متخصص و حرفه‌ای ورزشی، تغذیه و مکمل‌ها. به زبان فارسی و با لحن علمی، جدی و انگیزشی پاسخ می‌دهی. تو به تمام داده‌های آنبوردینگ ورزشکار (سن، قد، وزن، هدف، سطح فعالیت، آسیب‌دیدگی‌ها، رژیم غذایی، آلرژی‌ها) دسترسی کامل داری. قابلیت‌های تو: ارائه برنامه تمرینی هفتگی، تجویز دقیق کالری و درشت‌مغذی‌ها، معرفی مکمل‌ها با دوز مصرف، پاسخ به سوالات فنی تمرینات، راهنمایی در حالت باشگاه (Gym Mode). همیشه نکات ایمنی را رعایت کن. شعار ما: هر بدنی فیتاپ میخواد!`;
+    49→
+    50→export const DEFAULT_NUTRITION_PROMPT = `تو متخصص تغذیه و مربی هوشمند فیتاپ هستی. برنامه غذایی کاملاً شخصی‌سازی‌شده به زبان فارسی ارائه بده و درشت‌مغذی‌ها را دقیق محاسبه کن.
+    51→
+    52→قوانین علمی مکمل‌ها (بسیار مهم):
+    53→- مکمل‌ها باید بر اساس آخرین تحقیقات علمی و ایمن باشند.
+    54→- دوز مکمل‌ها باید در محدوده ایمن و توصیه‌شده باشد. هرگز دوز بالا تجویز نکن.
+    55→- ویتامین D: حداکثر ۱۰۰۰-۲۰۰۰ واحد بین‌المللی در روز. دوز بالای ویتامین D سم‌زا است.
+    56→- کراتین مونوهیدرات: ۳-۵ گرم در روز.
+    57→- پروتئین وی: ۲۵-۳۰ گرم در وعده.
+    58→- امگا ۳: ۱-۲ گرم در روز.
+    59→- مولتی‌ویتامین: ۱ قرص در روز.
+    60→- از تجویز مکمل‌های خطرناک یا هورمونی به‌شدت پرهیز کن.
+    61→- همیشه در بخش note بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."`;
+    62→
+    63→/** پرامپت نیکا — کارشناس فروش فوق‌حرفه‌ای و راهنمای کامل پلتفرم فیتاپ */
+    64→export const DEFAULT_NIKA_PROMPT = `تو «نیکا» هستی — کارشناس تخصصی فروش و راهنمای کامل پلتفرم فیتاپ. نام پلتفرم همیشه و فقط «فیتاپ» به فارسی نوشته می‌شود. هرگز کلمه FitUp یا fitup به انگلیسی ننویس.
+    65→
+    66→شخصیت تو:
+    67→- صمیمی، دوستانه، خوش‌برخورد و مشکل‌گشا
+    68→- حرفه‌ای و تخصصی — به تمام امکانات فیتاپ کاملاً مسلطی و دانش دقیق داری
+    69→- همیشه مشتاق کمک و انگیزه‌بخش
+    70→- از ایموجی‌های مناسب استفاده کن (🌟💡✨💪🔥)
+    71→- پاسخ‌هایت را کوتاه، دقیق و مفید نگه دار — حداکثر ۳-۴ پاراگراف، مستقیم به نقطه برس
+    72→
+    73→قوانین طلایی:
+    74→۱. تو به هیچ عنوان برنامه تمرینی یا رژیم غذایی شخصی تجویز نمی‌کنی. این کار مخصوص «فیتاپ هوشمند» (مربی هوشمند داخل پنل کاربر) است. اگر کاربر برنامه اختصاصی خواست، او را به خرید پلن پیشرفته یا حرفه‌ای راهنمایی کن.
+    75→۲. هرگز هیچ کد تخفیفی به کاربر ارائه نده. اگر کاربر درباره تخفیف پرسید، بگو: «تخفیف‌های ویژه به صورت خودکار در حساب کاربری شما اعمال می‌شوند، نیازی به کد ندارید.»
+    76→۳. هرگز قابلیت یا امکانی که در فیتاپ وجود ندارد را نساز. فقط درباره امکانات واقعی زیر صحبت کن.
+    77→۴. درباره هر پلن، قیمت و امکانات دقیق را بگو — از کلی‌گویی و حرف بازاریابی خالی پرهیز کن. تفاوت‌ها را مشخص کن.
+    78→۵. هرگز URL یا آدرس اینترنتی به کاربر نده — به جای آن از فرمت لینک درون‌برنامه‌ای زیر استفاده کن.
+    79→
+    80→📌 لینک‌دهی درون‌برنامه‌ای (بسیار مهم — همیشه این کار را بکن):
+    81→وقتی می‌خواهی کاربر را به بخشی از فیتاپ راهنمایی کنی، حتماً و فقط از این فرمت استفاده کن:
+    82→[متن لینک](action:screen_name)
+    83→screen_name فقط و فقط یکی از این مقادیر مجاز است:
+    84→- landing → صفحه اصلی فیتاپ
+    85→- auth → ثبت‌نام یا ورود کاربر
+    86→- tool-tdee → محاسبه‌گر کالری و TDEE
+    87→- tool-exercises → بانک حرکات ورزشی
+    88→- tool-foods → جدول کالری غذاها
+    89→- articles → مقالات ورزشی فیتاپ
+    90→- plans → مشاهده و خرید پلن‌ها (Overlay اشتراک)
+    91→
+    92→مثال درست: «می‌تونی [محاسبه کالری روزانه](action:tool-tdee) رو امتحان کنی.»
+    93→مثال درست: «برای دیدن پلن‌ها روی [مشاهده پلن‌ها](action:plans) کلیک کن.»
+    94→مثال غلط: «برو به آدرس fitap.ir/plans» (هیچ URL خارجی نده!)
+    95→مثال غلط: «برو به صفحه محاسبه کالری» (بدون فرمت لینک، کلیک نمی‌شود!)
+    96→
+    97→━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    98→دانش کامل تو درباره پلتفرم فیتاپ
+    99→━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   100→
+   101→🔹 ۴ پلن اشتراک (همه ۴۵ روزه، شامل ۱ فاز تمرینی کامل):
+   102→
+   103→۱) پلن اقتصادی — ۳۵۰,۰۰۰ تومان
+   104→   ✓ آنالیز پروفایل ورزشکار
+   105→   ✓ برنامه تمرینی هفتگی شخصی‌سازی‌شده
+   106→   ✓ برنامه تغذیه روزانه با ترکیب وعده و جایگزین‌ها
+   107→   ✓ پیگیری وزن
+   108→   ✗ بدون چت با مربی هوشمند
+   109→   ✗ بدون برنامه مکمل
+   110→   مناسب: کسی که برنامه پایه می‌خواهد و خودش مدیریت می‌کند.
+   111→
+   112→۲) پلن استاندارد — ۸۰۰,۰۰۰ تومان
+   113→   ✓ همه امکانات پلن اقتصادی
+   114→   ✓ برنامه مکمل ورزشی با دوز ایمن و علمی
+   115→   ✓ ۳ چکاپ دوره‌ای (هر ۱۵ روز)
+   116→   ✓ داشبورد پیشرفته با نمودار
+   117→   ✗ بدون چت با مربی هوشمند
+   118→   مناسب: ورزشکار جدی که مکمل و چکاپ دوره‌ای هم می‌خواهد.
+   119→
+   120→۳) پلن پیشرفته — ۱,۲۰۰,۰۰۰ تومان (پیشنهاد ویژه 🔥)
+   121→   ✓ همه امکانات پلن استاندارد
+   122→   ✓ چت بی‌نهایت با «فیتاپ هوشمند» (مربی AI ۲۴/۷)
+   123→   ✓ آنالیز عکس غذا (عکس بگیر، کالری و درشت‌مغذی‌ها را بگو)
+   124→   ✓ آنالیز عکس بدن (پیگیری پیشرفت ظاهری)
+   125→   ✓ حالت باشگاه (Gym Mode) با تایمر استراحت و ثبت ست
+   126→   ✓ دستیار تغذیه با ترکیب وعده و غذاهای جایگزین
+   127→   ✓ کتابخانه ویدیو حرکات
+   128→   مناسب: کسی که مربی همیشه در دسترس می‌خواهد.
+   129→
+   130→۴) پلن حرفه‌ای — ۱,۸۰۰,۰۰۰ تومان (کامل‌ترین 🏆)
+   131→   ✓ همه امکانات پلن پیشرفته
+   132→   ✓ ارسال ویدیو تمرین + آنالیز ویدیویی بدن توسط AI
+   133→   ✓ اصلاح تکنیک حرکات
+   134→   ✓ تحلیل آزمایش خون (عکس آزمایش بگیر، تحلیل کن)
+   135→   ✓ نظارت مربی انسانی
+   136→   مناسب: ورزشکار حرفه‌ای که کامل‌ترین همراهی می‌خواهد.
+   137→
+   138→→ برای مشاهده و خرید پلن‌ها همیشه از: [مشاهده پلن‌ها](action:plans)
+   139→→ برای ثبت‌نام کاربر جدید: [ورود/ثبت‌نام](action:auth)
+   140→
+   141→🔹 ابزارهای رایگان فیتاپ (بدون نیاز به اشتراک):
+   142→• [محاسبه‌گر کالری و TDEE](action:tool-tdee) — محاسبه دقیق BMR، TDEE و کالری هدف بر اساس سن، جنسیت، وزن، قد و سطح فعالیت.
+   143→• [بانک حرکات ورزشی](action:tool-exercises) — لیست کامل حرکات با توضیح نحوه انجام، نکات ایمنی، عضله هدف و سطح دشواری.
+   144→• [جدول کالری غذاها](action:tool-foods) — شاخص کالری، پروتئین، کربوهیدرات و چربی صدها غذا ایرانی و بین‌المللی.
+   145→
+   146→🔹 بخش مقالات ورزشی:
+   147→کاربران می‌توانند [مقالات تخصصی فیتاپ](action:articles) را بخوانند — راهنماهای جامع درباره برنامه بدنسازی، برنامه تغذیه، مکمل‌های ورزشی، کاهش وزن و عضله‌سازی. کاملاً رایگان و بدون نیاز به ثبت‌نام.
+   148→
+   149→🔹 قابلیت‌های پیشرفته داخل پنل کاربر (نیازمند پلن پیشرفته یا حرفه‌ای):
+   150→• مربی هوشمند: چت ۲۴/۷ با AI که به داده‌های آنبوردینگ شما دسترسی دارد و به سوالات تخصصی تمرین و تغذیه پاسخ می‌دهد.
+   151→• حالت باشگاه (Gym Mode): تایمر استراحت بین ست‌ها، ثبت وزنه و تکرار، و موسیقی انگیزشی.
+   152→• تحلیل عکس غذا: عکس غذای خود را بگیرید، هوش مصنوعی کالری و درشت‌مغذی‌ها را محاسبه می‌کند.
+   153→• تحلیل عکس بدن: عکس پیشرفت بگیرید و تغییرات ظاهری را پیگیری کنید.
+   154→• تحلیل ویدیویی بدن (مخصوص پلن حرفه‌ای): ویدیو تمرین بفرستید، فرم حرکت اصلاح می‌شود.
+   155→• تحلیل آزمایش خون (مخصوص پلن حرفه‌ای): عکس آزمایش خون بگیرید، تحلیل تخصصی دریافت کنید.
+   156→
+   157→وقتی کاربر سوال تخصصی تمرین یا تغذیه می‌پرسد، تو فقط اطلاعات کلی و علمی می‌دهی و او را به [مشاهده پلن‌ها](action:plans) دعوت می‌کنی تا از مربی هوشمند استفاده کند.
+   158→
+   159→شعار ما: هر بدنی فیتاپ میخواد! 🌟`;
+   160→
+   161→
+   162→// Build user context string from onboarding + plan tier
+   163→export function buildUserContext(data: OnboardingData, planName?: Plan | null): string {
+   164→  const bmr =
+   165→    data.gender === "male"
+   166→      ? 10 * data.weight + 6.25 * data.height - 5 * data.age + 5
+   167→      : 10 * data.weight + 6.25 * data.height - 5 * data.age - 161;
+   168→  const caps = getCapabilities(planName ?? null);
+   169→  const planLabel = planName ? PLAN_LABELS[planName] : "بدون پلن (Basic)";
+   170→  return `اطلاعات کاربر:
+   171→- جنسیت: ${GENDER_LABELS[data.gender]}
+   172→- سن: ${data.age} سال
+   173→- قد: ${data.height} سانتی‌متر
+   174→- وزن: ${data.weight} کیلوگرم
+   175→- وزن هدف: ${data.targetWeight ?? "نامشخص"} کیلوگرم
+   176→- هدف اصلی: ${GOAL_LABELS[data.goal]}
+   177→- سطح فعالیت: ${ACTIVITY_LABELS[data.activityLevel]}
+   178→- روزهای تمرین در هفته: ${data.workoutDays} روز${data.workoutDaysList && data.workoutDaysList.length > 0 ? ` (${data.workoutDaysList.join("، ")})` : ""}
+   179→- مکان تمرین: ${WORKOUT_PLACE_LABELS[data.workoutPlace]}
+   180→- تجهیزات: ${data.equipment.length ? data.equipment.join("، ") : "بدون تجهیزات خاص"}
+   181→- سوابق بیماری: ${data.diseases || "ندارد"}
+   182→- آسیب‌دیدگی مفصلی/عضلانی: ${data.injuries || "ندارد"}
+   183→- حساسیت غذایی: ${data.allergies || "ندارد"}
+   184→- نوع رژیم غذایی: ${DIET_LABELS[data.dietType]}
+   185→${data.trainingExperience ? `- سابقه ورزشی: ${TRAINING_EXPERIENCE_LABELS[data.trainingExperience]}` : ""}
+   186→${data.previousTrainingType ? `- نوع تمرین قبلی: ${data.previousTrainingType}` : ""}
+   187→${data.drugAllergies ? `- آلرژی‌های دارویی: ${data.drugAllergies}` : ""}
+   188→${data.currentMedications ? `- داروهای مصرفی: ${data.currentMedications}` : ""}
+   189→${data.maxLifts ? `- حداکثر وزنه‌ها: ${data.maxLifts}` : ""}
+   190→- BMR تخمینی: ${Math.round(bmr)} کالری
+   191→- پلن اشتراک کاربر: ${planLabel}
+   192→- قابلیت‌های فعال: ${[
+   193→    caps.workoutAndNutritionPlan ? "برنامه تمرین+تغذیه" : null,
+   194→    caps.supplementsPlan ? "برنامه مکمل" : null,
+   195→    caps.periodicCheckups ? "چکاپ دوره‌ای" : null,
+   196→    caps.aiChatQuestions !== 0 ? "چت هوشمند" : null,
+   197→    caps.mealPhotoAnalysis ? "آنالیز عکس غذا" : null,
+   198→    caps.bodyPhotoAnalysis ? "آنالیز عکس بدن" : null,
+   199→    caps.videoBodyAnalysis ? "آنالیز ویدیویی بدن" : null,
+   200→    caps.techniqueCorrection ? "اصلاح تکنیک" : null,
+   201→    caps.bloodTestAnalysis ? "تحلیل آزمایش خون" : null,
+   202→  ].filter(Boolean).join("، ")}`;
+   203→}
+   204→
+   205→/**
+   206→ * ساخت بلوک پرامپت مخصوص پلن کاربر.
+   207→ * بر اساس سطح پلن، سطح جزئیات و دامنه برنامه را تعیین می‌کند.
+   208→ * - Basic: فقط برنامه تمرین + تغذیه
+   209→ * - Standard+: اضافه‌کردن برنامه مکمل‌ها
+   210→ * - Ultimate: تزریق متغیرهای آزمایش خون و آنالیز ویدیویی
+   211→ */
+   212→export function buildPlanAwareInstructions(planName?: Plan | null, extras?: { bloodTestReport?: string; videoAnalysisResult?: string; bodyPhotoAnalysis?: string }): string {
+   213→  const caps = getCapabilities(planName ?? null);
+   214→  const instructions: string[] = [];
+   215→
+   216→  if (caps.supplementsPlan) {
+   217→    instructions.push(
+   218→      "برنامه مکمل‌های ورزشی: یک بخش «supplements» در JSON اضافه کن شامل مکمل‌های پیشنهادی با دوز ایمن و علمی. فقط مکمل‌های زیر مجاز هستند:\n" +
+   219→      "• کراتین مونوهیدرات: ۳-۵ گرم در روز (هر روز)\n" +
+   220→      "• پروتئین وی: ۲۵-۳۰ گرم در وعده (بعد تمرین)\n" +
+   221→      "• امگا ۳ (روغن ماهی): ۱-۲ گرم در روز\n" +
+   222→      "• مولتی‌ویتامین: ۱ قرص در روز\n" +
+   223→      "• ویتامین D3: ۱۰۰۰-۲۰۰۰ واحد در روز (نه بیشتر!)\n" +
+   224→      "• ال-گلوتامین: ۵ گرم در روز\n" +
+   225→      "هرگز دوز بالاتر از این مقادیر تجویز نکن. در بخش note هر مکمل بنویس: «قبل از شروع با پزشک مشورت کنید.»"
+   226→    );
+   227→  }
+   228→
+   229→  // آنالیز عکس بدن — برای کاربران Advanced / Ultimate که عکس بدن ارسال کرده‌اند.
+   230→  // نیازی به capability gate نیست: اگر extras.bodyPhotoAnalysis وجود دارد، یعنی کاربر
+   231→  // قبلاً از طریق submit-body-analysis عکس‌هایش را ارسال کرده و قابلیت bodyPhotoAnalysis
+   232→  // توسط requirePlanCapability تأیید شده است.
+   233→  if (extras?.bodyPhotoAnalysis) {
+   234→    instructions.push(
+   235→      `آنالیز عکس‌های بدن کاربر (توسط هوش مصنوعی بررسی شده):\n${extras.bodyPhotoAnalysis}\nاین اطلاعات را در طراحی برنامه لحاظ کن — نقاط ضعف فرم بدن، عدم تقارن، و حرکات اصلاحی پیشنهاد بده. تمرینات را بر اساس نقاط ضعف شناسایی‌شده اولویت‌بندی کن. اگر عدم تقارن عضلانی (مثلاً بین بازوی چپ و راست) دیده شد، تمرینات یک‌طرفه (unilateral) را در برنامه بگنجان.`
+   236→    );
+   237→  }
+   238→
+   239→  if (caps.videoBodyAnalysis && extras?.videoAnalysisResult) {
+   240→    instructions.push(
+   241→      `آنالیز ویدیویی بدن کاربر (توسط هوش مصنوعی بررسی شده):\n${extras.videoAnalysisResult}\nاین اطلاعات را در طراحی برنامه لحاظ کن — نقاط ضعف فرم بدن، عدم تقارن، و حرکات اصلاحی پیشنهاد بده.`
+   242→    );
+   243→  }
+   244→
+   245→  if (caps.bloodTestAnalysis && extras?.bloodTestReport) {
+   246→    instructions.push(
+   247→      `گزارش آزمایش خون کاربر:\n${extras.bloodTestReport}\nبرنامه تغذیه را بر اساس کمبودهای ویتامینی، سطح قند، چربی خون و هورمون‌ها بهینه‌سازی کن. در صورت کمبود، غذاهای غنی از آن ویتامین/ماده معدنی را اولویت بده. هشدارهای پزشکی لازم را در بخش notes بیاور.`
+   248→    );
+   249→  }
+   250→
+   251→  return instructions.length
+   252→    ? `\n\nدستورالعمل‌های ویژه پلن ${planName ? PLAN_LABELS[planName] : ""}:\n${instructions.map((i, idx) => `${idx + 1}. ${i}`).join("\n")}`
+   253→    : "";
+   254→}
+   255→
+   256→// Generate a weekly workout plan via AI
+   257→export async function generateWorkoutPlan(
+   258→  data: OnboardingData,
+   259→  planName?: Plan | null,
+   260→  extras?: { bloodTestReport?: string; videoAnalysisResult?: string; bodyPhotoAnalysis?: string }
+   261→): Promise<WorkoutPlanContent> {
+   262→  const systemPrompt = await getAiConfig("coach_system_prompt", DEFAULT_COACH_PROMPT);
+   263→  const context = buildUserContext(data, planName);
+   264→  const planInstructions = buildPlanAwareInstructions(planName, extras);
+   265→
+   266→  // Use user-selected specific weekdays if provided; otherwise fallback to first N days
+   267→  const chosenDays =
+   268→    data.workoutDaysList && data.workoutDaysList.length > 0
+   269→      ? data.workoutDaysList
+   270→      : PERSIAN_WEEKDAYS.slice(0, data.workoutDays);
+   271→
+   272→  // --- Fetch exercise names from the library so AI only uses real exercises ---
+   273→  let libraryNames: string[] = [];
+   274→  try {
+   275→    const all = await db.exerciseLibrary.findMany({ select: { name: true, muscle: true } });
+   276→    libraryNames = all.map((e: any) => e.name);
+   277→  } catch (e) {
+   278→    console.error("[generateWorkoutPlan] failed to load exercise library:", e);
+   279→  }
+   280→  const libraryList = libraryNames.length > 0
+   281→    ? `\n\nکتابخانه حرکات موجود (فقط از بین این حرکات انتخاب کن):\n${libraryNames.map((n, i) => `${i + 1}. ${n}`).join("\n")}\n`
+   282→    : "";
+   283→
+   284→  const userPrompt = `بر اساس اطلاعات زیر، یک برنامه تمرینی هفتگی کامل و شخصی‌سازی‌شده بساز.
+   285→
+   286→${context}
+   287→${planInstructions}
+   288→${libraryList}
+   289→
+   290→روزهای تمرین کاربر: ${chosenDays.join("، ")}
+   291→
+   292→فقط و فقط با ساختار JSON زیر پاسخ بده و هیچ متن اضافه‌ای قبل یا بعد از JSON ننویس:
+   293→{
+   294→  "days": [
+   295→    {
+   296→      "day": "شنبه",
+   297→      "title": "عنوان روز تمرین",
+   298→      "focus": "عضله هدف",
+   299→      "estimatedMinutes": 60,
+   300→      "exercises": [
+   301→        {
+   302→          "name": "نام حرکت (حتماً از کتابخانه حرکات بالا)",
+   303→          "muscle": "عضله هدف",
+   304→          "category": "push|pull|legs|core|cardio|fullbody",
+   305→          "description": "توضیح نحوه انجام (۲-۳ جمله کامل و واضح)",
+   306→          "tips": "نکته ایمنی و تکنیک",
+   307→          "difficulty": "beginner|intermediate|advanced",
+   308→          "sets": [
+   309→            {"setNumber": 1, "reps": "10-12", "restSec": 90},
+   310→            {"setNumber": 2, "reps": "10-12", "restSec": 90}
+   311→          ],
+   312→          "supersetGroup": "A",
+   313→          "supersetType": "superset"
+   314→        }
+   315→      ]
+   316→    }
+   317→  ],
+   318→  "weeklyGoal": "هدف هفته",
+   319→  "notes": "نکات کلی هفته"
+   320→}
+   321→
+   322→قوانین مهم:
+   323→- دقیقاً ${data.workoutDays} روز تمرین در روزهای ذکر شده (${chosenDays.join("، ")}) ایجاد کن.
+   324→- هر روز ۴ تا ۶ حرکت داشته باشد.
+   325→- **حتماً فقط از حرکات کتابخانه حرکات بالا استفاده کن** — نام حرکات را دقیقاً همان‌طور بنویس.
+   326→- اگر آسیب‌دیدگی وجود دارد، حرکات جایگزین ایمن پیشنهاد بده.
+   327→- برای تمرین در خانه، از حرکات با وزن بدن یا تجهیزات موجود استفاده کن.
+   328→- تعداد ست‌ها بین ۳ تا ۵ باشد.
+   329→- **سوپرست و تری‌ست**: برای افزایش شدت تمرین، در حداقل ۲ روز از هفته از سوپرست (۲ حرکت پشت سر هم بدون استراحت) یا تری‌ست (۳ حرکت) استفاده کن. برای حرکات سوپرست، فیلد "supersetGroup" را با یک حرف یکسان (مثل "A" یا "B") پر کن و "supersetType" را "superset" یا "triset" بگذار. حرکتی که سوپرست نیست، این فیلدها را خالی بگذار.
+   330→- برای هر حرکت، توضیح کامل و واضح بنویس که کاربر بتواند حرکت را درست انجام دهد.
+   331→- **نکات هفته (notes)**: این بخش را انگیزشی و جذاب بنویس. شامل ۳-۴ نکته کوتاه با ایموجی باشد. مثال: "🔥 این هفته روی فرم حرکات تمرکز کن — کیفیت مهم‌تر از کمیت است!\n💪 پروتئین کافی بخور تا ریکاوری بهتر شود.\n🎯 هدف هفته: افزایش وزنه در اسکوات!\n⚡ استراحت بین ست‌ها را رعایت کن — عضله در استراحت رشد می‌کند."`;
+   332→
+   333→  let content: string;
+   334→  try {
+   335→    const completion = await avalaiClient.chat.completions.create({
+   336→      model: TEXT_MODEL,
+   337→      messages: [
+   338→        { role: "system", content: systemPrompt },
+   339→        { role: "user", content: userPrompt },
+   340→      ],
+   341→    });
+   342→    content = completion.choices[0]?.message?.content || "";
+   343→  } catch (err) {
+   344→    console.error("[generateWorkoutPlan] AvalAI error:", err);
+   345→    throw new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+   346→  }
+   347→
+   348→  const parsed = parseJsonFromContent(content);
+   349→
+   350→  // Enrich exercises with IDs + superset fields
+   351→  const enriched: WorkoutPlanContent = {
+   352→    days: (parsed.days || []).map((day: any) => ({
+   353→      ...day,
+   354→      exercises: (day.exercises || []).map((ex: any, i: number) => ({
+   355→        ...ex,
+   356→        id: `ex_${Math.random().toString(36).slice(2, 9)}`,
+   357→        mediaUrl: "",
+   358→        sets: (ex.sets || []).map((s: any, j: number) => ({
+   359→          ...s,
+   360→          setNumber: j + 1,
+   361→          done: false,
+   362→          weight: undefined,
+   363→        })),
+   364→        supersetGroup: ex.supersetGroup || undefined,
+   365→        supersetType: ex.supersetType || undefined,
+   366→      })),
+   367→    })),
+   368→    weeklyGoal: parsed.weeklyGoal || "بهبود تدریجی قدرت و استقامت",
+   369→    notes: parsed.notes || "قبل از شروع حتماً ۵ تا ۱۰ دقیقه گرم کردن انجام دهید.",
+   370→    supplements: parsed.supplements || undefined,
+   371→  };
+   372→
+   373→  return enriched;
+   374→}
+   375→
+   376→// Generate a daily meal plan via AI
+   377→export async function generateMealPlan(
+   378→  data: OnboardingData,
+   379→  planName?: Plan | null,
+   380→  extras?: { bloodTestReport?: string; videoAnalysisResult?: string; bodyPhotoAnalysis?: string }
+   381→): Promise<MealPlanContent> {
+   382→  const systemPrompt = await getAiConfig(
+   383→    "nutrition_system_prompt",
+   384→    DEFAULT_NUTRITION_PROMPT
+   385→  );
+   386→  const context = buildUserContext(data, planName);
+   387→  const planInstructions = buildPlanAwareInstructions(planName, extras);
+   388→  const caps = getCapabilities(planName ?? null);
+   389→
+   390→  // Calculate target calories based on goal
+   391→  const bmr =
+   392→    data.gender === "male"
+   393→      ? 10 * data.weight + 6.25 * data.height - 5 * data.age + 5
+   394→      : 10 * data.weight + 6.25 * data.height - 5 * data.age - 161;
+   395→  const tdee = bmr * 1.4;
+   396→  let targetCal = tdee;
+   397→  if (data.goal === "fat_loss") targetCal = tdee - 400;
+   398→  if (data.goal === "muscle_gain") targetCal = tdee + 300;
+   399→
+   400→  const userPrompt = `بر اساس اطلاعات زیر، یک برنامه غذایی یک روزه کامل و شخصی‌سازی‌شده بساز.
+   401→
+   402→${context}
+   403→${planInstructions}
+   404→
+   405→کالری هدف روزانه: حدود ${Math.round(targetCal)} کالری
+   406→نوع رژیم: ${DIET_LABELS[data.dietType]}
+   407→حساسیت غذایی: ${data.allergies || "ندارد"}
+   408→
+   409→فقط و فقط با ساختار JSON زیر پاسخ بده و هیچ متن اضافه‌ای ننویس:
+   410→{
+   411→  "meals": [
+   412→    {
+   413→      "type": "breakfast",
+   414→      "label": "صبحانه",
+   415→      "combination": "تخم‌مرغ + نان سنگک + پنیر کم‌چرب",
+   416→      "items": [
+   417→        {"name": "تخم‌مرغ آب‌پز (۳ عدد)", "category": "breakfast", "calories": 210, "protein": 18, "carbs": 1, "fat": 15, "servingSize": "۳ عدد"},
+   418→        {"name": "نان سنگک", "category": "breakfast", "calories": 160, "protein": 5, "carbs": 32, "fat": 1, "servingSize": "۱ کف دست"}
+   419→      ],
+   420→      "alternatives": [
+   421→        {
+   422→          "combination": "جو دوسر + شیر + موز",
+   423→          "items": [
+   424→            {"name": "جو دوسر (۶۰ گرم)", "category": "breakfast", "calories": 230, "protein": 8, "carbs": 40, "fat": 4, "servingSize": "۶۰ گرم"},
+   425→            {"name": "شیر کم‌چرب", "category": "breakfast", "calories": 120, "protein": 8, "carbs": 12, "fat": 2, "servingSize": "۱ لیوان"},
+   426→            {"name": "موز", "category": "breakfast", "calories": 105, "protein": 1, "carbs": 27, "fat": 0, "servingSize": "۱ عدد متوسط"}
+   427→          ]
+   428→        },
+   429→        {
+   430→          "combination": "ماست یونانی + عسل + گردو",
+   431→          "items": [
+   432→            {"name": "ماست یونانی", "category": "breakfast", "calories": 150, "protein": 17, "carbs": 8, "fat": 4, "servingSize": "۲۰۰ گرم"},
+   433→            {"name": "عسل", "category": "breakfast", "calories": 65, "protein": 0, "carbs": 17, "fat": 0, "servingSize": "۱ قاشق"},
+   434→            {"name": "گردو", "category": "breakfast", "calories": 130, "protein": 3, "carbs": 3, "fat": 13, "servingSize": "۱۵ گرم"}
+   435→          ]
+   436→        }
+   437→      ]
+   438→    }
+   439→  ],
+   440→  "waterLiters": 2.5,
+   441→  "notes": "نکات تغذیه‌ای"${caps.supplementsPlan ? `,
+   442→  "supplements": [
+   443→    {"name": "نام مکمل (مثلاً کراتین مونوهیدرات)", "dose": "۵ گرم", "timing": "بعد از تمرین", "note": "نکته اختیاری"}
+   444→  ]` : ""}
+   445→}
+   446→
+   447→قوانین:
+   448→- وعده‌ها: صبحانه، ناهار، شام و یک میان‌وعده.
+   449→- درشت‌مغذی‌ها را دقیق محاسبه کن تا جمع کل به کالری هدف نزدیک شود.
+   450→- از غذاهای ایرانی و در دسترس استفاده کن.
+   451→- اگر حساسیت غذایی وجود دارد، آن را حذف کن.
+   452→- **فیلد "combination" برای هر وعده**: دقیقاً بنویس چه غذاهایی را با هم بخورد، مثلاً "تخم‌مرغ + نان سنگک + پنیر" یا "سینه مرغ گریل + برنج + سالاد".
+   453→- **فیلد "alternatives" برای هر وعده**: حداقل ۲ گزینه جایگزین بده. هر گزینه یک آبجکت با "combination" (توضیح ترکیب) و "items" (لیست غذاها با مقادیر دقیق) است. این به کاربر کمک می‌کند تنوع داشته باشد و راحت‌تر رژیم بگیرد.
+   454→- ${data.dietType === "vegetarian" ? "فقط غذاهای گیاه‌خواری." : ""}
+   455→- ${data.dietType === "vegan" ? "فقط غذاهای وگن." : ""}
+   456→- ${data.dietType === "keto" ? "رژیم کتوژنیک با کربوهیدرات پایین." : ""}${caps.supplementsPlan ? `
+   457→- بخش supplements را پر کن: حداقل ۳-۵ مکمل علمی و ضروری برای هدف کاربر (مثل پروتئین وی، کراتین، امگا۳، مولتی‌ویتامین) با دوز دقیق و زمان مصرف.` : ""}`;
+   458→
+   459→  let content: string;
+   460→  try {
+   461→    const completion = await avalaiClient.chat.completions.create({
+   462→      model: TEXT_MODEL,
+   463→      messages: [
+   464→        { role: "system", content: systemPrompt },
+   465→        { role: "user", content: userPrompt },
+   466→      ],
+   467→    });
+   468→    content = completion.choices[0]?.message?.content || "";
+   469→  } catch (err) {
+   470→    console.error("[generateMealPlan] AvalAI error:", err);
+   471→    throw new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+   472→  }
+   473→
+   474→  const parsed = parseJsonFromContent(content);
+   475→
+   476→  // Calculate totals & enrich — handle main items + alternatives
+   477→  const meals = (parsed.meals || []).map((m: any) => {
+   478→    const items = (m.items || []).map((it: any, i: number) => ({
+   479→      ...it,
+   480→      id: `food_${Math.random().toString(36).slice(2, 9)}`,
+   481→      imageUrl: "",
+   482→      done: false,
+   483→    }));
+   484→    // Enrich alternatives
+   485→    const alternatives = Array.isArray(m.alternatives) ? m.alternatives.map((alt: any, ai: number) => {
+   486→      const altItems = (alt.items || []).map((it: any, i: number) => ({
+   487→        ...it,
+   488→        id: `food_alt_${ai}_${Math.random().toString(36).slice(2, 9)}`,
+   489→        imageUrl: "",
+   490→        done: false,
+   491→      }));
+   492→      return {
+   493→        combination: alt.combination || "",
+   494→        items: altItems,
+   495→        totalCalories: altItems.reduce((s: number, x: any) => s + (x.calories || 0), 0),
+   496→      };
+   497→    }) : undefined;
+   498→
+   499→    return {
+   500→      ...m,
+   501→      items,
+   502→      combination: m.combination || items.map((it: any) => it.name).join(" + "),
+   503→      alternatives,
+   504→      totalCalories: items.reduce((s: number, x: any) => s + (x.calories || 0), 0),
+   505→      totalProtein: items.reduce((s: number, x: any) => s + (x.protein || 0), 0),
+   506→      totalCarbs: items.reduce((s: number, x: any) => s + (x.carbs || 0), 0),
+   507→      totalFat: items.reduce((s: number, x: any) => s + (x.fat || 0), 0),
+   508→    };
+   509→  });
+   510→
+   511→  return {
+   512→    meals,
+   513→    totalCalories: meals.reduce((s, m) => s + m.totalCalories, 0),
+   514→    totalProtein: meals.reduce((s, m) => s + m.totalProtein, 0),
+   515→    totalCarbs: meals.reduce((s, m) => s + m.totalCarbs, 0),
+   516→    totalFat: meals.reduce((s, m) => s + m.totalFat, 0),
+   517→    waterLiters: parsed.waterLiters || 2.5,
+   518→    notes: parsed.notes || "در طول روز منظم آب بنوشید.",
+   519→    supplements: Array.isArray(parsed.supplements) && parsed.supplements.length > 0
+   520→      ? parsed.supplements.map((s: any, i: number) => ({
+   521→          name: String(s.name || `مکمل ${i + 1}`),
+   522→          dose: String(s.dose || ""),
+   523→          timing: String(s.timing || ""),
+   524→          note: s.note ? String(s.note) : undefined,
+   525→        }))
+   526→      : undefined,
+   527→  };
+   528→}
+   529→
+   530→// AI chat - streaming not needed, return full message
+   531→export async function aiChat(
+   532→  data: OnboardingData | null,
+   533→  history: { role: string; content: string }[],
+   534→  userMessage: string,
+   535→  planName?: Plan | null
+   536→): Promise<string> {
+   537→  const systemPrompt = await getAiConfig("chat_system_prompt", DEFAULT_CHAT_PROMPT);
+   538→
+   539→  const contextPart = data
+   540→    ? `\n\nاطلاعات کاربر فعلی:\n${buildUserContext(data, planName)}\n\nپاسخ‌هایت را بر اساس این اطلاعات شخصی‌سازی کن.`
+   541→    : "";
+   542→
+   543→  // محدودیت بر اساس پلن: اگر Basic/Standard، فقط پاسخ محدود به برنامه تمرین/تغذیه
+   544→  const caps = getCapabilities(planName ?? null);
+   545→  const planNote = !caps.aiChatQuestions
+   546→    ? "\n\nتوجه: این کاربر به چت کامل دسترسی ندارد و فقط پاسخ محدود درباره برنامه موجود می‌بیند. اگر سوال خارج از برنامه پرسید، به خرید پلن Advanced دعوت کن."
+   547→    : "";
+   548→
+   549→  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+   550→    { role: "system", content: systemPrompt + contextPart + planNote },
+   551→    ...history.slice(-10).map((m) => ({
+   552→      role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user",
+   553→      content: m.content,
+   554→    })),
+   555→    { role: "user", content: userMessage },
+   556→  ];
+   557→
+   558→  try {
+   559→    const completion = await avalaiClient.chat.completions.create({
+   560→      model: TEXT_MODEL,
+   561→      messages,
+   562→    });
+   563→    return completion.choices[0]?.message?.content || "متأسفم، پاسخی دریافت نشد. دوباره تلاش کنید.";
+   564→  } catch (err) {
+   565→    console.error("[aiChat] AvalAI error:", err);
+   566→    throw new Error("خطا در ارتباط با مربی هوشمند. لطفاً کمی بعد دوباره تلاش کنید.");
+   567→  }
+   568→}
+   569→
+   570→/** چت نیکا — دستیار فروش و راهنما (هیچ برنامه‌ای تجویز نمی‌کند) */
+   571→export async function nikaChat(
+   572→  history: { role: string; content: string }[],
+   573→  userMessage: string,
+   574→  userPlan: Plan | null
+   575→): Promise<string> {
+   576→  const systemPrompt = await getAiConfig("nika_system_prompt", DEFAULT_NIKA_PROMPT);
+   577→
+   578→  // اضافه کردن اطلاعات پلن کاربر برای راهنمایی هدفمند
+   579→  const planInfo = userPlan
+   580→    ? `\n\nوضعیت پلن کاربر: ${userPlan === "basic" ? "اقتصادی (بدون چت مربی)" : userPlan === "standard" ? "استاندارد (بدون چت مربی)" : userPlan === "advanced" ? "پیشرفته (چت مربی فعال)" : "حرفه‌ای (چت مربی فعال + آنالیز ویدیو/آزمایش خون + نظارت مربی فدراسیون)"}`
+   581→    : "\n\nوضعیت پلن کاربر: مهمان (بدون ثبت‌نام)";
+   582→
+   583→  const upsellHint =
+   584→    !userPlan || userPlan === "basic" || userPlan === "standard"
+   585→      ? "\n\nیادآوری: این کاربر هنوز به چت مربی هوشمند دسترسی ندارد. او را به خرید پلن پیشرفته یا حرفه‌ای ترغیب کن."
+   586→      : "";
+   587→
+   588→  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+   589→    { role: "system", content: systemPrompt + planInfo + upsellHint },
+   590→    ...history.slice(-10).map((m) => ({
+   591→      role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user",
+   592→      content: m.content,
+   593→    })),
+   594→    { role: "user", content: userMessage },
+   595→  ];
+   596→
+   597→  try {
+   598→    const completion = await avalaiClient.chat.completions.create({
+   599→      model: TEXT_MODEL,
+   600→      messages,
+   601→    });
+   602→    return completion.choices[0]?.message?.content || "متأسفم، پاسخی دریافت نشد. دوباره تلاش کنید.";
+   603→  } catch (err) {
+   604→    console.error("[nikaChat] AvalAI error:", err);
+   605→    throw new Error("خطا در ارتباط با نیکا. لطفاً کمی بعد دوباره تلاش کنید.");
+   606→  }
+   607→}
+   608→
+   609→/** چت دستیار هوشمند پنل مدیریت — تحلیل آمار، پیشنهاد استراتژی، کمک در تولید محتوا */
+   610→export async function adminCopilotChat(
+   611→  history: { role: string; content: string }[],
+   612→  userMessage: string,
+   613→  context: { totalUsers: number; totalRevenue: number; activeSubs: number; pendingPrograms: number }
+   614→): Promise<string> {
+   615→  const systemPrompt = `تو دستیار هوش مصنوعی پنل مدیریت فیتاپ هستی. یک مشاور حرفه‌ای برای مدیران سایت که در تمام مراحل مدیریت کمک می‌کنی: تحلیل آمار، پیشنهاد استراتژی، کمک در نوشتن مقالات، بهینه‌سازی محتوا، پاسخ به سوالات فنی. به زبان فارسی پاسخ بده. اطلاعات فعلی سایت: ${context.totalUsers} کاربر، ${context.activeSubs} اشتراک فعال، ${context.pendingPrograms} برنامه در انتظار، درآمد کل: ${context.totalRevenue} تومان.`;
+   616→
+   617→  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+   618→    { role: "system", content: systemPrompt },
+   619→    ...history.slice(-10).map((m) => ({ role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user", content: m.content })),
+   620→    { role: "user", content: userMessage },
+   621→  ];
+   622→
+   623→  try {
+   624→    const completion = await avalaiClient.chat.completions.create({
+   625→      model: TEXT_MODEL,
+   626→      messages,
+   627→    });
+   628→    return completion.choices[0]?.message?.content || "متأسفم، پاسخی دریافت نشد.";
+   629→  } catch (err) {
+   630→    console.error("[adminCopilotChat] AvalAI error:", err);
+   631→    throw new Error("خطا در ارتباط با دستیار هوشمند مدیریت. لطفاً کمی بعد دوباره تلاش کنید.");
+   632→  }
+   633→}
+   634→
+   635→// Swap a food with an AI-suggested equivalent
+   636→export async function swapFood(
+   637→  foodName: string,
+   638→  calories: number,
+   639→  dietType: string,
+   640→  allergies: string
+   641→): Promise<{ name: string; calories: number; protein: number; carbs: number; fat: number; servingSize: string; reason: string }> {
+   642→  const userPrompt = `یک غذای جایگزین هم‌کالری برای "${foodName}" (حدود ${calories} کالری) پیشنهاد بده.
+   643→نوع رژیم: ${dietType}
+   644→حساسیت غذایی: ${allergies || "ندارد"}
+   645→
+   646→فقط JSON:
+   647→{"name":"نام غذا","calories":250,"protein":15,"carbs":30,"fat":8,"servingSize":"۱ وعده","reason":"دلیل پیشنهاد"}`;
+   648→
+   649→  let content: string;
+   650→  try {
+   651→    const completion = await avalaiClient.chat.completions.create({
+   652→      model: TEXT_MODEL,
+   653→      messages: [
+   654→        { role: "system", content: "تو متخصص تغذیه هستی. فقط JSON معتبر برگردان." },
+   655→        { role: "user", content: userPrompt },
+   656→      ],
+   657→    });
+   658→    content = completion.choices[0]?.message?.content || "";
+   659→  } catch (err) {
+   660→    console.error("[swapFood] AvalAI error:", err);
+   661→    throw new Error("خطا در دریافت پیشنهاد جایگزین غذا. لطفاً دوباره تلاش کنید.");
+   662→  }
+   663→
+   664→  return parseJsonFromContent(content);
+   665→}
+   666→
+   667→// ============== Vision functions (Gemini 3.5 Flash via AvalAI) ==============
+   668→
+   669→/**
+   670→ * آنالیز عکس غذا — تخمین کالری و درشت‌مغذی‌ها
+   671→ * از VISION_MODEL (gemini-3.5-flash) استفاده می‌کند.
+   672→ */
+   673→export async function analyzeMealPhoto(
+   674→  base64Image: string,
+   675→  mimeType: string,
+   676→  userContext: string
+   677→): Promise<{ calories: number; protein: number; carbs: number; fat: number; description: string }> {
+   678→  const systemPrompt = "تو متخصص تغذیه هستی. عکس غذا را تحلیل کن و کالری و درشت‌مغذی‌ها را تخمین بزن. فقط JSON معتبر برگردان و هیچ متن اضافه‌ای ننویس.";
+   679→
+   680→  const userText = `این عکس غذا را تحلیل کن. ${userContext ? userContext + "\n\n" : ""}فقط با ساختار JSON زیر پاسخ بده:
+   681→{"calories": 350, "protein": 25, "carbs": 40, "fat": 12, "description": "توضیح کوتاه فارسی درباره غذا و ارزش غذایی آن"}`;
+   682→
+   683→  let content: string;
+   684→  try {
+   685→    const completion = await avalaiClient.chat.completions.create({
+   686→      model: VISION_MODEL,
+   687→      messages: [
+   688→        { role: "system", content: systemPrompt },
+   689→        {
+   690→          role: "user",
+   691→          content: [
+   692→            { type: "text", text: userText },
+   693→            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+   694→          ],
+   695→        },
+   696→      ],
+   697→    });
+   698→    content = completion.choices[0]?.message?.content || "";
+   699→  } catch (err) {
+   700→    console.error("[analyzeMealPhoto] AvalAI error:", err);
+   701→    throw new Error("خطا در آنالیز عکس غذا. لطفاً دوباره تلاش کنید.");
+   702→  }
+   703→
+   704→  const parsed = parseJsonFromContent(content);
+   705→  return {
+   706→    calories: Number(parsed.calories) || 0,
+   707→    protein: Number(parsed.protein) || 0,
+   708→    carbs: Number(parsed.carbs) || 0,
+   709→    fat: Number(parsed.fat) || 0,
+   710→    description: parsed.description || "توضیحی دریافت نشد.",
+   711→  };
+   712→}
+   713→
+   714→/**
+   715→ * آنالیز عکس بدن — ارزیابی فرم بدن و توصیه‌ها
+   716→ * از VISION_MODEL (gemini-3.5-flash) استفاده می‌کند.
+   717→ */
+   718→export async function analyzeBodyPhoto(
+   719→  base64Image: string,
+   720→  mimeType: string,
+   721→  userContext: string
+   722→): Promise<{ bodyScore: number; analysis: string; recommendations: string[] }> {
+   723→  const systemPrompt = "تو متخصص فیزیولوژی ورزشی و آنالیز فرم بدن هستی. عکس بدن ورزشکار را تحلیل کن و امتیاز فرم بدن، تحلیل و توصیه‌های تمرینی بده. فقط JSON معتبر برگردان.";
+   724→
+   725→  const userText = `این عکس بدن ورزشکار را تحلیل کن. ${userContext ? userContext + "\n\n" : ""}فقط با ساختار JSON زیر پاسخ بده:
+   726→{"bodyScore": 75, "analysis": "تحلیل فارسی درباره فرم بدن، تقارن، عضلات و نقاط ضعف/قوت", "recommendations": ["توصیه ۱", "توصیه ۲", "توصیه ۳"]}
+   727→امتیاز bodyScore بین ۰ تا ۱۰۰ باشد.`;
+   728→
+   729→  let content: string;
+   730→  try {
+   731→    const completion = await avalaiClient.chat.completions.create({
+   732→      model: VISION_MODEL,
+   733→      messages: [
+   734→        { role: "system", content: systemPrompt },
+   735→        {
+   736→          role: "user",
+   737→          content: [
+   738→            { type: "text", text: userText },
+   739→            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+   740→          ],
+   741→        },
+   742→      ],
+   743→    });
+   744→    content = completion.choices[0]?.message?.content || "";
+   745→  } catch (err) {
+   746→    console.error("[analyzeBodyPhoto] AvalAI error:", err);
+   747→    throw new Error("خطا در آنالیز عکس بدن. لطفاً دوباره تلاش کنید.");
+   748→  }
+   749→
+   750→  const parsed = parseJsonFromContent(content);
+   751→  return {
+   752→    bodyScore: Number(parsed.bodyScore) || 0,
+   753→    analysis: parsed.analysis || "تحلیلی دریافت نشد.",
+   754→    recommendations: Array.isArray(parsed.recommendations)
+   755→      ? parsed.recommendations.map((r: any) => String(r))
+   756→      : [],
+   757→  };
+   758→}
+   759→
+   760→/**
+   761→ * آنالیز ویدیویی بدن — ارزیابی پوسچر، تقارن و فرم حرکات
+   762→ * از VISION_MODEL (gemini-3.5-flash) استفاده می‌کند.
+   763→ * نکته: اگر AvalAI از ویدیو base64 پشتیبانی نکرد، فریم اول به‌عنوان عکس تحلیل می‌شود.
+   764→ */
+   765→export async function analyzeVideoBody(
+   766→  base64Video: string,
+   767→  mimeType: string,
+   768→  userContext: string
+   769→): Promise<{ posture: string; symmetry: number; issues: string[]; recommendations: string[]; score: number }> {
+   770→  const systemPrompt = "تو متخصص بیومکانیک ورزشی و آنالیز ویدیویی حرکات هستی. ویدیوی ورزشکار را تحلیل کن و پوسچر، تقارن، مشکلات فرم و توصیه‌های اصلاحی بده. فقط JSON معتبر برگردان.";
+   771→
+   772→  const userText = `این ویدیوی ورزشکار را تحلیل کن. ${userContext ? userContext + "\n\n" : ""}فقط با ساختار JSON زیر پاسخ بده:
+   773→{"posture": "توصیف فارسی پوسچر کلی", "symmetry": 85, "issues": ["مشکل ۱", "مشکل ۲"], "recommendations": ["توصیه اصلاحی ۱", "توصیه اصلاحی ۲"], "score": 78}
+   774→symmetry و score بین ۰ تا ۱۰۰ باشند.`;
+   775→
+   776→  let content: string;
+   777→  try {
+   778→    const completion = await avalaiClient.chat.completions.create({
+   779→      model: VISION_MODEL,
+   780→      messages: [
+   781→        { role: "system", content: systemPrompt },
+   782→        {
+   783→          role: "user",
+   784→          content: [
+   785→            { type: "text", text: userText },
+   786→            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Video}` } },
+   787→          ],
+   788→        },
+   789→      ],
+   790→    });
+   791→    content = completion.choices[0]?.message?.content || "";
+   792→  } catch (err) {
+   793→    console.error("[analyzeVideoBody] AvalAI error:", err);
+   794→    throw new Error("خطا در آنالیز ویدیوی بدن. لطفاً دوباره تلاش کنید.");
+   795→  }
+   796→
+   797→  const parsed = parseJsonFromContent(content);
+   798→  return {
+   799→    posture: parsed.posture || "توصیفی دریافت نشد.",
+   800→    symmetry: Number(parsed.symmetry) || 0,
+   801→    issues: Array.isArray(parsed.issues) ? parsed.issues.map((i: any) => String(i)) : [],
+   802→    recommendations: Array.isArray(parsed.recommendations)
+   803→      ? parsed.recommendations.map((r: any) => String(r))
+   804→      : [],
+   805→    score: Number(parsed.score) || 0,
+   806→  };
+   807→}
+   808→
+   809→/**
+   810→ * تحلیل آزمایش خون — استخراج نشانگرها، کمبودها و توصیه‌ها
+   811→ * از VISION_MODEL (gemini-3.5-flash) استفاده می‌کند.
+   812→ *
+   813→ * پنل آزمایش شامل ۱۰ دسته کامل: CBC، چربی، کبد، کلیه، تیروئید،
+   814→ * هورمون‌ها (تستوسترون/کورتیزول/انسولین/HGH/...)، ویتامین‌ها و مواد معدنی،
+   815→ * قند خون و نشانگرهای التهاب.
+   816→ */
+   817→export async function analyzeBloodTest(
+   818→  base64Image: string,
+   819→  mimeType: string
+   820→): Promise<{
+   821→  overall: string;
+   822→  score: number;
+   823→  markers: Array<{
+   824→    key?: string;
+   825→    category?: string;
+   826→    categoryName?: string;
+   827→    name: string;
+   828→    value: string;
+   829→    unit?: string;
+   830→    status: "normal" | "low" | "high" | "borderline" | "unknown";
+   831→    reference?: string;
+   832→    explanation?: string;
+   833→  }>;
+   834→  deficiencies: string[];
+   835→  recommendations: string[];
+   836→  supplements: string[];
+   837→  warnings: string[];
+   838→}> {
+   839→  const systemPrompt =
+   840→    "تو متخصص پزشکی، تغذیه ورزشی و تحلیل آزمایش خون هستی. عکس آزمایش خون را با دقت بررسی کن، مقادیر هر نشانگر را استخراج کن، با محدوده نرمال مقایسه کن و برای ورزشکاران و بدنسازان تحلیل کن. فقط JSON معتبر برگردان.";
+   841→
+   842→  const userText = `این عکس آزمایش خون را به دقت بررسی کن. مقادیر هر تست را از روی برگه آزمایش استخراج کن و تحلیل کن.
+   843→
+   844→پنل کامل آزمایش‌های مورد انتظار (۱۰ دسته):
+   845→${bloodTestPromptSummary()}
+   846→
+   847→برای هر نشانگری که در عکس وجود دارد، یک آبجکت به markers اضافه کن. اگر تستی در عکس نبود، آن را درج نکن.
+   848→
+   849→فقط با ساختار JSON زیر پاسخ بده:
+   850→{
+   851→  "overall": "ارزیابی کلی فارسی از وضعیت سلامت ورزشکار (۲-۳ جمله)",
+   852→  "score": 75,
+   853→  "markers": [
+   854→    {
+   855→      "key": "hemoglobin",
+   856→      "category": "cbc",
+   857→      "categoryName": "آزمایش خون کامل (CBC)",
+   858→      "name": "هموگلوبین",
+   859→      "value": "۱۴.۲",
+   860→      "unit": "g/dL",
+   861→      "status": "normal",
+   862→      "reference": "۱۳-۱۷",
+   863→      "explanation": "توضیح فارسی کوتاه درباره وضعیت و معنای آن برای ورزشکار"
+   864→    }
+   865→  ],
+   866→  "deficiencies": ["کمبود ویتامین D", "کمبود آهن"],
+   867→  "recommendations": [
+   868→    "توصیه غذایی ۱ (مثلاً مصرف بیشتر گوشت قرمز)",
+   869→    "توصیه غذایی ۲"
+   870→  ],
+   871→  "supplements": [
+   872→    "مکمل توصیه‌شده ۱ (مثلاً ویتامین D3 2000 IU روزانه)",
+   873→    "مکمل توصیه‌شده ۲"
+   874→  ],
+   875→  "warnings": ["هشدار پزشکی حیاتی در صورت وجود"]
+   876→}
+   877→
+   878→قوانین:
+   879→- score عددی بین ۰ تا ۱۰۰ بر اساس سلامت کلی.
+   880→- status فقط یکی از: normal | low | high | borderline | unknown
+   881→- key باید یکی از کلیدهای تعریف‌شده در پنل بالا باشد (hemoglobin, testosterone_total, vitamin_d, ...).
+   882→- category همان id دسته است (cbc, lipid, liver, kidney, thyroid, hormones, vitamins_minerals, blood_sugar, inflammation).
+   883→- explanation حتماً فارسی و کوتاه (۱-۲ جمله) باشد و به تأثیر آن روی عملکرد ورزشکار اشاره کند.
+   884→- deficiencies شامل کمبودها و مقادیر خارج محدوده باشد.
+   885→- recommendations شامل توصیه‌های غذایی و سبک زندگی باشد.
+   886→- supplements شامل مکمل‌های پیشنهادی با دوز و زمان مصرف باشد.
+   887→- warnings شامل مواردی که نیاز به مراجعه فوری به پزشک دارند.
+   888→- اگر تستی در عکس نبود، آن را در markers درج نکن.
+   889→
+   890→هشدار مهم: این تحلیل جایگزین مشورت پزشک نیست و صرفاً جنبه راهنمایی دارد.`;
+   891→
+   892→  let content: string;
+   893→  try {
+   894→    const completion = await avalaiClient.chat.completions.create({
+   895→      model: VISION_MODEL,
+   896→      messages: [
+   897→        { role: "system", content: systemPrompt },
+   898→        {
+   899→          role: "user",
+   900→          content: [
+   901→            { type: "text", text: userText },
+   902→            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+   903→          ],
+   904→        },
+   905→      ],
+   906→    });
+   907→    content = completion.choices[0]?.message?.content || "";
+   908→  } catch (err) {
+   909→    console.error("[analyzeBloodTest] AvalAI error:", err);
+   910→    throw new Error("خطا در تحلیل آزمایش خون. لطفاً دوباره تلاش کنید.");
+   911→  }
+   912→
+   913→  const parsed = parseJsonFromContent(content);
+   914→  return {
+   915→    overall: parsed.overall || "ارزیابی‌ای دریافت نشد.",
+   916→    score: Number(parsed.score) || 0,
+   917→    markers: Array.isArray(parsed.markers) ? parsed.markers : [],
+   918→    deficiencies: Array.isArray(parsed.deficiencies) ? parsed.deficiencies.map((d: any) => String(d)) : [],
+   919→    recommendations: Array.isArray(parsed.recommendations)
+   920→      ? parsed.recommendations.map((r: any) => String(r))
+   921→      : [],
+   922→    supplements: Array.isArray(parsed.supplements)
+   923→      ? parsed.supplements.map((s: any) => String(s))
+   924→      : [],
+   925→    warnings: Array.isArray(parsed.warnings) ? parsed.warnings.map((w: any) => String(w)) : [],
+   926→  };
+   927→}
+   928→
+   929→/**
+   930→ * تحلیل چکاپ دوره‌ای بر اساس داده‌های متنی (وزن، اندازه‌ها، بازخورد).
+   931→ * این تابع بدون نیاز به عکس، با استفاده از مدل متنی، امتیاز بدن (bodyScore 0-100)،
+   932→ * تحلیل فارسی و توصیه‌های پیشرفت تولید می‌کند.
+   933→ */
+   934→export interface CheckupAnalysisInput {
+   935→  weight: number;
+   936→  bodyFatPercent?: number | null;
+   937→  leanBodyMass?: number | null;
+   938→  chestMeasurement?: number | null;
+   939→  armMeasurement?: number | null;
+   940→  waistMeasurement?: number | null;
+   941→  hipMeasurement?: number | null;
+   942→  thighMeasurement?: number | null;
+   943→  fatigueLevel: number; // 1-5
+   944→  sleepQuality: number; // 1-5
+   945→  dietAdherence: number; // 1-5
+   946→  workoutAdherence: number; // 1-5
+   947→  notes?: string;
+   948→  phaseNumber: number;
+   949→  userContext?: string; // اطلاعات آنبوردینگ و پلن کاربر
+   950→}
+   951→
+   952→export async function analyzeCheckup(
+   953→  input: CheckupAnalysisInput
+   954→): Promise<{
+   955→  bodyScore: number;
+   956→  bodyFatStatus: string;
+   957→  analysis: string;
+   958→  recommendations: string[];
+   959→  nextPhaseFocus: string;
+   960→}> {
+   961→  const systemPrompt =
+   962→    "تو مربی هوشمند و متخصص فیزیولوژی ورزشی و تغذیه فیتاپ هستی. داده‌های چکاپ دوره‌ای ورزشکار را تحلیل کن و امتیاز بدن (bodyScore 0-100)، وضعیت چربی بدن، تحلیل کلی، توصیه‌های پیشرفت و تمرکز فاز بعدی را ارائه بده. فقط JSON معتبر برگردان و هیچ متن اضافه‌ای ننویس.";
+   963→
+   964→  const parts: string[] = [
+   965→    `فاز تمرینی: ${input.phaseNumber}`,
+   966→    `وزن: ${input.weight} کیلوگرم`,
+   967→  ];
+   968→  if (input.bodyFatPercent != null) parts.push(`درصد چربی بدن (تخمینی): ${input.bodyFatPercent.toFixed(1)}٪`);
+   969→  if (input.leanBodyMass != null) parts.push(`جرم خالص بدن: ${input.leanBodyMass.toFixed(1)} کیلوگرم`);
+   970→  if (input.chestMeasurement != null) parts.push(`دور سینه: ${input.chestMeasurement} cm`);
+   971→  if (input.armMeasurement != null) parts.push(`دور بازو: ${input.armMeasurement} cm`);
+   972→  if (input.waistMeasurement != null) parts.push(`دور کمر: ${input.waistMeasurement} cm`);
+   973→  if (input.hipMeasurement != null) parts.push(`دور باسن: ${input.hipMeasurement} cm`);
+   974→  if (input.thighMeasurement != null) parts.push(`دور ران: ${input.thighMeasurement} cm`);
+   975→  parts.push(
+   976→    `خستگی (1-5): ${input.fatigueLevel}`,
+   977→    `کیفیت خواب (1-5): ${input.sleepQuality}`,
+   978→    `پیروی از رژیم (1-5): ${input.dietAdherence}`,
+   979→    `پیروی از تمرین (1-5): ${input.workoutAdherence}`
+   980→  );
+   981→  if (input.notes && input.notes.trim()) parts.push(`یادداشت ورزشکار: ${input.notes}`);
+   982→  if (input.userContext) parts.push(`\nاطلاعات ورزشکار:\n${input.userContext}`);
+   983→
+   984→  const userText = `داده‌های چکاپ دوره‌ای ورزشکار را تحلیل کن:
+   985→
+   986→${parts.join("\n")}
+   987→
+   988→فقط با ساختار JSON زیر پاسخ بده:
+   989→{
+   990→  "bodyScore": 75,
+   991→  "bodyFatStatus": "ارزیابی کوتاه فارسی درباره وضعیت چربی بدن",
+   992→  "analysis": "تحلیل کامل فارسی (۲-۳ پاراگراف): پیشرفت از فاز قبل، نقاط قوت، نقاط ضعف، وضعیت کلی بدن",
+   993→  "recommendations": ["توصیه تمرینی ۱", "توصیه تغذیه‌ای ۲", "توصیه ریکاوری ۳"],
+   994→  "nextPhaseFocus": "تمرکز اصلی فاز بعدی (یک جمله فارسی)"
+   995→}
+   996→
+   997→bodyScore بین ۰ تا ۱۰۰ بر اساس پیروی از برنامه، خستگی، خواب و پیشرفت اندازه‌ها باشد.
+   998→توصیه‌ها عملی و مشخص باشند.`;
+   999→
+  1000→  let content: string;
+  1001→  try {
+  1002→    const completion = await avalaiClient.chat.completions.create({
+  1003→      model: TEXT_MODEL,
+  1004→      messages: [
+  1005→        { role: "system", content: systemPrompt },
+  1006→        { role: "user", content: userText },
+  1007→      ],
+  1008→    });
+  1009→    content = completion.choices[0]?.message?.content || "";
+  1010→  } catch (err) {
+  1011→    console.error("[analyzeCheckup] AvalAI error:", err);
+  1012→    throw new Error("خطا در تحلیل چکاپ. لطفاً دوباره تلاش کنید.");
+  1013→  }
+  1014→
+  1015→  const parsed = parseJsonFromContent(content);
+  1016→  return {
+  1017→    bodyScore: Math.max(0, Math.min(100, Number(parsed.bodyScore) || 0)),
+  1018→    bodyFatStatus: parsed.bodyFatStatus || "ارزیابی‌ای دریافت نشد.",
+  1019→    analysis: parsed.analysis || "تحلیلی دریافت نشد.",
+  1020→    recommendations: Array.isArray(parsed.recommendations)
+  1021→      ? parsed.recommendations.map((r: any) => String(r))
+  1022→      : [],
+  1023→    nextPhaseFocus: parsed.nextPhaseFocus || "ادامه مسیر با تمرکز بر پیشرفت تدریجی.",
+  1024→  };
+  1025→}
+  1026→
+  1027→// Parse JSON from LLM content (handles markdown code fences + HTML error pages gracefully)
+  1028→function parseJsonFromContent(content: string): any {
+  1029→  if (!content || typeof content !== "string") {
+  1030→    return { days: [], meals: [], notes: "پاسخ هوش مصنوعی خالی بود." };
+  1031→  }
+  1032→
+  1033→  let cleaned = content.trim();
+  1034→
+  1035→  // Detect HTML error pages (gateway error, 502/504, AvalAI returning HTML)
+  1036→  // If the content looks like HTML and contains no JSON braces, bail out gracefully.
+  1037→  const looksLikeHtml = /^\s*<(?:html|!doctype|head|body|h1|div|p)\b/i.test(cleaned) ||
+  1038→    (cleaned.startsWith("<") && cleaned.includes("</") && !cleaned.includes("{"));
+  1039→  if (looksLikeHtml) {
+  1040→    console.error("[parseJsonFromContent] AI returned HTML (likely an error page):", cleaned.slice(0, 200));
+  1041→    return { days: [], meals: [], notes: "خطا در پاسخ هوش مصنوعی. لطفاً دوباره تلاش کنید." };
+  1042→  }
+  1043→
+  1044→  // Extract JSON from ```json ... ``` or ``` ... ```
+  1045→  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
+  1046→  if (fenceMatch) {
+  1047→    cleaned = fenceMatch[1].trim();
+  1048→  }
+  1049→
+  1050→  // Find first { and last }
+  1051→  const first = cleaned.indexOf("{");
+  1052→  const last = cleaned.lastIndexOf("}");
+  1053→  if (first !== -1 && last !== -1 && last > first) {
+  1054→    cleaned = cleaned.slice(first, last + 1);
+  1055→  }
+  1056→
+  1057→  try {
+  1058→    return JSON.parse(cleaned);
+  1059→  } catch (err) {
+  1060→    console.error("[parseJsonFromContent] JSON parse failed. Raw content:", content.slice(0, 300), err);
+  1061→    return { days: [], meals: [], notes: "خطا در پردازش پاسخ هوش مصنوعی." };
+  1062→  }
+  1063→}
+  1064→

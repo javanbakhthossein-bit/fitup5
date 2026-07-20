@@ -1,0 +1,722 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useEffect, useRef, useState } from "react";
+     4→     4→import { motion } from "framer-motion";
+     5→     5→import {
+     6→     6→  X,
+     7→     7→  TestTube,
+     8→     8→  Upload,
+     9→     9→  Loader2,
+    10→    10→  CheckCircle2,
+    11→    11→  Sparkles,
+    12→    12→  RefreshCw,
+    13→    13→  AlertTriangle,
+    14→    14→  Download,
+    15→    15→  Printer,
+    16→    16→  Pill,
+    17→    17→} from "lucide-react";
+    18→    18→import { useAppStore } from "@/lib/fitness/store";
+    19→    19→import { Button } from "@/components/ui/button";
+    20→    20→import { toPersianDigits, getCapabilities } from "@/lib/fitness/types";
+    21→    21→import {
+    22→    22→  BLOOD_TEST_CATEGORIES,
+    23→    23→  TOTAL_BLOOD_TESTS,
+    24→    24→  type BloodTestCategory,
+    25→    25→} from "@/lib/fitness/blood-tests";
+    26→    26→import { toast } from "sonner";
+    27→    27→
+    28→    28→const STATUS_COLORS: Record<string, string> = {
+    29→    29→  normal: "text-emerald-500 bg-emerald-500/10",
+    30→    30→  low: "text-amber-500 bg-amber-500/10",
+    31→    31→  high: "text-red-500 bg-red-500/10",
+    32→    32→  borderline: "text-orange-500 bg-orange-500/10",
+    33→    33→  unknown: "text-slate-500 bg-slate-500/10",
+    34→    34→};
+    35→    35→
+    36→    36→const STATUS_LABELS: Record<string, string> = {
+    37→    37→  normal: "نرمال",
+    38→    38→  low: "پایین",
+    39→    39→  high: "بالا",
+    40→    40→  borderline: "مرزی",
+    41→    41→  unknown: "نامشخص",
+    42→    42→};
+    43→    43→
+    44→    44→export function BloodTestView() {
+    45→    45→  const { setOverlay, user } = useAppStore();
+    46→    46→  const [file, setFile] = useState<File | null>(null);
+    47→    47→  const [imgUrl, setImgUrl] = useState<string>("");
+    48→    48→  const [analyzing, setAnalyzing] = useState(false);
+    49→    49→  const [result, setResult] = useState<any>(null);
+    50→    50→  const [downloading, setDownloading] = useState(false);
+    51→    51→  /** When true, the hidden printable prescription becomes visible (offscreen) for html-to-image capture. */
+    52→    52→  const [isCapturing, setIsCapturing] = useState(false);
+    53→    53→  const prescriptionRef = useRef<HTMLDivElement>(null);
+    54→    54→
+    55→    55→  // === سقف استفاده واقعی از پلن کاربر ===
+    56→    56→  const limit = getCapabilities(user?.planName ?? null).bloodTestLimit;
+    57→    57→  const usedCount = user?.bloodTestUsed ?? 0;
+    58→    58→  const limitReached = limit > 0 && usedCount >= limit;
+    59→    59→
+    60→    60→  // === بارگذاری آخرین نتیجه ذخیره‌شده در DB (تا رفرش صفحه اطلاعات را از دست ندهد) ===
+    61→    61→  useEffect(() => {
+    62→    62→    (async () => {
+    63→    63→      try {
+    64→    64→        const res = await fetch("/api/coach/analyze-blood");
+    65→    65→        const data = await res.json();
+    66→    66→        if (data?.result) {
+    67→    67→          setResult(data.result);
+    68→    68→        }
+    69→    69→      } catch {
+    70→    70→        // سکوت — خطای شبکه در بارگذاری نتیجه ذخیره‌شده نباید تجربه کاربر را خراب کند
+    71→    71→      }
+    72→    72→    })();
+    73→    73→  }, []);
+    74→    74→
+    75→    75→  function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    76→    76→    const f = e.target.files?.[0];
+    77→    77→    if (!f) return;
+    78→    78→    if (!f.type.startsWith("image/")) {
+    79→    79→      toast.error("فقط تصویر مجاز است");
+    80→    80→      return;
+    81→    81→    }
+    82→    82→    setFile(f);
+    83→    83→    setImgUrl(URL.createObjectURL(f));
+    84→    84→    setResult(null);
+    85→    85→  }
+    86→    86→
+    87→    87→  async function analyze() {
+    88→    88→    if (!file) return;
+    89→    89→    if (limitReached) {
+    90→    90→      toast.error("سقف استفاده از این قابلیت پر شده است.");
+    91→    91→      return;
+    92→    92→    }
+    93→    93→    setAnalyzing(true);
+    94→    94→    try {
+    95→    95→      const arrayBuffer = await file.arrayBuffer();
+    96→    96→      const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+    97→    97→      const res = await fetch("/api/coach/analyze-blood", {
+    98→    98→        method: "POST",
+    99→    99→        headers: { "Content-Type": "application/json" },
+   100→   100→        body: JSON.stringify({ base64Image: base64, mimeType: file.type }),
+   101→   101→      });
+   102→   102→      const data = await res.json();
+   103→   103→      if (!res.ok) throw new Error(data.error || "خطا در تحلیل آزمایش");
+   104→   104→      setResult(data);
+   105→   105→      // آپدیت فوری شمارنده استفاده در store — بدون نیاز به رفرش
+   106→   106→      useAppStore.setState((s) => ({
+   107→   107→        user: s.user ? { ...s.user, bloodTestUsed: (s.user.bloodTestUsed ?? 0) + 1 } : s.user,
+   108→   108→      }));
+   109→   109→      toast.success("آنالیز آزمایش خون کامل شد! 🩸");
+   110→   110→    } catch (e) {
+   111→   111→      toast.error(e instanceof Error ? e.message : "خطا در تحلیل");
+   112→   112→    } finally {
+   113→   113→      setAnalyzing(false);
+   114→   114→    }
+   115→   115→  }
+   116→   116→
+   117→   117→  function reset() {
+   118→   118→    if (imgUrl) URL.revokeObjectURL(imgUrl);
+   119→   119→    setFile(null);
+   120→   120→    setImgUrl("");
+   121→   121→    setResult(null);
+   122→   122→  }
+   123→   123→
+   124→   124→  /** Download the prescription as a PNG image (html-to-image).
+   125→   125→   *  We temporarily reveal the hidden printable div so html-to-image can capture its layout,
+   126→   126→   *  then hide it again. The div is positioned offscreen so it never overlaps visible content.
+   127→   127→   */
+   128→   128→  async function downloadPrescriptionImage() {
+   129→   129→    if (!prescriptionRef.current) return;
+   130→   130→    setDownloading(true);
+   131→   131→    setIsCapturing(true);
+   132→   132→    try {
+   133→   133→      // Wait two animation frames so React has flushed the display:block style.
+   134→   134→      await new Promise<void>((resolve) =>
+   135→   135→        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+   136→   136→      );
+   137→   137→      const { toPng } = await import("html-to-image");
+   138→   138→      const dataUrl = await toPng(prescriptionRef.current, {
+   139→   139→        cacheBust: true,
+   140→   140→        pixelRatio: 2,
+   141→   141→        backgroundColor: "#ffffff",
+   142→   142→        width: 800,
+   143→   143→      });
+   144→   144→      const link = document.createElement("a");
+   145→   145→      link.download = `fitap-blood-test-prescription-${Date.now()}.png`;
+   146→   146→      link.href = dataUrl;
+   147→   147→      link.click();
+   148→   148→      toast.success("فرم آزمایش دانلود شد ✓");
+   149→   149→    } catch (e) {
+   150→   150→      console.error("[downloadPrescriptionImage]", e);
+   151→   151→      toast.error("خطا در ساخت تصویر فرم آزمایش");
+   152→   152→    } finally {
+   153→   153→      setIsCapturing(false);
+   154→   154→      setDownloading(false);
+   155→   155→    }
+   156→   156→  }
+   157→   157→
+   158→   158→  /** Print the prescription (browser print dialog — user can save as PDF).
+   159→   159→   *  Reads outerHTML which works whether or not the div is visible.
+   160→   160→   */
+   161→   161→  function printPrescription() {
+   162→   162→    if (!prescriptionRef.current) return;
+   163→   163→    const html = prescriptionRef.current.outerHTML;
+   164→   164→    const win = window.open("", "_blank", "width=800,height=900");
+   165→   165→    if (!win) {
+   166→   166→      toast.error("لطفاً popupهای مرورگر را مجاز کنید");
+   167→   167→      return;
+   168→   168→    }
+   169→   169→    win.document.write(`
+   170→   170→      <html dir="rtl" lang="fa">
+   171→   171→        <head>
+   172→   172→          <meta charset="utf-8" />
+   173→   173→          <title>فرم آزمایش خون — فیتاپ</title>
+   174→   174→          <style>
+   175→   175→            body { font-family: Vazirmatn, Tahoma, Arial, system-ui, sans-serif; padding: 24px; background: #ffffff; color: #1e293b; }
+   176→   176→            @media print { body { padding: 0; } }
+   177→   177→          </style>
+   178→   178→        </head>
+   179→   179→        <body>${html}</body>
+   180→   180→      </html>
+   181→   181→    `);
+   182→   182→    win.document.close();
+   183→   183→    setTimeout(() => {
+   184→   184→      win.focus();
+   185→   185→      win.print();
+   186→   186→    }, 500);
+   187→   187→  }
+   188→   188→
+   189→   189→  /** Group markers by category id for display. */
+   190→   190→  const groupedMarkers: { category: BloodTestCategory | null; items: any[] }[] = (() => {
+   191→   191→    if (!result?.markers) return [];
+   192→   192→    const map = new Map<string, any[]>();
+   193→   193→    for (const m of result.markers) {
+   194→   194→      const catId = m.category || "_other";
+   195→   195→      if (!map.has(catId)) map.set(catId, []);
+   196→   196→      map.get(catId)!.push(m);
+   197→   197→    }
+   198→   198→    const out: { category: BloodTestCategory | null; items: any[] }[] = [];
+   199→   199→    // Preserve canonical category order from BLOOD_TEST_CATEGORIES
+   200→   200→    for (const c of BLOOD_TEST_CATEGORIES) {
+   201→   201→      const items = map.get(c.id);
+   202→   202→      if (items && items.length) out.push({ category: c, items });
+   203→   203→    }
+   204→   204→    const other = map.get("_other");
+   205→   205→    if (other && other.length) out.push({ category: null, items: other });
+   206→   206→    return out;
+   207→   207→  })();
+   208→   208→
+   209→   209→  return (
+   210→   210→    <div className="flex flex-col h-full relative">
+   211→   211→      {/* ============================================================
+   212→   212→          HIDDEN PRINTABLE PRESCRIPTION
+   213→   213→          display:none by default — ONLY revealed during download capture.
+   214→   214→          Offscreen (left: -9999px) so it never overlaps visible content.
+   215→   215→         ============================================================ */}
+   216→   216→      <div
+   217→   217→        ref={prescriptionRef}
+   218→   218→        style={{
+   219→   219→          position: "fixed",
+   220→   220→          top: 0,
+   221→   221→          left: "-9999px",
+   222→   222→          width: "800px",
+   223→   223→          background: "#ffffff",
+   224→   224→          padding: "32px",
+   225→   225→          fontFamily: "Vazirmatn, Tahoma, Arial, system-ui, sans-serif",
+   226→   226→          direction: "rtl",
+   227→   227→          color: "#1e293b",
+   228→   228→          pointerEvents: "none",
+   229→   229→          display: isCapturing ? "block" : "none",
+   230→   230→        }}
+   231→   231→        aria-hidden
+   232→   232→      >
+   233→   233→        {/* Header */}
+   234→   234→        <div
+   235→   235→          style={{
+   236→   236→            display: "flex",
+   237→   237→            alignItems: "center",
+   238→   238→            justifyContent: "space-between",
+   239→   239→            borderBottom: "3px solid #f59e0b",
+   240→   240→            paddingBottom: "16px",
+   241→   241→            marginBottom: "20px",
+   242→   242→          }}
+   243→   243→        >
+   244→   244→          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+   245→   245→            <div
+   246→   246→              style={{
+   247→   247→                width: "56px",
+   248→   248→                height: "56px",
+   249→   249→                borderRadius: "16px",
+   250→   250→                background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   251→   251→                display: "flex",
+   252→   252→                alignItems: "center",
+   253→   253→                justifyContent: "center",
+   254→   254→                overflow: "hidden",
+   255→   255→              }}
+   256→   256→            >
+   257→   257→              <img src="/fitup-logo.png" alt="فیتاپ" style={{ width: "100%", height: "100%", objectFit: "cover" }} crossOrigin="anonymous" />
+   258→   258→            </div>
+   259→   259→            <div>
+   260→   260→              <h1 style={{ fontSize: "28px", fontWeight: 900, margin: 0, color: "#1e293b" }}>
+   261→   261→                فیتاپ
+   262→   262→              </h1>
+   263→   263→              <p style={{ fontSize: "14px", color: "#64748b", margin: 0 }}>
+   264→   264→                فرم جامع آزمایش خون توصیه‌شده
+   265→   265→              </p>
+   266→   266→            </div>
+   267→   267→          </div>
+   268→   268→          <div style={{ textAlign: "left" }}>
+   269→   269→            <p style={{ fontSize: "12px", color: "#64748b", margin: 0 }}>تاریخ صدور</p>
+   270→   270→            <p style={{ fontSize: "16px", fontWeight: 700, color: "#1e293b", margin: 0 }}>
+   271→   271→              {new Date().toLocaleDateString("fa-IR")}
+   272→   272→            </p>
+   273→   273→          </div>
+   274→   274→        </div>
+   275→   275→
+   276→   276→        {/* Intro banner */}
+   277→   277→        <div
+   278→   278→          style={{
+   279→   279→            background: "linear-gradient(135deg, #fff7ed, #ffedd5)",
+   280→   280→            border: "1px solid #fed7aa",
+   281→   281→            borderRadius: "16px",
+   282→   282→            padding: "14px 18px",
+   283→   283→            marginBottom: "20px",
+   284→   284→          }}
+   285→   285→        >
+   286→   286→          <p style={{ fontSize: "12px", color: "#ea580c", fontWeight: 700, margin: "0 0 4px 0" }}>
+   287→   287→            🩸 موارد آزمایش ({toPersianDigits(TOTAL_BLOOD_TESTS)} نشانگر در {toPersianDigits(BLOOD_TEST_CATEGORIES.length)} دسته)
+   288→   288→          </p>
+   289→   289→          <p style={{ fontSize: "13px", color: "#1e293b", margin: 0 }}>
+   290→   290→            این آزمایش‌ها برای طراحی برنامه بهینه ورزشی و تغذیه‌ای ضروری هستند. لطفاً با مراجعه به آزمایشگاه، نتایج را پس از انجام به پلتفرم آپلود کنید.
+   291→   291→          </p>
+   292→   292→        </div>
+   293→   293→
+   294→   294→        {/* Tests list grouped by category */}
+   295→   295→        {BLOOD_TEST_CATEGORIES.map((cat) => (
+   296→   296→          <div key={cat.id} style={{ marginBottom: "18px" }}>
+   297→   297→            <div
+   298→   298→              style={{
+   299→   299→                display: "flex",
+   300→   300→                alignItems: "center",
+   301→   301→                gap: "8px",
+   302→   302→                background: "#fff7ed",
+   303→   303→                border: "1px solid #fed7aa",
+   304→   304→                borderRadius: "10px 10px 0 0",
+   305→   305→                padding: "8px 12px",
+   306→   306→                fontWeight: 800,
+   307→   307→                fontSize: "14px",
+   308→   308→                color: "#9a3412",
+   309→   309→              }}
+   310→   310→            >
+   311→   311→              <span style={{ fontSize: "16px" }}>{cat.icon}</span>
+   312→   312→              <span>{cat.name}</span>
+   313→   313→              <span style={{ marginRight: "auto", fontSize: "11px", fontWeight: 600, color: "#c2410c" }}>
+   314→   314→                {toPersianDigits(cat.tests.length)} آزمایش
+   315→   315→              </span>
+   316→   316→            </div>
+   317→   317→            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", border: "1px solid #fed7aa", borderTop: "none" }}>
+   318→   318→              <thead>
+   319→   319→                <tr style={{ background: "#fffbeb" }}>
+   320→   320→                  <th style={{ padding: "6px 8px", textAlign: "right", borderBottom: "1px solid #fef3c7", width: "28px", color: "#9a3412" }}>#</th>
+   321→   321→                  <th style={{ padding: "6px 8px", textAlign: "right", borderBottom: "1px solid #fef3c7", color: "#9a3412" }}>نام آزمایش</th>
+   322→   322→                  <th style={{ padding: "6px 8px", textAlign: "right", borderBottom: "1px solid #fef3c7", color: "#9a3412" }}>محدوده نرمال</th>
+   323→   323→                  <th style={{ padding: "6px 8px", textAlign: "right", borderBottom: "1px solid #fef3c7", color: "#9a3412" }}>توضیحات</th>
+   324→   324→                </tr>
+   325→   325→              </thead>
+   326→   326→              <tbody>
+   327→   327→                {cat.tests.map((t, i) => (
+   328→   328→                  <tr key={t.key} style={{ borderBottom: "1px solid #fef3c7" }}>
+   329→   329→                    <td style={{ padding: "6px 8px", textAlign: "right", color: "#9a3412", fontWeight: 700 }}>{toPersianDigits(i + 1)}</td>
+   330→   330→                    <td style={{ padding: "6px 8px", textAlign: "right", fontWeight: 700, color: "#1e293b" }}>
+   331→   331→                      {t.name}
+   332→   332→                      <span style={{ fontSize: "10px", color: "#94a3b8", fontWeight: 400, display: "block" }}>{t.enName}</span>
+   333→   333→                    </td>
+   334→   334→                    <td style={{ padding: "6px 8px", textAlign: "right", color: "#64748b", fontSize: "11px" }}>{t.refRange || "—"}</td>
+   335→   335→                    <td style={{ padding: "6px 8px", textAlign: "right", color: "#64748b", fontSize: "11px" }}>{t.desc || "—"}</td>
+   336→   336→                  </tr>
+   337→   337→                ))}
+   338→   338→              </tbody>
+   339→   339→            </table>
+   340→   340→          </div>
+   341→   341→        ))}
+   342→   342→
+   343→   343→        {/* Notes */}
+   344→   344→        <div
+   345→   345→          style={{
+   346→   346→            background: "#fff7ed",
+   347→   347→            border: "1px dashed #fdba74",
+   348→   348→            borderRadius: "12px",
+   349→   349→            padding: "12px 16px",
+   350→   350→            marginTop: "8px",
+   351→   351→          }}
+   352→   352→        >
+   353→   353→          <p style={{ fontSize: "12px", color: "#ea580c", fontWeight: 700, margin: "0 0 4px 0" }}>
+   354→   354→            📝 نکات مهم
+   355→   355→          </p>
+   356→   356→          <p style={{ fontSize: "12px", color: "#1e293b", margin: 0, lineHeight: 1.7 }}>
+   357→   357→            این آزمایش‌ها برای طراحی برنامه بهینه ضروری هستند. نتایج را پس از انجام به پلتفرم آپلود کنید.
+   358→   358→            حداقل ۱۲ ساعت قبل از آزمایش ناشتا باشید. داروهای مصرفی را پیش از آزمایش با پزشک مشورت کنید.
+   359→   359→          </p>
+   360→   360→        </div>
+   361→   361→
+   362→   362→        {/* Footer */}
+   363→   363→        <div
+   364→   364→          style={{
+   365→   365→            marginTop: "24px",
+   366→   366→            paddingTop: "14px",
+   367→   367→            borderTop: "2px solid #fed7aa",
+   368→   368→            display: "flex",
+   369→   369→            alignItems: "center",
+   370→   370→            justifyContent: "space-between",
+   371→   371→            fontSize: "11px",
+   372→   372→            color: "#94a3b8",
+   373→   373→          }}
+   374→   374→        >
+   375→   375→          <span>هر بدنی فیتاپ میخواد 💪</span>
+   376→   376→          <span>fitap.ir</span>
+   377→   377→        </div>
+   378→   378→      </div>
+   379→   379→
+   380→   380→      {/* ============================================================
+   381→   381→          VISIBLE UI — header
+   382→   382→         ============================================================ */}
+   383→   383→      <div className="flex items-center justify-between p-4 border-b glass-strong">
+   384→   384→        <div className="flex items-center gap-2">
+   385→   385→          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-red-500 to-rose-600 flex items-center justify-center">
+   386→   386→            <TestTube className="w-5 h-5 text-white" />
+   387→   387→          </div>
+   388→   388→          <div>
+   389→   389→            <h2 className="font-bold text-sm">آنالیز آزمایش خون</h2>
+   390→   390→            <p className="text-[10px] text-muted-foreground">
+   391→   391→              {limitReached
+   392→   392→                ? "سقف استفاده پر شده"
+   393→   393→                : `پلن حرفه‌ای — ${toPersianDigits(usedCount)}/${toPersianDigits(limit)} استفاده`}
+   394→   394→            </p>
+   395→   395→          </div>
+   396→   396→        </div>
+   397→   397→        <Button variant="ghost" size="icon" onClick={() => setOverlay(null)} className="rounded-full">
+   398→   398→          <X className="w-5 h-5" />
+   399→   399→        </Button>
+   400→   400→      </div>
+   401→   401→
+   402→   402→      {/* ============================================================
+   403→   403→          VISIBLE UI — scrollable body
+   404→   404→         ============================================================ */}
+   405→   405→      <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4 max-w-2xl mx-auto w-full">
+   406→   406→        <div className="glass-yellow rounded-2xl p-4 text-sm text-center">
+   407→   407→          <Sparkles className="w-5 h-5 text-primary mx-auto mb-1" />
+   408→   408→          عکس آزمایش خونت رو آپلود کن تا هوش مصنوعی نتایج رو در {toPersianDigits(BLOOD_TEST_CATEGORIES.length)} دسته و {toPersianDigits(TOTAL_BLOOD_TESTS)} نشانگر آنالیز و با برنامه‌ت تطبیق بده
+   409→   409→        </div>
+   410→   410→
+   411→   411→        {/* === Step 1: Upload section (only if no file) === */}
+   412→   412→        {!file && (
+   413→   413→          limitReached ? (
+   414→   414→            <div className="glass rounded-3xl border-2 border-amber-300 bg-amber-50/50 p-8 text-center">
+   415→   415→              <AlertTriangle className="w-12 h-12 text-amber-500 mx-auto mb-3" />
+   416→   416→              <p className="font-bold text-amber-700 mb-1">سقف استفاده از این قابلیت پر شده است</p>
+   417→   417→              <p className="text-xs text-amber-600">
+   418→   418→                شما از {toPersianDigits(usedCount)} از {toPersianDigits(limit)} تحلیل مجاز پلن حرفه‌ای خود استفاده کرده‌اید.
+   419→   419→                برای تحلیل آزمایش جدید، پلن خود را تمدید کنید.
+   420→   420→              </p>
+   421→   421→            </div>
+   422→   422→          ) : (
+   423→   423→            <label className="block">
+   424→   424→              <div className="glass rounded-3xl border-2 border-dashed border-border hover:border-primary/50 transition p-10 text-center cursor-pointer">
+   425→   425→                <motion.div
+   426→   426→                  animate={{ y: [0, -8, 0] }}
+   427→   427→                  transition={{ duration: 2, repeat: Infinity }}
+   428→   428→                  className="w-16 h-16 rounded-2xl bg-red-500/15 flex items-center justify-center mx-auto mb-4"
+   429→   429→                >
+   430→   430→                  <Upload className="w-8 h-8 text-red-400" />
+   431→   431→                </motion.div>
+   432→   432→                <p className="font-bold mb-1">عکس آزمایش خون را آپلود کن</p>
+   433→   433→                <p className="text-xs text-muted-foreground">فرمت: JPG, PNG — عکس واضح از برگه آزمایش</p>
+   434→   434→              </div>
+   435→   435→              <input type="file" accept="image/*" className="hidden" onChange={handleFile} />
+   436→   436→            </label>
+   437→   437→          )
+   438→   438→        )}
+   439→   439→
+   440→   440→        {/* === گزینه‌های وضعیت آزمایش خون (وقتی فایلی انتخاب نشده) === */}
+   441→   441→        {!file && !result && !limitReached && (
+   442→   442→          <div className="glass rounded-2xl p-4 space-y-3">
+   443→   443→            <p className="text-xs font-bold text-slate-700 text-center">اگر هنوز آزمایش خون ندارید:</p>
+   444→   444→            <div className="flex flex-col gap-2">
+   445→   445→              <button
+   446→   446→                onClick={async () => {
+   447→   447→                  try {
+   448→   448→                    await fetch("/api/blood-test-status", {
+   449→   449→                      method: "PATCH",
+   450→   450→                      headers: { "Content-Type": "application/json" },
+   451→   451→                      body: JSON.stringify({ status: "waiting" }),
+   452→   452→                    });
+   453→   453→                    toast.success("اطلاع شد. وقتی نتایج آماده شد، می‌توانید آپلود کنید.");
+   454→   454→                  } catch { toast.error("خطا"); }
+   455→   455→                }}
+   456→   456→                className="w-full p-3 rounded-xl bg-amber-50 border border-amber-200 text-sm font-medium text-amber-700 hover:bg-amber-100 transition text-center"
+   457→   457→              >
+   458→   458→                🔄 آزمایش داده‌ام، منتظر نتایج هستم
+   459→   459→              </button>
+   460→   460→              <button
+   461→   461→                onClick={async () => {
+   462→   462→                  try {
+   463→   463→                    await fetch("/api/blood-test-status", {
+   464→   464→                      method: "PATCH",
+   465→   465→                      headers: { "Content-Type": "application/json" },
+   466→   466→                      body: JSON.stringify({ status: "declined" }),
+   467→   467→                    });
+   468→   468→                    toast.success("باشه! برنامه شما بدون آزمایش خون طراحی می‌شود.");
+   469→   469→                    setOverlay(null);
+   470→   470→                  } catch { toast.error("خطا"); }
+   471→   471→                }}
+   472→   472→                className="w-full p-3 rounded-xl bg-slate-50 border border-slate-200 text-sm font-medium text-slate-600 hover:bg-slate-100 transition text-center"
+   473→   473→              >
+   474→   474→                ❌ نمی‌خواهم آزمایش خون آپلود کنم
+   475→   475→              </button>
+   476→   476→            </div>
+   477→   477→            <p className="text-[10px] text-slate-400 text-center">
+   478→   478→              برنامه شما در هر صورت توسط هوش مصنوعی طراحی می‌شود. آزمایش خون فقط برای دقت بیشتر است.
+   479→   479→            </p>
+   480→   480→          </div>
+   481→   481→        )}
+   482→   482→
+   483→   483→        {/* === Step 2: Image preview + Analyze button === */}
+   484→   484→        {file && !result && (
+   485→   485→          <div className="space-y-3">
+   486→   486→            <div className="glass rounded-2xl overflow-hidden">
+   487→   487→              <img src={imgUrl} alt="آزمایش خون آپلودشده" className="w-full max-h-72 object-contain bg-muted/20" />
+   488→   488→              <div className="p-3 flex items-center justify-between">
+   489→   489→                <p className="text-xs text-muted-foreground truncate">{file.name}</p>
+   490→   490→                <button onClick={reset} className="text-xs text-destructive flex items-center gap-1">
+   491→   491→                  <RefreshCw className="w-3.5 h-3.5" /> تغییر عکس
+   492→   492→                </button>
+   493→   493→              </div>
+   494→   494→            </div>
+   495→   495→            <Button onClick={analyze} disabled={analyzing} className="w-full rounded-xl h-12 font-bold">
+   496→   496→              {analyzing ? (
+   497→   497→                <span className="flex items-center gap-2">
+   498→   498→                  <Loader2 className="w-4 h-4 animate-spin" /> در حال آنالیز نتایج...
+   499→   499→                </span>
+   500→   500→              ) : (
+   501→   501→                <span className="flex items-center gap-2">
+   502→   502→                  <Sparkles className="w-4 h-4" /> شروع آنالیز آزمایش
+   503→   503→                </span>
+   504→   504→              )}
+   505→   505→            </Button>
+   506→   506→          </div>
+   507→   507→        )}
+   508→   508→
+   509→   509→        {/* === Step 3: Analyzing progress === */}
+   510→   510→        {analyzing && (
+   511→   511→          <div className="space-y-2">
+   512→   512→            {[
+   513→   513→              "استخراج مقادیر از عکس آزمایش...",
+   514→   514→              "مقایسه با محدوده نرمال...",
+   515→   515→              "شناسایی کمبودها و موارد بحرانی...",
+   516→   516→              "تطبیق با برنامه غذایی و مکمل...",
+   517→   517→            ].map((s, i) => (
+   518→   518→              <motion.div
+   519→   519→                key={i}
+   520→   520→                initial={{ opacity: 0, x: -20 }}
+   521→   521→                animate={{ opacity: 1, x: 0 }}
+   522→   522→                transition={{ delay: i * 0.8 }}
+   523→   523→                className="flex items-center gap-2 text-sm"
+   524→   524→              >
+   525→   525→                <CheckCircle2 className="w-4 h-4 text-primary" /> {s}
+   526→   526→              </motion.div>
+   527→   527→            ))}
+   528→   528→          </div>
+   529→   529→        )}
+   530→   530→
+   531→   531→        {/* === Step 4: AI Analysis Results === */}
+   532→   532→        {result && (
+   533→   533→          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-3">
+   534→   534→            {/* Overall health score */}
+   535→   535→            <div className="glass rounded-2xl p-5 text-center">
+   536→   536→              <p className="text-xs text-muted-foreground mb-2">سلامت عمومی</p>
+   537→   537→              <p className="text-3xl font-black gradient-text mb-1">{toPersianDigits(result.score)}</p>
+   538→   538→              <p className="text-sm font-bold text-emerald-500">{result.overall}</p>
+   539→   539→            </div>
+   540→   540→
+   541→   541→            {/* Markers grouped by category */}
+   542→   542→            {groupedMarkers.length > 0 && (
+   543→   543→              <div className="space-y-3">
+   544→   544→                {groupedMarkers.map(({ category, items }, gi) => (
+   545→   545→                  <div key={gi} className="glass rounded-2xl p-4">
+   546→   546→                    <h4 className="font-bold text-sm mb-3 flex items-center gap-2">
+   547→   547→                      {category ? (
+   548→   548→                        <>
+   549→   549→                          <span className="text-base">{category.icon}</span>
+   550→   550→                          <span>{category.name}</span>
+   551→   551→                        </>
+   552→   552→                      ) : (
+   553→   553→                        <span>سایر نشانگرها</span>
+   554→   554→                      )}
+   555→   555→                      <span className="text-[10px] text-muted-foreground mr-auto">
+   556→   556→                        {toPersianDigits(items.length)} مورد
+   557→   557→                      </span>
+   558→   558→                    </h4>
+   559→   559→                    <div className="space-y-2">
+   560→   560→                      {items.map((m: any, i: number) => (
+   561→   561→                        <div key={i} className="p-2.5 rounded-lg bg-muted/30">
+   562→   562→                          <div className="flex items-center justify-between gap-2 mb-1">
+   563→   563→                            <span className="font-medium text-xs">{m.name}</span>
+   564→   564→                            <div className="flex items-center gap-2 shrink-0">
+   565→   565→                              <span className="font-bold text-xs" dir="ltr">
+   566→   566→                                {m.value}
+   567→   567→                                {m.unit ? ` ${m.unit}` : ""}
+   568→   568→                              </span>
+   569→   569→                              <span
+   570→   570→                                className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${STATUS_COLORS[m.status] || STATUS_COLORS.unknown}`}
+   571→   571→                              >
+   572→   572→                                {STATUS_LABELS[m.status] || STATUS_LABELS.unknown}
+   573→   573→                              </span>
+   574→   574→                            </div>
+   575→   575→                          </div>
+   576→   576→                          {m.reference && (
+   577→   577→                            <p className="text-[10px] text-muted-foreground mb-1" dir="rtl">
+   578→   578→                              محدوده نرمال: <span dir="ltr">{m.reference}</span>
+   579→   579→                            </p>
+   580→   580→                          )}
+   581→   581→                          {m.explanation && (
+   582→   582→                            <p className="text-[11px] text-muted-foreground leading-relaxed">{m.explanation}</p>
+   583→   583→                          )}
+   584→   584→                        </div>
+   585→   585→                      ))}
+   586→   586→                    </div>
+   587→   587→                  </div>
+   588→   588→                ))}
+   589→   589→              </div>
+   590→   590→            )}
+   591→   591→
+   592→   592→            {/* Deficiencies */}
+   593→   593→            {result.deficiencies?.length > 0 && (
+   594→   594→              <div className="glass rounded-2xl p-4 border border-amber-500/30">
+   595→   595→                <h4 className="font-bold text-sm flex items-center gap-2 mb-2">
+   596→   596→                  <AlertTriangle className="w-4 h-4 text-amber-500" /> کمبودهای شناسایی‌شده
+   597→   597→                </h4>
+   598→   598→                <div className="flex flex-wrap gap-1.5">
+   599→   599→                  {result.deficiencies.map((d: string, i: number) => (
+   600→   600→                    <span key={i} className="text-xs px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-500">
+   601→   601→                      {d}
+   602→   602→                    </span>
+   603→   603→                  ))}
+   604→   604→                </div>
+   605→   605→              </div>
+   606→   606→            )}
+   607→   607→
+   608→   608→            {/* Food recommendations */}
+   609→   609→            {result.recommendations?.length > 0 && (
+   610→   610→              <div className="glass rounded-2xl p-4">
+   611→   611→                <h4 className="font-bold text-sm flex items-center gap-2 mb-2">
+   612→   612→                  <Sparkles className="w-4 h-4 text-primary" /> توصیه‌های تغذیه‌ای و سبک زندگی
+   613→   613→                </h4>
+   614→   614→                <ul className="space-y-1.5">
+   615→   615→                  {result.recommendations.map((rec: string, i: number) => (
+   616→   616→                    <li key={i} className="text-xs text-muted-foreground flex items-start gap-2">
+   617→   617→                      <CheckCircle2 className="w-3.5 h-3.5 text-primary shrink-0 mt-0.5" /> {rec}
+   618→   618→                    </li>
+   619→   619→                  ))}
+   620→   620→                </ul>
+   621→   621→              </div>
+   622→   622→            )}
+   623→   623→
+   624→   624→            {/* Supplement recommendations */}
+   625→   625→            {result.supplements?.length > 0 && (
+   626→   626→              <div className="glass rounded-2xl p-4 border border-orange-500/30">
+   627→   627→                <h4 className="font-bold text-sm flex items-center gap-2 mb-2">
+   628→   628→                  <Pill className="w-4 h-4 text-orange-500" /> مکمل‌های پیشنهادی
+   629→   629→                </h4>
+   630→   630→                <ul className="space-y-1.5">
+   631→   631→                  {result.supplements.map((s: string, i: number) => (
+   632→   632→                    <li key={i} className="text-xs text-muted-foreground flex items-start gap-2">
+   633→   633→                      <Pill className="w-3.5 h-3.5 text-orange-500 shrink-0 mt-0.5" /> {s}
+   634→   634→                    </li>
+   635→   635→                  ))}
+   636→   636→                </ul>
+   637→   637→              </div>
+   638→   638→            )}
+   639→   639→
+   640→   640→            {/* Medical warnings */}
+   641→   641→            {result.warnings?.length > 0 &&
+   642→   642→              result.warnings.map((w: string, i: number) => (
+   643→   643→                <div
+   644→   644→                  key={i}
+   645→   645→                  className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-xs text-red-500 flex items-start gap-2"
+   646→   646→                >
+   647→   647→                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" /> {w}
+   648→   648→                </div>
+   649→   649→              ))}
+   650→   650→
+   651→   651→            <Button onClick={reset} variant="outline" className="w-full rounded-xl">
+   652→   652→              <RefreshCw className="w-4 h-4" /> آپلود آزمایش جدید
+   653→   653→            </Button>
+   654→   654→          </motion.div>
+   655→   655→        )}
+   656→   656→
+   657→   657→        {/* === Step 5: Download / print prescription form (always available at bottom) === */}
+   658→   658→        <div className="bg-white rounded-2xl border-2 border-orange-200 overflow-hidden">
+   659→   659→          <div
+   660→   660→            className="flex items-center gap-2 px-4 py-3 text-white"
+   661→   661→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   662→   662→          >
+   663→   663→            <TestTube className="w-4 h-4" />
+   664→   664→            <h3 className="font-bold text-sm">فرم جامع آزمایش خون فیتاپ</h3>
+   665→   665→          </div>
+   666→   666→          <div className="p-4">
+   667→   667→            <p className="text-xs text-slate-600 leading-relaxed mb-3">
+   668→   668→              برای داشتن یک برنامه ورزشی و تغذیه‌ای کاملاً شخصی‌سازی‌شده، توصیه می‌کنیم آزمایش‌های زیر ({toPersianDigits(TOTAL_BLOOD_TESTS)} نشانگر در {toPersianDigits(BLOOD_TEST_CATEGORIES.length)} دسته) را انجام دهید. فرم را دانلود یا پرینت بگیرید و به آزمایشگاه ببرید.
+   669→   669→            </p>
+   670→   670→            <div className="space-y-2 mb-3 max-h-60 overflow-y-auto custom-scrollbar">
+   671→   671→              {BLOOD_TEST_CATEGORIES.map((cat) => (
+   672→   672→                <div key={cat.id} className="rounded-lg bg-orange-50/50 border border-orange-100 overflow-hidden">
+   673→   673→                  <div className="px-2.5 py-1.5 bg-orange-100/50 flex items-center gap-1.5">
+   674→   674→                    <span className="text-sm">{cat.icon}</span>
+   675→   675→                    <span className="text-xs font-bold text-slate-900">{cat.name}</span>
+   676→   676→                    <span className="text-[10px] text-slate-500 mr-auto">{toPersianDigits(cat.tests.length)} آزمایش</span>
+   677→   677→                  </div>
+   678→   678→                  <div className="p-2 space-y-1">
+   679→   679→                    {cat.tests.map((t) => (
+   680→   680→                      <div key={t.key} className="flex items-center justify-between gap-2 text-[11px]">
+   681→   681→                        <span className="font-medium text-slate-700">{t.name}</span>
+   682→   682→                        <span className="text-[10px] text-slate-400 truncate max-w-[50%] text-left" dir="ltr">
+   683→   683→                          {t.refRange || t.enName}
+   684→   684→                        </span>
+   685→   685→                      </div>
+   686→   686→                    ))}
+   687→   687→                  </div>
+   688→   688→                </div>
+   689→   689→              ))}
+   690→   690→            </div>
+   691→   691→            <div className="grid grid-cols-2 gap-2">
+   692→   692→              <Button
+   693→   693→                onClick={downloadPrescriptionImage}
+   694→   694→                disabled={downloading}
+   695→   695→                className="rounded-xl text-white font-bold"
+   696→   696→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   697→   697→              >
+   698→   698→                {downloading ? (
+   699→   699→                  <span className="flex items-center gap-2">
+   700→   700→                    <Loader2 className="w-4 h-4 animate-spin" /> در حال ساخت...
+   701→   701→                  </span>
+   702→   702→                ) : (
+   703→   703→                  <span className="flex items-center gap-2">
+   704→   704→                    <Download className="w-4 h-4" /> دانلود عکس
+   705→   705→                  </span>
+   706→   706→                )}
+   707→   707→              </Button>
+   708→   708→              <Button
+   709→   709→                onClick={printPrescription}
+   710→   710→                variant="outline"
+   711→   711→                className="rounded-xl border-orange-300 text-orange-600 hover:bg-orange-50"
+   712→   712→              >
+   713→   713→                <Printer className="w-4 h-4" /> پرینت / PDF
+   714→   714→              </Button>
+   715→   715→            </div>
+   716→   716→          </div>
+   717→   717→        </div>
+   718→   718→      </div>
+   719→   719→    </div>
+   720→   720→  );
+   721→   721→}
+   722→   722→

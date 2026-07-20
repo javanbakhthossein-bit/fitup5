@@ -1,0 +1,673 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState, useRef } from "react";
+     4→import { motion } from "framer-motion";
+     5→import {
+     6→  Dumbbell, Salad, Pill, Calendar, CheckCircle2, ChevronLeft,
+     7→  Sparkles, Loader2, Utensils, FileText, Image as ImageIcon, X, Repeat, Lightbulb,
+     8→} from "lucide-react";
+     9→import { useAppStore } from "@/lib/fitness/store";
+    10→import { Card } from "@/components/ui/card";
+    11→import { Button } from "@/components/ui/button";
+    12→import { Skeleton } from "@/components/ui/skeleton";
+    13→import {
+    14→  Dialog, DialogContent, DialogHeader, DialogTitle,
+    15→} from "@/components/ui/dialog";
+    16→import { toPersianDigits, PLAN_LABELS, formatToman } from "@/lib/fitness/types";
+    17→import { toast } from "sonner";
+    18→
+    19→interface ProgramItem {
+    20→  id: string;
+    21→  weekIndex: number;
+    22→  active: boolean;
+    23→  createdAt: string;
+    24→  days: number;
+    25→  exercises: number;
+    26→  weeklyGoal: string;
+    27→  notes: string;
+    28→  totalCalories: number;
+    29→  planName: string;
+    30→  status: string;
+    31→  startDate: string;
+    32→  endDate: string | null;
+    33→  supplements?: { name: string; dose: string; timing: string }[];
+    34→  meals?: { label: string; totalCalories: number; items?: { name: string; calories: number }[] }[];
+    35→  mealNotes?: string;
+    36→  waterLiters?: number;
+    37→  totalProtein?: number;
+    38→  totalCarbs?: number;
+    39→  totalFat?: number;
+    40→  workoutDays?: any[];
+    41→}
+    42→
+    43→export function ProgramsView() {
+    44→  const { user, setMainTab } = useAppStore();
+    45→  const [history, setHistory] = useState<any>(null);
+    46→  const [loading, setLoading] = useState(true);
+    47→  const [analyzing, setAnalyzing] = useState(false);
+    48→  const [regenerating, setRegenerating] = useState(false);
+    49→  const [viewModal, setViewModal] = useState<{ type: "workout" | "meal" | "supplement"; program: ProgramItem } | null>(null);
+    50→
+    51→  useEffect(() => {
+    52→    (async () => {
+    53→      try {
+    54→        const res = await fetch("/api/coach/program-history");
+    55→        const data = await res.json();
+    56→        setHistory(data);
+    57→      } catch {}
+    58→      finally { setLoading(false); }
+    59→    })();
+    60→  }, []);
+    61→
+    62→  async function generateAnalysis() {
+    63→    setAnalyzing(true);
+    64→    try {
+    65→      const res = await fetch("/api/coach/program-history?analyze=1");
+    66→      const data = await res.json();
+    67→      setHistory(data);
+    68→      toast.success("تحلیل فیتاپ هوشمند آماده شد ✨");
+    69→    } catch { toast.error("خطا در تحلیل"); }
+    70→    finally { setAnalyzing(false); }
+    71→  }
+    72→
+    73→  async function regeneratePlan() {
+    74→    setRegenerating(true);
+    75→    try {
+    76→      const res = await fetch("/api/coach/plan", { method: "PUT" });
+    77→      const data = await res.json();
+    78→      if (!res.ok) throw new Error(data.error);
+    79→      toast.success("برنامه تمرینی و غذایی شما با موفقیت ساخته شد! 🎯");
+    80→      // reload history
+    81→      const hres = await fetch("/api/coach/program-history");
+    82→      const hdata = await hres.json();
+    83→      setHistory(hdata);
+    84→    } catch (e) {
+    85→      toast.error(e instanceof Error ? e.message : "خطا در ساخت برنامه");
+    86→    } finally {
+    87→      setRegenerating(false);
+    88→    }
+    89→  }
+    90→
+    91→  if (loading) {
+    92→    return (
+    93→      <div className="px-4 py-4 space-y-3 max-w-3xl mx-auto">
+    94→        <Skeleton className="h-8 rounded-xl" />
+    95→        <Skeleton className="h-40 rounded-2xl" />
+    96→        <Skeleton className="h-40 rounded-2xl" />
+    97→      </div>
+    98→    );
+    99→  }
+   100→
+   101→  const programs: ProgramItem[] = history?.programs || [];
+   102→
+   103→  if (programs.length === 0) {
+   104→    return (
+   105→      <div className="px-4 py-8 text-center max-w-md mx-auto">
+   106→        <div className="w-20 h-20 rounded-3xl flex items-center justify-center mx-auto mb-4 overflow-hidden" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   107→          {/* eslint-disable-next-line @next/next/no-img-element */}
+   108→          <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   109→        </div>
+   110→        <h2 className="text-xl font-black text-slate-900 mb-2">هنوز برنامه‌ای ندارید</h2>
+   111→        <p className="text-sm text-slate-500 mb-6">
+   112→          {user?.planName
+   113→            ? "برنامه اختصاصی شما ساخته نشده است. همین حالا با فیتاپ هوشمند بسازید."
+   114→            : "برای دریافت برنامه اختصاصی، ابتدا یک پلن خریداری کنید."}
+   115→        </p>
+   116→        {user?.planName ? (
+   117→          <Button
+   118→            onClick={regeneratePlan}
+   119→            disabled={regenerating}
+   120→            className="rounded-xl text-white gap-2"
+   121→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   122→          >
+   123→            {regenerating ? (
+   124→              <><Loader2 className="w-4 h-4 animate-spin" /> فیتاپ هوشمند در حال ساخت برنامه...</>
+   125→            ) : (
+   126→              <><Sparkles className="w-4 h-4" /> ساخت برنامه با فیتاپ هوشمند</>
+   127→            )}
+   128→          </Button>
+   129→        ) : (
+   130→          <Button onClick={() => setMainTab("plans")} className="rounded-xl text-white" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   131→            خرید پلن
+   132→          </Button>
+   133→        )}
+   134→      </div>
+   135→    );
+   136→  }
+   137→
+   138→  return (
+   139→    <div className="px-4 py-4 space-y-4 max-w-3xl mx-auto">
+   140→      <div>
+   141→        <h2 className="text-2xl font-black text-slate-900">برنامه‌های من</h2>
+   142→        <p className="text-sm text-slate-500">{toPersianDigits(programs.length)} برنامه — برنامه جاری و برنامه‌های قبلی</p>
+   143→      </div>
+   144→
+   145→      {/* تحلیل فیتاپ هوشمند — با خرید هر برنامه یکبار قابل استفاده است */}
+   146→      {history?.aiAnalysis ? (
+   147→        <Card className="p-4 border-2 border-orange-200 bg-gradient-to-br from-orange-50 to-amber-50">
+   148→          <div className="flex items-center gap-2 mb-2">
+   149→            <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   150→              <Sparkles className="w-4 h-4 text-white" />
+   151→            </div>
+   152→            <div>
+   153→              <p className="text-xs font-bold text-orange-600">تحلیل فیتاپ هوشمند</p>
+   154→              <p className="text-[10px] text-slate-400">با خرید هر برنامه، یک‌بار قابل استفاده است</p>
+   155→            </div>
+   156→          </div>
+   157→          <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap">{history.aiAnalysis}</p>
+   158→        </Card>
+   159→      ) : programs.length > 0 && user?.planName ? (
+   160→        <Card className="p-4 border-2 border-orange-200 bg-gradient-to-br from-orange-50 to-amber-50">
+   161→          <div className="flex items-center gap-2 mb-3">
+   162→            <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   163→              <Sparkles className="w-4 h-4 text-white" />
+   164→            </div>
+   165→            <div>
+   166→              <p className="text-xs font-bold text-orange-600">تحلیل فیتاپ هوشمند</p>
+   167→              <p className="text-[10px] text-slate-400">با خرید هر برنامه، یک‌بار قابل استفاده است</p>
+   168→            </div>
+   169→          </div>
+   170→          <Button onClick={generateAnalysis} disabled={analyzing} className="w-full rounded-xl text-white" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   171→            {analyzing ? <><Loader2 className="w-4 h-4 animate-spin" /> فیتاپ هوشمند در حال تحلیل...</> : <><Sparkles className="w-4 h-4" /> تحلیل پیشرفت توسط فیتاپ هوشمند</>}
+   172→          </Button>
+   173→        </Card>
+   174→      ) : null}
+   175→
+   176→      {/* برنامه‌ها — جاری در بالا، قبلی در پایین */}
+   177→      {programs.map((p, i) => (
+   178→        <ProgramCard
+   179→          key={p.id}
+   180→          program={p}
+   181→          index={i}
+   182→          onOpenWorkouts={() => setMainTab("workouts")}
+   183→          onOpenNutrition={() => setMainTab("nutrition")}
+   184→          onOpenView={(type, prog) => setViewModal({ type, program: prog })}
+   185→        />
+   186→      ))}
+   187→
+   188→      {/* Plan View Modal with download */}
+   189→      {viewModal && (
+   190→        <PlanViewModal
+   191→          type={viewModal.type}
+   192→          program={viewModal.program}
+   193→          onClose={() => setViewModal(null)}
+   194→        />
+   195→      )}
+   196→    </div>
+   197→  );
+   198→}
+   199→
+   200→function ProgramCard({ program, index, onOpenWorkouts, onOpenNutrition, onOpenView }: {
+   201→  program: ProgramItem;
+   202→  index: number;
+   203→  onOpenWorkouts: () => void;
+   204→  onOpenNutrition: () => void;
+   205→  onOpenView: (type: "workout" | "meal" | "supplement", program: ProgramItem) => void;
+   206→}) {
+   207→  const isCurrent = program.active;
+   208→  const startDate = new Date(program.startDate);
+   209→  const endDate = program.endDate ? new Date(program.endDate) : new Date(startDate.getTime() + 45 * 24 * 60 * 60 * 1000);
+   210→  const daysPassed = Math.floor((Date.now() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+   211→  const daysTotal = Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 1000));
+   212→  const progressPct = isCurrent ? Math.min(100, Math.max(0, (daysPassed / daysTotal) * 100)) : 100;
+   213→
+   214→  return (
+   215→    <motion.div
+   216→      initial={{ opacity: 0, y: 20 }}
+   217→      animate={{ opacity: 1, y: 0 }}
+   218→      transition={{ delay: index * 0.1 }}
+   219→    >
+   220→      <Card className={`p-0 overflow-hidden ${isCurrent ? "border-2 border-orange-300 shadow-xl" : "border-2 border-slate-200"}`}>
+   221→        {/* Header با گرادیان */}
+   222→        <div
+   223→          className="p-4 text-white relative overflow-hidden"
+   224→          style={isCurrent
+   225→            ? { background: "linear-gradient(135deg, #f59e0b, #f97316)" }
+   226→            : { background: "linear-gradient(135deg, #94a3b8, #64748b)" }
+   227→          }
+   228→        >
+   229→          <div className="absolute -left-4 -top-4 w-20 h-20 rounded-full bg-white/10 blur-xl" />
+   230→          <div className="relative flex items-center justify-between">
+   231→            <div className="flex items-center gap-3">
+   232→              <div className="w-10 h-10 rounded-xl bg-white/20 backdrop-blur flex items-center justify-center text-sm font-black">
+   233→                {toPersianDigits(index + 1)}
+   234→              </div>
+   235→              <div>
+   236→                <div className="flex items-center gap-2">
+   237→                  <h3 className="font-black text-base">برنامه {toPersianDigits(index + 1)}</h3>
+   238→                  {isCurrent && (
+   239→                    <span className="text-[9px] px-2 py-0.5 rounded-full bg-white/25 backdrop-blur font-bold">
+   240→                      ● جاری
+   241→                    </span>
+   242→                  )}
+   243→                </div>
+   244→                <p className="text-[11px] opacity-90">{PLAN_LABELS[program.planName as any] || program.planName} • {program.days?.length || 0} روز تمرین</p>
+   245→              </div>
+   246→            </div>
+   247→          </div>
+   248→        </div>
+   249→
+   250→        {/* بدنه کارت */}
+   251→        <div className="p-4 space-y-3">
+   252→          {/* Date range — بدون «X روز» */}
+   253→          <div className="flex items-center gap-2 p-2 rounded-xl bg-orange-50/50">
+   254→            <Calendar className="w-3.5 h-3.5 text-orange-500 shrink-0" />
+   255→            <span className="text-[11px] text-slate-600 font-medium">
+   256→              {startDate.toLocaleDateString("fa-IR")} → {endDate.toLocaleDateString("fa-IR")}
+   257→            </span>
+   258→          </div>
+   259→
+   260→          {/* Progress bar for current program */}
+   261→          {isCurrent && (
+   262→            <div>
+   263→              <div className="flex justify-between text-[10px] text-slate-500 mb-1">
+   264→                <span>پیشرفت دوره</span>
+   265→                <span className="font-bold text-orange-600">{toPersianDigits(Math.round(progressPct))}٪</span>
+   266→              </div>
+   267→              <div className="h-2 bg-orange-100 rounded-full overflow-hidden">
+   268→                <div className="h-full rounded-full" style={{ width: `${progressPct}%`, background: "linear-gradient(90deg, #f59e0b, #f97316)" }} />
+   269→              </div>
+   270→            </div>
+   271→          )}
+   272→
+   273→          {/* Stats grid — ریدیزاین شده */}
+   274→          <div className="grid grid-cols-3 gap-2">
+   275→            <div className="p-2.5 rounded-xl bg-gradient-to-br from-orange-50 to-amber-50 text-center border border-orange-100">
+   276→              <Dumbbell className="w-4 h-4 mx-auto mb-1 text-orange-500" />
+   277→              <p className="text-sm font-black text-slate-900">{toPersianDigits(program.exercises)}</p>
+   278→              <p className="text-[9px] text-slate-400">حرکت</p>
+   279→            </div>
+   280→            <div className="p-2.5 rounded-xl bg-gradient-to-br from-orange-50 to-amber-50 text-center border border-orange-100">
+   281→              <Calendar className="w-4 h-4 mx-auto mb-1 text-orange-500" />
+   282→              <p className="text-sm font-black text-slate-900">{toPersianDigits(program.days)}</p>
+   283→              <p className="text-[9px] text-slate-400">روز تمرین</p>
+   284→            </div>
+   285→            <div className="p-2.5 rounded-xl bg-gradient-to-br from-orange-50 to-amber-50 text-center border border-orange-100">
+   286→              <Utensils className="w-4 h-4 mx-auto mb-1 text-orange-500" />
+   287→              <p className="text-sm font-black text-slate-900">{toPersianDigits(program.totalCalories)}</p>
+   288→              <p className="text-[9px] text-slate-400">کالری/روز</p>
+   289→            </div>
+   290→          </div>
+   291→
+   292→        {/* Supplements — برنامه مکمل‌ها */}
+   293→        {program.supplements && program.supplements.length > 0 && (
+   294→          <div className="mb-3 p-3 rounded-xl border border-orange-100 bg-orange-50/30">
+   295→            <div className="flex items-center gap-2 mb-2">
+   296→              <Pill className="w-3.5 h-3.5 text-orange-500" />
+   297→              <p className="text-[11px] font-bold text-slate-700">برنامه مکمل‌ها</p>
+   298→            </div>
+   299→            <div className="space-y-1">
+   300→              {program.supplements.map((s, j) => (
+   301→                <div key={j} className="flex items-center justify-between text-[10px]">
+   302→                  <span className="text-slate-700 font-medium">{s.name}</span>
+   303→                  <span className="text-slate-500">{s.dose} • {s.timing}</span>
+   304→                </div>
+   305→              ))}
+   306→            </div>
+   307→          </div>
+   308→        )}
+   309→
+   310→        {/* Meal Plan — برنامه غذایی */}
+   311→        {program.meals && program.meals.length > 0 && (
+   312→          <div className="mb-3 p-3 rounded-xl border border-orange-100 bg-white">
+   313→            <div className="flex items-center gap-2 mb-2">
+   314→              <Salad className="w-3.5 h-3.5 text-orange-500" />
+   315→              <p className="text-[11px] font-bold text-slate-700">برنامه غذایی</p>
+   316→            </div>
+   317→            <div className="space-y-1.5">
+   318→              {program.meals.map((m, j) => (
+   319→                <div key={j} className="flex items-center justify-between text-[10px] p-1.5 rounded-lg bg-orange-50/40">
+   320→                  <span className="text-slate-700 font-medium">{m.label}</span>
+   321→                  <span className="text-orange-600 font-bold">{toPersianDigits(m.totalCalories)} کالری</span>
+   322→                </div>
+   323→              ))}
+   324→            </div>
+   325→            {/* Macros */}
+   326→            <div className="grid grid-cols-3 gap-1 mt-2">
+   327→              <div className="text-center p-1 rounded bg-orange-50/30">
+   328→                <p className="text-[9px] text-slate-400">پروتئین</p>
+   329→                <p className="text-[10px] font-bold text-slate-700">{toPersianDigits(program.totalProtein || 0)}g</p>
+   330→              </div>
+   331→              <div className="text-center p-1 rounded bg-orange-50/30">
+   332→                <p className="text-[9px] text-slate-400">کربو</p>
+   333→                <p className="text-[10px] font-bold text-slate-700">{toPersianDigits(program.totalCarbs || 0)}g</p>
+   334→              </div>
+   335→              <div className="text-center p-1 rounded bg-orange-50/30">
+   336→                <p className="text-[9px] text-slate-400">چربی</p>
+   337→                <p className="text-[10px] font-bold text-slate-700">{toPersianDigits(program.totalFat || 0)}g</p>
+   338→              </div>
+   339→            </div>
+   340→          </div>
+   341→        )}
+   342→
+   343→        {/* Actions — 3 buttons: تمرین / تغذیه / مکمل */}
+   344→        <div className="space-y-2">
+   345→          <div className="grid grid-cols-3 gap-2">
+   346→            <Button
+   347→              size="sm"
+   348→              variant="outline"
+   349→              className="rounded-xl text-xs border-orange-200 text-orange-600 hover:bg-orange-50 gap-1"
+   350→              onClick={() => onOpenView("workout", program)}
+   351→            >
+   352→              <Dumbbell className="w-3.5 h-3.5" /> تمرین
+   353→            </Button>
+   354→            <Button
+   355→              size="sm"
+   356→              variant="outline"
+   357→              className="rounded-xl text-xs border-emerald-200 text-emerald-600 hover:bg-emerald-50 gap-1"
+   358→              onClick={() => onOpenView("meal", program)}
+   359→            >
+   360→              <Salad className="w-3.5 h-3.5" /> تغذیه
+   361→            </Button>
+   362→            {program.supplements && program.supplements.length > 0 ? (
+   363→              <Button
+   364→                size="sm"
+   365→                variant="outline"
+   366→                className="rounded-xl text-xs border-purple-200 text-purple-600 hover:bg-purple-50 gap-1"
+   367→                onClick={() => onOpenView("supplement", program)}
+   368→              >
+   369→                <Pill className="w-3.5 h-3.5" /> مکمل
+   370→              </Button>
+   371→            ) : (
+   372→              <Button
+   373→                size="sm"
+   374→                variant="outline"
+   375→                disabled
+   376→                className="rounded-xl text-xs border-slate-100 text-slate-300 gap-1 cursor-not-allowed"
+   377→                title="مکمل در پلن شما موجود نیست"
+   378→              >
+   379→                <Pill className="w-3.5 h-3.5" /> مکمل
+   380→              </Button>
+   381→            )}
+   382→          </div>
+   383→          <div className="flex gap-2">
+   384→            <Button
+   385→              size="sm"
+   386→              variant="outline"
+   387→              className="flex-1 rounded-xl text-xs border-orange-200 text-orange-600 hover:bg-orange-50 gap-1"
+   388→              onClick={onOpenWorkouts}
+   389→            >
+   390→              <ChevronLeft className="w-3.5 h-3.5" /> مشاهده کامل تمرینات
+   391→            </Button>
+   392→          </div>
+   393→        </div>
+   394→        </div>
+   395→      </Card>
+   396→    </motion.div>
+   397→  );
+   398→}
+   399→
+   400→/* ============ Plan View Modal — نمایش کامل برنامه + دانلود ============ */
+   401→function PlanViewModal({ type, program, onClose }: {
+   402→  type: "workout" | "meal" | "supplement";
+   403→  program: ProgramItem;
+   404→  onClose: () => void;
+   405→}) {
+   406→  const [downloading, setDownloading] = useState<"image" | "pdf" | null>(null);
+   407→  const printableRef = useRef<HTMLDivElement>(null);
+   408→
+   409→  if (!program) {
+   410→    return null;
+   411→  }
+   412→
+   413→  const typeMeta = {
+   414→    workout: { label: "برنامه تمرینی", icon: Dumbbell, color: "#f59e0b" },
+   415→    meal: { label: "برنامه غذایی", icon: Salad, color: "#10b981" },
+   416→    supplement: { label: "برنامه مکمل‌ها", icon: Pill, color: "#a855f7" },
+   417→  }[type];
+   418→  const Icon = typeMeta.icon;
+   419→
+   420→  async function downloadAsImage() {
+   421→    if (!printableRef.current) return;
+   422→    setDownloading("image");
+   423→    try {
+   424→      const { toPng } = await import("html-to-image");
+   425→      const node = printableRef.current;
+   426→      const orig = { position: node.style.position, top: node.style.top, left: node.style.left, zIndex: node.style.zIndex };
+   427→      node.style.position = "fixed"; node.style.top = "0"; node.style.left = "0"; node.style.zIndex = "-9999";
+   428→      await new Promise(r => setTimeout(r, 30));
+   429→      let dataUrl: string;
+   430→      try {
+   431→        dataUrl = await toPng(node, { cacheBust: true, pixelRatio: 2, backgroundColor: "#ffffff", width: 800 });
+   432→      } finally {
+   433→        node.style.position = orig.position; node.style.top = orig.top; node.style.left = orig.left; node.style.zIndex = orig.zIndex;
+   434→      }
+   435→      const link = document.createElement("a");
+   436→      link.download = `fitup-${type}-${Date.now()}.png`;
+   437→      link.href = dataUrl;
+   438→      link.click();
+   439→      toast.success("تصویر دانلود شد ✓");
+   440→    } catch (e) {
+   441→      console.error("[downloadAsImage]", e);
+   442→      toast.error("خطا در ساخت تصویر");
+   443→    } finally { setDownloading(null); }
+   444→  }
+   445→
+   446→  async function downloadAsPDF() {
+   447→    if (!printableRef.current) return;
+   448→    setDownloading("pdf");
+   449→    try {
+   450→      const { toPng } = await import("html-to-image");
+   451→      const { jsPDF } = await import("jspdf");
+   452→      const node = printableRef.current;
+   453→      const orig = { position: node.style.position, top: node.style.top, left: node.style.left, zIndex: node.style.zIndex };
+   454→      node.style.position = "fixed"; node.style.top = "0"; node.style.left = "0"; node.style.zIndex = "-9999";
+   455→      await new Promise(r => setTimeout(r, 30));
+   456→      let dataUrl: string;
+   457→      try {
+   458→        dataUrl = await toPng(node, { cacheBust: true, pixelRatio: 2, backgroundColor: "#ffffff", width: 800 });
+   459→      } finally {
+   460→        node.style.position = orig.position; node.style.top = orig.top; node.style.left = orig.left; node.style.zIndex = orig.zIndex;
+   461→      }
+   462→      const img = new Image();
+   463→      img.src = dataUrl;
+   464→      await new Promise(res => { img.onload = res; });
+   465→      const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+   466→      const pw = pdf.internal.pageSize.getWidth();
+   467→      const ph = pdf.internal.pageSize.getHeight();
+   468→      const ratio = img.height / img.width;
+   469→      const iw = pw - 40;
+   470→      const ih = iw * ratio;
+   471→      if (ih <= ph - 40) {
+   472→        pdf.addImage(dataUrl, "PNG", 20, 20, iw, ih);
+   473→      } else {
+   474→        const canvas = document.createElement("canvas");
+   475→        canvas.width = img.width; canvas.height = img.height;
+   476→        const ctx = canvas.getContext("2d")!;
+   477→        ctx.drawImage(img, 0, 0);
+   478→        const sliceH = Math.floor((img.width * (ph - 40)) / (pw - 40));
+   479→        let y = 0; let p = 0;
+   480→        while (y < img.height) {
+   481→          const sc = document.createElement("canvas");
+   482→          sc.width = img.width; sc.height = Math.min(sliceH, img.height - y);
+   483→          const sctx = sc.getContext("2d")!;
+   484→          sctx.drawImage(canvas, 0, y, img.width, sc.height, 0, 0, img.width, sc.height);
+   485→          if (p > 0) pdf.addPage();
+   486→          pdf.addImage(sc.toDataURL("image/png"), "PNG", 20, 20, iw, (sc.height / img.width) * iw);
+   487→          y += sliceH; p++;
+   488→        }
+   489→      }
+   490→      pdf.save(`fitup-${type}-${Date.now()}.pdf`);
+   491→      toast.success("PDF دانلود شد ✓");
+   492→    } catch (e) {
+   493→      console.error("[downloadAsPDF]", e);
+   494→      toast.error("خطا در ساخت PDF");
+   495→    } finally { setDownloading(null); }
+   496→  }
+   497→
+   498→  return (
+   499→    <Dialog open onOpenChange={onClose}>
+   500→      <DialogContent dir="rtl" className="max-w-3xl max-h-[92vh] overflow-y-auto custom-scrollbar">
+   501→        <DialogHeader>
+   502→          <DialogTitle className="flex items-center justify-between">
+   503→            <span className="flex items-center gap-2">
+   504→              <Icon className="w-5 h-5" style={{ color: typeMeta.color }} />
+   505→              {typeMeta.label}
+   506→            </span>
+   507→            <div className="flex gap-2">
+   508→              <Button size="sm" variant="outline" onClick={downloadAsImage} disabled={downloading !== null} className="rounded-xl gap-1.5">
+   509→                {downloading === "image" ? <Loader2 className="w-4 h-4 animate-spin" /> : <ImageIcon className="w-4 h-4" />}
+   510→                تصویر
+   511→              </Button>
+   512→              <Button size="sm" variant="outline" onClick={downloadAsPDF} disabled={downloading !== null} className="rounded-xl gap-1.5">
+   513→                {downloading === "pdf" ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileText className="w-4 h-4" />}
+   514→                PDF
+   515→              </Button>
+   516→            </div>
+   517→          </DialogTitle>
+   518→        </DialogHeader>
+   519→
+   520→        {/* Printable content */}
+   521→        <div ref={printableRef} className="p-4 bg-white rounded-xl" style={{ fontFamily: "Vazirmatn, Tahoma, Arial, system-ui, sans-serif" }}>
+   522→          {/* Header */}
+   523→          <div className="flex items-center gap-3 pb-3 mb-4 border-b-2" style={{ borderColor: typeMeta.color }}>
+   524→            <div className="w-12 h-12 rounded-xl flex items-center justify-center overflow-hidden" style={{ background: `linear-gradient(135deg, ${typeMeta.color}, ${typeMeta.color}dd)` }}>
+   525→              {/* eslint-disable-next-line @next/next/no-img-element */}
+   526→              <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" crossOrigin="anonymous" />
+   527→            </div>
+   528→            <div className="flex-1">
+   529→              <h2 className="text-xl font-black text-slate-900">{typeMeta.label} — فیتاپ</h2>
+   530→              <p className="text-xs text-slate-500">پلن {program.planName === "basic" ? "اقتصادی" : program.planName === "standard" ? "استاندارد" : program.planName === "advanced" ? "پیشرفته" : program.planName === "ultimate" ? "حرفه‌ای" : (program.planName || "")} • {program.days?.length || 0} روز تمرین</p>
+   531→            </div>
+   532→          </div>
+   533→
+   534→          {/* Content per type */}
+   535→          {type === "workout" && program.workoutDays && (
+   536→            <div className="space-y-4">
+   537→              {program.workoutDays.map((day, di) => (
+   538→                <div key={di}>
+   539→                  <div className="rounded-xl p-2.5 mb-2 text-white" style={{ background: `linear-gradient(135deg, ${typeMeta.color}, ${typeMeta.color}dd)` }}>
+   540→                    <p className="font-black text-sm">{day.day} — {day.title}</p>
+   541→                    <p className="text-[10px] opacity-90">{day.focus} • {toPersianDigits(day.estimatedMinutes)} دقیقه • {toPersianDigits(day.exercises?.length || 0)} حرکت</p>
+   542→                  </div>
+   543→                  <table className="w-full text-xs border-collapse">
+   544→                    <thead>
+   545→                      <tr style={{ background: "#fff7ed" }}>
+   546→                        <th className="p-2 text-right border border-orange-100 text-orange-700 w-8">#</th>
+   547→                        <th className="p-2 text-right border border-orange-100 text-orange-700">حرکت</th>
+   548→                        <th className="p-2 text-center border border-orange-100 text-orange-700">ست</th>
+   549→                        <th className="p-2 text-center border border-orange-100 text-orange-700">تکرار</th>
+   550→                        <th className="p-2 text-center border border-orange-100 text-orange-700">استراحت</th>
+   551→                      </tr>
+   552→                    </thead>
+   553→                    <tbody>
+   554→                      {day.exercises?.map((ex, ei) => (
+   555→                        <tr key={ei} className="border-b border-orange-50">
+   556→                          <td className="p-2 text-right font-bold text-orange-600 align-top">{toPersianDigits(ei + 1)}</td>
+   557→                          <td className="p-2 text-right align-top">
+   558→                            <div className="flex items-center gap-1.5 flex-wrap">
+   559→                              <span className="font-bold text-slate-900">{ex.name}</span>
+   560→                              {ex.supersetGroup && (
+   561→                                <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-700 border border-purple-200 font-bold">
+   562→                                  {ex.supersetType === "triset" ? "تری‌ست" : "سوپرست"} {ex.supersetGroup}
+   563→                                </span>
+   564→                              )}
+   565→                            </div>
+   566→                            <p className="text-[10px] text-slate-400 mt-0.5">{ex.muscle}</p>
+   567→                            {ex.description && <p className="text-[10px] text-slate-600 mt-1 leading-relaxed">{ex.description}</p>}
+   568→                            {ex.tips && <p className="text-[9px] text-amber-600 mt-0.5">💡 {ex.tips}</p>}
+   569→                          </td>
+   570→                          <td className="p-2 text-center font-bold text-slate-900 align-top">{toPersianDigits(ex.sets?.length || 0)}</td>
+   571→                          <td className="p-2 text-center text-slate-700 align-top">
+   572→                            {ex.sets?.map((s, k) => (
+   573→                              <span key={k}>{toPersianDigits(s.reps)}{k < ex.sets.length - 1 ? " / " : ""}</span>
+   574→                            ))}
+   575→                          </td>
+   576→                          <td className="p-2 text-center text-slate-700 align-top">
+   577→                            {ex.supersetGroup ? "—" : `${toPersianDigits(ex.sets?.[0]?.restSec ?? 0)}s`}
+   578→                          </td>
+   579→                        </tr>
+   580→                      ))}
+   581→                    </tbody>
+   582→                  </table>
+   583→                </div>
+   584→              ))}
+   585→            </div>
+   586→          )}
+   587→
+   588→          {type === "meal" && program.meals && (
+   589→            <div className="space-y-3">
+   590→              {/* Macros summary */}
+   591→              <div className="grid grid-cols-4 gap-2 p-3 rounded-xl bg-emerald-50/50">
+   592→                <div className="text-center">
+   593→                  <p className="text-[10px] text-slate-500">کالری</p>
+   594→                  <p className="font-black text-emerald-600">{toPersianDigits(program.totalCalories || 0)}</p>
+   595→                </div>
+   596→                <div className="text-center">
+   597→                  <p className="text-[10px] text-slate-500">پروتئین</p>
+   598→                  <p className="font-bold text-red-600">{toPersianDigits(program.totalProtein || 0)}g</p>
+   599→                </div>
+   600→                <div className="text-center">
+   601→                  <p className="text-[10px] text-slate-500">کربو</p>
+   602→                  <p className="font-bold text-amber-600">{toPersianDigits(program.totalCarbs || 0)}g</p>
+   603→                </div>
+   604→                <div className="text-center">
+   605→                  <p className="text-[10px] text-slate-500">چربی</p>
+   606→                  <p className="font-bold text-blue-600">{toPersianDigits(program.totalFat || 0)}g</p>
+   607→                </div>
+   608→              </div>
+   609→
+   610→              {program.meals.map((m, mi) => (
+   611→                <div key={mi} className="p-3 rounded-xl border border-emerald-100">
+   612→                  <div className="flex items-center justify-between mb-2">
+   613→                    <span className="font-bold text-slate-900 text-sm">{m.label}</span>
+   614→                    <span className="text-xs text-emerald-600 font-bold">{toPersianDigits(m.totalCalories)} کالری</span>
+   615→                  </div>
+   616→                  {m.combination && (
+   617→                    <p className="text-[11px] text-slate-600 mb-2 p-1.5 rounded bg-emerald-50/50">🍽 ترکیب: {m.combination}</p>
+   618→                  )}
+   619→                  <div className="space-y-1">
+   620→                    {m.items?.map((it, ii) => (
+   621→                      <div key={ii} className="flex items-center justify-between text-[11px] py-1 border-b last:border-0 border-emerald-50">
+   622→                        <div>
+   623→                          <span className="font-medium text-slate-700">{it.name}</span>
+   624→                          {it.servingSize && <span className="text-slate-400 mr-2">({it.servingSize})</span>}
+   625→                        </div>
+   626→                        <div className="flex items-center gap-1.5">
+   627→                          <span className="text-slate-500">{toPersianDigits(it.calories)} کالری</span>
+   628→                          <span className="text-[9px] px-1 rounded bg-red-50 text-red-600">P{toPersianDigits(it.protein)}</span>
+   629→                          <span className="text-[9px] px-1 rounded bg-amber-50 text-amber-600">C{toPersianDigits(it.carbs)}</span>
+   630→                          <span className="text-[9px] px-1 rounded bg-blue-50 text-blue-600">F{toPersianDigits(it.fat)}</span>
+   631→                        </div>
+   632→                      </div>
+   633→                    ))}
+   634→                  </div>
+   635→                  {m.alternatives && m.alternatives.length > 0 && (
+   636→                    <div className="mt-2 pt-2 border-t border-emerald-50">
+   637→                      <p className="text-[10px] font-bold text-slate-500 mb-1">🔄 غذاهای جایگزین:</p>
+   638→                      {m.alternatives.map((alt, ai) => (
+   639→                        <div key={ai} className="text-[10px] text-slate-600 p-1.5 rounded bg-slate-50 mb-1">
+   640→                          <span className="font-medium">گزینه {toPersianDigits(ai + 1)}: {alt.combination}</span>
+   641→                          <span className="text-slate-400 mr-2">({toPersianDigits(alt.totalCalories)} کالری)</span>
+   642→                        </div>
+   643→                      ))}
+   644→                    </div>
+   645→                  )}
+   646→                </div>
+   647→              ))}
+   648→              {program.waterLiters && (
+   649→                <p className="text-[11px] text-cyan-600 text-center">💧 آب روزانه: {toPersianDigits(program.waterLiters)} لیتر</p>
+   650→              )}
+   651→            </div>
+   652→          )}
+   653→
+   654→          {type === "supplement" && program.supplements && (
+   655→            <div className="space-y-2">
+   656→              {program.supplements.map((s, si) => (
+   657→                <div key={si} className="p-3 rounded-xl border border-purple-100 bg-purple-50/30">
+   658→                  <div className="flex items-center justify-between">
+   659→                    <span className="font-bold text-slate-900 text-sm">{s.name}</span>
+   660→                    <span className="text-xs text-purple-600 font-bold">{s.dose}</span>
+   661→                  </div>
+   662→                  <p className="text-[11px] text-slate-500 mt-1">⏰ {s.timing}</p>
+   663→                  {s.note && <p className="text-[10px] text-slate-400 mt-1">{s.note}</p>}
+   664→                </div>
+   665→              ))}
+   666→            </div>
+   667→          )}
+   668→        </div>
+   669→      </DialogContent>
+   670→    </Dialog>
+   671→  );
+   672→}
+   673→

@@ -1,0 +1,830 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useEffect, useState, useCallback, useRef } from "react";
+     4→     4→import { motion, AnimatePresence } from "framer-motion";
+     5→     5→import {
+     6→     6→  Headphones,
+     7→     7→  Plus,
+     8→     8→  ChevronLeft,
+     9→     9→  Send,
+    10→    10→  Loader2,
+    11→    11→  MessageSquare,
+    12→    12→  XCircle,
+    13→    13→  Inbox,
+    14→    14→  Search,
+    15→    15→  Lightbulb,
+    16→    16→  Wallet,
+    17→    17→  Dumbbell,
+    18→    18→  Apple,
+    19→    19→  Gift,
+    20→    20→  Bug,
+    21→    21→  Sparkles,
+    22→    22→} from "lucide-react";
+    23→    23→import {
+    24→    24→  Select,
+    25→    25→  SelectContent,
+    26→    26→  SelectItem,
+    27→    27→  SelectTrigger,
+    28→    28→  SelectValue,
+    29→    29→} from "@/components/ui/select";
+    30→    30→import {
+    31→    31→  Accordion,
+    32→    32→  AccordionContent,
+    33→    33→  AccordionItem,
+    34→    34→  AccordionTrigger,
+    35→    35→} from "@/components/ui/accordion";
+    36→    36→import {
+    37→    37→  Dialog,
+    38→    38→  DialogContent,
+    39→    39→  DialogHeader,
+    40→    40→  DialogTitle,
+    41→    41→  DialogFooter,
+    42→    42→} from "@/components/ui/dialog";
+    43→    43→import { Button } from "@/components/ui/button";
+    44→    44→import { Card } from "@/components/ui/card";
+    45→    45→import { FeedbackModal } from "@/components/fitness/feedback-modal";
+    46→    46→import { Input } from "@/components/ui/input";
+    47→    47→import { Label } from "@/components/ui/label";
+    48→    48→import { Badge } from "@/components/ui/badge";
+    49→    49→import { Textarea } from "@/components/ui/textarea";
+    50→    50→import { Skeleton } from "@/components/ui/skeleton";
+    51→    51→import { toPersianDigits } from "@/lib/fitness/types";
+    52→    52→import { toast } from "sonner";
+    53→    53→
+    54→    54→// ---------- Types ----------
+    55→    55→interface TicketReplyDto {
+    56→    56→  id: string;
+    57→    57→  role: string; // user | admin
+    58→    58→  message: string;
+    59→    59→  createdAt: string;
+    60→    60→  user: { id: string; name: string | null; mobile: string };
+    61→    61→}
+    62→    62→
+    63→    63→interface TicketDto {
+    64→    64→  id: string;
+    65→    65→  subject: string;
+    66→    66→  category: string;
+    67→    67→  priority: string;
+    68→    68→  status: string; // open | answered | closed
+    69→    69→  message: string;
+    70→    70→  adminReply: string | null;
+    71→    71→  createdAt: string;
+    72→    72→  updatedAt: string;
+    73→    73→  repliedAt: string | null;
+    74→    74→  userId: string;
+    75→    75→  user: { id: string; name: string | null; mobile: string; planName: string | null };
+    76→    76→  replies: TicketReplyDto[];
+    77→    77→}
+    78→    78→
+    79→    79→// ---------- Constants ----------
+    80→    80→const CATEGORY_LABELS: Record<string, string> = {
+    81→    81→  general: "عمومی",
+    82→    82→  technical: "فنی",
+    83→    83→  payment: "پرداخت",
+    84→    84→  program: "برنامه",
+    85→    85→  bug: "باگ",
+    86→    86→};
+    87→    87→
+    88→    88→const PRIORITY_LABELS: Record<string, string> = {
+    89→    89→  low: "کم",
+    90→    90→  normal: "معمولی",
+    91→    91→  high: "مهم",
+    92→    92→  urgent: "فوری",
+    93→    93→};
+    94→    94→
+    95→    95→const PRIORITY_COLORS: Record<string, string> = {
+    96→    96→  low: "bg-slate-100 text-slate-700",
+    97→    97→  normal: "bg-cyan-100 text-cyan-700",
+    98→    98→  high: "bg-amber-100 text-amber-700",
+    99→    99→  urgent: "bg-red-100 text-red-700",
+   100→   100→};
+   101→   101→
+   102→   102→const STATUS_LABELS: Record<string, string> = {
+   103→   103→  open: "باز",
+   104→   104→  answered: "پاسخ داده شد",
+   105→   105→  closed: "بسته شد",
+   106→   106→};
+   107→   107→
+   108→   108→const STATUS_COLORS: Record<string, string> = {
+   109→   109→  open: "bg-amber-100 text-amber-700",
+   110→   110→  answered: "bg-emerald-100 text-emerald-700",
+   111→   111→  closed: "bg-slate-100 text-slate-600",
+   112→   112→};
+   113→   113→
+   114→   114→function formatJalali(iso: string): string {
+   115→   115→  try {
+   116→   116→    return new Intl.DateTimeFormat("fa-IR-u-ca-persian", {
+   117→   117→      day: "numeric",
+   118→   118→      month: "long",
+   119→   119→      hour: "2-digit",
+   120→   120→      minute: "2-digit",
+   121→   121→    }).format(new Date(iso));
+   122→   122→  } catch {
+   123→   123→    return new Date(iso).toLocaleString("fa-IR");
+   124→   124→  }
+   125→   125→}
+   126→   126→
+   127→   127→// ---------- Main view ----------
+   128→   128→export function SupportView() {
+   129→   129→  const [tickets, setTickets] = useState<TicketDto[]>([]);
+   130→   130→  const [loading, setLoading] = useState(true);
+   131→   131→  const [selected, setSelected] = useState<TicketDto | null>(null);
+   132→   132→  const [showNew, setShowNew] = useState(false);
+   133→   133→  const [feedbackOpen, setFeedbackOpen] = useState(false);
+   134→   134→  const [faqSearch, setFaqSearch] = useState("");
+   135→   135→
+   136→   136→  const fetchTickets = useCallback(async () => {
+   137→   137→    setLoading(true);
+   138→   138→    try {
+   139→   139→      const res = await fetch("/api/support/tickets", { cache: "no-store" }, { cache: "no-store" });
+   140→   140→      const data = await res.json();
+   141→   141→      if (Array.isArray(data.tickets)) setTickets(data.tickets);
+   142→   142→    } catch {
+   143→   143→      toast.error("خطا در دریافت تیکت‌ها");
+   144→   144→    } finally {
+   145→   145→      setLoading(false);
+   146→   146→    }
+   147→   147→  }, []);
+   148→   148→
+   149→   149→  useEffect(() => {
+   150→   150→    void fetchTickets();
+   151→   151→  }, [fetchTickets]);
+   152→   152→
+   153→   153→  function handleCreated(t: TicketDto) {
+   154→   154→    setTickets((prev) => [t, ...prev]);
+   155→   155→    setShowNew(false);
+   156→   156→    setSelected(t);
+   157→   157→    toast.success("تیکت شما ثبت شد ✅");
+   158→   158→  }
+   159→   159→
+   160→   160→  function handleTicketUpdated(t: TicketDto) {
+   161→   161→    setTickets((prev) => prev.map((x) => (x.id === t.id ? t : x)));
+   162→   162→    setSelected(t);
+   163→   163→  }
+   164→   164→
+   165→   165→  return (
+   166→   166→    <div className="p-4 max-w-3xl mx-auto space-y-5">
+   167→   167→      {/* Header */}
+   168→   168→      <div className="flex items-center justify-between gap-3">
+   169→   169→        <div className="flex items-center gap-2">
+   170→   170→          <div
+   171→   171→            className="w-10 h-10 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-orange-500/20"
+   172→   172→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   173→   173→          >
+   174→   174→            <Headphones className="w-5 h-5" />
+   175→   175→          </div>
+   176→   176→          <div>
+   177→   177→            <h1 className="text-lg font-black text-slate-900">پشتیبانی</h1>
+   178→   178→            <p className="text-xs text-slate-500">
+   179→   179→              سوالات متداول، تیکت‌ها و پیشنهادات
+   180→   180→            </p>
+   181→   181→          </div>
+   182→   182→        </div>
+   183→   183→        <div className="flex gap-2">
+   184→   184→          <Button
+   185→   185→            variant="outline"
+   186→   186→            onClick={() => setFeedbackOpen(true)}
+   187→   187→            className="rounded-xl gap-1.5 text-xs"
+   188→   188→          >
+   189→   189→            <Lightbulb className="w-4 h-4 text-orange-500" />
+   190→   190→            <span className="hidden sm:inline">پیشنهادات</span>
+   191→   191→          </Button>
+   192→   192→          <Button
+   193→   193→            onClick={() => setShowNew(true)}
+   194→   194→            className="rounded-xl gap-1.5"
+   195→   195→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   196→   196→          >
+   197→   197→            <Plus className="w-4 h-4" />
+   198→   198→            <span className="hidden sm:inline">تیکت جدید</span>
+   199→   199→          </Button>
+   200→   200→        </div>
+   201→   201→      </div>
+   202→   202→
+   203→   203→      {/* FAQ Section */}
+   204→   204→      {!selected && <FaqSection search={faqSearch} setSearch={setFaqSearch} />}
+   205→   205→
+   206→   206→      {/* Tickets */}
+   207→   207→      {!selected && (
+   208→   208→        <div>
+   209→   209→          <div className="flex items-center gap-2 mb-3 mt-6">
+   210→   210→            <div className="h-px flex-1 bg-orange-100" />
+   211→   211→            <span className="text-xs font-bold text-slate-400 px-2">تیکت‌های پشتیبانی</span>
+   212→   212→            <div className="h-px flex-1 bg-orange-100" />
+   213→   213→          </div>
+   214→   214→          <p className="text-xs text-slate-500 text-center mb-3">
+   215→   215→            پاسخ خود را در سوالات متداول پیدا نکردید؟ تیکت بزنید تا پشتیبانی پاسخ دهد:
+   216→   216→          </p>
+   217→   217→        </div>
+   218→   218→      )}
+   219→   219→
+   220→   220→      {/* Content */}
+   221→   221→      <AnimatePresence mode="wait">
+   222→   222→        {selected ? (
+   223→   223→          <motion.div
+   224→   224→            key="detail"
+   225→   225→            initial={{ opacity: 0, x: -10 }}
+   226→   226→            animate={{ opacity: 1, x: 0 }}
+   227→   227→            exit={{ opacity: 0, x: 10 }}
+   228→   228→          >
+   229→   229→            <TicketDetail
+   230→   230→              ticket={selected}
+   231→   231→              onBack={() => setSelected(null)}
+   232→   232→              onUpdated={handleTicketUpdated}
+   233→   233→            />
+   234→   234→          </motion.div>
+   235→   235→        ) : (
+   236→   236→          <motion.div
+   237→   237→            key="list"
+   238→   238→            initial={{ opacity: 0, x: 10 }}
+   239→   239→            animate={{ opacity: 1, x: 0 }}
+   240→   240→            exit={{ opacity: 0, x: -10 }}
+   241→   241→          >
+   242→   242→            <TicketList
+   243→   243→              tickets={tickets}
+   244→   244→              loading={loading}
+   245→   245→              onOpen={(t) => setSelected(t)}
+   246→   246→              onRetry={fetchTickets}
+   247→   247→            />
+   248→   248→          </motion.div>
+   249→   249→        )}
+   250→   250→      </AnimatePresence>
+   251→   251→
+   252→   252→      {/* New ticket dialog */}
+   253→   253→      {showNew && (
+   254→   254→        <NewTicketDialog
+   255→   255→          onClose={() => setShowNew(false)}
+   256→   256→          onCreated={handleCreated}
+   257→   257→        />
+   258→   258→      )}
+   259→   259→
+   260→   260→      {/* Feedback modal */}
+   261→   261→      <FeedbackModal open={feedbackOpen} onClose={() => setFeedbackOpen(false)} />
+   262→   262→    </div>
+   263→   263→  );
+   264→   264→}
+   265→   265→
+   266→   266→// ---------- Ticket list ----------
+   267→   267→function TicketList({
+   268→   268→  tickets,
+   269→   269→  loading,
+   270→   270→  onOpen,
+   271→   271→  onRetry,
+   272→   272→}: {
+   273→   273→  tickets: TicketDto[];
+   274→   274→  loading: boolean;
+   275→   275→  onOpen: (t: TicketDto) => void;
+   276→   276→  onRetry: () => void;
+   277→   277→}) {
+   278→   278→  if (loading) {
+   279→   279→    return (
+   280→   280→      <div className="space-y-3">
+   281→   281→        {[1, 2, 3].map((i) => (
+   282→   282→          <Skeleton key={i} className="h-24 rounded-2xl" />
+   283→   283→        ))}
+   284→   284→      </div>
+   285→   285→    );
+   286→   286→  }
+   287→   287→
+   288→   288→  if (tickets.length === 0) {
+   289→   289→    return (
+   290→   290→      <Card className="p-10 text-center glass">
+   291→   291→        <div className="mx-auto w-16 h-16 rounded-2xl bg-orange-50 flex items-center justify-center mb-3">
+   292→   292→          <Inbox className="w-8 h-8 text-orange-400" />
+   293→   293→        </div>
+   294→   294→        <p className="text-slate-700 font-bold mb-1">هنوز تیکتی ثبت نکرده‌اید</p>
+   295→   295→        <p className="text-xs text-slate-500 mb-4">
+   296→   296→          اگر سوال یا مشکلی دارید، اولین تیکت خود را ثبت کنید
+   297→   297→        </p>
+   298→   298→        <Button onClick={onRetry} variant="outline" size="sm" className="rounded-xl">
+   299→   299→          تلاش مجدد
+   300→   300→        </Button>
+   301→   301→      </Card>
+   302→   302→    );
+   303→   303→  }
+   304→   304→
+   305→   305→  return (
+   306→   306→    <div className="space-y-2">
+   307→   307→      {tickets.map((t) => (
+   308→   308→        <button
+   309→   309→          key={t.id}
+   310→   310→          onClick={() => onOpen(t)}
+   311→   311→          className="w-full text-right"
+   312→   312→        >
+   313→   313→          <Card className="p-3.5 glass hover:border-orange-300 transition-all hover:shadow-md hover:shadow-orange-500/10">
+   314→   314→            <div className="flex items-start justify-between gap-3">
+   315→   315→              <div className="flex items-start gap-2.5 min-w-0 flex-1">
+   316→   316→                <div className="w-9 h-9 rounded-xl bg-orange-100 flex items-center justify-center shrink-0 mt-0.5">
+   317→   317→                  <MessageSquare className="w-4 h-4 text-orange-600" />
+   318→   318→                </div>
+   319→   319→                <div className="min-w-0 flex-1">
+   320→   320→                  <p className="font-bold text-sm text-slate-900 truncate">{t.subject}</p>
+   321→   321→                  <p className="text-xs text-slate-500 line-clamp-2 mt-0.5">
+   322→   322→                    {t.message}
+   323→   323→                  </p>
+   324→   324→                  <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+   325→   325→                    <Badge className={`text-[10px] ${STATUS_COLORS[t.status] || "bg-slate-100"}`}>
+   326→   326→                      {STATUS_LABELS[t.status] || t.status}
+   327→   327→                    </Badge>
+   328→   328→                    <Badge className={`text-[10px] ${PRIORITY_COLORS[t.priority] || "bg-slate-100"}`}>
+   329→   329→                      {PRIORITY_LABELS[t.priority] || t.priority}
+   330→   330→                    </Badge>
+   331→   331→                    <Badge variant="outline" className="text-[10px]">
+   332→   332→                      {CATEGORY_LABELS[t.category] || t.category}
+   333→   333→                    </Badge>
+   334→   334→                    {t.replies.length > 0 && (
+   335→   335→                      <span className="text-[10px] text-slate-500 flex items-center gap-0.5">
+   336→   336→                        <MessageSquare className="w-3 h-3" />
+   337→   337→                        {toPersianDigits(t.replies.length)}
+   338→   338→                      </span>
+   339→   339→                    )}
+   340→   340→                  </div>
+   341→   341→                </div>
+   342→   342→              </div>
+   343→   343→              <div className="flex flex-col items-end gap-1 shrink-0">
+   344→   344→                <ChevronLeft className="w-4 h-4 text-slate-400" />
+   345→   345→                <span className="text-[10px] text-slate-400 whitespace-nowrap">
+   346→   346→                  {formatJalali(t.updatedAt)}
+   347→   347→                </span>
+   348→   348→              </div>
+   349→   349→            </div>
+   350→   350→          </Card>
+   351→   351→        </button>
+   352→   352→      ))}
+   353→   353→    </div>
+   354→   354→  );
+   355→   355→}
+   356→   356→
+   357→   357→// ---------- Ticket detail ----------
+   358→   358→function TicketDetail({
+   359→   359→  ticket,
+   360→   360→  onBack,
+   361→   361→  onUpdated,
+   362→   362→}: {
+   363→   363→  ticket: TicketDto;
+   364→   364→  onBack: () => void;
+   365→   365→  onUpdated: (t: TicketDto) => void;
+   366→   366→}) {
+   367→   367→  const [reply, setReply] = useState("");
+   368→   368→  const [sending, setSending] = useState(false);
+   369→   369→  const [refreshing, setRefreshing] = useState(false);
+   370→   370→  const scrollRef = useRef<HTMLDivElement | null>(null);
+   371→   371→
+   372→   372→  // Refresh ticket on mount to ensure replies are up-to-date
+   373→   373→  useEffect(() => {
+   374→   374→    void (async () => {
+   375→   375→      try {
+   376→   376→        setRefreshing(true);
+   377→   377→        const res = await fetch(`/api/support/tickets/${ticket.id}`, { cache: "no-store" });
+   378→   378→        if (res.ok) {
+   379→   379→          const data = await res.json();
+   380→   380→          if (data.ticket) onUpdated(data.ticket);
+   381→   381→        }
+   382→   382→      } catch {} finally {
+   383→   383→        setRefreshing(false);
+   384→   384→      }
+   385→   385→    })();
+   386→   386→  }, [ticket.id, onUpdated]);
+   387→   387→
+   388→   388→  // Auto-scroll to bottom when replies change
+   389→   389→  useEffect(() => {
+   390→   390→    if (scrollRef.current) {
+   391→   391→      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+   392→   392→    }
+   393→   393→  }, [ticket.replies.length]);
+   394→   394→
+   395→   395→  async function sendReply(e?: React.FormEvent) {
+   396→   396→    e?.preventDefault();
+   397→   397→    if (!reply.trim()) return;
+   398→   398→    if (ticket.status === "closed") {
+   399→   399→      toast.error("این تیکت بسته شده است. ابتدا آن را باز کنید.");
+   400→   400→      return;
+   401→   401→    }
+   402→   402→    setSending(true);
+   403→   403→    try {
+   404→   404→      const res = await fetch(`/api/support/tickets/${ticket.id}`, {
+   405→   405→        method: "POST",
+   406→   406→        headers: { "Content-Type": "application/json" },
+   407→   407→        body: JSON.stringify({ message: reply.trim() }),
+   408→   408→      });
+   409→   409→      const data = await res.json();
+   410→   410→      if (!res.ok) throw new Error(data?.error || "خطا در ارسال پاسخ");
+   411→   411→      onUpdated(data.ticket);
+   412→   412→      setReply("");
+   413→   413→      toast.success("پاسخ شما ارسال شد");
+   414→   414→    } catch (err) {
+   415→   415→      toast.error(err instanceof Error ? err.message : "خطای ناشناخته");
+   416→   416→    } finally {
+   417→   417→      setSending(false);
+   418→   418→    }
+   419→   419→  }
+   420→   420→
+   421→   421→  return (
+   422→   422→    <div className="space-y-3">
+   423→   423→      {/* Back button */}
+   424→   424→      <button
+   425→   425→        onClick={onBack}
+   426→   426→        className="flex items-center gap-1 text-sm text-slate-600 hover:text-slate-900 transition"
+   427→   427→      >
+   428→   428→        <ChevronLeft className="w-4 h-4 rotate-180" />
+   429→   429→        بازگشت به لیست تیکت‌ها
+   430→   430→      </button>
+   431→   431→
+   432→   432→      {/* Ticket header card */}
+   433→   433→      <Card className="p-4 glass">
+   434→   434→        <div className="flex items-start justify-between gap-3 mb-3">
+   435→   435→          <div className="flex items-start gap-2.5 min-w-0 flex-1">
+   436→   436→            <div className="w-10 h-10 rounded-xl bg-orange-100 flex items-center justify-center shrink-0">
+   437→   437→              <MessageSquare className="w-5 h-5 text-orange-600" />
+   438→   438→            </div>
+   439→   439→            <div className="min-w-0">
+   440→   440→              <h2 className="font-bold text-slate-900 truncate">{ticket.subject}</h2>
+   441→   441→              <p className="text-[11px] text-slate-500 mt-0.5">
+   442→   442→                {formatJalali(ticket.createdAt)}
+   443→   443→              </p>
+   444→   444→            </div>
+   445→   445→          </div>
+   446→   446→          <Badge className={`text-[10px] ${STATUS_COLORS[ticket.status] || "bg-slate-100"}`}>
+   447→   447→            {STATUS_LABELS[ticket.status] || ticket.status}
+   448→   448→          </Badge>
+   449→   449→        </div>
+   450→   450→        <div className="flex items-center gap-1.5 flex-wrap">
+   451→   451→          <Badge variant="outline" className="text-[10px]">
+   452→   452→            {CATEGORY_LABELS[ticket.category] || ticket.category}
+   453→   453→          </Badge>
+   454→   454→          <Badge className={`text-[10px] ${PRIORITY_COLORS[ticket.priority] || "bg-slate-100"}`}>
+   455→   455→            اولویت: {PRIORITY_LABELS[ticket.priority] || ticket.priority}
+   456→   456→          </Badge>
+   457→   457→        </div>
+   458→   458→        <p className="text-sm text-slate-700 leading-relaxed mt-3 whitespace-pre-wrap">
+   459→   459→          {ticket.message}
+   460→   460→        </p>
+   461→   461→      </Card>
+   462→   462→
+   463→   463→      {/* Replies thread */}
+   464→   464→      <Card className="p-3 glass">
+   465→   465→        <div className="flex items-center justify-between mb-2 px-1">
+   466→   466→          <h3 className="text-xs font-bold text-slate-700">گفتگو</h3>
+   467→   467→          {refreshing && (
+   468→   468→            <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" />
+   469→   469→          )}
+   470→   470→        </div>
+   471→   471→
+   472→   472→        <div
+   473→   473→          ref={scrollRef}
+   474→   474→          className="max-h-[40vh] overflow-y-auto custom-scrollbar space-y-2.5 pr-1"
+   475→   475→        >
+   476→   476→          {ticket.replies.length === 0 && (
+   477→   477→            <div className="text-center py-6 text-xs text-slate-500">
+   478→   478→              هنوز پاسخی ثبت نشده است. اولین نفر باشید!
+   479→   479→            </div>
+   480→   480→          )}
+   481→   481→          {ticket.replies.map((r) => (
+   482→   482→            <ReplyBubble key={r.id} reply={r} />
+   483→   483→          ))}
+   484→   484→        </div>
+   485→   485→      </Card>
+   486→   486→
+   487→   487→      {/* Reply input */}
+   488→   488→      <Card className="p-3 glass">
+   489→   489→        {ticket.status === "closed" ? (
+   490→   490→          <div className="text-center py-3 text-xs text-slate-500 flex items-center justify-center gap-1.5">
+   491→   491→            <XCircle className="w-4 h-4 text-slate-400" />
+   492→   492→            این تیکت بسته شده است.
+   493→   493→          </div>
+   494→   494→        ) : (
+   495→   495→          <form onSubmit={sendReply} className="space-y-2">
+   496→   496→            <Label className="text-xs text-slate-700">پاسخ شما</Label>
+   497→   497→            <Textarea
+   498→   498→              value={reply}
+   499→   499→              onChange={(e) => setReply(e.target.value)}
+   500→   500→              placeholder="متن پاسخ خود را بنویسید..."
+   501→   501→              rows={3}
+   502→   502→              className="rounded-xl resize-none"
+   503→   503→              dir="rtl"
+   504→   504→            />
+   505→   505→            <div className="flex justify-end">
+   506→   506→              <Button
+   507→   507→                type="submit"
+   508→   508→                disabled={sending || !reply.trim()}
+   509→   509→                className="rounded-xl gap-1.5"
+   510→   510→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   511→   511→              >
+   512→   512→                {sending ? (
+   513→   513→                  <Loader2 className="w-4 h-4 animate-spin" />
+   514→   514→                ) : (
+   515→   515→                  <Send className="w-4 h-4" />
+   516→   516→                )}
+   517→   517→                ارسال پاسخ
+   518→   518→              </Button>
+   519→   519→            </div>
+   520→   520→          </form>
+   521→   521→        )}
+   522→   522→      </Card>
+   523→   523→    </div>
+   524→   524→  );
+   525→   525→}
+   526→   526→
+   527→   527→// ---------- Reply bubble ----------
+   528→   528→function ReplyBubble({ reply }: { reply: TicketReplyDto }) {
+   529→   529→  const isAdmin = reply.role === "admin";
+   530→   530→  return (
+   531→   531→    <div className={`flex ${isAdmin ? "justify-start" : "justify-end"}`}>
+   532→   532→      <div
+   533→   533→        className={`max-w-[80%] rounded-2xl px-3.5 py-2.5 ${
+   534→   534→          isAdmin
+   535→   535→            ? "bg-orange-50 border border-orange-200 text-slate-800 rounded-bl-md"
+   536→   536→            : "bg-slate-100 text-slate-800 rounded-br-md"
+   537→   537→        }`}
+   538→   538→      >
+   539→   539→        <div className="flex items-center gap-1.5 mb-1">
+   540→   540→          {isAdmin ? (
+   541→   541→            <Badge className="text-[9px] bg-orange-500 text-white">پشتیبانی</Badge>
+   542→   542→          ) : (
+   543→   543→            <span className="text-[10px] font-bold text-slate-600">شما</span>
+   544→   544→          )}
+   545→   545→          <span className="text-[9px] text-slate-400">{formatJalali(reply.createdAt)}</span>
+   546→   546→        </div>
+   547→   547→        <p className="text-sm whitespace-pre-wrap leading-relaxed">{reply.message}</p>
+   548→   548→      </div>
+   549→   549→    </div>
+   550→   550→  );
+   551→   551→}
+   552→   552→
+   553→   553→// ---------- New ticket dialog ----------
+   554→   554→function NewTicketDialog({
+   555→   555→  onClose,
+   556→   556→  onCreated,
+   557→   557→}: {
+   558→   558→  onClose: () => void;
+   559→   559→  onCreated: (t: TicketDto) => void;
+   560→   560→}) {
+   561→   561→  const [subject, setSubject] = useState("");
+   562→   562→  const [category, setCategory] = useState("general");
+   563→   563→  const [priority, setPriority] = useState("normal");
+   564→   564→  const [message, setMessage] = useState("");
+   565→   565→  const [saving, setSaving] = useState(false);
+   566→   566→
+   567→   567→  async function submit(e?: React.FormEvent) {
+   568→   568→    e?.preventDefault();
+   569→   569→    if (subject.trim().length < 3) {
+   570→   570→      toast.error("موضوع باید حداقل ۳ کاراکتر باشد");
+   571→   571→      return;
+   572→   572→    }
+   573→   573→    if (message.trim().length < 5) {
+   574→   574→      toast.error("متن پیام باید حداقل ۵ کاراکتر باشد");
+   575→   575→      return;
+   576→   576→    }
+   577→   577→    setSaving(true);
+   578→   578→    try {
+   579→   579→      const res = await fetch("/api/support/tickets", { cache: "no-store" }, {
+   580→   580→        method: "POST",
+   581→   581→        headers: { "Content-Type": "application/json" },
+   582→   582→        body: JSON.stringify({
+   583→   583→          subject: subject.trim(),
+   584→   584→          category,
+   585→   585→          priority,
+   586→   586→          message: message.trim(),
+   587→   587→        }),
+   588→   588→      });
+   589→   589→      const data = await res.json();
+   590→   590→      if (!res.ok) throw new Error(data?.error || "خطا در ثبت تیکت");
+   591→   591→      onCreated(data.ticket);
+   592→   592→    } catch (err) {
+   593→   593→      toast.error(err instanceof Error ? err.message : "خطای ناشناخته");
+   594→   594→    } finally {
+   595→   595→      setSaving(false);
+   596→   596→    }
+   597→   597→  }
+   598→   598→
+   599→   599→  return (
+   600→   600→    <Dialog open onOpenChange={onClose}>
+   601→   601→      <DialogContent dir="rtl" className="max-w-md">
+   602→   602→        <DialogHeader>
+   603→   603→          <DialogTitle className="flex items-center gap-2">
+   604→   604→            <Plus className="w-5 h-5 text-primary" />
+   605→   605→            تیکت جدید
+   606→   606→          </DialogTitle>
+   607→   607→        </DialogHeader>
+   608→   608→        <form onSubmit={submit} className="space-y-3">
+   609→   609→          <div className="space-y-1.5">
+   610→   610→            <Label className="text-xs">موضوع</Label>
+   611→   611→            <Input
+   612→   612→              value={subject}
+   613→   613→              onChange={(e) => setSubject(e.target.value)}
+   614→   614→              placeholder="مثلاً: مشکل در ورود به حساب کاربری"
+   615→   615→              className="rounded-xl"
+   616→   616→              maxLength={120}
+   617→   617→            />
+   618→   618→          </div>
+   619→   619→
+   620→   620→          <div className="grid grid-cols-2 gap-2">
+   621→   621→            <div className="space-y-1.5">
+   622→   622→              <Label className="text-xs">دسته‌بندی</Label>
+   623→   623→              <Select value={category} onValueChange={setCategory}>
+   624→   624→                <SelectTrigger className="rounded-xl">
+   625→   625→                  <SelectValue placeholder="انتخاب کنید" />
+   626→   626→                </SelectTrigger>
+   627→   627→                <SelectContent>
+   628→   628→                  <SelectItem value="general">عمومی</SelectItem>
+   629→   629→                  <SelectItem value="technical">فنی</SelectItem>
+   630→   630→                  <SelectItem value="payment">پرداخت</SelectItem>
+   631→   631→                  <SelectItem value="program">برنامه</SelectItem>
+   632→   632→                  <SelectItem value="bug">باگ</SelectItem>
+   633→   633→                </SelectContent>
+   634→   634→              </Select>
+   635→   635→            </div>
+   636→   636→            <div className="space-y-1.5">
+   637→   637→              <Label className="text-xs">اولویت</Label>
+   638→   638→              <Select value={priority} onValueChange={setPriority}>
+   639→   639→                <SelectTrigger className="rounded-xl">
+   640→   640→                  <SelectValue placeholder="انتخاب کنید" />
+   641→   641→                </SelectTrigger>
+   642→   642→                <SelectContent>
+   643→   643→                  <SelectItem value="low">کم</SelectItem>
+   644→   644→                  <SelectItem value="normal">معمولی</SelectItem>
+   645→   645→                  <SelectItem value="high">مهم</SelectItem>
+   646→   646→                  <SelectItem value="urgent">فوری</SelectItem>
+   647→   647→                </SelectContent>
+   648→   648→              </Select>
+   649→   649→            </div>
+   650→   650→          </div>
+   651→   651→
+   652→   652→          <div className="space-y-1.5">
+   653→   653→            <Label className="text-xs">متن پیام</Label>
+   654→   654→            <Textarea
+   655→   655→              value={message}
+   656→   656→              onChange={(e) => setMessage(e.target.value)}
+   657→   657→              placeholder="مشکل یا سوال خود را با جزئیات شرح دهید..."
+   658→   658→              rows={5}
+   659→   659→              className="rounded-xl resize-none"
+   660→   660→              dir="rtl"
+   661→   661→            />
+   662→   662→          </div>
+   663→   663→
+   664→   664→          <DialogFooter>
+   665→   665→            <Button type="button" onClick={onClose} variant="outline" className="rounded-xl">
+   666→   666→              انصراف
+   667→   667→            </Button>
+   668→   668→            <Button
+   669→   669→              type="submit"
+   670→   670→              disabled={saving}
+   671→   671→              className="rounded-xl gap-1.5"
+   672→   672→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   673→   673→            >
+   674→   674→              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+   675→   675→              ثبت تیکت
+   676→   676→            </Button>
+   677→   677→          </DialogFooter>
+   678→   678→        </form>
+   679→   679→      </DialogContent>
+   680→   680→    </Dialog>
+   681→   681→  );
+   682→   682→}
+   683→   683→
+   684→   684→// ---------- FAQ Section ----------
+   685→   685→const FAQ_DATA: { category: string; icon: any; items: { q: string; a: string }[] }[] = [
+   686→   686→  {
+   687→   687→    category: "شروع کار با فیتاپ",
+   688→   688→    icon: Sparkles,
+   689→   689→    items: [
+   690→   690→      { q: "چگونه در فیتاپ ثبت‌نام کنم؟", a: "کافیست شماره موبایل خود را وارد کنید، کد ۴ رقمی پیامکی را تایید کنید و سپس اطلاعات آنبوردینگ (سن، قد، وزن، هدف) را تکمیل کنید. ثبت‌نام کاملاً رایگان است." },
+   691→   691→      { q: "آنبوردینگ چیست و چرا مهم است؟", a: "آنبوردینگ جمع‌آوری اطلاعات فیزیکی شما (سن، قد، وزن، هدف، سطح فعالیت، آسیب‌دیدگی‌ها) است. این اطلاعات برای تولید برنامه تمرینی و غذایی شخصی‌سازی‌شده و گزارش هوشمند ضروری است." },
+   692→   692→      { q: "گزارش هوشمند چیست؟", a: "پس از تکمیل آنبوردینگ، فیتاپ یک گزارش هوشمند شامل BMI، BMR، TDEE، درشت‌مغذی‌های هدف، مسیر رسیدن به وزن هدف و پیشنهاد پلن مناسب نمایش می‌دهد." },
+   693→   693→      { q: "چگونه پلن مناسب خود را انتخاب کنم؟", a: "فیتاپ ۴ پلن دارد: اقتصادی (۳۵۰هزار تومان)، استاندارد (۸۰۰هزار)، پیشرفته (۱.۲ میلیون) و حرفه‌ای (۱.۸ میلیون). همه پلن‌ها ۴۵ روزه هستند. پلن پیشرفته برای اکثر ورزشکاران توصیه می‌شود." },
+   694→   694→    ],
+   695→   695→  },
+   696→   696→  {
+   697→   697→    category: "پلن‌ها و پرداخت",
+   698→   698→    icon: Wallet,
+   699→   699→    items: [
+   700→   700→      { q: "مدت اشتراک چقدر است؟", a: "تمام پلن‌ها ۴۵ روزه هستند و شامل ۱ فاز تمرینی کامل می‌باشند." },
+   701→   701→      { q: "پرداخت چگونه انجام می‌شود؟", a: "پرداخت از طریق درگاه امن زرین‌پال یا کیف پول فیتاپ انجام می‌شود. پس از پرداخت موفق، اشتراک شما فوراً فعال می‌شود." },
+   702→   702→      { q: "تمدید اشتراک چگونه است؟", a: "کاربرانی که اشتراکشان منقضی شده یا نزدیک انقضا است، به‌صورت خودار پاداش تمدید دریافت می‌کنند. این پاداش در پنل کاربری نمایش داده می‌شود." },
+   703→   703→    ],
+   704→   704→  },
+   705→   705→  {
+   706→   706→    category: "برنامه تمرینی و غذایی",
+   707→   707→    icon: Dumbbell,
+   708→   708→    items: [
+   709→   709→      { q: "چگونه برنامه تمرینی دریافت کنم؟", a: "پس از خرید پلن اقتصادی یا استاندارد، برنامه تمرینی و غذایی به‌صورت خودکار توسط هوش مصنوعی ساخته می‌شود. برای پلن پیشرفته و حرفه‌ای، ابتدا باید عکس بدن ارسال کنید." },
+   710→   710→      { q: "پلن پیشرفته/حرفه‌ای چرا نیاز به عکس بدن دارد؟", a: "برای شخصی‌سازی دقیق‌تر برنامه، فیتاپ عکس‌های بدن شما را با هوش مصنوعی تحلیل می‌کند و بر اساس فرم بدن، تقارن عضلانی و نقاط ضعف، برنامه را طراحی می‌کند." },
+   711→   711→      { q: "آیا می‌توانم برنامه را تغییر دهم؟", a: "بله، از بخش «چت با مربی هوشمند» می‌توانید درخواست تغییر برنامه بدهید. مربی هوشمند به پرونده کامل شما دسترسی دارد." },
+   712→   712→      { q: "برنامه غذایی شامل چه چیزی است؟", a: "برنامه غذایی شامل کالری هدف روزانه، درشت‌مغذی‌ها (پروتئین/کربو/چربی)، وعده‌های غذایی با ترکیب غذاها، غذاهای جایگزین و برنامه مکمل با دوز ایمن است." },
+   713→   713→    ],
+   714→   714→  },
+   715→   715→  {
+   716→   716→    category: "مربی هوشمند",
+   717→   717→    icon: MessageSquare,
+   718→   718→    items: [
+   719→   719→      { q: "مربی هوشمند چیست؟", a: "مربی هوشمند یک چت ۲۴ ساعته با هوش مصنوعی است که به پرونده کامل شما (آنبوردینگ، برنامه، پیشرفت) دسترسی دارد. می‌توانید هر سوال فنی ورزشی یا تغذیه‌ای بپرسید." },
+   720→   720→      { q: "چه سوالاتی می‌توانم بپرسم؟", a: "سوالات درباره تمرینات، تکنیک حرکات، تغذیه، مکمل‌ها، کالری، جایگزینی غذا، اصلاح برنامه و هر موضوع مرتبط با تناسب اندام." },
+   721→   721→      { q: "آیا می‌توانم عکس بفرستم؟", a: "بله، کاربران پلن پیشرفته می‌توانند عکس و کاربران پلن حرفه‌ای عکس و ویدیو ارسال کنند. هوش مصنوعی عکس غذا، بدن یا تجهیزات را تحلیل می‌کند." },
+   722→   722→      { q: "تحلیل عکس غذا چگونه کار می‌کند؟", a: "عکس غذای خود را در چت مربی بفرستید. هوش مصنوعی مواد تشکیل‌دهنده، کالری تخمینی و درشت‌مغذی‌ها را تحلیل می‌کند." },
+   723→   723→    ],
+   724→   724→  },
+   725→   725→  {
+   726→   726→    category: "امکانات ویژه",
+   727→   727→    icon: Apple,
+   728→   728→    items: [
+   729→   729→      { q: "حالت باشگاه چیست؟", a: "حالت باشگاه (Gym Mode) یک محیط تمرین ویژه است که شامل پخش موسیقی، نمایش تمرین روز و چت زنده با مربی هوشمند در حین تمرین است. این قابلیت برای پلن پیشرفته و حرفه‌ای موجود است." },
+   730→   730→      { q: "تحلیل آزمایش خون چیست؟", a: "کاربران پلن حرفه‌ای می‌توانند عکس آزمایش خون خود را ارسال کنند. هوش مصنوعی ۴۷ ماده آزمایشی در ۱۰ دسته (CBC، چربی، کبد، کلیه، هورمون‌ها، ویتامین‌ها و...) را تحلیل می‌کند." },
+   731→   731→      { q: "آنالیز ویدیویی چیست؟", a: "کاربران پلن حرفه‌ای می‌توانند ویدیوی فرم حرکات خود را ارسال کنند. هوش مصنوعی پوسچر، تقارن و تکنیک را بررسی و اصلاحات لازم را پیشنهاد می‌دهد." },
+   732→   732→      { q: "چکاپ دوره‌ای چیست؟", a: "در طول ۴۵ روز، ۳ چکاپ دوره‌ای برای رصد پیشرفت (وزن، اندازه‌های بدن، سطح انرژی) انجام می‌شود. این قابلیت برای پلن استاندارد و بالاتر موجود است." },
+   733→   733→    ],
+   734→   734→  },
+   735→   735→  {
+   736→   736→    category: "معرفی به دوست",
+   737→   737→    icon: Gift,
+   738→   738→    items: [
+   739→   739→      { q: "سیستم معرفی چگونه کار می‌کند؟", a: "لینک اختصاصی معرفی خود را از بخش «معرفی به دوست» در پنل دریافت کنید. هر دوست که با لینک شما ثبت‌نام و پلن خرید کند، هر دو طرف ۱۵۰هزار تومان پاداش دریافت می‌کنید." },
+   740→   740→      { q: "پاداش کجا واریز می‌شود؟", a: "پاداش مستقیماً به کیف پول فیتاپ شما واریز می‌شود و می‌توانید از آن برای خرید یا تمدید پلن استفاده کنید." },
+   741→   741→    ],
+   742→   742→  },
+   743→   743→  {
+   744→   744→    category: "مشکلات فنی",
+   745→   745→    icon: Bug,
+   746→   746→    items: [
+   747→   747→      { q: "سایت کند است", a: "کش مرورگر را پاک کنید (Ctrl+Shift+R) یا مرورگر را ببندید و دوباره باز کنید. اگر مشکل ادامه داشت، اتصال اینترنت خود را بررسی کنید." },
+   748→   748→      { q: "پیامک تایید نیامد", a: "۲ دقیقه صبر کنید. اگر پیامک نیامد، دوباره درخواست کد بدهید. در صورت تکرار، شماره موبایل خود را بررسی کنید یا تیکت بزنید." },
+   749→   749→      { q: "پرداخت موفق بود ولی پلن فعال نشد", a: "پلن معمولاً بلافاصله فعال می‌شود. اگر پس از ۵ دقیقه فعال نشد، یک بار صفحه را رفرش کنید. در صورت تداوم مشکل، تیکت بزنید." },
+   750→   750→      { q: "برنامه تمرینی نمایش داده نمی‌شود", a: "اگر پلن پیشرفته یا حرفه‌ای دارید، ابتدا باید عکس بدن خود را از بنر «ارسال عکس بدن» ارسال کنید. سپس برنامه به‌صورت خودکار ساخته می‌شود." },
+   751→   751→    ],
+   752→   752→  },
+   753→   753→];
+   754→   754→
+   755→   755→function FaqSection({ search, setSearch }: { search: string; setSearch: (s: string) => void }) {
+   756→   756→  const filtered = search.trim()
+   757→   757→    ? FAQ_DATA.map((cat) => ({
+   758→   758→        ...cat,
+   759→   759→        items: cat.items.filter(
+   760→   760→          (item) =>
+   761→   761→            item.q.includes(search) ||
+   762→   762→            item.a.includes(search) ||
+   763→   763→            cat.category.includes(search)
+   764→   764→        ),
+   765→   765→      })).filter((cat) => cat.items.length > 0)
+   766→   766→    : FAQ_DATA;
+   767→   767→
+   768→   768→  return (
+   769→   769→    <div>
+   770→   770→      {/* Search */}
+   771→   771→      <div className="relative mb-4">
+   772→   772→        <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+   773→   773→        <input
+   774→   774→          type="text"
+   775→   775→          value={search}
+   776→   776→          onChange={(e) => setSearch(e.target.value)}
+   777→   777→          placeholder="جستجو در سوالات متداول..."
+   778→   778→          className="w-full rounded-xl border border-slate-200 pr-10 pl-4 py-2.5 text-sm focus:outline-none focus:border-orange-400"
+   779→   779→        />
+   780→   780→      </div>
+   781→   781→
+   782→   782→      {/* FAQ accordion */}
+   783→   783→      <Accordion type="single" collapsible className="space-y-3">
+   784→   784→        {filtered.map((cat, ci) => {
+   785→   785→          const CatIcon = cat.icon;
+   786→   786→          return (
+   787→   787→            <AccordionItem
+   788→   788→              key={ci}
+   789→   789→              value={`cat-${ci}`}
+   790→   790→              className="rounded-2xl border border-orange-100 bg-white overflow-hidden shadow-sm"
+   791→   791→            >
+   792→   792→              <AccordionTrigger className="px-4 py-3 hover:no-underline hover:bg-orange-50/50 transition">
+   793→   793→                <div className="flex items-center gap-2.5 text-right flex-1">
+   794→   794→                  <div className="w-8 h-8 rounded-xl flex items-center justify-center shrink-0" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   795→   795→                    <CatIcon className="w-4 h-4 text-white" />
+   796→   796→                  </div>
+   797→   797→                  <span className="font-bold text-sm text-slate-900">{cat.category}</span>
+   798→   798→                  <span className="text-[10px] text-slate-400 mr-auto">{cat.items.length} سوال</span>
+   799→   799→                </div>
+   800→   800→              </AccordionTrigger>
+   801→   801→              <AccordionContent className="px-4 pb-3 pt-1">
+   802→   802→                <div className="space-y-3">
+   803→   803→                  {cat.items.map((item, ii) => (
+   804→   804→                    <div key={ii} className="rounded-xl bg-orange-50/40 p-3 border border-orange-50">
+   805→   805→                      <p className="text-xs font-bold text-slate-900 mb-1.5 flex items-start gap-1.5">
+   806→   806→                        <span className="text-orange-500 shrink-0">س:</span>
+   807→   807→                        {item.q}
+   808→   808→                      </p>
+   809→   809→                      <p className="text-xs text-slate-600 leading-relaxed flex items-start gap-1.5">
+   810→   810→                        <span className="text-emerald-500 shrink-0 font-bold">ج:</span>
+   811→   811→                        {item.a}
+   812→   812→                      </p>
+   813→   813→                    </div>
+   814→   814→                  ))}
+   815→   815→                </div>
+   816→   816→              </AccordionContent>
+   817→   817→            </AccordionItem>
+   818→   818→          );
+   819→   819→        })}
+   820→   820→      </Accordion>
+   821→   821→
+   822→   822→      {filtered.length === 0 && (
+   823→   823→        <div className="text-center py-8">
+   824→   824→          <p className="text-sm text-slate-500">نتیجه‌ای یافت نشد. تیکت بزنید تا پشتیبانی پاسخ دهد.</p>
+   825→   825→        </div>
+   826→   826→      )}
+   827→   827→    </div>
+   828→   828→  );
+   829→   829→}
+   830→   830→

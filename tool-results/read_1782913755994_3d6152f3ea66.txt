@@ -1,0 +1,749 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState, useMemo } from "react";
+     4→import { motion, AnimatePresence } from "framer-motion";
+     5→import {
+     6→  X,
+     7→  LayoutDashboard,
+     8→  Users,
+     9→  Wallet,
+    10→  ListChecks,
+    11→  Search,
+    12→  Ban,
+    13→  Check,
+    14→  Shield,
+    15→  Plus,
+    16→  Crown,
+    17→  TrendingUp,
+    18→  DollarSign,
+    19→  UserCheck,
+    20→  Target,
+    21→  ChevronLeft,
+    22→  ChevronRight,
+    23→  Loader2,
+    24→  AlertTriangle,
+    25→  Clock,
+    26→  CheckCircle2,
+    27→  Eye,
+    28→} from "lucide-react";
+    29→import {
+    30→  AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
+    31→  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
+    32→} from "recharts";
+    33→import { useAppStore } from "@/lib/fitness/store";
+    34→import { Button } from "@/components/ui/button";
+    35→import { Card } from "@/components/ui/card";
+    36→import { Input } from "@/components/ui/input";
+    37→import { Label } from "@/components/ui/label";
+    38→import { Badge } from "@/components/ui/badge";
+    39→import { Skeleton } from "@/components/ui/skeleton";
+    40→import {
+    41→  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+    42→} from "@/components/ui/dialog";
+    43→import {
+    44→  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+    45→} from "@/components/ui/select";
+    46→import {
+    47→  SUBSCRIPTION_PLANS, toPersianDigits, formatToman, PLAN_LABELS, type Plan,
+    48→} from "@/lib/fitness/types";
+    49→import { toast } from "sonner";
+    50→
+    51→type AdminTab = "dashboard" | "users" | "finance" | "programs";
+    52→
+    53→const PLAN_COLORS: Record<string, string> = {
+    54→  basic: "#64748b", standard: "#06b6d4", advanced: "#f59e0b", ultimate: "#a855f7",
+    55→};
+    56→
+    57→export function AdminOverlay() {
+    58→  const { setOverlay } = useAppStore();
+    59→  const [tab, setTab] = useState<AdminTab>("dashboard");
+    60→
+    61→  const tabs: { id: AdminTab; label: string; icon: any }[] = [
+    62→    { id: "dashboard", label: "داشبورد", icon: LayoutDashboard },
+    63→    { id: "users", label: "کاربران", icon: Users },
+    64→    { id: "finance", label: "مالی و تراکنش‌ها", icon: Wallet },
+    65→    { id: "programs", label: "صف برنامه‌ها", icon: ListChecks },
+    66→  ];
+    67→
+    68→  return (
+    69→    <div className="flex flex-col h-full bg-background">
+    70→      {/* Header */}
+    71→      <div className="flex items-center justify-between p-4 border-b glass-dark">
+    72→        <div className="flex items-center gap-2">
+    73→          <Shield className="w-5 h-5 text-primary" />
+    74→          <h2 className="font-bold">پنل مدیریت فیتاپ</h2>
+    75→        </div>
+    76→        <Button variant="ghost" size="icon" onClick={() => setOverlay(null)} className="rounded-full">
+    77→          <X className="w-5 h-5" />
+    78→        </Button>
+    79→      </div>
+    80→
+    81→      {/* Tabs */}
+    82→      <div className="flex gap-1 p-2 border-b overflow-x-auto no-scrollbar glass-dark">
+    83→        {tabs.map((t) => (
+    84→          <button
+    85→            key={t.id}
+    86→            onClick={() => setTab(t.id)}
+    87→            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium shrink-0 transition ${
+    88→              tab === t.id ? "bg-primary text-primary-foreground glow-gold-sm" : "hover:bg-muted text-muted-foreground"
+    89→            }`}
+    90→          >
+    91→            <t.icon className="w-4 h-4" />
+    92→            {t.label}
+    93→          </button>
+    94→        ))}
+    95→      </div>
+    96→
+    97→      {/* Content */}
+    98→      <div className="flex-1 overflow-y-auto custom-scrollbar">
+    99→        <AnimatePresence mode="wait">
+   100→          <motion.div key={tab} initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }}>
+   101→            {tab === "dashboard" && <DashboardTab />}
+   102→            {tab === "users" && <UsersTab />}
+   103→            {tab === "finance" && <FinanceTab />}
+   104→            {tab === "programs" && <ProgramsTab />}
+   105→          </motion.div>
+   106→        </AnimatePresence>
+   107→      </div>
+   108→    </div>
+   109→  );
+   110→}
+   111→
+   112→/* ============================================================
+   113→   ۱. داشبورد — KPIs + نمودارها
+   114→   ============================================================ */
+   115→function DashboardTab() {
+   116→  const [data, setData] = useState<any>(null);
+   117→  const [loading, setLoading] = useState(true);
+   118→
+   119→  useEffect(() => {
+   120→    (async () => {
+   121→      try {
+   122→        const res = await fetch("/api/admin/stats");
+   123→        const d = await res.json();
+   124→        setData(d);
+   125→      } catch {} finally { setLoading(false); }
+   126→    })();
+   127→  }, []);
+   128→
+   129→  if (loading) return <div className="p-4 grid grid-cols-2 lg:grid-cols-4 gap-3">{[1,2,3,4].map(i => <Skeleton key={i} className="h-28 rounded-2xl" />)}</div>;
+   130→
+   131→  const s = data?.stats;
+   132→  const planDistData = (data?.planDistribution || []).map((p: any) => ({
+   133→    name: PLAN_LABELS[p.planName as Plan] || p.planName,
+   134→    value: p._count,
+   135→    color: PLAN_COLORS[p.planName] || "#888",
+   136→  }));
+   137→
+   138→  return (
+   139→    <div className="p-4 space-y-4 max-w-7xl mx-auto">
+   140→      {/* KPI cards */}
+   141→      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+   142→        <KpiCard icon={DollarSign} label="مجموع درآمد" value={`${toPersianDigits(formatToman(s?.totalRevenue || 0))} ت`} color="emerald" />
+   143→        <KpiCard icon={Users} label="کل کاربران" value={toPersianDigits(s?.totalUsers || 0)} sub={`ورزشکاران فعال: ${toPersianDigits(s?.activeSubscriptions || 0)}`} color="cyan" />
+   144→        <KpiCard icon={ListChecks} label="برنامه‌های فعال" value={toPersianDigits(s?.activeSubscriptions || 0)} sub={`در انتظار: ${toPersianDigits(s?.pendingPrograms || 0)}`} color="amber" />
+   145→        <KpiCard icon={Target} label="نرخ تبدیل" value={`${toPersianDigits(s?.conversionRate || 0)}٪`} sub={`${toPersianDigits(s?.usersWithPlan || 0)} کاربر پولی`} color="violet" />
+   146→      </div>
+   147→
+   148→      {/* Charts */}
+   149→      <div className="grid lg:grid-cols-2 gap-4">
+   150→        {/* User growth */}
+   151→        <Card className="p-4 glass">
+   152→          <h3 className="font-bold text-sm mb-3 flex items-center gap-2"><TrendingUp className="w-4 h-4 text-primary" /> روند رشد کاربران</h3>
+   153→          <ResponsiveContainer width="100%" height={220}>
+   154→            <AreaChart data={data?.userGrowth || []}>
+   155→              <defs>
+   156→                <linearGradient id="userGrad" x1="0" y1="0" x2="0" y2="1">
+   157→                  <stop offset="0%" stopColor="#F4C542" stopOpacity={0.4} />
+   158→                  <stop offset="100%" stopColor="#F4C542" stopOpacity={0} />
+   159→                </linearGradient>
+   160→              </defs>
+   161→              <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-muted/20" />
+   162→              <XAxis dataKey="month" tick={{ fontSize: 11, fill: "currentColor" }} className="text-muted-foreground" />
+   163→              <YAxis tick={{ fontSize: 11, fill: "currentColor" }} className="text-muted-foreground" />
+   164→              <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: "12px", fontSize: "12px" }} />
+   165→              <Area type="monotone" dataKey="total" stroke="#F4C542" strokeWidth={2} fill="url(#userGrad)" name="کل کاربران" />
+   166→            </AreaChart>
+   167→          </ResponsiveContainer>
+   168→        </Card>
+   169→
+   170→        {/* Revenue growth */}
+   171→        <Card className="p-4 glass">
+   172→          <h3 className="font-bold text-sm mb-3 flex items-center gap-2"><DollarSign className="w-4 h-4 text-emerald-500" /> روند درآمد (۶ ماه)</h3>
+   173→          <ResponsiveContainer width="100%" height={220}>
+   174→            <BarChart data={data?.revenueGrowth || []}>
+   175→              <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-muted/20" />
+   176→              <XAxis dataKey="month" tick={{ fontSize: 11, fill: "currentColor" }} className="text-muted-foreground" />
+   177→              <YAxis tick={{ fontSize: 11, fill: "currentColor" }} className="text-muted-foreground" tickFormatter={(v) => `${(v / 1000000).toFixed(1)}م`} />
+   178→              <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: "12px", fontSize: "12px" }} formatter={(v: any) => `${toPersianDigits(formatToman(v))} ت`} />
+   179→              <Bar dataKey="revenue" fill="#10b981" radius={[8, 8, 0, 0]} name="درآمد" />
+   180→            </BarChart>
+   181→          </ResponsiveContainer>
+   182→        </Card>
+   183→      </div>
+   184→
+   185→      {/* Plan distribution + Revenue by plan */}
+   186→      <div className="grid lg:grid-cols-2 gap-4">
+   187→        <Card className="p-4 glass">
+   188→          <h3 className="font-bold text-sm mb-3 flex items-center gap-2"><Crown className="w-4 h-4 text-primary" /> توزیع کاربران در پلن‌ها</h3>
+   189→          {planDistData.length > 0 ? (
+   190→            <ResponsiveContainer width="100%" height={220}>
+   191→              <PieChart>
+   192→                <Pie data={planDistData} cx="50%" cy="50%" innerRadius={50} outerRadius={80} paddingAngle={3} dataKey="value">
+   193→                  {planDistData.map((entry: any, i: number) => <Cell key={i} fill={entry.color} />)}
+   194→                </Pie>
+   195→                <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: "12px", fontSize: "12px" }} />
+   196→                <Legend wrapperStyle={{ fontSize: 11 }} />
+   197→              </PieChart>
+   198→            </ResponsiveContainer>
+   199→          ) : <p className="text-center text-sm text-muted-foreground py-12">داده‌ای موجود نیست</p>}
+   200→        </Card>
+   201→
+   202→        <Card className="p-4 glass">
+   203→          <h3 className="font-bold text-sm mb-3 flex items-center gap-2"><DollarSign className="w-4 h-4 text-amber-500" /> درآمد بر اساس پلن</h3>
+   204→          <div className="space-y-2">
+   205→            {(data?.revenueByPlan || []).map((r: any, i: number) => (
+   206→              <div key={i} className="flex items-center justify-between p-2.5 rounded-xl bg-muted/40">
+   207→                <div className="flex items-center gap-2">
+   208→                  <div className="w-3 h-3 rounded-full" style={{ background: PLAN_COLORS[r.plan] || "#888" }} />
+   209→                  <span className="text-sm font-medium">{PLAN_LABELS[r.plan as Plan] || r.plan}</span>
+   210→                </div>
+   211→                <div className="text-left">
+   212→                  <p className="font-bold text-sm font-stat">{toPersianDigits(formatToman(r._sum.amount || 0))} ت</p>
+   213→                  <p className="text-[10px] text-muted-foreground">{toPersianDigits(r._count)} پرداخت</p>
+   214→                </div>
+   215→              </div>
+   216→            ))}
+   217→            {(data?.revenueByPlan || []).length === 0 && <p className="text-center text-sm text-muted-foreground py-8">داده‌ای موجود نیست</p>}
+   218→          </div>
+   219→        </Card>
+   220→      </div>
+   221→
+   222→      {/* Recent users */}
+   223→      <Card className="p-4 glass">
+   224→        <h3 className="font-bold text-sm mb-3">آخرین کاربران ثبت‌نام‌شده</h3>
+   225→        <div className="space-y-2">
+   226→          {(data?.recentUsers || []).map((u: any) => (
+   227→            <div key={u.id} className="flex items-center justify-between p-2 rounded-lg bg-muted/30">
+   228→              <div className="flex items-center gap-2">
+   229→                <div className="w-8 h-8 rounded-full bg-primary/15 flex items-center justify-center text-xs font-bold text-primary">{u.name?.[0] || "ک"}</div>
+   230→                <div>
+   231→                  <p className="text-sm font-medium">{u.name || "بدون نام"}</p>
+   232→                  <p className="text-[11px] text-muted-foreground" dir="ltr">{u.mobile}</p>
+   233→                </div>
+   234→              </div>
+   235→              <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+   236→                {u.planName && <Badge className="text-[9px]" style={{ background: `${PLAN_COLORS[u.planName]}20`, color: PLAN_COLORS[u.planName] }}>{PLAN_LABELS[u.planName as Plan]}</Badge>}
+   237→                {u.onboardingDone && <span>✓ آنبوردینگ</span>}
+   238→                <span>{new Date(u.createdAt).toLocaleDateString("fa-IR")}</span>
+   239→              </div>
+   240→            </div>
+   241→          ))}
+   242→        </div>
+   243→      </Card>
+   244→    </div>
+   245→  );
+   246→}
+   247→
+   248→function KpiCard({ icon: Icon, label, value, sub, color }: { icon: any; label: string; value: string; sub?: string; color: string }) {
+   249→  const colors: Record<string, string> = {
+   250→    emerald: "from-emerald-500/20 to-emerald-500/5 text-emerald-500",
+   251→    cyan: "from-cyan-500/20 to-cyan-500/5 text-cyan-500",
+   252→    amber: "from-amber-500/20 to-amber-500/5 text-amber-500",
+   253→    violet: "from-violet-500/20 to-violet-500/5 text-violet-500",
+   254→  };
+   255→  return (
+   256→    <Card className="p-4 glass relative overflow-hidden">
+   257→      <div className={`absolute -left-3 -top-3 w-14 h-14 rounded-full bg-gradient-to-br ${colors[color]} opacity-50`} />
+   258→      <div className="relative">
+   259→        <Icon className={`w-5 h-5 mb-2 ${colors[color].split(" ").pop()}`} />
+   260→        <p className="text-lg font-black font-stat">{value}</p>
+   261→        <p className="text-[10px] text-muted-foreground">{label}</p>
+   262→        {sub && <p className="text-[9px] text-muted-foreground/70">{sub}</p>}
+   263→      </div>
+   264→    </Card>
+   265→  );
+   266→}
+   267→
+   268→/* ============================================================
+   269→   ۲. مدیریت کاربران
+   270→   ============================================================ */
+   271→function UsersTab() {
+   272→  const [users, setUsers] = useState<any[]>([]);
+   273→  const [loading, setLoading] = useState(true);
+   274→  const [search, setSearch] = useState("");
+   275→  const [roleFilter, setRoleFilter] = useState("");
+   276→  const [planFilter, setPlanFilter] = useState("");
+   277→  const [page, setPage] = useState(1);
+   278→  const [totalPages, setTotalPages] = useState(1);
+   279→  const [viewUser, setViewUser] = useState<any>(null);
+   280→  const [chargeUser, setChargeUser] = useState<any>(null);
+   281→  const pageSize = 15;
+   282→
+   283→  async function load() {
+   284→    setLoading(true);
+   285→    try {
+   286→      const params = new URLSearchParams({ search, page: String(page), pageSize: String(pageSize) });
+   287→      if (roleFilter) params.set("role", roleFilter);
+   288→      if (planFilter) params.set("plan", planFilter);
+   289→      const res = await fetch(`/api/admin/users?${params}`);
+   290→      const data = await res.json();
+   291→      setUsers(data.users || []);
+   292→      setTotalPages(Math.ceil((data.total || 0) / pageSize));
+   293→    } catch {} finally { setLoading(false); }
+   294→  }
+   295→
+   296→  useEffect(() => {
+   297→    const t = setTimeout(load, 300);
+   298→    return () => clearTimeout(t);
+   299→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   300→  }, [search, roleFilter, planFilter, page]);
+   301→
+   302→  async function action(userId: string, act: string) {
+   303→    try {
+   304→      const res = await fetch("/api/admin/users", {
+   305→        method: "PATCH", headers: { "Content-Type": "application/json" },
+   306→        body: JSON.stringify({ userId, action: act }),
+   307→      });
+   308→      if (!res.ok) throw new Error();
+   309→      toast.success("عملیات انجام شد");
+   310→      load();
+   311→    } catch { toast.error("خطا"); }
+   312→  }
+   313→
+   314→  return (
+   315→    <div className="p-4 space-y-3 max-w-7xl mx-auto">
+   316→      {/* Filters */}
+   317→      <div className="flex flex-wrap gap-2">
+   318→        <div className="relative flex-1 min-w-[200px]">
+   319→          <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+   320→          <Input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} placeholder="جستجو با شماره یا نام..." className="pr-10 rounded-xl glass" />
+   321→        </div>
+   322→        <Select value={roleFilter} onValueChange={(v) => { setRoleFilter(v === "all" ? "" : v); setPage(1); }}>
+   323→          <SelectTrigger className="w-[130px] rounded-xl glass"><SelectValue placeholder="نقش" /></SelectTrigger>
+   324→          <SelectContent>
+   325→            <SelectItem value="all">همه نقش‌ها</SelectItem>
+   326→            <SelectItem value="USER">ورزشکار</SelectItem>
+   327→            <SelectItem value="ADMIN">ادمین</SelectItem>
+   328→          </SelectContent>
+   329→        </Select>
+   330→        <Select value={planFilter} onValueChange={(v) => { setPlanFilter(v === "all" ? "" : v); setPage(1); }}>
+   331→          <SelectTrigger className="w-[130px] rounded-xl glass"><SelectValue placeholder="پلن" /></SelectTrigger>
+   332→          <SelectContent>
+   333→            <SelectItem value="all">همه پلن‌ها</SelectItem>
+   334→            <SelectItem value="none">بدون پلن</SelectItem>
+   335→            <SelectItem value="basic">اقتصادی</SelectItem>
+   336→            <SelectItem value="standard">استاندارد</SelectItem>
+   337→            <SelectItem value="advanced">پیشرفته</SelectItem>
+   338→            <SelectItem value="ultimate">حرفه‌ای</SelectItem>
+   339→          </SelectContent>
+   340→        </Select>
+   341→      </div>
+   342→
+   343→      {/* Table */}
+   344→      <Card className="glass overflow-hidden">
+   345→        <div className="overflow-x-auto">
+   346→          <table className="w-full text-sm">
+   347→            <thead>
+   348→              <tr className="border-b bg-muted/40 text-xs text-muted-foreground">
+   349→                <th className="text-right p-3 font-bold">کاربر</th>
+   350→                <th className="text-right p-3 font-bold hidden sm:table-cell">نقش</th>
+   351→                <th className="text-right p-3 font-bold">پلن</th>
+   352→                <th className="text-right p-3 font-bold hidden md:table-cell">کیف پول</th>
+   353→                <th className="text-right p-3 font-bold hidden lg:table-cell">ثبت‌نام</th>
+   354→                <th className="text-center p-3 font-bold">عملیات</th>
+   355→              </tr>
+   356→            </thead>
+   357→            <tbody>
+   358→              {loading ? (
+   359→                [1,2,3].map(i => <tr key={i}><td colSpan={6}><Skeleton className="h-12 m-1" /></td></tr>)
+   360→              ) : users.length === 0 ? (
+   361→                <tr><td colSpan={6} className="text-center py-8 text-muted-foreground">کاربری یافت نشد</td></tr>
+   362→              ) : users.map((u) => (
+   363→                <tr key={u.id} className="border-b last:border-0 hover:bg-muted/20">
+   364→                  <td className="p-3">
+   365→                    <div className="flex items-center gap-2">
+   366→                      <div className="w-8 h-8 rounded-full bg-primary/15 flex items-center justify-center text-xs font-bold text-primary shrink-0">{u.name?.[0] || "ک"}</div>
+   367→                      <div className="min-w-0">
+   368→                        <p className="font-medium text-sm truncate flex items-center gap-1">
+   369→                          {u.name || "بدون نام"}
+   370→                          {u.isBlocked && <Ban className="w-3 h-3 text-destructive" />}
+   371→                        </p>
+   372→                        <p className="text-[10px] text-muted-foreground" dir="ltr">{u.mobile}</p>
+   373→                      </div>
+   374→                    </div>
+   375→                  </td>
+   376→                  <td className="p-3 hidden sm:table-cell">
+   377→                    {u.role === "ADMIN" ? <Badge className="bg-primary text-[9px]">ادمین</Badge> : <span className="text-xs text-muted-foreground">ورزشکار</span>}
+   378→                  </td>
+   379→                  <td className="p-3">
+   380→                    {u.planName ? (
+   381→                      <Badge className="text-[9px]" style={{ background: `${PLAN_COLORS[u.planName]}20`, color: PLAN_COLORS[u.planName] }}>
+   382→                        {PLAN_LABELS[u.planName as Plan]}
+   383→                      </Badge>
+   384→                    ) : <span className="text-xs text-muted-foreground">—</span>}
+   385→                  </td>
+   386→                  <td className="p-3 hidden md:table-cell font-stat text-xs">{toPersianDigits(formatToman(u.walletBalance || 0))} ت</td>
+   387→                  <td className="p-3 hidden lg:table-cell text-[11px] text-muted-foreground">{new Date(u.createdAt).toLocaleDateString("fa-IR")}</td>
+   388→                  <td className="p-3">
+   389→                    <div className="flex items-center justify-center gap-1">
+   390→                      <button onClick={() => setViewUser(u)} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground hover:text-primary transition" title="مشاهده پروفایل"><Eye className="w-3.5 h-3.5" /></button>
+   391→                      <button onClick={() => setChargeUser(u)} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground hover:text-cyan-500 transition" title="شارژ کیف پول"><Wallet className="w-3.5 h-3.5" /></button>
+   392→                      {u.isBlocked ? (
+   393→                        <button onClick={() => action(u.id, "unblock")} className="p-1.5 rounded-lg hover:bg-emerald-500/10 text-muted-foreground hover:text-emerald-500 transition" title="رفع مسدودیت"><Check className="w-3.5 h-3.5" /></button>
+   394→                      ) : (
+   395→                        <button onClick={() => action(u.id, "block")} className="p-1.5 rounded-lg hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition" title="مسدود"><Ban className="w-3.5 h-3.5" /></button>
+   396→                      )}
+   397→                    </div>
+   398→                  </td>
+   399→                </tr>
+   400→              ))}
+   401→            </tbody>
+   402→          </table>
+   403→        </div>
+   404→
+   405→        {/* Pagination */}
+   406→        {totalPages > 1 && (
+   407→          <div className="flex items-center justify-between p-3 border-t">
+   408→            <span className="text-xs text-muted-foreground">صفحه {toPersianDigits(page)} از {toPersianDigits(totalPages)}</span>
+   409→            <div className="flex gap-1">
+   410→              <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="rounded-lg h-8"><ChevronRight className="w-4 h-4" /></Button>
+   411→              <Button size="sm" variant="outline" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)} className="rounded-lg h-8"><ChevronLeft className="w-4 h-4" /></Button>
+   412→            </div>
+   413→          </div>
+   414→        )}
+   415→      </Card>
+   416→
+   417→      {/* View user profile */}
+   418→      {viewUser && <UserProfileDialog user={viewUser} onClose={() => setViewUser(null)} />}
+   419→      {/* Charge wallet */}
+   420→      {chargeUser && <ChargeWalletDialog user={chargeUser} onClose={() => setChargeUser(null)} onDone={() => { load(); setChargeUser(null); }} />}
+   421→    </div>
+   422→  );
+   423→}
+   424→
+   425→function UserProfileDialog({ user, onClose }: { user: any; onClose: () => void }) {
+   426→  const [profile, setProfile] = useState<any>(null);
+   427→  const [loading, setLoading] = useState(true);
+   428→
+   429→  useEffect(() => {
+   430→    (async () => {
+   431→      try {
+   432→        const res = await fetch(`/api/progress`);
+   433→        const data = await res.json();
+   434→        setProfile(data);
+   435→      } catch {} finally { setLoading(false); }
+   436→    })();
+   437→  }, []);
+   438→
+   439→  return (
+   440→    <Dialog open onOpenChange={onClose}>
+   441→      <DialogContent dir="rtl" className="max-w-md">
+   442→        <DialogHeader><DialogTitle>پروفایل {user.name || "ورزشکار"}</DialogTitle></DialogHeader>
+   443→        {loading ? <Loader2 className="w-6 h-6 animate-spin mx-auto" /> : (
+   444→          <div className="space-y-3 text-sm">
+   445→            <div className="grid grid-cols-2 gap-2">
+   446→              <InfoRow label="شماره موبایل" value={user.mobile} />
+   447→              <InfoRow label="نقش" value={user.role === "ADMIN" ? "ادمین" : "ورزشکار"} />
+   448→              <InfoRow label="پلن" value={user.planName ? PLAN_LABELS[user.planName as Plan] : "بدون پلن"} />
+   449→              <InfoRow label="کیف پول" value={`${toPersianDigits(formatToman(user.walletBalance || 0))} ت`} />
+   450→              <InfoRow label="وزن شروع" value={profile?.startWeight ? `${toPersianDigits(profile.startWeight)} kg` : "—"} />
+   451→              <InfoRow label="وزن هدف" value={profile?.targetWeight ? `${toPersianDigits(profile.targetWeight)} kg` : "—"} />
+   452→            </div>
+   453→            {user.hasActiveSubscription && (
+   454→              <div className="p-2 rounded-lg bg-emerald-500/10 text-xs text-emerald-500">✓ اشتراک فعال — انقضا: {user.subscriptionEnd ? new Date(user.subscriptionEnd).toLocaleDateString("fa-IR") : "—"}</div>
+   455→            )}
+   456→          </div>
+   457→        )}
+   458→        <DialogFooter><Button onClick={onClose} variant="outline" className="rounded-xl">بستن</Button></DialogFooter>
+   459→      </DialogContent>
+   460→    </Dialog>
+   461→  );
+   462→}
+   463→
+   464→function ChargeWalletDialog({ user, onClose, onDone }: { user: any; onClose: () => void; onDone: () => void }) {
+   465→  const [amount, setAmount] = useState("");
+   466→  const [desc, setDesc] = useState("");
+   467→  const [saving, setSaving] = useState(false);
+   468→
+   469→  async function charge() {
+   470→    if (!amount || Number(amount) <= 0) return;
+   471→    setSaving(true);
+   472→    try {
+   473→      const res = await fetch("/api/admin/wallet-charge", {
+   474→        method: "POST", headers: { "Content-Type": "application/json" },
+   475→        body: JSON.stringify({ userId: user.id, amount: Number(amount), description: desc }),
+   476→      });
+   477→      if (!res.ok) throw new Error();
+   478→      toast.success(`کیف پول ${toPersianDigits(formatToman(Number(amount)))} ت شارژ شد`);
+   479→      onDone();
+   480→    } catch { toast.error("خطا در شارژ"); } finally { setSaving(false); }
+   481→  }
+   482→
+   483→  return (
+   484→    <Dialog open onOpenChange={onClose}>
+   485→      <DialogContent dir="rtl" className="max-w-sm">
+   486→        <DialogHeader><DialogTitle>شارژ کیف پول — {user.name || user.mobile}</DialogTitle></DialogHeader>
+   487→        <div className="space-y-3">
+   488→          <div className="p-2 rounded-lg bg-muted/40 text-xs text-center">موجودی فعلی: <b className="font-stat">{toPersianDigits(formatToman(user.walletBalance || 0))} ت</b></div>
+   489→          <div>
+   490→            <Label className="mb-1 block">مبلغ (تومان)</Label>
+   491→            <Input type="number" dir="ltr" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="مثلاً 500000" className="rounded-xl text-center font-stat" />
+   492→          </div>
+   493→          <div>
+   494→            <Label className="mb-1 block">توضیحات (اختیاری)</Label>
+   495→            <Input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="شارژ تستی / پشتیبانی" className="rounded-xl" />
+   496→          </div>
+   497→          <div className="flex gap-2 flex-wrap">
+   498→            {[100000, 500000, 1000000].map(v => (
+   499→              <button key={v} onClick={() => setAmount(String(v))} className="text-xs px-3 py-1.5 rounded-lg bg-muted hover:bg-primary hover:text-primary-foreground transition font-stat">
+   500→                {toPersianDigits(formatToman(v))}
+   501→              </button>
+   502→            ))}
+   503→          </div>
+   504→        </div>
+   505→        <DialogFooter>
+   506→          <Button onClick={onClose} variant="outline" className="rounded-xl">انصراف</Button>
+   507→          <Button onClick={charge} disabled={!amount || saving} className="rounded-xl">{saving ? <Loader2 className="w-4 h-4 animate-spin" /> : "شارژ"}</Button>
+   508→        </DialogFooter>
+   509→      </DialogContent>
+   510→    </Dialog>
+   511→  );
+   512→}
+   513→
+   514→function InfoRow({ label, value }: { label: string; value: string }) {
+   515→  return (
+   516→    <div className="flex items-center justify-between p-2 rounded-lg bg-muted/40">
+   517→      <span className="text-xs text-muted-foreground">{label}</span>
+   518→      <span className="text-sm font-medium">{value}</span>
+   519→    </div>
+   520→  );
+   521→}
+   522→
+   523→/* ============================================================
+   524→   ۳. مالی و تراکنش‌ها
+   525→   ============================================================ */
+   526→function FinanceTab() {
+   527→  const [txns, setTxns] = useState<any[]>([]);
+   528→  const [loading, setLoading] = useState(true);
+   529→  const [page, setPage] = useState(1);
+   530→  const [totalPages, setTotalPages] = useState(1);
+   531→  const [statusFilter, setStatusFilter] = useState("");
+   532→  const [search, setSearch] = useState("");
+   533→  const pageSize = 20;
+   534→
+   535→  async function load() {
+   536→    setLoading(true);
+   537→    try {
+   538→      const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+   539→      if (statusFilter) params.set("status", statusFilter);
+   540→      if (search) params.set("search", search);
+   541→      const res = await fetch(`/api/admin/transactions?${params}`);
+   542→      const data = await res.json();
+   543→      setTxns(data.transactions || []);
+   544→      setTotalPages(data.totalPages || 1);
+   545→    } catch {} finally { setLoading(false); }
+   546→  }
+   547→
+   548→  useEffect(() => {
+   549→    const t = setTimeout(load, 300);
+   550→    return () => clearTimeout(t);
+   551→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   552→  }, [page, statusFilter, search]);
+   553→
+   554→  const STATUS_LABELS: Record<string, string> = { success: "موفق", failed: "ناموفق", pending: "در انتظار", cancelled: "لغو شده" };
+   555→  const STATUS_COLORS: Record<string, string> = { success: "text-emerald-500", failed: "text-red-500", pending: "text-amber-500", cancelled: "text-muted-foreground" };
+   556→
+   557→  return (
+   558→    <div className="p-4 space-y-3 max-w-7xl mx-auto">
+   559→      <div className="flex flex-wrap gap-2">
+   560→        <div className="relative flex-1 min-w-[200px]">
+   561→          <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+   562→          <Input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} placeholder="جستجو با شماره یا نام..." className="pr-10 rounded-xl glass" />
+   563→        </div>
+   564→        <Select value={statusFilter} onValueChange={(v) => { setStatusFilter(v === "all" ? "" : v); setPage(1); }}>
+   565→          <SelectTrigger className="w-[140px] rounded-xl glass"><SelectValue placeholder="وضعیت" /></SelectTrigger>
+   566→          <SelectContent>
+   567→            <SelectItem value="all">همه</SelectItem>
+   568→            <SelectItem value="success">موفق</SelectItem>
+   569→            <SelectItem value="pending">در انتظار</SelectItem>
+   570→            <SelectItem value="failed">ناموفق</SelectItem>
+   571→            <SelectItem value="cancelled">لغو شده</SelectItem>
+   572→          </SelectContent>
+   573→        </Select>
+   574→      </div>
+   575→
+   576→      <Card className="glass overflow-hidden">
+   577→        <div className="overflow-x-auto">
+   578→          <table className="w-full text-sm">
+   579→            <thead>
+   580→              <tr className="border-b bg-muted/40 text-xs text-muted-foreground">
+   581→                <th className="text-right p-3 font-bold">کاربر</th>
+   582→                <th className="text-right p-3 font-bold">نوع</th>
+   583→                <th className="text-right p-3 font-bold">مبلغ</th>
+   584→                <th className="text-right p-3 font-bold hidden md:table-cell">پلن/روش</th>
+   585→                <th className="text-right p-3 font-bold">وضعیت</th>
+   586→                <th className="text-right p-3 font-bold hidden lg:table-cell">تاریخ</th>
+   587→                <th className="text-right p-3 font-bold hidden xl:table-cell">کد پیگیری</th>
+   588→              </tr>
+   589→            </thead>
+   590→            <tbody>
+   591→              {loading ? [1,2,3].map(i => <tr key={i}><td colSpan={7}><Skeleton className="h-12 m-1" /></td></tr>) :
+   592→               txns.length === 0 ? <tr><td colSpan={7} className="text-center py-8 text-muted-foreground">تراکنشی یافت نشد</td></tr> :
+   593→               txns.map((t) => (
+   594→                <tr key={t.id} className="border-b last:border-0 hover:bg-muted/20">
+   595→                  <td className="p-3">
+   596→                    <p className="text-sm font-medium">{t.userName || "—"}</p>
+   597→                    <p className="text-[10px] text-muted-foreground" dir="ltr">{t.userMobile}</p>
+   598→                  </td>
+   599→                  <td className="p-3">
+   600→                    {t.type === "wallet" ? <Badge className="bg-cyan-500/15 text-cyan-500 text-[9px]">کیف پول</Badge> : <Badge className="bg-amber-500/15 text-amber-500 text-[9px]">پلن</Badge>}
+   601→                  </td>
+   602→                  <td className="p-3 font-stat text-sm font-bold">{t.amount > 0 ? "+" : ""}{toPersianDigits(formatToman(Math.abs(t.amount)))} ت</td>
+   603→                  <td className="p-3 hidden md:table-cell text-xs">
+   604→                    {t.plan ? <span>{PLAN_LABELS[t.plan as Plan] || t.plan}</span> : ""}
+   605→                    <span className="text-muted-foreground"> • {t.paymentMethod === "wallet" ? "کیف پول" : "درگاه"}</span>
+   606→                  </td>
+   607→                  <td className="p-3"><span className={`text-xs font-bold ${STATUS_COLORS[t.status]}`}>{STATUS_LABELS[t.status]}</span></td>
+   608→                  <td className="p-3 hidden lg:table-cell text-[11px] text-muted-foreground">{new Date(t.createdAt).toLocaleString("fa-IR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
+   609→                  <td className="p-3 hidden xl:table-cell text-[10px] font-mono text-muted-foreground" dir="ltr">{t.refId?.slice(0, 12) || "—"}</td>
+   610→                </tr>
+   611→              ))}
+   612→            </tbody>
+   613→          </table>
+   614→        </div>
+   615→        {totalPages > 1 && (
+   616→          <div className="flex items-center justify-between p-3 border-t">
+   617→            <span className="text-xs text-muted-foreground">صفحه {toPersianDigits(page)} از {toPersianDigits(totalPages)}</span>
+   618→            <div className="flex gap-1">
+   619→              <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="rounded-lg h-8"><ChevronRight className="w-4 h-4" /></Button>
+   620→              <Button size="sm" variant="outline" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)} className="rounded-lg h-8"><ChevronLeft className="w-4 h-4" /></Button>
+   621→            </div>
+   622→          </div>
+   623→        )}
+   624→      </Card>
+   625→    </div>
+   626→  );
+   627→}
+   628→
+   629→/* ============================================================
+   630→   ۴. صف برنامه‌ها
+   631→   ============================================================ */
+   632→function ProgramsTab() {
+   633→  const [programs, setPrograms] = useState<any[]>([]);
+   634→  const [loading, setLoading] = useState(true);
+   635→  const [statusFilter, setStatusFilter] = useState("pending");
+   636→
+   637→  async function load() {
+   638→    setLoading(true);
+   639→    try {
+   640→      const params = new URLSearchParams();
+   641→      if (statusFilter && statusFilter !== "all") params.set("status", statusFilter);
+   642→      const res = await fetch(`/api/admin/programs?${params}`);
+   643→      const data = await res.json();
+   644→      setPrograms(data.programs || []);
+   645→    } catch {} finally { setLoading(false); }
+   646→  }
+   647→
+   648→  useEffect(() => { load(); }, [statusFilter]);
+   649→
+   650→  async function updateStatus(programId: string, status: string) {
+   651→    try {
+   652→      const res = await fetch("/api/admin/programs", {
+   653→        method: "PATCH", headers: { "Content-Type": "application/json" },
+   654→        body: JSON.stringify({ programId, status }),
+   655→      });
+   656→      if (!res.ok) throw new Error();
+   657→      toast.success("وضعیت برنامه به‌روزرسانی شد");
+   658→      load();
+   659→    } catch { toast.error("خطا"); }
+   660→  }
+   661→
+   662→  const STATUS_LABELS: Record<string, string> = { pending: "در انتظار تولید", generating: "در حال تولید", ready: "آماده", failed: "ناموفق" };
+   663→  const STATUS_ICONS: Record<string, any> = { pending: Clock, generating: Loader2, ready: CheckCircle2, failed: AlertTriangle };
+   664→  const STATUS_COLORS: Record<string, string> = { pending: "text-amber-500", generating: "text-cyan-500", ready: "text-emerald-500", failed: "text-red-500" };
+   665→
+   666→  return (
+   667→    <div className="p-4 space-y-3 max-w-5xl mx-auto">
+   668→      {/* Filter tabs */}
+   669→      <div className="flex gap-2 flex-wrap">
+   670→        {[
+   671→          { id: "pending", label: "در انتظار تولید" },
+   672→          { id: "generating", label: "در حال تولید" },
+   673→          { id: "ready", label: "آماده" },
+   674→          { id: "failed", label: "ناموفق" },
+   675→          { id: "all", label: "همه" },
+   676→        ].map(f => (
+   677→          <button
+   678→            key={f.id}
+   679→            onClick={() => setStatusFilter(f.id)}
+   680→            className={`px-4 py-2 rounded-xl text-xs font-bold transition ${
+   681→              statusFilter === f.id ? "bg-primary text-primary-foreground glow-gold-sm" : "glass text-muted-foreground hover:text-foreground"
+   682→            }`}
+   683→          >
+   684→            {f.label}
+   685→          </button>
+   686→        ))}
+   687→      </div>
+   688→
+   689→      {/* Program cards */}
+   690→      {loading ? (
+   691→        <div className="space-y-2">{[1,2,3].map(i => <Skeleton key={i} className="h-24 rounded-2xl" />)}</div>
+   692→      ) : programs.length === 0 ? (
+   693→        <Card className="p-8 text-center glass">
+   694→          <ListChecks className="w-12 h-12 mx-auto mb-3 text-muted-foreground/30" />
+   695→          <p className="text-sm text-muted-foreground">برنامه‌ای در این وضعیت موجود نیست</p>
+   696→        </Card>
+   697→      ) : (
+   698→        <div className="space-y-2">
+   699→          {programs.map((p) => {
+   700→            const StatusIcon = STATUS_ICONS[p.status] || Clock;
+   701→            const isVip = p.plan === "ultimate";
+   702→            return (
+   703→              <Card key={p.id} className={`p-4 glass ${isVip ? "border-violet-500/30" : ""}`}>
+   704→                <div className="flex items-start justify-between gap-3">
+   705→                  <div className="flex items-center gap-3 flex-1 min-w-0">
+   706→                    <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style={{ background: `${PLAN_COLORS[p.plan]}20` }}>
+   707→                      <Crown className="w-5 h-5" style={{ color: PLAN_COLORS[p.plan] }} />
+   708→                    </div>
+   709→                    <div className="flex-1 min-w-0">
+   710→                      <div className="flex items-center gap-2 mb-0.5">
+   711→                        <p className="font-bold text-sm truncate">{p.userName || "—"}</p>
+   712→                        <Badge className="text-[9px]" style={{ background: `${PLAN_COLORS[p.plan]}20`, color: PLAN_COLORS[p.plan] }}>{PLAN_LABELS[p.plan as Plan] || p.plan}</Badge>
+   713→                        {isVip && <Badge className="bg-violet-500/15 text-violet-500 text-[9px]">VIP</Badge>}
+   714→                      </div>
+   715→                      <p className="text-[11px] text-muted-foreground" dir="ltr">{p.userMobile}</p>
+   716→                      <div className="flex items-center gap-2 mt-1">
+   717→                        <StatusIcon className={`w-3.5 h-3.5 ${STATUS_COLORS[p.status]} ${p.status === "generating" ? "animate-spin" : ""}`} />
+   718→                        <span className={`text-xs font-bold ${STATUS_COLORS[p.status]}`}>{STATUS_LABELS[p.status]}</span>
+   719→                        <span className="text-[10px] text-muted-foreground">• {new Date(p.createdAt).toLocaleString("fa-IR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+   720→                      </div>
+   721→                    </div>
+   722→                  </div>
+   723→                  <div className="flex items-center gap-1 shrink-0">
+   724→                    {p.status === "pending" && (
+   725→                      <Button size="sm" variant="outline" className="rounded-lg text-xs h-8" onClick={() => updateStatus(p.id, "generating")}>
+   726→                        شروع تولید
+   727→                      </Button>
+   728→                    )}
+   729→                    {p.status === "generating" && (
+   730→                      <Button size="sm" className="rounded-lg text-xs h-8 bg-emerald-600 hover:bg-emerald-700" onClick={() => updateStatus(p.id, "ready")}>
+   731→                        <Check className="w-3.5 h-3.5" /> تایید
+   732→                      </Button>
+   733→                    )}
+   734→                    {p.status === "pending" && (
+   735→                      <Button size="sm" variant="ghost" className="rounded-lg text-xs h-8 text-destructive" onClick={() => updateStatus(p.id, "failed")}>
+   736→                        رد
+   737→                      </Button>
+   738→                    )}
+   739→                  </div>
+   740→                </div>
+   741→              </Card>
+   742→            );
+   743→          })}
+   744→        </div>
+   745→      )}
+   746→    </div>
+   747→  );
+   748→}
+   749→

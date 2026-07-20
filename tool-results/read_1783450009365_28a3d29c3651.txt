@@ -1,0 +1,852 @@
+     1→"use client";
+     2→
+     3→import { useState } from "react";
+     4→import { motion, AnimatePresence } from "framer-motion";
+     5→import {
+     6→  Dumbbell,
+     7→  Target,
+     8→  Activity,
+     9→  Salad,
+    10→  ChevronLeft,
+    11→  Check,
+    12→  Sparkles,
+    13→  Loader2,
+    14→  Crown,
+    15→} from "lucide-react";
+    16→import { Input } from "@/components/ui/input";
+    17→import { Label } from "@/components/ui/label";
+    18→import { Textarea } from "@/components/ui/textarea";
+    19→import { useAppStore } from "@/lib/fitness/store";
+    20→import {
+    21→  type OnboardingData,
+    22→  type Gender,
+    23→  type Goal,
+    24→  type ActivityLevel,
+    25→  type WorkoutPlace,
+    26→  type DietType,
+    27→  GOAL_LABELS,
+    28→  ACTIVITY_LABELS,
+    29→  WORKOUT_PLACE_LABELS,
+    30→  DIET_LABELS,
+    31→  GENDER_LABELS,
+    32→  PERSIAN_WEEKDAYS,
+    33→  toPersianDigits,
+    34→} from "@/lib/fitness/types";
+    35→import { toast } from "sonner";
+    36→
+    37→const TOTAL_STEPS = 4;
+    38→
+    39→/* Shared gold gradient style for primary buttons */
+    40→const GOLD_GRADIENT: React.CSSProperties = {
+    41→  background: "linear-gradient(135deg, #f59e0b, #f97316)",
+    42→};
+    43→
+    44→export function OnboardingScreen() {
+    45→  const { setUser, setScreen } = useAppStore();
+    46→  const [step, setStep] = useState(0);
+    47→  const [data, setData] = useState<Partial<OnboardingData>>({
+    48→    firstName: "",
+    49→    lastName: "",
+    50→    gender: undefined,
+    51→    age: undefined,
+    52→    height: undefined,
+    53→    weight: undefined,
+    54→    goal: undefined,
+    55→    activityLevel: "moderate",
+    56→    workoutDays: 3,
+    57→    workoutDaysList: ["شنبه", "دوشنبه", "چهارشنبه"],
+    58→    workoutPlace: "gym",
+    59→    equipment: [],
+    60→    diseases: "",
+    61→    injuries: "",
+    62→    allergies: "",
+    63→    dietType: "standard",
+    64→    mealCount: 3,
+    65→  });
+    66→  const [submitting, setSubmitting] = useState(false);
+    67→  const [generating, setGenerating] = useState(false);
+    68→
+    69→  const update = (patch: Partial<OnboardingData>) =>
+    70→    setData((d) => ({ ...d, ...patch }));
+    71→
+    72→  const canNext = (): boolean => {
+    73→    switch (step) {
+    74→      case 0:
+    75→        return (
+    76→          !!data.firstName && data.firstName.trim().length >= 2 &&
+    77→          !!data.lastName && data.lastName.trim().length >= 2 &&
+    78→          !!data.gender &&
+    79→          !!data.age && data.age >= 12 && data.age <= 100 &&
+    80→          !!data.height && data.height >= 100 && data.height <= 250 &&
+    81→          !!data.weight && data.weight >= 30 && data.weight <= 250
+    82→        );
+    83→      case 1:
+    84→        return !!data.goal && !!data.activityLevel && (data.workoutDaysList?.length ?? 0) > 0;
+    85→      case 2:
+    86→        return !!data.workoutPlace;
+    87→      case 3:
+    88→        return !!data.dietType;
+    89→      default:
+    90→        return true;
+    91→    }
+    92→  };
+    93→
+    94→  const next = () => setStep((s) => Math.min(s + 1, TOTAL_STEPS - 1));
+    95→  const prev = () => setStep((s) => Math.max(s - 1, 0));
+    96→
+    97→  async function finish() {
+    98→    setSubmitting(true);
+    99→    try {
+   100→      // Save onboarding data only — NO plan generation (user hasn't purchased a plan yet)
+   101→      // NOTE: Photos (body + blood test) are no longer collected during onboarding.
+   102→      // They are collected AFTER purchase via /api/coach/submit-body-analysis (body photos)
+   103→      // and via the blood-test feature in the panel (blood test photos).
+   104→      const payload = { ...data };
+   105→      const saveRes = await fetch("/api/onboarding", {
+   106→        method: "POST",
+   107→        headers: { "Content-Type": "application/json" },
+   108→        body: JSON.stringify(payload),
+   109→      });
+   110→      const saveData = await saveRes.json();
+   111→      if (!saveRes.ok) throw new Error(saveData.error);
+   112→
+   113→      toast.success("اطلاعات شما ذخیره شد! 🎉");
+   114→      const fullName = `${data.firstName ?? ""} ${data.lastName ?? ""}`.trim();
+   115→      setUser({ ...useAppStore.getState().user!, onboardingDone: true, name: fullName || useAppStore.getState().user!.name });
+   116→      // Go to analysis screen (NOT main dashboard — no plan purchased yet)
+   117→      setScreen("analysis");
+   118→    } catch (e) {
+   119→      const msg = e instanceof Error ? e.message : "خطا در ذخیره اطلاعات";
+   120→      toast.error(msg);
+   121→    } finally {
+   122→      setSubmitting(false);
+   123→      setGenerating(false);
+   124→    }
+   125→  }
+   126→
+   127→  if (generating) {
+   128→    return <GeneratingScreen />;
+   129→  }
+   130→
+   131→  return (
+   132→    <div className="min-h-screen flex flex-col bg-white relative overflow-hidden">
+   133→      {/* Subtle gold accents */}
+   134→      <div className="absolute inset-0 -z-10 pointer-events-none">
+   135→        <div className="absolute -top-24 -left-20 w-72 h-72 rounded-full bg-amber-100/50 blur-3xl" />
+   136→        <div className="absolute bottom-1/4 -right-20 w-64 h-64 rounded-full bg-orange-100/40 blur-3xl" />
+   137→      </div>
+   138→
+   139→      {/* Progress bar */}
+   140→      <div className="px-5 pt-6 pb-2">
+   141→        <div className="flex items-center justify-between mb-3">
+   142→          <button
+   143→            onClick={prev}
+   144→            disabled={step === 0}
+   145→            className="p-2 rounded-full hover:bg-orange-50 disabled:opacity-30 transition"
+   146→          >
+   147→            <ChevronLeft className="w-5 h-5 text-slate-700" />
+   148→          </button>
+   149→          <span className="text-sm font-medium text-slate-500">
+   150→            مرحله {toPersianDigits(step + 1)} از {toPersianDigits(TOTAL_STEPS)}
+   151→          </span>
+   152→          <div className="w-9" />
+   153→        </div>
+   154→        <div className="h-2 bg-orange-100 rounded-full overflow-hidden">
+   155→          <motion.div
+   156→            className="h-full rounded-full"
+   157→            style={{ background: "linear-gradient(90deg, #f59e0b, #f97316)" }}
+   158→            initial={false}
+   159→            animate={{ width: `${((step + 1) / TOTAL_STEPS) * 100}%` }}
+   160→            transition={{ type: "spring", stiffness: 200, damping: 25 }}
+   161→          />
+   162→        </div>
+   163→      </div>
+   164→
+   165→      {/* Step content */}
+   166→      <div className="flex-1 px-5 py-4 overflow-y-auto custom-scrollbar">
+   167→        <AnimatePresence mode="wait">
+   168→          <motion.div
+   169→            key={step}
+   170→            initial={{ opacity: 0, x: -30 }}
+   171→            animate={{ opacity: 1, x: 0 }}
+   172→            exit={{ opacity: 0, x: 30 }}
+   173→            transition={{ duration: 0.25 }}
+   174→          >
+   175→            {step === 0 && <StepBasicInfo data={data} onChange={update} />}
+   176→            {step === 1 && <StepActivityGoals data={data} onChange={update} />}
+   177→            {step === 2 && <StepTrainingPrefs data={data} onChange={update} />}
+   178→            {step === 3 && <StepNutrition data={data} onChange={update} />}
+   179→          </motion.div>
+   180→        </AnimatePresence>
+   181→      </div>
+   182→
+   183→      {/* Bottom action */}
+   184→      <div className="px-5 py-4 border-t border-orange-100 bg-white">
+   185→        {step < TOTAL_STEPS - 1 ? (
+   186→          <button
+   187→            onClick={next}
+   188→            disabled={!canNext()}
+   189→            className="w-full h-12 rounded-2xl text-base font-bold text-white shadow-lg shadow-orange-500/30 transition-all hover:scale-[1.02] hover:shadow-xl hover:shadow-orange-500/40 disabled:opacity-50 disabled:hover:scale-100 disabled:hover:shadow-lg"
+   190→            style={GOLD_GRADIENT}
+   191→          >
+   192→            ادامه
+   193→          </button>
+   194→        ) : (
+   195→          <button
+   196→            onClick={finish}
+   197→            disabled={!canNext() || submitting}
+   198→            className="w-full h-12 rounded-2xl text-base font-bold text-white shadow-lg shadow-orange-500/30 transition-all hover:scale-[1.02] hover:shadow-xl hover:shadow-orange-500/40 disabled:opacity-50 disabled:hover:scale-100 disabled:hover:shadow-lg flex items-center justify-center gap-2"
+   199→            style={GOLD_GRADIENT}
+   200→          >
+   201→            {submitting ? (
+   202→              <span className="flex items-center gap-2">
+   203→                <Loader2 className="w-4 h-4 animate-spin" />
+   204→                در حال ذخیره...
+   205→              </span>
+   206→            ) : (
+   207→              <span className="flex items-center gap-2">
+   208→                <Sparkles className="w-5 h-5" />
+   209→                تکمیل و مشاهده تحلیل
+   210→              </span>
+   211→            )}
+   212→          </button>
+   213→        )}
+   214→      </div>
+   215→    </div>
+   216→  );
+   217→}
+   218→
+   219→function StepHeader({ icon: Icon, title, subtitle }: { icon: React.ComponentType<{ className?: string }>; title: string; subtitle: string }) {
+   220→  return (
+   221→    <div className="mb-6">
+   222→      <div className="w-14 h-14 rounded-2xl bg-amber-100 border border-amber-200 flex items-center justify-center mb-4 shadow-sm shadow-orange-500/10">
+   223→        <Icon className="w-7 h-7 text-orange-500" />
+   224→      </div>
+   225→      <h2 className="text-2xl font-black text-slate-900 mb-1">{title}</h2>
+   226→      <p className="text-slate-500 text-sm">{subtitle}</p>
+   227→    </div>
+   228→  );
+   229→}
+   230→
+   231→/* Reusable input class string for gold-themed inputs */
+   232→const goldInputCls =
+   233→  "h-12 rounded-xl bg-white border-2 border-orange-100 focus-visible:border-orange-400 focus-visible:ring-orange-300/40 text-slate-900 placeholder:text-slate-400 text-center text-lg font-stat";
+   234→
+   235→/* Text input variant (right-aligned, normal size, for names etc.) */
+   236→const goldTextCls =
+   237→  "h-12 rounded-xl bg-white border-2 border-orange-100 focus-visible:border-orange-400 focus-visible:ring-orange-300/40 text-slate-900 placeholder:text-slate-400 text-right text-base";
+   238→
+   239→/* ============ STEP 1: Basic Info ============ */
+   240→function StepBasicInfo({ data, onChange }: { data: Partial<OnboardingData>; onChange: (p: Partial<OnboardingData>) => void }) {
+   241→  return (
+   242→    <div>
+   243→      <StepHeader icon={Dumbbell} title="اطلاعات پایه" subtitle="برای شروع، نام و اطلاعات فیزیکی خود را وارد کنید" />
+   244→
+   245→      {/* First + Last Name */}
+   246→      <div className="grid grid-cols-2 gap-3 mb-5">
+   247→        <div>
+   248→          <Label className="mb-2 block text-slate-700">نام</Label>
+   249→          <Input
+   250→            type="text"
+   251→            value={data.firstName ?? ""}
+   252→            onChange={(e) => onChange({ firstName: e.target.value })}
+   253→            placeholder="مثال: علی"
+   254→            className={goldTextCls}
+   255→            maxLength={30}
+   256→          />
+   257→        </div>
+   258→        <div>
+   259→          <Label className="mb-2 block text-slate-700">نام خانوادگی</Label>
+   260→          <Input
+   261→            type="text"
+   262→            value={data.lastName ?? ""}
+   263→            onChange={(e) => onChange({ lastName: e.target.value })}
+   264→            placeholder="مثال: رضایی"
+   265→            className={goldTextCls}
+   266→            maxLength={40}
+   267→          />
+   268→        </div>
+   269→      </div>
+   270→
+   271→      {/* Gender */}
+   272→      <div className="mb-5">
+   273→        <Label className="mb-2 block text-slate-700">جنسیت</Label>
+   274→        <div className="grid grid-cols-2 gap-3">
+   275→          {(["male", "female"] as const).map((g) => (
+   276→            <button
+   277→              key={g}
+   278→              onClick={() => onChange({ gender: g })}
+   279→              className={`relative p-4 rounded-2xl border-2 bg-white transition-all ${
+   280→                data.gender === g
+   281→                  ? "border-orange-500 bg-orange-50 shadow-md shadow-orange-500/10"
+   282→                  : "border-orange-200 hover:border-orange-300"
+   283→              }`}
+   284→            >
+   285→              <div className="text-3xl mb-2">{g === "male" ? "👨" : "👩"}</div>
+   286→              <div className="font-bold text-slate-900">{GENDER_LABELS[g]}</div>
+   287→              {data.gender === g && (
+   288→                <div className="absolute top-2 left-2 w-5 h-5 rounded-full flex items-center justify-center" style={GOLD_GRADIENT}>
+   289→                  <Check className="w-3 h-3 text-white" />
+   290→                </div>
+   291→              )}
+   292→            </button>
+   293→          ))}
+   294→        </div>
+   295→      </div>
+   296→      {/* Age */}
+   297→      <div className="mb-4">
+   298→        <Label className="mb-2 block text-slate-700">سن (سال)</Label>
+   299→        <Input type="number" value={data.age ?? ""} onChange={(e) => onChange({ age: Number(e.target.value) })} placeholder="۲۵" className={goldInputCls} inputMode="numeric" />
+   300→      </div>
+   301→      {/* Height + Weight */}
+   302→      <div className="grid grid-cols-2 gap-3 mb-4">
+   303→        <div>
+   304→          <Label className="mb-2 block text-slate-700">قد (cm)</Label>
+   305→          <Input type="number" value={data.height ?? ""} onChange={(e) => onChange({ height: Number(e.target.value) })} placeholder="۱۷۵" className={goldInputCls} inputMode="numeric" />
+   306→        </div>
+   307→        <div>
+   308→          <Label className="mb-2 block text-slate-700">وزن فعلی (kg)</Label>
+   309→          <Input type="number" value={data.weight ?? ""} onChange={(e) => onChange({ weight: Number(e.target.value) })} placeholder="۷۵" className={goldInputCls} inputMode="numeric" />
+   310→        </div>
+   311→      </div>
+   312→      {/* Target weight */}
+   313→      <div>
+   314→        <Label className="mb-2 block text-slate-700">وزن هدف (kg) — اختیاری</Label>
+   315→        <Input type="number" value={data.targetWeight ?? ""} onChange={(e) => onChange({ targetWeight: Number(e.target.value) })} placeholder="۷۰" className={goldInputCls} inputMode="numeric" />
+   316→      </div>
+   317→    </div>
+   318→  );
+   319→}
+   320→
+   321→/* ============ STEP 2: Activity & Goals ============ */
+   322→function StepActivityGoals({ data, onChange }: { data: Partial<OnboardingData>; onChange: (p: Partial<OnboardingData>) => void }) {
+   323→  const goals: { id: Goal; label: string; icon: string; desc: string }[] = [
+   324→    { id: "fat_loss", label: "کاهش وزن", icon: "🔥", desc: "کاهش چربی بدن" },
+   325→    { id: "muscle_gain", label: "عضله‌سازی", icon: "💪", desc: "افزایش حجم و قدرت" },
+   326→    { id: "endurance", label: "افزایش استقامت", icon: "🏃", desc: "بهبود توان هوازی" },
+   327→    { id: "fitness", label: "تثبیت وزن", icon: "⚡", desc: "حفظ تناسب و سلامت" },
+   328→  ];
+   329→  return (
+   330→    <div>
+   331→      <StepHeader icon={Target} title="سطح فعالیت و اهداف" subtitle="هدف اصلی و سطح فعالیت روزانه خود را انتخاب کنید" />
+   332→      <div className="space-y-2.5 mb-6">
+   333→        {goals.map((g) => (
+   334→          <button
+   335→            key={g.id}
+   336→            onClick={() => onChange({ goal: g.id })}
+   337→            className={`w-full flex items-center gap-4 p-4 rounded-2xl border-2 bg-white transition-all text-right ${
+   338→              data.goal === g.id
+   339→                ? "border-orange-500 bg-orange-50 shadow-md shadow-orange-500/10"
+   340→                : "border-orange-200 hover:border-orange-300"
+   341→            }`}
+   342→          >
+   343→            <div className="text-3xl">{g.icon}</div>
+   344→            <div className="flex-1">
+   345→              <div className="font-bold text-slate-900">{g.label}</div>
+   346→              <div className="text-xs text-slate-500">{g.desc}</div>
+   347→            </div>
+   348→            {data.goal === g.id && (
+   349→              <div className="w-6 h-6 rounded-full flex items-center justify-center" style={GOLD_GRADIENT}>
+   350→                <Check className="w-4 h-4 text-white" />
+   351→              </div>
+   352→            )}
+   353→          </button>
+   354→        ))}
+   355→      </div>
+   356→      <div className="mb-4">
+   357→        <Label className="mb-2 block text-slate-700">سطح فعالیت روزانه</Label>
+   358→        <div className="space-y-2">
+   359→          {(["sedentary", "light", "moderate", "active", "very_active"] as const).map((a) => (
+   360→            <button
+   361→              key={a}
+   362→              onClick={() => onChange({ activityLevel: a })}
+   363→              className={`w-full p-3 rounded-xl border-2 bg-white text-sm text-right transition ${
+   364→                data.activityLevel === a
+   365→                  ? "border-orange-500 bg-orange-50 text-slate-900"
+   366→                  : "border-orange-200 text-slate-700 hover:border-orange-300"
+   367→              }`}
+   368→            >
+   369→              {ACTIVITY_LABELS[a]}
+   370→            </button>
+   371→          ))}
+   372→        </div>
+   373→      </div>
+   374→      <div>
+   375→        <Label className="mb-2 block text-slate-700">
+   376→          روزهای تمرین هفته —{" "}
+   377→          <span className="font-stat text-orange-600">
+   378→            {toPersianDigits((data.workoutDaysList || []).length)} روز انتخاب‌شده
+   379→          </span>
+   380→        </Label>
+   381→        <p className="text-[11px] text-slate-500 mb-2 leading-relaxed">
+   382→          برای انتخاب/لغو روزها روی آن‌ها بزنید. تعداد روزهای تمرین به‌صورت خودکار از روزهای انتخاب‌شده محاسبه می‌شود.
+   383→        </p>
+   384→        <div className="grid grid-cols-4 gap-2">
+   385→          {PERSIAN_WEEKDAYS.map((day) => {
+   386→            const list = data.workoutDaysList || [];
+   387→            const isSelected = list.includes(day);
+   388→            return (
+   389→              <button
+   390→                key={day}
+   391→                type="button"
+   392→                onClick={() => {
+   393→                  let newList: string[];
+   394→                  if (isSelected) {
+   395→                    newList = list.filter((d) => d !== day);
+   396→                  } else {
+   397→                    newList = [...list, day];
+   398→                  }
+   399→                  onChange({
+   400→                    workoutDaysList: newList,
+   401→                    workoutDays: newList.length,
+   402→                  });
+   403→                }}
+   404→                className={`relative p-3 rounded-xl border-2 text-xs font-bold transition-all ${
+   405→                  isSelected
+   406→                    ? "text-white shadow-md shadow-orange-500/20 border-transparent hover:scale-105"
+   407→                    : "border-orange-200 bg-white text-slate-700 hover:border-orange-300"
+   408→                }`}
+   409→                style={
+   410→                  isSelected
+   411→                    ? { background: "linear-gradient(135deg, #f59e0b, #f97316)" }
+   412→                    : undefined
+   413→                }
+   414→              >
+   415→                {day}
+   416→                {isSelected && (
+   417→                  <span className="absolute -top-1.5 -left-1.5 w-4 h-4 rounded-full bg-white flex items-center justify-center shadow-sm">
+   418→                    <Check className="w-2.5 h-2.5 text-orange-500" strokeWidth={4} />
+   419→                  </span>
+   420→                )}
+   421→              </button>
+   422→            );
+   423→          })}
+   424→        </div>
+   425→        {(data.workoutDaysList || []).length === 0 && (
+   426→          <p className="text-[11px] text-amber-600 mt-2">
+   427→            ⚠️ حداقل یک روز را انتخاب کنید
+   428→          </p>
+   429→        )}
+   430→      </div>
+   431→    </div>
+   432→  );
+   433→}
+   434→
+   435→/* ============ STEP 3: Training Preferences ============ */
+   436→function StepTrainingPrefs({ data, onChange }: { data: Partial<OnboardingData>; onChange: (p: Partial<OnboardingData>) => void }) {
+   437→  const items = [
+   438→    { id: "dumbbell", label: "دمبل", icon: "🏋️" },
+   439→    { id: "barbell", label: "هالتر", icon: "⚖️" },
+   440→    { id: "kettlebell", label: "کتل‌بل", icon: "🔔" },
+   441→    { id: "bands", label: "کش مقاومتی", icon: "➰" },
+   442→    { id: "pullup_bar", label: "بارفیکس", icon: "🤸" },
+   443→    { id: "bench", label: "نیمکت", icon: "🪑" },
+   444→    { id: "machine", label: "دستگاه بدنسازی", icon: "⚙️" },
+   445→    { id: "bodyweight", label: "فقط وزن بدن", icon: "🧘" },
+   446→  ];
+   447→  const toggle = (id: string) => onChange({ equipment: data.equipment?.includes(id) ? data.equipment.filter((x) => x !== id) : [...(data.equipment || []), id] });
+   448→  return (
+   449→    <div>
+   450→      <StepHeader icon={Activity} title="ترجیحات تمرینی" subtitle="محیط تمرین، تجهیزات و محدودیت‌های بدنی" />
+   451→      <div className="mb-5">
+   452→        <Label className="mb-2 block text-slate-700">محیط تمرین</Label>
+   453→        <div className="grid grid-cols-3 gap-2">
+   454→          {(["gym", "home", "both"] as const).map((p) => (
+   455→            <button
+   456→              key={p}
+   457→              onClick={() => onChange({ workoutPlace: p })}
+   458→              className={`p-3 rounded-xl border-2 bg-white text-sm font-medium transition ${
+   459→                data.workoutPlace === p
+   460→                  ? "border-orange-500 bg-orange-50 text-orange-600"
+   461→                  : "border-orange-200 text-slate-700 hover:border-orange-300"
+   462→              }`}
+   463→            >
+   464→              {WORKOUT_PLACE_LABELS[p]}
+   465→            </button>
+   466→          ))}
+   467→        </div>
+   468→      </div>
+   469→      <div className="mb-5">
+   470→        <Label className="mb-2 block text-slate-700">تجهیزات در دسترس</Label>
+   471→        <div className="grid grid-cols-2 gap-2">
+   472→          {items.map((it) => (
+   473→            <button
+   474→              key={it.id}
+   475→              onClick={() => toggle(it.id)}
+   476→              className={`flex items-center gap-2 p-3 rounded-xl border-2 bg-white transition text-right ${
+   477→                data.equipment?.includes(it.id)
+   478→                  ? "border-orange-500 bg-orange-50"
+   479→                  : "border-orange-200 hover:border-orange-300"
+   480→              }`}
+   481→            >
+   482→              <span className="text-xl">{it.icon}</span>
+   483→              <span className="text-xs font-medium text-slate-700">{it.label}</span>
+   484→            </button>
+   485→          ))}
+   486→        </div>
+   487→      </div>
+   488→      <div className="space-y-3">
+   489→        <div>
+   490→          <Label className="mb-2 block text-slate-700">آسیب‌دیدگی یا محدودیت بدنی</Label>
+   491→          <Textarea
+   492→            value={data.injuries || ""}
+   493→            onChange={(e) => onChange({ injuries: e.target.value })}
+   494→            placeholder="مثلاً: زانو درد، مشکل کمر، شانه آسیب‌دیده..."
+   495→            className="rounded-xl min-h-[72px] bg-white border-2 border-orange-100 focus-visible:border-orange-400 focus-visible:ring-orange-300/40 text-slate-900 placeholder:text-slate-400"
+   496→          />
+   497→        </div>
+   498→        <div>
+   499→          <Label className="mb-2 block text-slate-700">سوابق بیماری</Label>
+   500→          <Textarea
+   501→            value={data.diseases || ""}
+   502→            onChange={(e) => onChange({ diseases: e.target.value })}
+   503→            placeholder="مثلاً: فشار خون بالا، دیابت..."
+   504→            className="rounded-xl min-h-[72px] bg-white border-2 border-orange-100 focus-visible:border-orange-400 focus-visible:ring-orange-300/40 text-slate-900 placeholder:text-slate-400"
+   505→          />
+   506→        </div>
+   507→      </div>
+   508→
+   509→      {/* Professional advanced fields — for pro athletes */}
+   510→      <ProfessionalAdvancedFields data={data} onChange={onChange} />
+   511→    </div>
+   512→  );
+   513→}
+   514→
+   515→/* ============ Professional Advanced Fields ============ */
+   516→function ProfessionalAdvancedFields({
+   517→  data,
+   518→  onChange,
+   519→}: {
+   520→  data: Partial<OnboardingData>;
+   521→  onChange: (p: Partial<OnboardingData>) => void;
+   522→}) {
+   523→  const [expanded, setExpanded] = useState(false);
+   524→  const experienceOptions: { id: NonNullable<OnboardingData["trainingExperience"]>; label: string; icon: string }[] = [
+   525→    { id: "beginner", label: "مبتدی", icon: "🌱" },
+   526→    { id: "intermediate", label: "متوسط", icon: "⚡" },
+   527→    { id: "advanced", label: "پیشرفته", icon: "🔥" },
+   528→    { id: "pro", label: "حرفه‌ای", icon: "👑" },
+   529→  ];
+   530→
+   531→  return (
+   532→    <div className="mt-5 rounded-2xl border-2 border-amber-200 bg-amber-50/40 overflow-hidden">
+   533→      <button
+   534→        type="button"
+   535→        onClick={() => setExpanded((v) => !v)}
+   536→        className="w-full flex items-center justify-between p-4 text-right"
+   537→      >
+   538→        <div className="flex items-center gap-2">
+   539→          <div
+   540→            className="w-9 h-9 rounded-xl flex items-center justify-center text-white shadow-sm"
+   541→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   542→          >
+   543→            <Crown className="w-5 h-5" />
+   544→          </div>
+   545→          <div>
+   546→            <p className="text-sm font-bold text-slate-900">فیلدهای حرفه‌ای (اختیاری)</p>
+   547→            <p className="text-[11px] text-slate-500">برای ورزشکاران پیشرفته و حرفه‌ای</p>
+   548→          </div>
+   549→        </div>
+   550→        <ChevronLeft
+   551→          className={`w-5 h-5 text-slate-400 transition-transform ${expanded ? "-rotate-90" : ""}`}
+   552→        />
+   553→      </button>
+   554→
+   555→      {expanded && (
+   556→        <div className="px-4 pb-4 space-y-4">
+   557→          {/* Training experience */}
+   558→          <div>
+   559→            <Label className="mb-2 block text-slate-700">سابقه ورزشی</Label>
+   560→            <div className="grid grid-cols-4 gap-2">
+   561→              {experienceOptions.map((opt) => (
+   562→                <button
+   563→                  key={opt.id}
+   564→                  type="button"
+   565→                  onClick={() =>
+   566→                    onChange({
+   567→                      trainingExperience:
+   568→                        data.trainingExperience === opt.id ? undefined : opt.id,
+   569→                    })
+   570→                  }
+   571→                  className={`p-2.5 rounded-xl border-2 text-center transition ${
+   572→                    data.trainingExperience === opt.id
+   573→                      ? "border-transparent text-white shadow-md"
+   574→                      : "border-orange-200 bg-white text-slate-700 hover:border-orange-300"
+   575→                  }`}
+   576→                  style={
+   577→                    data.trainingExperience === opt.id
+   578→                      ? { background: "linear-gradient(135deg, #f59e0b, #f97316)" }
+   579→                      : undefined
+   580→                  }
+   581→                >
+   582→                  <div className="text-lg">{opt.icon}</div>
+   583→                  <div className="text-[11px] font-bold mt-0.5">{opt.label}</div>
+   584→                </button>
+   585→              ))}
+   586→            </div>
+   587→          </div>
+   588→
+   589→          {/* Previous training type */}
+   590→          <div>
+   591→            <Label className="mb-2 block text-slate-700">نوع تمرین قبلی</Label>
+   592→            <Input
+   593→              value={data.previousTrainingType || ""}
+   594→              onChange={(e) => onChange({ previousTrainingType: e.target.value })}
+   595→              placeholder="مثلاً: بدنسازی، کراس‌فیت، فوتبال، کاراته..."
+   596→              className="h-11 rounded-xl bg-white border-2 border-orange-100 focus-visible:border-orange-400 text-slate-900 placeholder:text-slate-400 text-sm"
+   597→            />
+   598→          </div>
+   599→
+   600→          {/* Drug allergies */}
+   601→          <div>
+   602→            <Label className="mb-2 block text-slate-700">آلرژی‌های دارویی</Label>
+   603→            <Input
+   604→              value={data.drugAllergies || ""}
+   605→              onChange={(e) => onChange({ drugAllergies: e.target.value })}
+   606→              placeholder="مثلاً: پنی‌سیلین، آسپرین..."
+   607→              className="h-11 rounded-xl bg-white border-2 border-orange-100 focus-visible:border-orange-400 text-slate-900 placeholder:text-slate-400 text-sm"
+   608→            />
+   609→          </div>
+   610→
+   611→          {/* Current medications */}
+   612→          <div>
+   613→            <Label className="mb-2 block text-slate-700">داروهای مصرفی فعلی</Label>
+   614→            <Input
+   615→              value={data.currentMedications || ""}
+   616→              onChange={(e) => onChange({ currentMedications: e.target.value })}
+   617→              placeholder="مثلاً: متفورمین، امگا ۳، مولتی‌ویتامین..."
+   618→              className="h-11 rounded-xl bg-white border-2 border-orange-100 focus-visible:border-orange-400 text-slate-900 placeholder:text-slate-400 text-sm"
+   619→            />
+   620→          </div>
+   621→
+   622→          {/* Max lifts (for pro athletes) */}
+   623→          <div>
+   624→            <Label className="mb-2 block text-slate-700">
+   625→              حداکثر وزنه‌ها (اختیاری) — اسکوات / پرس سینه / ددلیفت
+   626→            </Label>
+   627→            <Input
+   628→              value={data.maxLifts || ""}
+   629→              onChange={(e) => onChange({ maxLifts: e.target.value })}
+   630→              placeholder="مثلاً: اسکوات ۱۲۰ / پرس ۱۰۰ / ددلیفت ۱۵۰ کیلو"
+   631→              className="h-11 rounded-xl bg-white border-2 border-orange-100 focus-visible:border-orange-400 text-slate-900 placeholder:text-slate-400 text-sm"
+   632→              dir="rtl"
+   633→            />
+   634→            <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">
+   635→              این اطلاعات برای ورزشکاران حرفه‌ای استفاده می‌شود تا برنامه دقیق‌تری طراحی شود.
+   636→            </p>
+   637→          </div>
+   638→        </div>
+   639→      )}
+   640→    </div>
+   641→  );
+   642→}
+   643→
+   644→/* ============ STEP 4: Nutrition ============ */
+   645→function StepNutrition({ data, onChange }: { data: Partial<OnboardingData>; onChange: (p: Partial<OnboardingData>) => void }) {
+   646→  const diets: { id: DietType; label: string; icon: string; desc: string }[] = [
+   647→    { id: "standard", label: "عادی", icon: "🍽️", desc: "بدون محدودیت" },
+   648→    { id: "vegetarian", label: "گیاه‌خواری", icon: "🥗", desc: "بدون گوشت" },
+   649→    { id: "vegan", label: "وگن", icon: "🌱", desc: "بدون محصولات حیوانی" },
+   650→    { id: "keto", label: "کتوژنیک", icon: "🥑", desc: "کم‌کربو" },
+   651→  ];
+   652→  return (
+   653→    <div>
+   654→      <StepHeader icon={Salad} title="اطلاعات تغذیه‌ای" subtitle="رژیم غذایی، آلرژی‌ها و تعداد وعده‌ها" />
+   655→      <div className="mb-5">
+   656→        <Label className="mb-2 block text-slate-700">نوع رژیم غذایی</Label>
+   657→        <div className="space-y-2">
+   658→          {diets.map((d) => (
+   659→            <button
+   660→              key={d.id}
+   661→              onClick={() => onChange({ dietType: d.id })}
+   662→              className={`w-full flex items-center gap-4 p-3 rounded-xl border-2 bg-white transition text-right ${
+   663→                data.dietType === d.id
+   664→                  ? "border-orange-500 bg-orange-50"
+   665→                  : "border-orange-200 hover:border-orange-300"
+   666→              }`}
+   667→            >
+   668→              <div className="text-2xl">{d.icon}</div>
+   669→              <div className="flex-1">
+   670→                <div className="font-bold text-sm text-slate-900">{d.label}</div>
+   671→                <div className="text-[11px] text-slate-500">{d.desc}</div>
+   672→              </div>
+   673→              {data.dietType === d.id && <Check className="w-5 h-5 text-orange-500" />}
+   674→            </button>
+   675→          ))}
+   676→        </div>
+   677→      </div>
+   678→      <div className="mb-5">
+   679→        <Label className="mb-2 block text-slate-700">تعداد وعده‌های غذایی رغبتی</Label>
+   680→        <div className="grid grid-cols-4 gap-2">
+   681→          {[2, 3, 4, 5].map((n) => (
+   682→            <button
+   683→              key={n}
+   684→              onClick={() => onChange({ mealCount: n })}
+   685→              className={`p-3 rounded-xl border-2 bg-white text-sm font-stat transition ${
+   686→                data.mealCount === n
+   687→                  ? "border-orange-500 bg-orange-50 text-orange-600"
+   688→                  : "border-orange-200 text-slate-700 hover:border-orange-300"
+   689→              }`}
+   690→            >
+   691→              {toPersianDigits(n)} وعده
+   692→            </button>
+   693→          ))}
+   694→        </div>
+   695→      </div>
+   696→      <div>
+   697→        <Label className="mb-2 block text-slate-700">آلرژی‌های غذایی</Label>
+   698→        <Textarea
+   699→          value={data.allergies || ""}
+   700→          onChange={(e) => onChange({ allergies: e.target.value })}
+   701→          placeholder="مثلاً: لاکتوز، گلوتن، آجیل..."
+   702→          className="rounded-xl min-h-[72px] bg-white border-2 border-orange-100 focus-visible:border-orange-400 focus-visible:ring-orange-300/40 text-slate-900 placeholder:text-slate-400"
+   703→        />
+   704→      </div>
+   705→
+   706→      {/* Optional body measurements — moved here from the removed upload step */}
+   707→      <div className="mt-5">
+   708→        <OptionalBodyMeasurements data={data} onChange={onChange} />
+   709→      </div>
+   710→    </div>
+   711→  );
+   712→}
+   713→
+   714→/* ============ STEP 4 (REMOVED): Photo Uploads ============
+   715→ * The photo upload step has been REMOVED from onboarding entirely.
+   716→ * Both blood test photos and body photos are now collected AFTER purchase:
+   717→ *   - Body photos: via /api/coach/submit-body-analysis (for Advanced/Ultimate users)
+   718→ *     — these photos are analyzed by AI and used in program generation.
+   719→ *   - Blood test photos: via the separate blood-test feature in the panel
+   720→ *     (completely optional, never required for program generation).
+   721→ * The optional body measurements (chest/arm/waist/hip/thigh) are now collected
+   722→ * at the end of StepNutrition (step 3) — see OptionalBodyMeasurements component below.
+   723→ */
+   724→
+   725→/* ============ Optional Body Measurements (اختیاری) ============ */
+   726→function OptionalBodyMeasurements({
+   727→  data,
+   728→  onChange,
+   729→}: {
+   730→  data: Partial<OnboardingData>;
+   731→  onChange: (p: Partial<OnboardingData>) => void;
+   732→}) {
+   733→  const [expanded, setExpanded] = useState(false);
+   734→
+   735→  const fields: { key: keyof Pick<OnboardingData, "chestMeasurement" | "armMeasurement" | "waistMeasurement" | "hipMeasurement" | "thighMeasurement">; label: string; icon: string }[] = [
+   736→    { key: "chestMeasurement", label: "دور قفسه سینه", icon: "🫁" },
+   737→    { key: "armMeasurement", label: "دور بازو", icon: "💪" },
+   738→    { key: "waistMeasurement", label: "دور کمر", icon: "🎯" },
+   739→    { key: "hipMeasurement", label: "دور باسن", icon: "🍑" },
+   740→    { key: "thighMeasurement", label: "دور ران", icon: "🦵" },
+   741→  ];
+   742→
+   743→  return (
+   744→    <div className="rounded-2xl border-2 border-amber-200 bg-amber-50/40 overflow-hidden">
+   745→      <button
+   746→        type="button"
+   747→        onClick={() => setExpanded((v) => !v)}
+   748→        className="w-full flex items-center justify-between p-4 text-right"
+   749→      >
+   750→        <div className="flex items-center gap-2">
+   751→          <div
+   752→            className="w-9 h-9 rounded-xl flex items-center justify-center text-white shadow-sm"
+   753→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   754→          >
+   755→            <Activity className="w-5 h-5" />
+   756→          </div>
+   757→          <div>
+   758→            <p className="text-sm font-bold text-slate-900">اندازه‌های بدنی (اختیاری)</p>
+   759→            <p className="text-[11px] text-slate-500">اختیاری — اما برای تحلیل پیشرفت بهتر توصیه می‌شود</p>
+   760→          </div>
+   761→        </div>
+   762→        <ChevronLeft
+   763→          className={`w-5 h-5 text-slate-400 transition-transform ${expanded ? "-rotate-90" : ""}`}
+   764→        />
+   765→      </button>
+   766→
+   767→      {expanded && (
+   768→        <div className="px-4 pb-4 space-y-3">
+   769→          <p className="text-[11px] text-slate-600 leading-relaxed bg-white/60 rounded-lg p-2.5 border border-amber-100">
+   770→            این اندازه‌ها به عنوان <b>چکاپ اولیه (baseline)</b> ذخیره می‌شوند تا در چکاپ‌های بعدی بتوانیم پیشرفت شما را دقیق‌تر بسنجیم. اگر متر ندارید یا نمی‌خواهید وارد کنید، همین‌طور هم کار می‌کند.
+   771→          </p>
+   772→          <div className="grid grid-cols-1 gap-2.5">
+   773→            {fields.map((f) => (
+   774→              <div key={f.key}>
+   775→                <Label className="mb-1 block text-slate-700 text-xs flex items-center gap-1.5">
+   776→                  <span className="text-base">{f.icon}</span>
+   777→                  {f.label} <span className="text-slate-400 font-normal">(cm)</span>
+   778→                </Label>
+   779→                <Input
+   780→                  type="number"
+   781→                  dir="ltr"
+   782→                  inputMode="numeric"
+   783→                  value={data[f.key] ?? ""}
+   784→                  onChange={(e) => {
+   785→                    const v = e.target.value;
+   786→                    onChange({ [f.key]: v ? Number(v) : undefined } as Partial<OnboardingData>);
+   787→                  }}
+   788→                  placeholder="مثلاً ۱۰۰"
+   789→                  className="h-11 rounded-xl bg-white border-2 border-orange-100 focus-visible:border-orange-400 text-slate-900 placeholder:text-slate-400 text-center text-sm"
+   790→                />
+   791→              </div>
+   792→            ))}
+   793→          </div>
+   794→        </div>
+   795→      )}
+   796→    </div>
+   797→  );
+   798→}
+   799→
+   800→function GeneratingScreen() {
+   801→  return (
+   802→    <div className="min-h-screen flex flex-col items-center justify-center px-8 bg-white relative overflow-hidden">
+   803→      {/* Subtle gold accents */}
+   804→      <div className="absolute inset-0 -z-10 pointer-events-none">
+   805→        <div className="absolute top-1/4 -left-24 w-72 h-72 rounded-full bg-amber-100/60 blur-3xl" />
+   806→        <div className="absolute bottom-1/4 -right-24 w-72 h-72 rounded-full bg-orange-100/50 blur-3xl" />
+   807→      </div>
+   808→
+   809→      <motion.div
+   810→        animate={{ rotate: 360 }}
+   811→        transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
+   812→        className="w-20 h-20 rounded-3xl flex items-center justify-center mb-8 shadow-xl shadow-orange-500/30 overflow-hidden"
+   813→        style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   814→      >
+   815→        {/* eslint-disable-next-line @next/next/no-img-element */}
+   816→        <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   817→      </motion.div>
+   818→
+   819→      <motion.h2
+   820→        initial={{ opacity: 0 }}
+   821→        animate={{ opacity: 1 }}
+   822→        className="text-xl font-black text-slate-900 mb-2 text-center"
+   823→      >
+   824→        فیتاپ هوشمند در حال ساخت برنامه شماست...
+   825→      </motion.h2>
+   826→      <p className="text-slate-500 text-sm text-center max-w-xs mb-8">
+   827→        مربی هوشمند در حال تحلیل اطلاعات شما و طراحی برنامه تمرینی و غذایی اختصاصی است.
+   828→      </p>
+   829→
+   830→      <div className="space-y-3 w-full max-w-xs">
+   831→        {[
+   832→          { label: "تحلیل اطلاعات فیزیکی", delay: 0 },
+   833→          { label: "محاسبه کالری و درشت‌مغذی‌ها", delay: 0.3 },
+   834→          { label: "طراحی برنامه تمرینی", delay: 0.6 },
+   835→          { label: "آماده‌سازی برنامه غذایی", delay: 0.9 },
+   836→        ].map((s, i) => (
+   837→          <motion.div
+   838→            key={i}
+   839→            initial={{ opacity: 0, x: -20 }}
+   840→            animate={{ opacity: 1, x: 0 }}
+   841→            transition={{ delay: s.delay }}
+   842→            className="flex items-center gap-3 text-sm bg-white border border-orange-100 rounded-xl px-4 py-3 shadow-sm"
+   843→          >
+   844→            <Loader2 className="w-4 h-4 animate-spin text-orange-500" />
+   845→            <span className="text-slate-700">{s.label}</span>
+   846→          </motion.div>
+   847→        ))}
+   848→      </div>
+   849→    </div>
+   850→  );
+   851→}
+   852→

@@ -1,0 +1,1165 @@
+     1→/**
+     2→ * SEO Agent — Fully Automated, Self-Sustaining Agentic SEO System
+     3→ *
+     4→ * Pipeline:
+     5→ *  1. analyzeSite() — بررسی دقیق سایت: مقالات موجود، صفحات کلیدی، ساختار URL، کلمات کلیدی فعلی
+     6→ *  2. extractKeywords() — استخراج کلمات کلیدی متناسب با کسب‌وکار فیتاپ (با درنظرگرفتن کلمات موجود)
+     7→ *  3. generateStrategy() — نوشتن استراتژی جامع سئو: content pillars، کلاسترها، تقویم محتوا، نقشه لینک‌سازی
+     8→ *  4. planArticles() — برنامه‌ریزی N مقاله با عنوان، slug، کلمات کلیدی، لینک‌های داخلی، پرامپت تصویر
+     9→ *  5. generateArticle() — تولید محتوای کامل + تصاویر + انتشار
+    10→ *
+    11→ * Self-sustaining features:
+    12→ *  - استراتژی و نقشه سایت در DB ذخیره می‌شود
+    13→ *  - مقالات برنامه‌ریزی‌شده در صف (SeoArticlePlan) نگهداری می‌شوند
+    14→ *  - هر اجرا، قبل از تولید، سایت را دوباره تحلیل می‌کند تا لینک‌سازی همیشه به‌روز باشد
+    15→ *  - در صورت شکست تولید یک مقاله، بقیه مقالات ادامه می‌دهند
+    16→ *  - slug تکراری تولید نمی‌شود (چک در DB + plan)
+    17→ *  - تصاویر با نام SEO-friendly و در ۳ سایز (cover/thumb/full) ذخیره می‌شوند
+    18→ */
+    19→import { db } from "@/lib/db";
+    20→import { avalaiClient, TEXT_MODEL } from "@/lib/fitness/ai";
+    21→import { generateImage, type AspectRatio } from "@/lib/fitness/avalai-image";
+    22→import {
+    23→  processAndSaveArticleImage,
+    24→  processAndSaveInlineImage,
+    25→} from "@/lib/fitness/image-processing";
+    26→
+    27→// ─── Types ───
+    28→export interface SiteAnalysis {
+    29→  pages: { url: string; title: string; type: "landing" | "tool" | "list" }[];
+    30→  articles: {
+    31→    id: string;
+    32→    title: string;
+    33→    slug: string;
+    34→    category: string;
+    35→    tags: string;
+    36→    excerpt: string;
+    37→  }[];
+    38→  existingKeywords: string[];
+    39→  totalArticles: number;
+    40→  totalViews: number;
+    41→}
+    42→
+    43→export interface SeoStrategyContent {
+    44→  brand: string;
+    45→  domain: string;
+    46→  market: string;
+    47→  contentPillars: { id: string; name: string; description: string }[];
+    48→  targetKeywords: {
+    49→    keyword: string;
+    50→    intent: "informational" | "transactional" | "navigational";
+    51→    difficulty: "low" | "medium" | "high";
+    52→    pillar: string;
+    53→  }[];
+    54→  clusters: { pillar: string; theme: string; keywords: string[] }[];
+    55→  contentCalendar: { week: number; topic: string; keyword: string }[];
+    56→  internalLinkMap: { from: string; to: string; anchor: string }[];
+    57→  competitiveNotes: string;
+    58→  sustainabilityPlan: string;
+    59→}
+    60→
+    61→export interface ArticlePlan {
+    62→  id?: string;
+    63→  keyword: string;
+    64→  title: string;
+    65→  slug: string;
+    66→  category: string;
+    67→  excerpt: string;
+    68→  pillar: string;
+    69→  secondaryKeywords: string[];
+    70→  internalLinks: { slug: string; title: string; anchor: string }[];
+    71→  coverImagePrompt: string;
+    72→  inlineImagePrompts: string[];
+    73→}
+    74→
+    75→export interface RunProgress {
+    76→  level: "info" | "success" | "warn" | "error";
+    77→  msg: string;
+    78→  ts: number;
+    79→}
+    80→
+    81→export interface RunContext {
+    82→  runId: string;
+    83→  mode: "full" | "continue" | "strategy_only";
+    84→  count: number;
+    85→  logs: RunProgress[];
+    86→  adminId: string;
+    87→  startedAt: number;
+    88→  successCount: number;
+    89→  failCount: number;
+    90→  articles: any[];
+    91→  errors: string[];
+    92→}
+    93→
+    94→// ─── Logger helper ───
+    95→function log(
+    96→  ctx: RunContext,
+    97→  level: RunProgress["level"],
+    98→  msg: string
+    99→): void {
+   100→  const entry: RunProgress = { level, msg, ts: Date.now() };
+   101→  ctx.logs.push(entry);
+   102→  // Also print to server log for debugging
+   103→  const prefix =
+   104→    level === "error"
+   105→      ? "[SEO-AGENT:ERROR]"
+   106→      : level === "warn"
+   107→      ? "[SEO-AGENT:WARN]"
+   108→      : level === "success"
+   109→      ? "[SEO-AGENT:OK]"
+   110→      : "[SEO-AGENT]";
+   111→  console.log(`${prefix} ${msg}`);
+   112→  // Persist to DB every 5 logs or every 3 seconds — for live UI updates
+   113→  const now = Date.now();
+   114→  const lastPersist = (ctx as any)._lastPersist || 0;
+   115→  if (ctx.logs.length % 5 === 0 || now - lastPersist > 3000) {
+   116→    (ctx as any)._lastPersist = now;
+   117→    // fire-and-forget — don't block the agent
+   118→    db.seoAgentRun
+   119→      .update({
+   120→        where: { id: ctx.runId },
+   121→        data: {
+   122→          logs: JSON.stringify(ctx.logs.slice(-200)),
+   123→          successCount: ctx.successCount,
+   124→          failCount: ctx.failCount,
+   125→        },
+   126→      })
+   127→      .catch(() => null);
+   128→  }
+   129→}
+   130→
+   131→// ─── JSON extraction helper ───
+   132→function extractJson(content: string): any | null {
+   133→  if (!content) return null;
+   134→  // Try code block first
+   135→  const codeBlock = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+   136→  const candidate = codeBlock ? codeBlock[1].trim() : content.trim();
+   137→  // Find the first balanced { ... }
+   138→  const start = candidate.indexOf("{");
+   139→  if (start === -1) return null;
+   140→  let depth = 0;
+   141→  for (let i = start; i < candidate.length; i++) {
+   142→    if (candidate[i] === "{") depth++;
+   143→    else if (candidate[i] === "}") {
+   144→      depth--;
+   145→      if (depth === 0) {
+   146→        const jsonStr = candidate.slice(start, i + 1);
+   147→        try {
+   148→          return JSON.parse(jsonStr);
+   149→        } catch {
+   150→          // try to fix common issues
+   151→          try {
+   152→            return JSON.parse(
+   153→              jsonStr
+   154→                .replace(/,\s*}/g, "}")
+   155→                .replace(/,\s*]/g, "]")
+   156→                .replace(/[\u201C\u201D]/g, '"')
+   157→                .replace(/[\u2018\u2019]/g, "'")
+   158→            );
+   159→          } catch {
+   160→            return null;
+   161→          }
+   162→        }
+   163→      }
+   164→    }
+   165→  }
+   166→  return null;
+   167→}
+   168→
+   169→async function callLlm(system: string, user: string, maxTokens = 4000): Promise<string> {
+   170→  const completion = await avalaiClient.chat.completions.create({
+   171→    model: TEXT_MODEL,
+   172→    messages: [
+   173→      { role: "system", content: system },
+   174→      { role: "user", content: user },
+   175→    ],
+   176→    max_tokens: maxTokens,
+   177→    temperature: 0.7,
+   178→  } as any);
+   179→  return completion.choices[0]?.message?.content || "";
+   180→}
+   181→
+   182→// ─── Step 1: Analyze site ───
+   183→export async function analyzeSite(ctx: RunContext): Promise<SiteAnalysis> {
+   184→  log(ctx, "info", "🔍 شروع تحلیل سایت — استخراج صفحات و مقالات موجود");
+   185→  // Static landing pages & tools (همیشه در سایت فیتاپ وجود دارند)
+   186→  // مهم: همه مسیرهای معتبر لینک داخلی در سایت فیتاپ. از این لیست برای لینک‌سازی استفاده کن.
+   187→  const pages = [
+   188→    { url: "/", title: "فیتاپ — مربی هوشمند بدنسازی و تغذیه", type: "landing" as const },
+   189→    { url: "/?screen=articles", title: "مقالات ورزشی و تغذیه فیتاپ", type: "list" as const },
+   190→    { url: "/?tool=tdee", title: "محاسبه‌گر کالری و TDEE", type: "tool" as const },
+   191→    { url: "/?tool=exercises", title: "بانک حرکات ورزشی", type: "tool" as const },
+   192→    { url: "/?tool=foods", title: "جدول کالری غذاها", type: "tool" as const },
+   193→    { url: "/?screen=auth", title: "ورود / ثبت‌نام فیتاپ", type: "landing" as const },
+   194→  ];
+   195→
+   196→  const articles = await db.article.findMany({
+   197→    where: { status: "published" },
+   198→    select: {
+   199→      id: true,
+   200→      title: true,
+   201→      slug: true,
+   202→      category: true,
+   203→      tags: true,
+   204→      excerpt: true,
+   205→    },
+   206→    orderBy: { createdAt: "desc" },
+   207→  });
+   208→
+   209→  // Collect existing keywords from tags
+   210→  const existingKeywords = new Set<string>();
+   211→  for (const a of articles) {
+   212→    if (a.tags) {
+   213→      for (const t of a.tags.split(",").map((s) => s.trim()).filter(Boolean)) {
+   214→        existingKeywords.add(t);
+   215→      }
+   216→    }
+   217→  }
+   218→
+   219→  const totalViewsAgg = await db.article.aggregate({
+   220→    where: { status: "published" },
+   221→    _sum: { views: true },
+   222→  });
+   223→
+   224→  const result: SiteAnalysis = {
+   225→    pages,
+   226→    articles: articles.map((a) => ({
+   227→      id: a.id,
+   228→      title: a.title,
+   229→      slug: a.slug,
+   230→      category: a.category,
+   231→      tags: a.tags,
+   232→      excerpt: a.excerpt,
+   233→    })),
+   234→    existingKeywords: Array.from(existingKeywords),
+   235→    totalArticles: articles.length,
+   236→    totalViews: totalViewsAgg._sum.views || 0,
+   237→  };
+   238→
+   239→  log(
+   240→    ctx,
+   241→    "success",
+   242→    `✅ تحلیل سایت کامل شد: ${result.pages.length} صفحه کلیدی، ${result.totalArticles} مقاله موجود، ${result.existingKeywords.length} کلمه کلیدی موجود، ${result.totalViews} بازدید کل`
+   243→  );
+   244→  return result;
+   245→}
+   246→
+   247→// ─── Step 2 & 3: Generate strategy ───
+   248→export async function generateStrategy(
+   249→  ctx: RunContext,
+   250→  site: SiteAnalysis
+   251→): Promise<SeoStrategyContent> {
+   252→  log(ctx, "info", "🧠 شروع تولید استراتژی جامع سئو با هوش مصنوعی");
+   253→
+   254→  const siteSummary = `
+   255→صفحات موجود در سایت:
+   256→${site.pages.map((p) => `- ${p.url} — ${p.title} (${p.type})`).join("\n")}
+   257→
+   258→مقالات موجود (${site.totalArticles} مقاله):
+   259→${site.articles
+   260→  .slice(0, 30)
+   261→  .map((a, i) => `${i + 1}. "${a.title}" — slug: ${a.slug} — دسته: ${a.category}${a.tags ? ` — تگ‌ها: ${a.tags}` : ""}`)
+   262→  .join("\n")}
+   263→
+   264→کلمات کلیدی موجود در سایت:
+   265→${site.existingKeywords.join("، ") || "(هیچ)"}
+   266→`.trim();
+   267→
+   268→  const systemPrompt = `تو یک متخصص ارشد سئو (SEO Strategist) هستی که برای پلتفرم ایرانی فیتاپ (FitUp) کار می‌کنی.
+   269→فیتاپ یک پلتفرم هوشمند بدنسازی و تغذیه با هوش مصنوعی است که خدمات زیر را ارائه می‌دهد:
+   270→- ۴ پلن اشتراک: اقتصادی (۳۵۰هزار تومان/۴۵روز)، استاندارد (۸۰۰هزار)، پیشرفته (۱.۲ میلیون)، حرفه‌ای (۱.۸ میلیون)
+   271→- برنامه تمرینی هوشمند (شامل سوپرست و تری‌ست)
+   272→- برنامه غذایی شخصی‌سازی‌شده (با ترکیب و جایگزینی غذا)
+   273→- مکمل‌ها با دوز ایمن
+   274→- مربی هوشمند ۲۴ ساعته (چت)
+   275→- تحلیل عکس غذا، عکس بدن، ویدیو تمرین، آزمایش خون (۴۷ ماده)
+   276→- ۳ ابزار رایگان: محاسبه TDEE، بانک حرکات، جدول کالری غذاها
+   277→- سیستم معرفی دوست (۱۵۰هزار تومان پاداش برای هر دو نفر)
+   278→- مقالات ورزشی و تغذیه
+   279→
+   280→بازار هدف: ایران، فارسی‌زبانان
+   281→دامنه: ${process.env.NEXT_PUBLIC_SITE_URL || "https://fittup.ir"}
+   282→
+   283→شما باید یک استراتژی سئوی جامع، حرفه‌ای و پایدار طراحی کنید که:
+   284→۱. کلمات کلیدی باارتفاع بالا و رقابت منطقی برای بازار ایران هدف‌گذاری کند
+   285→۲. بر اساس content pillars و topic clusters سازمان‌دهی شود
+   286→۳. نقشه لینک‌سازی داخلی دقیق بر اساس صفحات و مقالات موجود بسازد
+   287→۴. پایدار باشد — یعنی بعد از ۲ ماه هم کار کند و به‌روز باشد
+   288→۵. کلمات کلیدی موجود در سایت را گسترش دهد، نه تکرار کند
+   289→
+   290→فقط و فقط با ساختار JSON زیر پاسخ بده. هیچ متن اضافه‌ای ننویس:
+   291→{
+   292→  "brand": "فیتاپ",
+   293→  "domain": process.env.NEXT_PUBLIC_SITE_URL || "https://fittup.ir",
+   294→  "market": "ایران — فارسی",
+   295→  "contentPillars": [
+   296→    { "id": "training", "name": "تمرین و بدنسازی", "description": "..." },
+   297→    { "id": "nutrition", "name": "تغذیه و رژیم", "description": "..." },
+   298→    ...
+   299→  ],
+   300→  "targetKeywords": [
+   301→    { "keyword": "برنامه بدنسازی", "intent": "informational", "difficulty": "medium", "pillar": "training" },
+   302→    ...
+   303→  ],
+   304→  "clusters": [
+   305→    { "pillar": "training", "theme": "تمرینات قفسه سینه", "keywords": ["پرس سینه", "فلای سینه", "..."] },
+   306→    ...
+   307→  ],
+   308→  "contentCalendar": [
+   309→    { "week": 1, "topic": "...", "keyword": "..." },
+   310→    ...
+   311→  ],
+   312→  "internalLinkMap": [
+   313→    { "from": "new-article-slug", "to": "existing-article-slug-or-page-url", "anchor": "متن لینک" }
+   314→  ],
+   315→  "competitiveNotes": "نکات رقابتی و فرصت‌ها",
+   316→  "sustainabilityPlan": "برنامه پایداری — چگونه بعد از ۲ ماه هم کار کند"
+   317→}
+   318→
+   319→مهم: حداقل ۵ content pillar، حداقل ۲۰ کلمه کلیدی هدف، حداقل ۸ کلاستر، حداقل ۱۲ هفته تقویم محتوا، حداقل ۱۰ لینک داخلی پیشنهادی.`;
+   320→
+   321→  const userPrompt = `سایت را تحلیل کن و استراتژی سئو بنویس:\n\n${siteSummary}`;
+   322→
+   323→  let strategy: SeoStrategyContent | null = null;
+   324→  try {
+   325→    const content = await callLlm(systemPrompt, userPrompt, 8000);
+   326→    const parsed = extractJson(content);
+   327→    if (parsed) {
+   328→      strategy = parsed as SeoStrategyContent;
+   329→    }
+   330→  } catch (e: any) {
+   331→    log(ctx, "error", `خطا در تولید استراتژی: ${e.message}`);
+   332→  }
+   333→
+   334→  if (!strategy) {
+   335→    // Fallback strategy — ensures sustainability even if AI fails
+   336→    log(ctx, "warn", "استفاده از استراتژی fallback (پیش‌فرض)");
+   337→    strategy = {
+   338→      brand: "فیتاپ",
+   339→      domain: process.env.NEXT_PUBLIC_SITE_URL || "https://fittup.ir",
+   340→      market: "ایران — فارسی",
+   341→      contentPillars: [
+   342→        { id: "training", name: "تمرین و بدنسازی", description: "برنامه‌های تمرینی، حرکات، تکنیک‌ها" },
+   343→        { id: "nutrition", name: "تغذیه و رژیم", description: "رژیم غذایی، درشت‌مغذی‌ها، کالری" },
+   344→        { id: "supplement", name: "مکمل‌های ورزشی", description: "کراتین، پروتئین، ویتامین‌ها" },
+   345→        { id: "recovery", name: "بازیابی و استراحت", description: "خواب، ریکاوری عضله، جلوگیری از آسیب" },
+   346→        { id: "motivation", name: "انگیزه و روان‌شناسی", description: "هدف‌گذاری، استمرار، روان‌شناسی ورزش" },
+   347→      ],
+   348→      targetKeywords: [
+   349→        { keyword: "برنامه بدنسازی", intent: "informational", difficulty: "medium", pillar: "training" },
+   350→        { keyword: "برنامه غذایی کاهش وزن", intent: "informational", difficulty: "medium", pillar: "nutrition" },
+   351→        { keyword: "کراتین چیست", intent: "informational", difficulty: "low", pillar: "supplement" },
+   352→        { keyword: "پروتئین وی چیست", intent: "informational", difficulty: "low", pillar: "supplement" },
+   353→        { keyword: "تمرین پرس سینه", intent: "informational", difficulty: "low", pillar: "training" },
+   354→        { keyword: "اسکوات صحیح", intent: "informational", difficulty: "low", pillar: "training" },
+   355→        { keyword: "کالری روزانه", intent: "informational", difficulty: "low", pillar: "nutrition" },
+   356→        { keyword: "کاهش چربی شکم", intent: "informational", difficulty: "high", pillar: "training" },
+   357→        { keyword: "افزایش عضله", intent: "informational", difficulty: "medium", pillar: "training" },
+   358→        { keyword: "ویتامین D ورزشکاران", intent: "informational", difficulty: "low", pillar: "supplement" },
+   359→        { keyword: "خواب و ریکاوری عضله", intent: "informational", difficulty: "low", pillar: "recovery" },
+   360→        { keyword: "انگیزه ورزش", intent: "informational", difficulty: "low", pillar: "motivation" },
+   361→        { keyword: "تغذیه قبل تمرین", intent: "informational", difficulty: "low", pillar: "nutrition" },
+   362→        { keyword: "تغذیه بعد تمرین", intent: "informational", difficulty: "low", pillar: "nutrition" },
+   363→        { keyword: "ددلیفت صحیح", intent: "informational", difficulty: "medium", pillar: "training" },
+   364→        { keyword: "برنامه عضله‌سازی", intent: "informational", difficulty: "medium", pillar: "training" },
+   365→        { keyword: "محاسبه BMR", intent: "informational", difficulty: "low", pillar: "nutrition" },
+   366→        { keyword: "بادی بیلدینگ", intent: "informational", difficulty: "high", pillar: "training" },
+   367→        { keyword: "تناسب اندام", intent: "informational", difficulty: "high", pillar: "training" },
+   368→        { keyword: "مکمل افزایش وزن", intent: "informational", difficulty: "medium", pillar: "supplement" },
+   369→      ],
+   370→      clusters: [
+   371→        { pillar: "training", theme: "حرکات پایه بدنسازی", keywords: ["اسکوات", "ددلیفت", "پرس سینه", "پرس بالاسینه"] },
+   372→        { pillar: "training", theme: "تمرینات بازو", keywords: ["جلو بازو", "پشت بازو", "بازو با دمبل"] },
+   373→        { pillar: "nutrition", theme: "رژیم کاهش وزن", keywords: ["کالری دریافتی", "نقص کالری", "چربی‌سوزی"] },
+   374→        { pillar: "nutrition", theme: "رژیم عضله‌سازی", keywords: ["مازاد کالری", "پروتئین بالا", "کربو بالانس"] },
+   375→        { pillar: "supplement", theme: "مکمل‌های پایه", keywords: ["کراتین", "پروتئین وی", "مولتی‌ویتامین"] },
+   376→        { pillar: "supplement", theme: "ویتامین‌ها", keywords: ["ویتامین D", "B12", "امگا ۳"] },
+   377→        { pillar: "recovery", theme: "خواب و ریکاوری", keywords: ["خواب عمیق", "استراحت عضله", "ریکاوری فعال"] },
+   378→        { pillar: "motivation", theme: "استمرار ورزش", keywords: ["انگیزه روزانه", "هدف‌گذاری ورزشی", "غلوز بر تنبلی"] },
+   379→      ],
+   380→      contentCalendar: [
+   381→        { week: 1, topic: "آماده‌سازی بدن برای شروع بدنسازی", keyword: "برنامه بدنسازی" },
+   382→        { week: 2, topic: "تغذیه قبل و بعد تمرین", keyword: "تغذیه قبل تمرین" },
+   383→        { week: 3, topic: "آموزش صحیح اسکوات", keyword: "اسکوات صحیح" },
+   384→        { week: 4, topic: "مکمل کراتین و نحوه مصرف", keyword: "کراتین چیست" },
+   385→        { week: 5, topic: "محاسبه کالری روزانه", keyword: "کالری روزانه" },
+   386→        { week: 6, topic: "تکنیک صحیح ددلیفت", keyword: "ددلیفت صحیح" },
+   387→      ],
+   388→      internalLinkMap: [],
+   389→      competitiveNotes:
+   390→        "بازار ایران در حوزه فیتنس به شدت در حال رشد است. کلمات کلیدی فارسی رقابت کمتری نسبت به انگلیسی دارند. تمرکز روی long-tail keywords فارسی مزیت رقابتی ایجاد می‌کند.",
+   391→      sustainabilityPlan:
+   392→        "هر هفته ۳ مقاله جدید تولید می‌شود. استراتژی هر ۲ ماه یک‌بار با تحلیل مقالات جدید و کلمات کلیدی در حال ظهور بازبینی می‌شود. صف planned articles همیشه حاوی حداقل ۱۰ ایده آماده تولید است.",
+   393→    };
+   394→  }
+   395→
+   396→  // Save strategy to DB
+   397→  const siteMap = JSON.stringify(site);
+   398→  const summary = `استراتژی سئو ${strategy.contentPillars?.length || 0} ستون محتوایی، ${
+   399→    strategy.targetKeywords?.length || 0
+   400→  } کلمه کلیدی هدف، ${strategy.clusters?.length || 0} کلاستر، ${
+   401→    strategy.contentCalendar?.length || 0
+   402→  } هفته تقویم محتوا.`;
+   403→
+   404→  // Deactivate previous strategies, save new one
+   405→  await db.seoStrategy.updateMany({
+   406→    where: { isActive: true },
+   407→    data: { isActive: false },
+   408→  });
+   409→  const prev = await db.seoStrategy.findFirst({
+   410→    orderBy: { version: "desc" },
+   411→  });
+   412→  await db.seoStrategy.create({
+   413→    data: {
+   414→      version: (prev?.version || 0) + 1,
+   415→      isActive: true,
+   416→      content: JSON.stringify(strategy),
+   417→      summary,
+   418→      targetKeywords: (strategy.targetKeywords || [])
+   419→        .map((k) => k.keyword)
+   420→        .join(", "),
+   421→      siteMap,
+   422→      plannedCount: 0,
+   423→      autoMode: true,
+   424→      lastRunAt: new Date(),
+   425→    },
+   426→  });
+   427→
+   428→  log(
+   429→    ctx,
+   430→    "success",
+   431→    `✅ استراتژی سئو ذخیره شد (نسخه ${(prev?.version || 0) + 1}): ${summary}`
+   432→  );
+   433→  return strategy;
+   434→}
+   435→
+   436→// ─── Step 4: Plan articles ───
+   437→export async function planArticles(
+   438→  ctx: RunContext,
+   439→  strategy: SeoStrategyContent,
+   440→  site: SiteAnalysis,
+   441→  count: number
+   442→): Promise<ArticlePlan[]> {
+   443→  log(ctx, "info", `📅 برنامه‌ریزی ${count} مقاله جدید بر اساس استراتژی`);
+   444→
+   445→  // Build list of existing slugs to avoid duplicates
+   446→  const existingSlugs = new Set(site.articles.map((a) => a.slug));
+   447→  const existingTitles = new Set(
+   448→    site.articles.map((a) => a.title.toLowerCase())
+   449→  );
+   450→
+   451→  // Get already-planned articles (not yet published)
+   452→  const planned = await db.seoArticlePlan.findMany({
+   453→    where: { status: { in: ["planned", "queued", "generating"] } },
+   454→    select: { keyword: true, title: true, slug: true },
+   455→  });
+   456→  for (const p of planned) {
+   457→    existingSlugs.add(p.slug);
+   458→    existingTitles.add(p.title.toLowerCase());
+   459→  }
+   460→
+   461→  // Pick top keywords not already covered (avoid duplicate keywords)
+   462→  const coveredKeywords = new Set([
+   463→    ...site.existingKeywords.map((k) => k.toLowerCase()),
+   464→    ...planned.map((p) => p.keyword.toLowerCase()),
+   465→  ]);
+   466→
+   467→  const candidateKeywords = (strategy.targetKeywords || [])
+   468→    .filter((k) => !coveredKeywords.has(k.keyword.toLowerCase()))
+   469→    .slice(0, count * 2); // get extra in case some fail
+   470→
+   471→  if (candidateKeywords.length < count) {
+   472→    // also consider cluster keywords
+   473→    for (const cluster of strategy.clusters || []) {
+   474→      for (const kw of cluster.keywords || []) {
+   475→        if (!coveredKeywords.has(kw.toLowerCase()) && candidateKeywords.length < count * 2) {
+   476→          candidateKeywords.push({
+   477→            keyword: kw,
+   478→            intent: "informational" as const,
+   479→            difficulty: "low" as const,
+   480→            pillar: cluster.pillar,
+   481→          });
+   482→        }
+   483→      }
+   484→    }
+   485→  }
+   486→
+   487→  // Pick top N
+   488→  const selected = candidateKeywords.slice(0, count);
+   489→
+   490→  const systemPrompt = `تو یک متخصص سئو و برنامه‌ریز محتوای فارسی هستی. برای هر کلمه کلیدی، یک ایده مقاله سئوشده با عنوان جذاب، slug انگلیسی مناسب، و خلاصه تولید کن.
+   491→همچنین برای هر مقاله:
+   492→- ۳-۵ کلمه کلیدی ثانویه مرتبط پیشنهاد بده
+   493→- ۲-۳ لینک داخلی به صفحات/مقالات موجود پیشنهاد بده (با anchor text مناسب)
+   494→- یک پرامپت حرفه‌ای به انگلیسی برای تولید تصویر کاور بنویس (photorealistic, fitness-related, no text in image, orange/white theme when applicable)
+   495→- ۱-۲ پرامپت انگلیسی برای تصاویر داخل مقاله
+   496→
+   497→فقط با ساختار JSON زیر پاسخ بده:
+   498→{
+   499→  "articles": [
+   500→    {
+   501→      "keyword": "کلمه کلیدی",
+   502→      "title": "عنوان جذاب مقاله (شامل کلمه کلیدی)",
+   503→      "slug": "english-slug-with-dashes",
+   504→      "category": "training|nutrition|motivation|general|supplement|recovery",
+   505→      "excerpt": "خلاصه ۱-۲ خطی",
+   506→      "pillar": "training|nutrition|...",
+   507→      "secondaryKeywords": ["کلمه ۱", "کلمه ۲"],
+   508→      "internalLinks": [
+   509→        { "slug": "existing-article-slug", "title": "عنوان مقاله هدف", "anchor": "متن لینک" }
+   510→      ],
+   511→      "coverImagePrompt": "English prompt for cover image",
+   512→      "inlineImagePrompts": ["English prompt 1", "English prompt 2"]
+   513→    }
+   514→  ]
+   515→}`;
+   516→
+   517→  const existingForLinks = [...site.articles.slice(0, 15), ...site.pages.map((p) => ({
+   518→    id: "",
+   519→    title: p.title,
+   520→    slug: p.url,
+   521→    category: "page",
+   522→    tags: "",
+   523→    excerpt: "",
+   524→  }))];
+   525→
+   526→  const userPrompt = `برای این ${selected.length} کلمه کلیدی، ایده مقاله تولید کن:
+   527→${selected
+   528→  .map(
+   529→    (k, i) =>
+   530→      `${i + 1}. "${k.keyword}" — ستون: ${k.pillar} — سختی: ${k.difficulty}`
+   531→  )
+   532→  .join("\n")}
+   533→
+   534→صفحات/مقالات موجود برای لینک‌سازی داخلی (فقط به این‌ها لینک بده):
+   535→${existingForLinks
+   536→  .map((p) => `- slug="${p.slug}" title="${p.title}"`)
+   537→  .join("\n")}
+   538→
+   539→قوانین مهم:
+   540→- slug باید انگلیسی، با dash، کوتاه و توصیفی باشد (مثلاً: bench-press-form-guide)
+   541→- عنوان باید جذاب، شامل کلمه کلیدی و قابل کلیک باشد
+   542→- category باید یکی از: training, nutrition, supplement, recovery, motivation, general
+   543→- حداقل ۲ لینک داخلی به مقالات/صفحات موجود بساز
+   544→- coverImagePrompt: تصویر باید مرتبط، حرفه‌ای، بدون متن، واقع‌گرایانه باشد`;
+   545→
+   546→  let articles: ArticlePlan[] = [];
+   547→  try {
+   548→    const content = await callLlm(systemPrompt, userPrompt, 8000);
+   549→    const parsed = extractJson(content);
+   550→    if (parsed?.articles && Array.isArray(parsed.articles)) {
+   551→      articles = parsed.articles.filter(
+   552→        (a: any) =>
+   553→          a.keyword &&
+   554→          a.title &&
+   555→          a.slug &&
+   556→          !existingSlugs.has(a.slug) &&
+   557→          !existingTitles.has(a.title.toLowerCase())
+   558→      );
+   559→    }
+   560→  } catch (e: any) {
+   561→    log(ctx, "error", `خطا در برنامه‌ریزی مقالات: ${e.message}`);
+   562→  }
+   563→
+   564→  // Save plans to DB
+   565→  const savedPlans: ArticlePlan[] = [];
+   566→  for (const plan of articles) {
+   567→    try {
+   568→      const dbPlan = await db.seoArticlePlan.create({
+   569→        data: {
+   570→          keyword: plan.keyword,
+   571→          title: plan.title,
+   572→          slug: plan.slug,
+   573→          category: plan.category || "general",
+   574→          excerpt: plan.excerpt || "",
+   575→          pillar: plan.pillar || "general",
+   576→          secondaryKeywords: (plan.secondaryKeywords || []).join(", "),
+   577→          internalLinks: JSON.stringify(plan.internalLinks || []),
+   578→          coverImagePrompt: plan.coverImagePrompt || "",
+   579→          status: "planned",
+   580→          priority: 50,
+   581→        },
+   582→      });
+   583→      savedPlans.push({ ...plan, id: dbPlan.id });
+   584→    } catch (e: any) {
+   585→      log(ctx, "warn", `ذخیره plan برای "${plan.title}" شکست خورد: ${e.message}`);
+   586→    }
+   587→  }
+   588→
+   589→  log(
+   590→    ctx,
+   591→    "success",
+   592→    `✅ ${savedPlans.length} مقاله برنامه‌ریزی و در صف ذخیره شد`
+   593→  );
+   594→
+   595→  // Update strategy planned count
+   596→  await db.seoStrategy.updateMany({
+   597→    where: { isActive: true },
+   598→    data: { plannedCount: savedPlans.length },
+   599→  });
+   600→
+   601→  return savedPlans;
+   602→}
+   603→
+   604→// ─── Step 5: Generate single article with images ───
+   605→export async function generateArticle(
+   606→  ctx: RunContext,
+   607→  plan: ArticlePlan,
+   608→  site: SiteAnalysis
+   609→): Promise<{ articleId: string; coverUrl: string; wordCount: number }> {
+   610→  log(ctx, "info", `📝 شروع تولید مقاله: "${plan.title}" (slug: ${plan.slug})`);
+   611→
+   612→  // Mark plan as generating
+   613→  if (plan.id) {
+   614→    await db.seoArticlePlan.update({
+   615→      where: { id: plan.id },
+   616→      data: { status: "generating", attempts: { increment: 1 } },
+   617→    });
+   618→  }
+   619→
+   620→  // Build internal link context — existing articles for the AI to reference
+   621→  const existingForLinks = [...site.articles.slice(0, 20), ...site.pages.map((p) => ({
+   622→    slug: p.url,
+   623→    title: p.title,
+   624→  }))];
+   625→
+   626→  // Generate full article content (2000+ words)
+   627→  const contentSystem = `تو یک نویسنده حرفه‌ای محتوای ورزشی و تغذیه فارسی هستی. مقالات تو:
+   628→- حداقل ۱۸۰۰ کلمه هستند
+   629→- کاملاً سئوشده هستند (کلمه کلیدی اصلی در H1، پاراگراف اول، چند بار در متن، و در نتیجه‌گیری)
+   630→- ساختار حرفه‌ای دارند: H1، چند H2، چند H3، لیست‌ها، نقل‌قول‌های برجسته
+   631→- علمی، دقیق و کاربردی هستند (نه کلی‌گویی)
+   632→- لحن حرفه‌ای اما قابل فهم دارند
+   633→- شامل ایموجی‌های مرتبط برای خوانایی بهتر
+   634→- با فرمت Markdown هستند
+   635→- شامل حداقل ۲ جای‌نگهدار تصویر با فرمت ![توضیح فارسی تصویر](IMAGE_PLACEHOLDER_1) و ![توضیح فارسی تصویر](IMAGE_PLACEHOLDER_2)
+   636→  • مهم: alt text هر تصویر باید توصیفی، فارسی و حاوی کلمه کلیدی باشد (حداقل ۵ کلمه). مثال: ![جدول کالری غذاها و مواد مغذی](IMAGE_PLACEHOLDER_1)
+   637→- شامل جدول مقایسه‌ای (Markdown table) حداقل در یک بخش
+   638→- شامل سؤالات متداول (FAQ) با ساختار H3 در انتها
+   639→- شامل نتیجه‌گیری انگیزشی
+   640→
+   641→قوانین بسیار مهم (حتماً رعایت کن):
+   642→- هر مقاله حتماً باید یک H1 در ابتدا داشته باشد (عنوان مقاله).
+   643→- هیچ‌گاه دو تصویر را پشت سر هم قرار نده — همیشه حداقل یک پاراگراف متن بین دو تصویر باشد.
+   644→- هیچ‌گاه کلمات h1, h2, h3, H1, H2, H3 را به‌عنوان متن در heading‌ها ننویس. مثلاً ننویس '### h3 سوال' یا '### H3: سوال' — فقط بنویس '### سوال'.
+   645→- از جدول Markdown (table) برای مقایسه‌ها و داده‌های ساختاریافته استفاده کن — حداقل یک جدول در هر مقاله.
+   646→
+   647→قوانین مهم لینک‌های داخلی (بسیار مهم):
+   648→لینک‌های داخلی فقط با این فرمت‌ها مجاز هستند:
+   649→۱. لینک به صفحه اصلی: [متن](/)
+   650→۲. لینک به ابزارها: [متن](/?tool=tdee) یا [متن](/?tool=exercises) یا [متن](/?tool=foods)
+   651→۳. لینک به مقاله دیگر: [متن](/?article=slug) — slug را از لیست مقالات موجود انتخاب کن
+   652→۴. لینک به لیست مقالات: [متن](/?screen=articles)
+   653→هیچ‌گاه از فرمت /article/slug استفاده نکن — این کار نمی‌کند. همیشه /?article=slug استفاده کن.
+   654→هیچ‌گاه از /blog استفاده نکن — این مسیر وجود ندارد. از /?screen=articles استفاده کن.`;
+   655→
+   656→  const contentUser = `یک مقاله کامل بنویس با مشخصات زیر:
+   657→
+   658→عنوان: ${plan.title}
+   659→کلمه کلیدی اصلی: ${plan.keyword}
+   660→کلمات کلیدی ثانویه: ${plan.secondaryKeywords.join("، ")}
+   661→دسته: ${plan.category}
+   662→خلاصه: ${plan.excerpt}
+   663→
+   664→لینک‌های داخلی پیشنهادی (حتماً در متن از این‌ها استفاده کن):
+   665→${plan.internalLinks
+   666→  .map((l) => `- [${l.anchor}](/?article=${l.slug}) — هدف: "${l.title}"`)
+   667→  .join("\n")}
+   668→
+   669→سایر صفحات/مقالات موجود برای لینک‌سازی اضافی (به این‌ها هم با فرمت /?article=slug یا /?tool=... لینک بزن):
+   670→${existingForLinks
+   671→  .map((p) => `- slug="${p.slug}" title="${p.title}"`)
+   672→  .join("\n")}
+   673→
+   674→یادآوری فرمت لینک‌ها:
+   675→- لینک به ابزار: [متن](/?tool=tdee) یا [متن](/?tool=exercises) یا [متن](/?tool=foods)
+   676→- لینک به مقاله: [متن](/?article=slug)
+   677→- لینک به صفحه اصلی: [متن](/)
+   678→- لینک به لیست مقالات: [متن](/?screen=articles)
+   679→
+   680→فقط محتوای Markdown بنویس. بدون توضیح اضافه در ابتدا یا انتها.`;
+   681→
+   682→  let articleContent = "";
+   683→  try {
+   684→    articleContent = await callLlm(contentSystem, contentUser, 8000);
+   685→  } catch (e: any) {
+   686→    throw new Error(`خطا در تولید محتوا: ${e.message}`);
+   687→  }
+   688→
+   689→  // Strip code fences if present
+   690→  articleContent = articleContent.replace(/^```(?:markdown)?\s*/i, "").replace(/\s*```\s*$/i, "");
+   691→
+   692→  // === Post-processing: clean "h1/h2/h3/H1/H2/H3" literal text from headings ===
+   693→  // The AI sometimes literally writes "### h3 سوال" or "### H3: سوال" instead of "### سوال".
+   694→  // این regex تمام موارد را تمیز می‌کند.
+   695→  const beforeClean = articleContent;
+   696→  articleContent = articleContent.replace(
+   697→    /^(#{1,6})\s*[hH][1-6][:：\-\s]+/gm,
+   698→    "$1 "
+   699→  );
+   700→  if (articleContent !== beforeClean) {
+   701→    log(ctx, "info", `🧹 پاک‌سازی h1/h2/h3 literal از heading‌ها انجام شد.`);
+   702→  }
+   703→
+   704→  // === Post-processing: fix broken internal link patterns ===
+   705→  // AI گاهی از فرمت اشتباه /article/slug یا /article// یا /blog استفاده می‌کند.
+   706→  // این Step همه موارد را به فرمت صحیح تبدیل می‌کند.
+   707→  const beforeLinkFix = articleContent;
+   708→  // 1) /article// (double slash) → / (e.g. /article//?tool=tdee → /?tool=tdee)
+   709→  articleContent = articleContent.replace(/\/article\/\//g, "/");
+   710→  // 2) Markdown links ](/article/slug) → ](/?article=slug)
+   711→  articleContent = articleContent.replace(/\]\(\/article\/([^)]+)\)/g, (match, rest: string) => {
+   712→    if (rest.includes("?")) {
+   713→      const [slug, query] = rest.split("?");
+   714→      return `](/?article=${slug}&${query})`;
+   715→    }
+   716→    return `](/?article=${rest})`;
+   717→  });
+   718→  // 3) ](/blog) → ](/?screen=articles)
+   719→  articleContent = articleContent.replace(/\]\(\/blog\)/g, "](/?screen=articles)");
+   720→  // 4) standalone /blog references (not in markdown links)
+   721→  articleContent = articleContent.replace(/(^|[\s(])\/blog(?=[\s)]|$)/g, "$1/?screen=articles");
+   722→  if (articleContent !== beforeLinkFix) {
+   723→    log(ctx, "info", `🔗 اصلاح لینک‌های داخلی شکسته (double-slash, /article/slug, /blog) انجام شد.`);
+   724→  }
+   725→
+   726→  // === Post-processing safety net: insert a paragraph between consecutive images ===
+   727→  // حتی اگر AI دستورالعمل «دو تصویر پشت سر هم نده» را نادیده بگیرد، این Step اطمینان می‌دهد
+   728→  // که هیچ دو تصویری بدون متن بینشان در خروجی نهایی نباشد.
+   729→  const beforeImgFix = articleContent;
+   730→  let iterations = 0;
+   731→  while (iterations < 10) {
+   732→    const next = articleContent.replace(
+   733→      /(!\[[^\]]*\]\([^\)]+\))[\s\n]+(!\[[^\]]*\]\([^\)]+\))/g,
+   734→      "$1\n\nبرای درک بهتر، تصویر زیر نکات کلیدی را نشان می‌دهد:\n\n$2"
+   735→    );
+   736→    if (next === articleContent) break;
+   737→    articleContent = next;
+   738→    iterations++;
+   739→  }
+   740→  if (articleContent !== beforeImgFix) {
+   741→    log(ctx, "info", `🖼 درج پاراگراف انتقالی بین ${iterations} جفت تصویر متوالی انجام شد.`);
+   742→  }
+   743→
+   744→  const wordCount = articleContent.trim().split(/\s+/).length;
+   745→  log(ctx, "info", `📄 محتوای مقاله تولید شد (${wordCount} کلمه) — شروع تولید تصاویر`);
+   746→
+   747→  // ─── Generate cover image ───
+   748→  let coverUrl = "";
+   749→  try {
+   750→    const coverPrompt =
+   751→      plan.coverImagePrompt ||
+   752→      `Professional fitness photograph related to "${plan.keyword}", modern athletic aesthetic, natural lighting, high quality, photorealistic, no text, no watermark`;
+   753→    log(ctx, "info", `🖼 تولید تصویر کاور با مدل Nano Banana 2 Lite...`);
+   754→    const coverImg = await generateImage({
+   755→      prompt: coverPrompt,
+   756→      aspectRatio: "16:9" as AspectRatio,
+   757→      timeoutMs: 120000,
+   758→    });
+   759→    const processed = await processAndSaveArticleImage({
+   760→      buffer: coverImg.buffer,
+   761→      articleSlug: plan.slug,
+   762→      descriptiveName: plan.keyword.replace(/\s+/g, "-").slice(0, 40),
+   763→    });
+   764→    coverUrl = processed.cover.url;
+   765→    log(
+   766→      ctx,
+   767→      "success",
+   768→      `✅ تصویر کاور تولید و بهینه شد: ${coverUrl} (${Math.round(processed.cover.bytes / 1024)}KB)`
+   769→    );
+   770→  } catch (e: any) {
+   771→    log(ctx, "warn", `تولید تصویر کاور شکست خورد: ${e.message}`);
+   772→  }
+   773→
+   774→  // ─── Generate inline images ───
+   775→  // Find IMAGE_PLACEHOLDER_N in content
+   776→  const placeholderRegex = /!\[([^\]]*)\]\(IMAGE_PLACEHOLDER_(\d+)\)/g;
+   777→  const placeholders: { alt: string; index: number; fullMatch: string }[] = [];
+   778→  let match;
+   779→  while ((match = placeholderRegex.exec(articleContent)) !== null) {
+   780→    placeholders.push({
+   781→      alt: match[1],
+   782→      index: parseInt(match[2], 10),
+   783→      fullMatch: match[0],
+   784→    });
+   785→  }
+   786→
+   787→  // Generate inline images (max 3)
+   788→  const inlinePrompts = plan.inlineImagePrompts || [];
+   789→  for (let i = 0; i < Math.min(placeholders.length, 3); i++) {
+   790→    const ph = placeholders[i];
+   791→    const prompt =
+   792→      inlinePrompts[i] ||
+   793→      `Photorealistic fitness image illustrating: ${ph.alt || plan.keyword}, professional lighting, athletic, high quality, no text, no watermark`;
+   794→    try {
+   795→      log(ctx, "info", `🖼 تولید تصویر داخل متن ${i + 1}/${placeholders.length}...`);
+   796→      const img = await generateImage({
+   797→        prompt,
+   798→        aspectRatio: "16:9" as AspectRatio,
+   799→        timeoutMs: 120000,
+   800→      });
+   801→      const processed = await processAndSaveInlineImage({
+   802→        buffer: img.buffer,
+   803→        articleSlug: plan.slug,
+   804→        descriptiveName: ph.alt.slice(0, 40),
+   805→        index: ph.index,
+   806→      });
+   807→      // Replace placeholder with actual image URL
+   808→      articleContent = articleContent.replace(
+   809→        ph.fullMatch,
+   810→        `![${ph.alt}](${processed.url})`
+   811→      );
+   812→      log(
+   813→        ctx,
+   814→        "success",
+   815→        `✅ تصویر داخل متن ${i + 1} تولید و جایگزین شد: ${processed.url}`
+   816→      );
+   817→    } catch (e: any) {
+   818→      log(ctx, "warn", `تولید تصویر داخل متن ${i + 1} شکست خورد: ${e.message}`);
+   819→      // Remove the placeholder on failure
+   820→      articleContent = articleContent.replace(ph.fullMatch, "");
+   821→    }
+   822→  }
+   823→
+   824→  // Remove any remaining placeholders
+   825→  articleContent = articleContent.replace(
+   826→    /!\[[^\]]*\]\(IMAGE_PLACEHOLDER_\d+\)/g,
+   827→    ""
+   828→  );
+   829→
+   830→  // ─── Generate SEO fields ───
+   831→  const seoSystem = `تو متخصص سئو هستی. فیلدهای سئو برای یک مقاله ورزشی/تغذیه فارسی تولید کن. فقط JSON.`;
+   832→  const seoUser = `برای مقاله زیر فیلدهای سئو بنویس:
+   833→عنوان: ${plan.title}
+   834→کلمه کلیدی: ${plan.keyword}
+   835→خلاصه: ${plan.excerpt}
+   836→
+   837→JSON:
+   838→{
+   839→  "seoTitle": "عنوان سئو حداکثر ۶۰ کاراکتر (شامل کلمه کلیدی)",
+   840→  "seoDescription": "توضیحات متا حداکثر ۱۶۰ کاراکتر (شامل کلمه کلیدی، ترغیب‌کننده)",
+   841→  "metaKeywords": "کلمه۱, کلمه۲, کلمه۳, کلمه۴, کلمه۵"
+   842→}`;
+   843→
+   844→  let seo = { seoTitle: "", seoDescription: "", metaKeywords: "" };
+   845→  try {
+   846→    const seoContent = await callLlm(seoSystem, seoUser, 500);
+   847→    const parsed = extractJson(seoContent);
+   848→    if (parsed) seo = { ...seo, ...parsed };
+   849→  } catch {
+   850→    // keep defaults
+   851→  }
+   852→
+   853→  if (!seo.seoTitle) seo.seoTitle = plan.title.slice(0, 60);
+   854→  if (!seo.seoDescription) seo.seoDescription = plan.excerpt.slice(0, 160);
+   855→  if (!seo.metaKeywords) seo.metaKeywords = [plan.keyword, ...plan.secondaryKeywords.slice(0, 4)].join(", ");
+   856→
+   857→  // ─── Compute reading time ───
+   858→  const readingMinutes = Math.max(1, Math.ceil(wordCount / 200));
+   859→
+   860→  // ─── Save article to DB ───
+   861→  const article = await db.article.create({
+   862→    data: {
+   863→      title: plan.title,
+   864→      slug: plan.slug,
+   865→      excerpt: plan.excerpt,
+   866→      content: articleContent,
+   867→      category: plan.category,
+   868→      tags: [plan.keyword, ...plan.secondaryKeywords].slice(0, 8).join(", "),
+   869→      status: "published",
+   870→      authorId: ctx.adminId,
+   871→      coverImage: coverUrl,
+   872→      seoTitle: seo.seoTitle,
+   873→      seoDescription: seo.seoDescription,
+   874→      metaKeywords: seo.metaKeywords,
+   875→      ogImage: coverUrl,
+   876→      canonicalUrl: "",
+   877→      robots: "index,follow",
+   878→      readingMinutes,
+   879→    },
+   880→  });
+   881→
+   882→  // Update plan as published
+   883→  if (plan.id) {
+   884→    await db.seoArticlePlan.update({
+   885→      where: { id: plan.id },
+   886→      data: { status: "published", articleId: article.id },
+   887→    });
+   888→  }
+   889→
+   890→  log(
+   891→    ctx,
+   892→    "success",
+   893→    `✅ مقاله منتشر شد: "${plan.title}" — ${wordCount} کلمه، ${readingMinutes} دقیقه مطالعه، ${coverUrl ? "با تصویر" : "بدون تصویر"}`
+   894→  );
+   895→
+   896→  return { articleId: article.id, coverUrl, wordCount };
+   897→}
+   898→
+   899→// ─── Main entry point: run the agent ───
+   900→export async function runSeoAgent(opts: {
+   901→  runId: string;
+   902→  adminId: string;
+   903→  mode: "full" | "continue" | "strategy_only";
+   904→  count: number;
+   905→}): Promise<RunContext> {
+   906→  const ctx: RunContext = {
+   907→    runId: opts.runId,
+   908→    mode: opts.mode,
+   909→    count: opts.count,
+   910→    logs: [],
+   911→    adminId: opts.adminId,
+   912→    startedAt: Date.now(),
+   913→    successCount: 0,
+   914→    failCount: 0,
+   915→    articles: [],
+   916→    errors: [],
+   917→  };
+   918→
+   919→  const startedRun = await db.seoAgentRun.update({
+   920→    where: { id: opts.runId },
+   921→    data: {
+   922→      status: "running",
+   923→      mode: opts.mode,
+   924→      requestedCount: opts.count,
+   925→      startedAt: new Date(),
+   926→    },
+   927→  }).catch(() => null);
+   928→
+   929→  try {
+   930→    // Step 1: Always analyze site first (for accurate internal linking)
+   931→    const site = await analyzeSite(ctx);
+   932→
+   933→    // Step 2: Generate/refresh strategy (in full mode) or load existing
+   934→    let strategy: SeoStrategyContent;
+   935→    if (opts.mode === "full") {
+   936→      strategy = await generateStrategy(ctx, site);
+   937→    } else {
+   938→      const existing = await db.seoStrategy.findFirst({
+   939→        where: { isActive: true },
+   940→        orderBy: { version: "desc" },
+   941→      });
+   942→      if (existing) {
+   943→        strategy = JSON.parse(existing.content) as SeoStrategyContent;
+   944→        log(ctx, "info", `📋 استفاده از استراتژی موجود (نسخه ${existing.version})`);
+   945→      } else {
+   946→        // No strategy yet — must generate
+   947→        log(ctx, "warn", "استراتژی موجود نیست — تولید استراتژی جدید");
+   948→        strategy = await generateStrategy(ctx, site);
+   949→      }
+   950→    }
+   951→
+   952→    if (opts.mode === "strategy_only") {
+   953→      log(ctx, "success", "🏁 حالت strategy_only — استراتژی تولید شد، بدون تولید مقاله");
+   954→      await finishRun(ctx, "completed");
+   955→      return ctx;
+   956→    }
+   957→
+   958→    // Step 3: Plan articles (or use existing planned ones)
+   959→    let plans: ArticlePlan[] = [];
+   960→
+   961→    // First: use existing planned articles (continue mode)
+   962→    const existingPlans = await db.seoArticlePlan.findMany({
+   963→      where: { status: "planned" },
+   964→      orderBy: { priority: "desc" },
+   965→      take: opts.count,
+   966→    });
+   967→
+   968→    if (existingPlans.length >= opts.count && opts.mode === "continue") {
+   969→      plans = existingPlans.map((p) => ({
+   970→        id: p.id,
+   971→        keyword: p.keyword,
+   972→        title: p.title,
+   973→        slug: p.slug,
+   974→        category: p.category,
+   975→        excerpt: p.excerpt,
+   976→        pillar: p.pillar,
+   977→        secondaryKeywords: p.secondaryKeywords.split(", ").filter(Boolean),
+   978→        internalLinks: JSON.parse(p.internalLinks || "[]"),
+   979→        coverImagePrompt: p.coverImagePrompt,
+   980→        inlineImagePrompts: [],
+   981→      }));
+   982→      log(ctx, "info", `📋 استفاده از ${plans.length} مقاله برنامه‌ریزی‌شده موجود در صف`);
+   983→    } else {
+   984→      // Plan new articles
+   985→      const needed = opts.count - existingPlans.length;
+   986→      if (needed > 0) {
+   987→        log(ctx, "info", `📅 نیاز به ${needed} مقاله جدید — برنامه‌ریزی...`);
+   988→        await planArticles(ctx, strategy, site, Math.max(needed, opts.count));
+   989→      }
+   990→      // Now fetch all planned
+   991→      const allPlanned = await db.seoArticlePlan.findMany({
+   992→        where: { status: "planned" },
+   993→        orderBy: { priority: "desc" },
+   994→        take: opts.count,
+   995→      });
+   996→      plans = allPlanned.map((p) => ({
+   997→        id: p.id,
+   998→        keyword: p.keyword,
+   999→        title: p.title,
+  1000→        slug: p.slug,
+  1001→        category: p.category,
+  1002→        excerpt: p.excerpt,
+  1003→        pillar: p.pillar,
+  1004→        secondaryKeywords: p.secondaryKeywords.split(", ").filter(Boolean),
+  1005→        internalLinks: JSON.parse(p.internalLinks || "[]"),
+  1006→        coverImagePrompt: p.coverImagePrompt,
+  1007→        inlineImagePrompts: [],
+  1008→      }));
+  1009→    }
+  1010→
+  1011→    if (plans.length === 0) {
+  1012→      log(ctx, "warn", "هیچ مقاله‌ای برای تولید یافت نشد");
+  1013→      await finishRun(ctx, "completed");
+  1014→      return ctx;
+  1015→    }
+  1016→
+  1017→    log(ctx, "info", `🚀 شروع تولید ${plans.length} مقاله`);
+  1018→
+  1019→    // Step 4: Generate each article (sequentially to avoid rate limits)
+  1020→    // Re-analyze site before each article to ensure accurate internal linking (new articles get added)
+  1021→    for (let i = 0; i < plans.length; i++) {
+  1022→      const plan = plans[i];
+  1023→      log(ctx, "info", `━━━ مقاله ${i + 1}/${plans.length} ━━━`);
+  1024→      try {
+  1025→        // Refresh site analysis (so newly-published articles can be linked)
+  1026→        const freshSite = i === 0 ? site : await analyzeSite(ctx);
+  1027→        const result = await generateArticle(ctx, plan, freshSite);
+  1028→        ctx.articles.push({
+  1029→          id: result.articleId,
+  1030→          title: plan.title,
+  1031→          slug: plan.slug,
+  1032→          keyword: plan.keyword,
+  1033→          coverImage: result.coverUrl ? "✓" : "✗",
+  1034→          words: result.wordCount,
+  1035→        });
+  1036→        ctx.successCount++;
+  1037→      } catch (e: any) {
+  1038→        log(ctx, "error", `مقاله "${plan.title}" شکست خورد: ${e.message}`);
+  1039→        ctx.errors.push(`${plan.title}: ${e.message}`);
+  1040→        ctx.failCount++;
+  1041→        if (plan.id) {
+  1042→          await db.seoArticlePlan.update({
+  1043→            where: { id: plan.id },
+  1044→            data: { status: "failed", errorMessage: e.message.slice(0, 500) },
+  1045→          }).catch(() => null);
+  1046→        }
+  1047→      }
+  1048→      // Persist progress to DB after each article
+  1049→      await persistRunProgress(ctx);
+  1050→    }
+  1051→
+  1052→    log(
+  1053→      ctx,
+  1054→      "success",
+  1055→      `🏁 پایان اجرا — ${ctx.successCount} موفق، ${ctx.failCount} ناموفق`
+  1056→    );
+  1057→
+  1058→    await finishRun(ctx, ctx.failCount === 0 ? "completed" : "partial");
+  1059→    return ctx;
+  1060→  } catch (e: any) {
+  1061→    log(ctx, "error", `خطای بحرانی در اجرای ایجنت: ${e.message}`);
+  1062→    ctx.errors.push(`CRITICAL: ${e.message}`);
+  1063→    await finishRun(ctx, "failed");
+  1064→    return ctx;
+  1065→  }
+  1066→}
+  1067→
+  1068→async function persistRunProgress(ctx: RunContext) {
+  1069→  await db.seoAgentRun
+  1070→    .update({
+  1071→      where: { id: ctx.runId },
+  1072→      data: {
+  1073→        successCount: ctx.successCount,
+  1074→        failCount: ctx.failCount,
+  1075→        logs: JSON.stringify(ctx.logs.slice(-100)), // keep last 100 logs
+  1076→        results: JSON.stringify({
+  1077→          articles: ctx.articles,
+  1078→          errors: ctx.errors,
+  1079→        }),
+  1080→      },
+  1081→    })
+  1082→    .catch(() => null);
+  1083→}
+  1084→
+  1085→async function finishRun(ctx: RunContext, status: string) {
+  1086→  const durationMs = Date.now() - ctx.startedAt;
+  1087→  await db.seoAgentRun
+  1088→    .update({
+  1089→      where: { id: ctx.runId },
+  1090→      data: {
+  1091→        status,
+  1092→        successCount: ctx.successCount,
+  1093→        failCount: ctx.failCount,
+  1094→        logs: JSON.stringify(ctx.logs),
+  1095→        results: JSON.stringify({
+  1096→          articles: ctx.articles,
+  1097→          errors: ctx.errors,
+  1098→        }),
+  1099→        durationMs,
+  1100→        finishedAt: new Date(),
+  1101→      },
+  1102→    })
+  1103→    .catch(() => null);
+  1104→  // Update strategy lastRunAt
+  1105→  await db.seoStrategy
+  1106→    .updateMany({
+  1107→      where: { isActive: true },
+  1108→      data: { lastRunAt: new Date() },
+  1109→    })
+  1110→    .catch(() => null);
+  1111→}
+  1112→
+  1113→// ─── Background runner (in-memory) ───
+  1114→// Track running status globally so we don't start concurrent runs
+  1115→declare global {
+  1116→  var __seoAgentRunning: boolean | undefined;
+  1117→  var __seoAgentRunId: string | undefined;
+  1118→}
+  1119→
+  1120→export function isAgentRunning(): boolean {
+  1121→  return !!globalThis.__seoAgentRunning;
+  1122→}
+  1123→
+  1124→export function getCurrentRunId(): string | undefined {
+  1125→  return globalThis.__seoAgentRunId;
+  1126→}
+  1127→
+  1128→export async function startBackgroundRun(opts: {
+  1129→  adminId: string;
+  1130→  mode: "full" | "continue" | "strategy_only";
+  1131→  count: number;
+  1132→}): Promise<{ runId: string; alreadyRunning: boolean }> {
+  1133→  if (isAgentRunning()) {
+  1134→    return { runId: getCurrentRunId() || "", alreadyRunning: true };
+  1135→  }
+  1136→  // Create run record
+  1137→  const run = await db.seoAgentRun.create({
+  1138→    data: {
+  1139→      mode: opts.mode,
+  1140→      requestedCount: opts.count,
+  1141→      status: "running",
+  1142→      startedAt: new Date(),
+  1143→    },
+  1144→  });
+  1145→  globalThis.__seoAgentRunning = true;
+  1146→  globalThis.__seoAgentRunId = run.id;
+  1147→
+  1148→  // Fire and forget — run in background
+  1149→  runSeoAgent({
+  1150→    runId: run.id,
+  1151→    adminId: opts.adminId,
+  1152→    mode: opts.mode,
+  1153→    count: opts.count,
+  1154→  })
+  1155→    .catch((e) => {
+  1156→      console.error("[SEO-AGENT] background run crashed:", e);
+  1157→    })
+  1158→    .finally(() => {
+  1159→      globalThis.__seoAgentRunning = false;
+  1160→      globalThis.__seoAgentRunId = undefined;
+  1161→    });
+  1162→
+  1163→  return { runId: run.id, alreadyRunning: false };
+  1164→}
+  1165→

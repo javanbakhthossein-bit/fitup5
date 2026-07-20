@@ -1,0 +1,715 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useRef, useState } from "react";
+     4→import { motion, AnimatePresence } from "framer-motion";
+     5→import {
+     6→  Apple,
+     7→  Flame,
+     8→  Beef,
+     9→  Wheat,
+    10→  Droplet,
+    11→  Plus,
+    12→  Trash2,
+    13→  Utensils,
+    14→  Sparkles,
+    15→  X,
+    16→  Check,
+    17→  Salad,
+    18→  Pill,
+    19→  ChevronLeft,
+    20→  Camera,
+    21→  Loader2,
+    22→} from "lucide-react";
+    23→import { useAppStore, type LoggedFood } from "@/lib/fitness/store";
+    24→import { Card } from "@/components/ui/card";
+    25→import { Button } from "@/components/ui/button";
+    26→import { Input } from "@/components/ui/input";
+    27→import { Label } from "@/components/ui/label";
+    28→import { Skeleton } from "@/components/ui/skeleton";
+    29→import { toast } from "sonner";
+    30→import {
+    31→  canAccess,
+    32→  toPersianDigits,
+    33→  type MealPlanContent,
+    34→} from "@/lib/fitness/types";
+    35→
+    36→const MEAL_LABELS: Record<string, string> = {
+    37→  breakfast: "صبحانه",
+    38→  lunch: "ناهار",
+    39→  dinner: "شام",
+    40→  snack: "میان‌وعده",
+    41→};
+    42→
+    43→export function NutritionView() {
+    44→  const {
+    45→    user,
+    46→    mealPlan,
+    47→    setMealPlan,
+    48→    caloriesConsumed,
+    49→    setCaloriesConsumed,
+    50→    loggedFoods,
+    51→    addLoggedFood,
+    52→    removeLoggedFood,
+    53→  } = useAppStore();
+    54→  const [loading, setLoading] = useState(!mealPlan);
+    55→  const [showAddFood, setShowAddFood] = useState(false);
+    56→  const [expandedMeal, setExpandedMeal] = useState<number | null>(0);
+    57→
+    58→  // --- آنالیز عکس غذا (پلن پیشرفته+) ---
+    59→  const canAnalyzeMeal = canAccess(user?.planName ?? null, "mealPhotoAnalysis");
+    60→  const [mealAnalyzing, setMealAnalyzing] = useState(false);
+    61→  const [mealAnalysisResult, setMealAnalysisResult] = useState<{ analysis: string; imageUrl: string } | null>(null);
+    62→  const mealPhotoInputRef = useRef<HTMLInputElement>(null);
+    63→
+    64→  async function handleMealPhotoSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    65→    const file = e.target.files?.[0];
+    66→    // ریست مقدار input تا همان فایل دوباره قابل انتخاب باشد
+    67→    e.target.value = "";
+    68→    if (!file) return;
+    69→
+    70→    if (!file.type.startsWith("image/")) {
+    71→      toast.error("فقط فایل تصویری مجاز است.");
+    72→      return;
+    73→    }
+    74→    // محدودیت حجم حذف شد — خودکار در سرور کاهش می‌یابد
+    75→    if (file.size > 30 * 1024 * 1024) {
+    76→      toast.error("حداکثر حجم فایل ۳۰ مگابایت است.");
+    77→      return;
+    78→    }
+    79→
+    80→    setMealAnalyzing(true);
+    81→    setMealAnalysisResult(null);
+    82→    try {
+    83→      const fd = new FormData();
+    84→      fd.append("image", file);
+    85→      const res = await fetch("/api/coach/meal-photo-analysis", {
+    86→        method: "POST",
+    87→        body: fd,
+    88→      });
+    89→      const data = await res.json();
+    90→      if (!res.ok) throw new Error(data.error || "خطا در آنالیز عکس");
+    91→      setMealAnalysisResult({ analysis: data.analysis, imageUrl: data.imageUrl });
+    92→      toast.success("آنالیز عکس غذا انجام شد! 🍽️");
+    93→    } catch (err) {
+    94→      toast.error(err instanceof Error ? err.message : "خطا در ارتباط با سرور");
+    95→    } finally {
+    96→      setMealAnalyzing(false);
+    97→    }
+    98→  }
+    99→
+   100→  useEffect(() => {
+   101→    // Always fetch the CURRENT user's active meal plan fresh from the server
+   102→    // so the nutrition tab never shows a stale/cached/generic version.
+   103→    let cancelled = false;
+   104→    (async () => {
+   105→      try {
+   106→        const res = await fetch("/api/coach/plan", { cache: "no-store" });
+   107→        const data = await res.json();
+   108→        if (cancelled) return;
+   109→        setMealPlan(data.meal ? (data.meal as MealPlanContent) : null);
+   110→      } catch {
+   111→        // network error — keep whatever is in store
+   112→      } finally {
+   113→        if (!cancelled) setLoading(false);
+   114→      }
+   115→    })();
+   116→    return () => {
+   117→      cancelled = true;
+   118→    };
+   119→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   120→  }, []);
+   121→
+   122→  const targetCal = mealPlan?.totalCalories ?? 2200;
+   123→  const burnedCal = 0;
+   124→  const remainingCal = Math.max(0, targetCal - caloriesConsumed + burnedCal);
+   125→
+   126→  // Aggregate macros from logged foods (fallback to meal plan)
+   127→  const macroTotals = loggedFoods.length
+   128→    ? {
+   129→        protein: loggedFoods.reduce((s, f) => s + f.protein, 0),
+   130→        carbs: loggedFoods.reduce((s, f) => s + f.carbs, 0),
+   131→        fat: loggedFoods.reduce((s, f) => s + f.fat, 0),
+   132→      }
+   133→    : {
+   134→        protein: mealPlan?.totalProtein ?? 0,
+   135→        carbs: mealPlan?.totalCarbs ?? 0,
+   136→        fat: mealPlan?.totalFat ?? 0,
+   137→      };
+   138→
+   139→  return (
+   140→    <div className="px-4 py-4 space-y-4 max-w-5xl mx-auto lg:px-6">
+   141→      {/* فایل مخفی برای انتخاب عکس غذا */}
+   142→      <input
+   143→        ref={mealPhotoInputRef}
+   144→        type="file"
+   145→        accept="image/*"
+   146→        className="hidden"
+   147→        onChange={handleMealPhotoSelect}
+   148→      />
+   149→      <div className="flex items-center justify-between">
+   150→        <div>
+   151→          <h2 className="text-2xl font-black">کالری‌شمار و تغذیه</h2>
+   152→          <p className="text-sm text-muted-foreground">هر لقمه رو ثبت کن، به هدفت نزدیک‌تر شو</p>
+   153→        </div>
+   154→        <div className="flex items-center gap-2">
+   155→          {canAnalyzeMeal && (
+   156→            <Button
+   157→              variant="outline"
+   158→              className="rounded-xl"
+   159→              onClick={() => mealPhotoInputRef.current?.click()}
+   160→              disabled={mealAnalyzing}
+   161→              title="آنالیز عکس غذا با هوش مصنوعی"
+   162→            >
+   163→              {mealAnalyzing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Camera className="w-4 h-4" />}
+   164→              <span className="hidden sm:inline">آنالیز عکس غذا</span>
+   165→            </Button>
+   166→          )}
+   167→          <Button onClick={() => setShowAddFood(true)} className="rounded-xl">
+   168→            <Plus className="w-4 h-4" />
+   169→            ثبت غذا
+   170→          </Button>
+   171→        </div>
+   172→      </div>
+   173→
+   174→      {/* کارت نتیجه آنالیز عکس غذا */}
+   175→      {mealAnalyzing && (
+   176→        <Card className="p-5 border-2 border-orange-200 bg-orange-50/30">
+   177→          <div className="flex items-center gap-3">
+   178→            <Loader2 className="w-6 h-6 animate-spin text-orange-500" />
+   179→            <div>
+   180→              <p className="font-bold text-slate-900">در حال آنالیز عکس غذا...</p>
+   181→              <p className="text-xs text-slate-500">کمی صبر کنید، هوش مصنوعی در حال شناسایی مواد و کالری است.</p>
+   182→            </div>
+   183→          </div>
+   184→        </Card>
+   185→      )}
+   186→
+   187→      {mealAnalysisResult && !mealAnalyzing && (
+   188→        <Card className="p-5 border-2 border-orange-200 bg-orange-50/30">
+   189→          <div className="flex items-start justify-between gap-3 mb-3">
+   190→            <div className="flex items-center gap-2">
+   191→              <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   192→                <Camera className="w-5 h-5 text-white" />
+   193→              </div>
+   194→              <div>
+   195→                <h3 className="font-bold text-slate-900">آنالیز عکس غذا</h3>
+   196→                <p className="text-[11px] text-slate-500">با هوش مصنوعی فیتاپ</p>
+   197→              </div>
+   198→            </div>
+   199→            <button
+   200→              onClick={() => setMealAnalysisResult(null)}
+   201→              className="p-1.5 rounded-lg hover:bg-orange-100 text-slate-400 hover:text-slate-700 transition"
+   202→              title="بستن"
+   203→              aria-label="بستن نتیجه آنالیز"
+   204→            >
+   205→              <X className="w-4 h-4" />
+   206→            </button>
+   207→          </div>
+   208→          <div className="flex flex-col sm:flex-row gap-4">
+   209→            {/* عکس آپلودشده */}
+   210→            <div className="shrink-0">
+   211→              <img
+   212→                src={mealAnalysisResult.imageUrl}
+   213→                alt="عکس غذای ارسالی"
+   214→                className="w-full sm:w-32 h-32 object-cover rounded-xl border border-orange-200"
+   215→              />
+   216→            </div>
+   217→            {/* متن تحلیل */}
+   218→            <div className="flex-1 min-w-0">
+   219→              <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+   220→                {mealAnalysisResult.analysis}
+   221→              </p>
+   222→            </div>
+   223→          </div>
+   224→        </Card>
+   225→      )}
+   226→
+   227→      {loading ? (
+   228→        <div className="space-y-3">
+   229→          <Skeleton className="h-28 rounded-2xl" />
+   230→          <Skeleton className="h-48 rounded-2xl" />
+   231→        </div>
+   232→      ) : !mealPlan ? (
+   233→        <Card className="p-8 text-center border-2 border-orange-200 bg-orange-50/30">
+   234→          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   235→            <Salad className="w-8 h-8 text-white" />
+   236→          </div>
+   237→          <h3 className="font-black text-lg text-slate-900 mb-2">برنامه غذایی شما ساخته نشده</h3>
+   238→          <p className="text-sm text-slate-500 mb-5">
+   239→            {user?.planName
+   240→              ? "فیتاپ هوشمند می‌تواند همین حالا برنامه غذایی شخصی‌سازی‌شده برای شما بسازد."
+   241→              : "برای دریافت برنامه غذایی اختصاصی، ابتدا یک پلن خریداری کنید."}
+   242→          </p>
+   243→          {user?.planName ? (
+   244→            <Button
+   245→              onClick={async () => {
+   246→                try {
+   247→                  const res = await fetch("/api/coach/plan", { method: "PUT" });
+   248→                  const data = await res.json();
+   249→                  if (!res.ok) throw new Error(data.error);
+   250→                  if (data.meal) setMealPlan(data.meal as MealPlanContent);
+   251→                  toast.success("برنامه غذایی شما ساخته شد! 🎯");
+   252→                } catch (e) {
+   253→                  toast.error(e instanceof Error ? e.message : "خطا در ساخت برنامه");
+   254→                }
+   255→              }}
+   256→              className="rounded-xl text-white gap-2"
+   257→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   258→            >
+   259→              <Sparkles className="w-4 h-4" /> ساخت برنامه غذایی
+   260→            </Button>
+   261→          ) : (
+   262→            <Button onClick={() => useAppStore.getState().setMainTab("plans")} className="rounded-xl text-white" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   263→              خرید پلن
+   264→            </Button>
+   265→          )}
+   266→        </Card>
+   267→      ) : (
+   268→        <>
+   269→          {/* Calorie formula bar */}
+   270→          <Card className="p-5 glass">
+   271→            <div className="flex items-center gap-2 mb-3">
+   272→              <Flame className="w-5 h-5 text-orange-400" />
+   273→              <h3 className="font-bold">وضعیت کالری امروز</h3>
+   274→            </div>
+   275→            <div className="flex flex-wrap items-center justify-center gap-2 text-xs mb-4">
+   276→              <span className="px-2.5 py-1 rounded-lg bg-muted/60"><b className="text-cyan-400">{toPersianDigits(targetCal)}</b> هدف</span>
+   277→              <span className="text-muted-foreground">−</span>
+   278→              <span className="px-2.5 py-1 rounded-lg bg-muted/60"><b className="text-orange-400">{toPersianDigits(caloriesConsumed)}</b> مصرف</span>
+   279→              <span className="text-muted-foreground">+</span>
+   280→              <span className="px-2.5 py-1 rounded-lg bg-muted/60"><b className="text-emerald-400">{toPersianDigits(burnedCal)}</b> تمرین</span>
+   281→              <span className="text-muted-foreground">=</span>
+   282→              <span className="px-2.5 py-1 rounded-lg bg-primary/15"><b className="text-primary">{toPersianDigits(remainingCal)}</b> باقی‌مانده</span>
+   283→            </div>
+   284→            <div className="h-4 rounded-full bg-muted overflow-hidden flex relative">
+   285→              <motion.div
+   286→                className="h-full bg-gradient-to-l from-orange-400 to-orange-500"
+   287→                initial={{ width: 0 }}
+   288→                animate={{ width: `${Math.min(100, (caloriesConsumed / targetCal) * 100)}%` }}
+   289→                transition={{ duration: 0.8 }}
+   290→              />
+   291→            </div>
+   292→            <p className="text-[11px] text-muted-foreground text-center mt-2">
+   293→              {remainingCal > 0
+   294→                ? `${toPersianDigits(remainingCal)} کالری دیگه می‌تونی بخوری`
+   295→                : "به هدف کالری رسیدی! 🎯"}
+   296→            </p>
+   297→          </Card>
+   298→
+   299→          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+   300→            {/* Macro donut */}
+   301→            <Card className="p-5 glass">
+   302→              <div className="flex items-center gap-2 mb-4">
+   303→                <Beef className="w-5 h-5 text-primary" />
+   304→                <h3 className="font-bold">درشت‌مغذی‌ها (ماکروها)</h3>
+   305→              </div>
+   306→              <MacroDonut
+   307→                protein={macroTotals.protein}
+   308→                carbs={macroTotals.carbs}
+   309→                fat={macroTotals.fat}
+   310→              />
+   311→            </Card>
+   312→
+   313→            {/* Today's meals from plan — full meal plan with food items */}
+   314→            <Card className="p-5 glass border-2 border-orange-200">
+   315→              <div className="flex items-center gap-2 mb-4">
+   316→                <Utensils className="w-5 h-5 text-orange-500" />
+   317→                <h3 className="font-bold text-slate-900">برنامه غذایی امروز — چه بخوریم؟</h3>
+   318→              </div>
+   319→              <div className="space-y-2">
+   320→                {mealPlan?.meals.map((meal, i) => {
+   321→                  const expanded = expandedMeal === i;
+   322→                  return (
+   323→                    <div key={i} className="rounded-xl border border-orange-100 overflow-hidden bg-white">
+   324→                      {/* Meal header (clickable) */}
+   325→                      <button
+   326→                        onClick={() => setExpandedMeal(expanded ? null : i)}
+   327→                        className="w-full flex items-center justify-between p-3 hover:bg-orange-50/50 transition"
+   328→                      >
+   329→                        <div className="flex items-center gap-2">
+   330→                          <span className="text-xl">{getMealIcon(meal.type)}</span>
+   331→                          <div className="text-right">
+   332→                            <span className="text-sm font-bold text-slate-900">{meal.label}</span>
+   333→                            <span className="block text-[10px] text-slate-400">
+   334→                              {toPersianDigits(meal.items?.length || 0)} مورد • {toPersianDigits(meal.totalCalories)} کالری
+   335→                            </span>
+   336→                          </div>
+   337→                        </div>
+   338→                        <div className="flex items-center gap-2">
+   339→                          <span className="text-[10px] text-slate-400">
+   340→                            P: {toPersianDigits(Math.round(meal.totalProtein))}g
+   341→                          </span>
+   342→                          <motion.div animate={{ rotate: expanded ? 90 : 0 }} transition={{ duration: 0.2 }}>
+   343→                            <ChevronLeft className="w-4 h-4 text-orange-500" />
+   344→                          </motion.div>
+   345→                        </div>
+   346→                      </button>
+   347→                      {/* Food items (expandable) */}
+   348→                      {expanded && meal.items && meal.items.length > 0 && (
+   349→                        <motion.div
+   350→                          initial={{ height: 0, opacity: 0 }}
+   351→                          animate={{ height: "auto", opacity: 1 }}
+   352→                          className="border-t border-orange-50 bg-orange-50/30"
+   353→                        >
+   354→                          {/* Combination banner */}
+   355→                          {meal.combination && (
+   356→                            <div className="p-2 bg-emerald-50/50 border-b border-emerald-100">
+   357→                              <p className="text-[11px] text-emerald-700 font-medium">🍽 ترکیب این وعده: <span className="font-bold">{meal.combination}</span></p>
+   358→                            </div>
+   359→                          )}
+   360→                          {meal.items.map((item, j) => (
+   361→                            <div key={j} className="flex items-start justify-between p-2.5 border-b last:border-0 border-orange-50/50">
+   362→                              <div className="flex-1 min-w-0">
+   363→                                <p className="text-xs font-bold text-slate-900">{item.name}</p>
+   364→                                <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-500 flex-wrap">
+   365→                                  {item.servingSize && <span>🍽 {item.servingSize}</span>}
+   366→                                  <span>🔥 {toPersianDigits(item.calories)} کالری</span>
+   367→                                </div>
+   368→                              </div>
+   369→                              <div className="flex items-center gap-2 text-[9px] text-slate-400 shrink-0 mr-2">
+   370→                                <span className="px-1.5 py-0.5 rounded bg-red-50 text-red-600">P {toPersianDigits(item.protein)}g</span>
+   371→                                <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-600">C {toPersianDigits(item.carbs)}g</span>
+   372→                                <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-600">F {toPersianDigits(item.fat)}g</span>
+   373→                              </div>
+   374→                            </div>
+   375→                          ))}
+   376→                          {/* Alternatives */}
+   377→                          {meal.alternatives && meal.alternatives.length > 0 && (
+   378→                            <div className="p-2.5 bg-purple-50/30 border-t border-purple-100">
+   379→                              <p className="text-[10px] font-bold text-purple-700 mb-1.5 flex items-center gap-1">
+   380→                                <Sparkles className="w-3 h-3" /> غذاهای جایگزین (یکی را انتخاب کنید):
+   381→                              </p>
+   382→                              <div className="space-y-1.5">
+   383→                                {meal.alternatives.map((alt, ai) => (
+   384→                                  <div key={ai} className="p-2 rounded-lg bg-white border border-purple-100">
+   385→                                    <div className="flex items-center justify-between mb-1">
+   386→                                      <span className="text-[11px] font-bold text-purple-800">گزینه {toPersianDigits(ai + 1)}: {alt.combination}</span>
+   387→                                      <span className="text-[9px] text-purple-500">{toPersianDigits(alt.totalCalories)} کالری</span>
+   388→                                    </div>
+   389→                                    <div className="flex flex-wrap gap-1">
+   390→                                      {alt.items.map((it, ii) => (
+   391→                                        <span key={ii} className="text-[9px] px-1.5 py-0.5 rounded bg-purple-50 text-purple-600">
+   392→                                          {it.name} ({it.servingSize})
+   393→                                        </span>
+   394→                                      ))}
+   395→                                    </div>
+   396→                                  </div>
+   397→                                ))}
+   398→                              </div>
+   399→                            </div>
+   400→                          )}
+   401→                        </motion.div>
+   402→                      )}
+   403→                    </div>
+   404→                  );
+   405→                })}
+   406→              </div>
+   407→              {mealPlan?.notes && (
+   408→                <div className="mt-3 p-3 rounded-xl bg-orange-50/50 border border-orange-100">
+   409→                  <p className="text-[11px] text-slate-600 leading-relaxed">💡 {mealPlan.notes}</p>
+   410→                </div>
+   411→              )}
+   412→              {mealPlan?.waterLiters && (
+   413→                <div className="mt-2 flex items-center gap-2 text-[11px] text-cyan-600">
+   414→                  <Droplet className="w-3.5 h-3.5" />
+   415→                  آب روزانه: {toPersianDigits(mealPlan.waterLiters)} لیتر
+   416→                </div>
+   417→              )}
+   418→            </Card>
+   419→          </div>
+   420→
+   421→          {/* Supplements — برنامه مکمل‌ها (Standard+) */}
+   422→          {mealPlan?.supplements && mealPlan.supplements.length > 0 && (
+   423→            <Card className="p-5 border-2 border-orange-200 bg-orange-50/30">
+   424→              <div className="flex items-center gap-2 mb-3">
+   425→                <Pill className="w-5 h-5 text-orange-500" />
+   426→                <h3 className="font-bold text-slate-900">برنامه مکمل‌های شما</h3>
+   427→              </div>
+   428→              <div className="space-y-2">
+   429→                {mealPlan.supplements.map((s, i) => (
+   430→                  <div key={i} className="flex items-start justify-between p-3 rounded-xl bg-white border border-orange-100">
+   431→                    <div className="flex-1 min-w-0">
+   432→                      <p className="text-sm font-bold text-slate-900">{s.name}</p>
+   433→                      <div className="flex items-center gap-3 mt-1 text-[11px] text-slate-500">
+   434→                        {s.dose && <span>💊 {s.dose}</span>}
+   435→                        {s.timing && <span>⏰ {s.timing}</span>}
+   436→                      </div>
+   437→                      {s.note && <p className="text-[10px] text-slate-400 mt-1">{s.note}</p>}
+   438→                    </div>
+   439→                  </div>
+   440→                ))}
+   441→              </div>
+   442→            </Card>
+   443→          )}
+   444→
+   445→          {/* Logged foods today */}
+   446→          <Card className="p-5 glass">
+   447→            <div className="flex items-center gap-2 mb-3">
+   448→              <Apple className="w-5 h-5 text-primary" />
+   449→              <h3 className="font-bold">غذاهای ثبت‌شده امروز</h3>
+   450→              <span className="text-[11px] px-2 py-0.5 rounded-full bg-muted text-muted-foreground mr-auto">
+   451→                {toPersianDigits(loggedFoods.length)} مورد
+   452→              </span>
+   453→            </div>
+   454→            {loggedFoods.length === 0 ? (
+   455→              <div className="text-center py-6 text-muted-foreground">
+   456→                <Apple className="w-10 h-10 mx-auto mb-2 opacity-30" />
+   457→                <p className="text-sm">هنوز غذایی ثبت نشده</p>
+   458→                <Button size="sm" variant="outline" className="mt-2 rounded-xl" onClick={() => setShowAddFood(true)}>
+   459→                  <Plus className="w-4 h-4" />
+   460→                  اولین غذات رو ثبت کن
+   461→                </Button>
+   462→              </div>
+   463→            ) : (
+   464→              <div className="space-y-2">
+   465→                {loggedFoods.map((f) => (
+   466→                  <motion.div
+   467→                    key={f.id}
+   468→                    initial={{ opacity: 0, x: -20 }}
+   469→                    animate={{ opacity: 1, x: 0 }}
+   470→                    exit={{ opacity: 0, x: 20 }}
+   471→                    className="p-3 rounded-xl bg-white border-2 border-orange-100"
+   472→                  >
+   473→                    <div className="flex items-center justify-between gap-2">
+   474→                      <div className="flex-1 min-w-0">
+   475→                        <div className="flex items-center gap-2">
+   476→                          <span className="text-base">{getMealIcon(f.meal)}</span>
+   477→                          <p className="text-sm font-bold truncate">{f.name}</p>
+   478→                        </div>
+   479→                        <p className="text-[11px] text-muted-foreground mt-0.5">
+   480→                          {MEAL_LABELS[f.meal]}
+   481→                        </p>
+   482→                      </div>
+   483→                      <div className="flex flex-col items-end shrink-0">
+   484→                        <div className="flex items-baseline gap-1">
+   485→                          <span className="text-lg font-black text-orange-500 leading-none">
+   486→                            {toPersianDigits(f.calories)}
+   487→                          </span>
+   488→                          <span className="text-[10px] text-muted-foreground">کالری</span>
+   489→                        </div>
+   490→                        <button
+   491→                          onClick={() => removeLoggedFood(f.id)}
+   492→                          className="p-1 rounded-lg hover:bg-destructive/10 text-muted-foreground hover:text-destructive mt-1"
+   493→                          aria-label="حذف"
+   494→                        >
+   495→                          <Trash2 className="w-3.5 h-3.5" />
+   496→                        </button>
+   497→                      </div>
+   498→                    </div>
+   499→                    {/* Macros row */}
+   500→                    <div className="flex items-center gap-1.5 mt-2 pt-2 border-t border-orange-50">
+   501→                      <span className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md bg-yellow-50 text-yellow-700">
+   502→                        <Beef className="w-2.5 h-2.5" /> P {toPersianDigits(f.protein)}g
+   503→                      </span>
+   504→                      <span className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md bg-cyan-50 text-cyan-700">
+   505→                        <Wheat className="w-2.5 h-2.5" /> C {toPersianDigits(f.carbs)}g
+   506→                      </span>
+   507→                      <span className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-md bg-purple-50 text-purple-700">
+   508→                        <Droplet className="w-2.5 h-2.5" /> F {toPersianDigits(f.fat)}g
+   509→                      </span>
+   510→                    </div>
+   511→                  </motion.div>
+   512→                ))}
+   513→
+   514→                {/* Total bar */}
+   515→                <div
+   516→                  className="flex items-center justify-between p-3 rounded-xl text-white mt-3"
+   517→                  style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   518→                >
+   519→                  <span className="text-sm font-bold flex items-center gap-1.5">
+   520→                    <Flame className="w-4 h-4" />
+   521→                    مجموع
+   522→                  </span>
+   523→                  <div className="flex items-baseline gap-1">
+   524→                    <span className="text-xl font-black">{toPersianDigits(caloriesConsumed)}</span>
+   525→                    <span className="text-xs opacity-90">کالری</span>
+   526→                  </div>
+   527→                </div>
+   528→              </div>
+   529→            )}
+   530→          </Card>
+   531→        </>
+   532→      )}
+   533→
+   534→      {/* Add food modal */}
+   535→      <AnimatePresence>
+   536→        {showAddFood && (
+   537→          <AddFoodModal
+   538→            onClose={() => setShowAddFood(false)}
+   539→            onAdd={(food) => {
+   540→              addLoggedFood(food);
+   541→              setShowAddFood(false);
+   542→            }}
+   543→          />
+   544→        )}
+   545→      </AnimatePresence>
+   546→    </div>
+   547→  );
+   548→}
+   549→
+   550→function MacroDonut({ protein, carbs, fat }: { protein: number; carbs: number; fat: number }) {
+   551→  const total = protein + carbs + fat || 1;
+   552→  const pPct = (protein / total) * 100;
+   553→  const cPct = (carbs / total) * 100;
+   554→  const fPct = (fat / total) * 100;
+   555→
+   556→  const segments = [
+   557→    { pct: pPct, color: "#F4C542", label: "پروتئین", value: protein, icon: Beef },
+   558→    { pct: cPct, color: "#06b6d4", label: "کربوهیدرات", value: carbs, icon: Wheat },
+   559→    { pct: fPct, color: "#a855f7", label: "چربی", value: fat, icon: Droplet },
+   560→  ];
+   561→
+   562→  let offset = 0;
+   563→  const c = 2 * Math.PI * 40;
+   564→
+   565→  return (
+   566→    <div className="flex items-center gap-4">
+   567→      <div className="relative w-32 h-32 shrink-0">
+   568→        <svg viewBox="0 0 100 100" className="w-full h-full -rotate-90">
+   569→          <circle cx="50" cy="50" r="40" fill="none" stroke="currentColor" strokeWidth="10" className="text-muted/30" />
+   570→          {segments.map((seg, i) => {
+   571→            const len = (seg.pct / 100) * c;
+   572→            const dasharray = `${len} ${c - len}`;
+   573→            const el = (
+   574→              <motion.circle
+   575→                key={i}
+   576→                cx="50"
+   577→                cy="50"
+   578→                r="40"
+   579→                fill="none"
+   580→                stroke={seg.color}
+   581→                strokeWidth="10"
+   582→                strokeDasharray={dasharray}
+   583→                strokeDashoffset={-offset}
+   584→                initial={{ opacity: 0 }}
+   585→                animate={{ opacity: 1 }}
+   586→                transition={{ delay: i * 0.2 }}
+   587→                style={{ filter: `drop-shadow(0 0 3px ${seg.color}60)` }}
+   588→              />
+   589→            );
+   590→            offset += len;
+   591→            return el;
+   592→          })}
+   593→        </svg>
+   594→        <div className="absolute inset-0 flex flex-col items-center justify-center">
+   595→          <span className="text-lg font-black">{toPersianDigits(Math.round(total))}</span>
+   596→          <span className="text-[10px] text-muted-foreground">گرم کل</span>
+   597→        </div>
+   598→      </div>
+   599→      <div className="flex-1 space-y-2">
+   600→        {segments.map((seg, i) => (
+   601→          <div key={i} className="flex items-center gap-2">
+   602→            <div className="w-3 h-3 rounded-full" style={{ background: seg.color }} />
+   603→            <div className="flex-1">
+   604→              <p className="text-xs text-muted-foreground">{seg.label}</p>
+   605→              <p className="text-sm font-bold">
+   606→                {toPersianDigits(Math.round(seg.value))}g <span className="text-[10px] text-muted-foreground font-normal">({toPersianDigits(Math.round(seg.pct))}٪)</span>
+   607→              </p>
+   608→            </div>
+   609→          </div>
+   610→        ))}
+   611→      </div>
+   612→    </div>
+   613→  );
+   614→}
+   615→
+   616→function AddFoodModal({ onClose, onAdd }: { onClose: () => void; onAdd: (f: LoggedFood) => void }) {
+   617→  const [name, setName] = useState("");
+   618→  const [meal, setMeal] = useState<LoggedFood["meal"]>("snack");
+   619→  const [calories, setCalories] = useState("");
+   620→  const [protein, setProtein] = useState("");
+   621→  const [carbs, setCarbs] = useState("");
+   622→  const [fat, setFat] = useState("");
+   623→
+   624→  function submit() {
+   625→    if (!name || !calories) return;
+   626→    onAdd({
+   627→      id: `food_${Date.now()}`,
+   628→      name,
+   629→      meal,
+   630→      calories: Number(calories),
+   631→      protein: Number(protein) || 0,
+   632→      carbs: Number(carbs) || 0,
+   633→      fat: Number(fat) || 0,
+   634→      loggedAt: new Date().toISOString(),
+   635→    });
+   636→  }
+   637→
+   638→  return (
+   639→    <motion.div
+   640→      initial={{ opacity: 0 }}
+   641→      animate={{ opacity: 1 }}
+   642→      exit={{ opacity: 0 }}
+   643→      className="fixed inset-0 z-[90] bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-4"
+   644→      onClick={onClose}
+   645→    >
+   646→      <motion.div
+   647→        initial={{ y: 50, opacity: 0 }}
+   648→        animate={{ y: 0, opacity: 1 }}
+   649→        exit={{ y: 50, opacity: 0 }}
+   650→        onClick={(e) => e.stopPropagation()}
+   651→        className="glass-strong rounded-3xl p-5 w-full max-w-md"
+   652→      >
+   653→        <div className="flex items-center justify-between mb-4">
+   654→          <h3 className="font-bold text-lg flex items-center gap-2">
+   655→            <Apple className="w-5 h-5 text-primary" />
+   656→            ثبت سریع غذا
+   657→          </h3>
+   658→          <button onClick={onClose} className="p-2 rounded-lg hover:bg-muted">
+   659→            <X className="w-5 h-5" />
+   660→          </button>
+   661→        </div>
+   662→        <div className="space-y-3">
+   663→          <div>
+   664→            <Label className="mb-1.5 block text-sm">نام غذا</Label>
+   665→            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="مثلاً سینه مرغ گریل" className="rounded-xl" />
+   666→          </div>
+   667→          <div>
+   668→            <Label className="mb-1.5 block text-sm">وعده غذایی</Label>
+   669→            <div className="grid grid-cols-4 gap-2">
+   670→              {(["breakfast", "lunch", "dinner", "snack"] as const).map((m) => (
+   671→                <button
+   672→                  key={m}
+   673→                  onClick={() => setMeal(m)}
+   674→                  className={`py-2 rounded-xl text-xs font-medium transition ${
+   675→                    meal === m ? "bg-primary text-primary-foreground" : "bg-muted/60 text-muted-foreground"
+   676→                  }`}
+   677→                >
+   678→                  {MEAL_LABELS[m]}
+   679→                </button>
+   680→              ))}
+   681→            </div>
+   682→          </div>
+   683→          <div>
+   684→            <Label className="mb-1.5 block text-sm">کالری</Label>
+   685→            <Input type="number" dir="ltr" value={calories} onChange={(e) => setCalories(e.target.value)} placeholder="250" className="rounded-xl text-center" />
+   686→          </div>
+   687→          <div className="grid grid-cols-3 gap-2">
+   688→            <div>
+   689→              <Label className="mb-1 block text-xs text-yellow-500">پروتئین (g)</Label>
+   690→              <Input type="number" dir="ltr" value={protein} onChange={(e) => setProtein(e.target.value)} placeholder="20" className="rounded-lg text-center text-sm h-9" />
+   691→            </div>
+   692→            <div>
+   693→              <Label className="mb-1 block text-xs text-cyan-400">کربو (g)</Label>
+   694→              <Input type="number" dir="ltr" value={carbs} onChange={(e) => setCarbs(e.target.value)} placeholder="30" className="rounded-lg text-center text-sm h-9" />
+   695→            </div>
+   696→            <div>
+   697→              <Label className="mb-1 block text-xs text-purple-400">چربی (g)</Label>
+   698→              <Input type="number" dir="ltr" value={fat} onChange={(e) => setFat(e.target.value)} placeholder="8" className="rounded-lg text-center text-sm h-9" />
+   699→            </div>
+   700→          </div>
+   701→          <Button onClick={submit} disabled={!name || !calories} className="w-full rounded-xl h-11 font-bold">
+   702→            <Check className="w-4 h-4" />
+   703→            ثبت غذا
+   704→          </Button>
+   705→        </div>
+   706→      </motion.div>
+   707→    </motion.div>
+   708→  );
+   709→}
+   710→
+   711→function getMealIcon(type: string): string {
+   712→  const map: Record<string, string> = { breakfast: "🍳", lunch: "🍱", dinner: "🍽️", snack: "🍎" };
+   713→  return map[type] || "🍽️";
+   714→}
+   715→
