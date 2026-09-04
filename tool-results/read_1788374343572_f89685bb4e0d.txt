@@ -1,0 +1,889 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState, useRef, useCallback } from "react";
+     4→import { motion } from "framer-motion";
+     5→import {
+     6→  TrendingDown,
+     7→  Camera,
+     8→  Target,
+     9→  Scale,
+    10→  Trophy,
+    11→  Ruler,
+    12→  Sparkles,
+    13→  Activity,
+    14→  Award,
+    15→  Zap,
+    16→  TrendingUp,
+    17→  Plus,
+    18→  Loader2,
+    19→  Trash2,
+    20→  Lock,
+    21→} from "lucide-react";
+    22→import {
+    23→  ComposedChart,
+    24→  Line,
+    25→  XAxis,
+    26→  YAxis,
+    27→  CartesianGrid,
+    28→  Tooltip,
+    29→  ResponsiveContainer,
+    30→} from "recharts";
+    31→import { useAppStore } from "@/lib/fitness/store";
+    32→import { Card } from "@/components/ui/card";
+    33→import { Button } from "@/components/ui/button";
+    34→import { Input } from "@/components/ui/input";
+    35→import { Label } from "@/components/ui/label";
+    36→import { Skeleton } from "@/components/ui/skeleton";
+    37→import {
+    38→  AlertDialog,
+    39→  AlertDialogAction,
+    40→  AlertDialogCancel,
+    41→  AlertDialogContent,
+    42→  AlertDialogDescription,
+    43→  AlertDialogFooter,
+    44→  AlertDialogHeader,
+    45→  AlertDialogTitle,
+    46→} from "@/components/ui/alert-dialog";
+    47→import { toPersianDigits, canAccess, planTierRank } from "@/lib/fitness/types";
+    48→import { toast } from "sonner";
+    49→import { CheckupSection } from "./checkup-section";
+    50→
+    51→interface ProgressData {
+    52→  weights: { id: string; weight: number; note: string; loggedAt: string }[];
+    53→  photos: { id: string; imageUrl: string; type: string; note: string; takenAt: string }[];
+    54→  startWeight: number | null;
+    55→  targetWeight: number | null;
+    56→}
+    57→
+    58→/**
+    59→ * پارس امن aiAnalysis (FE-M3) — JSON.parse بدون try/catch در render می‌توانست
+    60→ * با رشته خراب کل ویو (و اپ) را crash کند. حالا null برمی‌گرداند و رندر گارد می‌شود.
+    61→ */
+    62→function safeParseAiAnalysis(value: any): any | null {
+    63→  if (value == null) return null;
+    64→  if (typeof value !== "string") return value;
+    65→  try {
+    66→    const parsed = JSON.parse(value);
+    67→    return parsed ?? null;
+    68→  } catch {
+    69→    return null;
+    70→  }
+    71→}
+    72→
+    73→export function ProgressView() {
+    74→  const { bodyMeasurements, setBodyMeasurements, user, setMainTab } = useAppStore();
+    75→  const [data, setData] = useState<ProgressData | null>(null);
+    76→  const [loading, setLoading] = useState(true);
+    77→  // FIX: خطای شبکه قبلاً بی‌صدا «هنوز عکسی ثبت نشده» نشان می‌داد (گمراه‌کننده!)
+    78→  // حالا خطا شفاف + دکمه تلاش مجدد
+    79→  const [loadError, setLoadError] = useState<string | null>(null);
+    80→  const [showMeasurements, setShowMeasurements] = useState(false);
+    81→  const [checkups, setCheckups] = useState<any[]>([]);
+    82→  const [mediaData, setMediaData] = useState<any>(null);
+    83→
+    84→  useEffect(() => {
+    85→    load();
+    86→  }, []);
+    87→
+    88→  async function load() {
+    89→    setLoading(true);
+    90→    setLoadError(null);
+    91→    try {
+    92→      const [progressRes, checkupRes, mediaRes] = await Promise.all([
+    93→        fetch("/api/progress", { cache: "no-store" }),
+    94→        fetch("/api/checkup", { cache: "no-store" }),
+    95→        fetch("/api/user-media").catch(() => null),
+    96→      ]);
+    97→      if (!progressRes.ok) {
+    98→        // خطای واقعی (شبکه/401) — به‌جای حالت «خالی» گمراه‌کننده، خطا نشان بده
+    99→        throw new Error("خطا در دریافت اطلاعات پیشرفت — دوباره تلاش کن");
+   100→      }
+   101→      const d = await progressRes.json();
+   102→      setData(d);
+   103→      try {
+   104→        const c = await checkupRes.json();
+   105→        const checkupList: any[] = c.checkups || [];
+   106→        setCheckups(checkupList);
+   107→
+   108→        // ─── FE-M7: hydrate اندازه‌های بدن از آخرین چکاپ دارای اندازه ───
+   109→        // قبلاً bodyMeasurements فقط در حافظه Zustand بود و با refresh پاک می‌شد؛
+   110→        // حالا از همان منبع ماندگار (چکاپ‌ها — همان که مودال عکس بدن با
+   111→        // /api/checkup/baseline-measurements در آن می‌نویسد) پر می‌شود.
+   112→        const hasLocal = Boolean(
+   113→          bodyMeasurements.waist || bodyMeasurements.arm || bodyMeasurements.chest || bodyMeasurements.hip
+   114→        );
+   115→        if (!hasLocal) {
+   116→          const src = checkupList.find(
+   117→            (ch: any) => ch.waistMeasurement || ch.armMeasurement || ch.chestMeasurement || ch.hipMeasurement
+   118→          );
+   119→          if (src) {
+   120→            setBodyMeasurements({
+   121→              waist: src.waistMeasurement ?? undefined,
+   122→              arm: src.armMeasurement ?? undefined,
+   123→              chest: src.chestMeasurement ?? undefined,
+   124→              hip: src.hipMeasurement ?? undefined,
+   125→            });
+   126→          }
+   127→        }
+   128→
+   129→        // آخرین وزن شناخته‌شده — برای تخمین کالری تمرین (جایگزین ۷۵kg هاردکد)
+   130→        const progressWeights = Array.isArray(d?.weights) ? d.weights : [];
+   131→        const fromProgress = progressWeights.length > 0
+   132→          ? Number(progressWeights[progressWeights.length - 1].weight)
+   133→          : NaN;
+   134→        const fromCheckup = Number(checkupList.find((ch: any) => ch.weight)?.weight);
+   135→        const latestWeight = Number.isFinite(fromProgress) && fromProgress > 0
+   136→          ? fromProgress
+   137→          : fromCheckup;
+   138→        if (Number.isFinite(latestWeight) && latestWeight > 0) {
+   139→          useAppStore.getState().setLastKnownWeightKg(latestWeight);
+   140→        }
+   141→      } catch {}
+   142→      if (mediaRes) {
+   143→        try { setMediaData(await mediaRes.json()); } catch {}
+   144→      }
+   145→    } catch (err) {
+   146→      setLoadError(err instanceof Error ? err.message : "خطا در بارگذاری");
+   147→    } finally {
+   148→      setLoading(false);
+   149→    }
+   150→  }
+   151→
+   152→  const currentWeight = data?.weights[data.weights.length - 1]?.weight;
+   153→  const startWeight = data?.startWeight;
+   154→  const totalLost = startWeight && currentWeight ? (startWeight - currentWeight) : 0;
+   155→
+   156→  // آخرین چکاپ برای نمایش درصد چربی و عضله
+   157→  const lastCheckup = checkups[0];
+   158→  const bodyFatPercent = lastCheckup?.bodyFatPercent;
+   159→  const leanBodyMass = lastCheckup?.leanBodyMass;
+   160→  // پارس امن (FE-M3) — رشته خراب دیگر render را crash نمی‌کند
+   161→  const lastAiAnalysis = safeParseAiAnalysis(lastCheckup?.aiAnalysis);
+   162→  const bodyScore = lastAiAnalysis?.bodyScore ?? null;
+   163→
+   164→  // ─── C3: داده‌های نمودار بر اساس چکاپ‌ها (از اولین خرید پلن تاکنون) ───
+   165→  const checkupChart = (() => {
+   166→    // چکاپ‌ها از API نزولی می‌آیند — برای نمودار صعودی مرتب می‌کنیم
+   167→    const asc = [...checkups].sort(
+   168→      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+   169→    );
+   170→    if (asc.length === 0) return { points: [], hasBodyFat: false };
+   171→
+   172→    // شروع بازه: planStartedAt → (planExpiresAt − ۴۵ روز) → earliest checkup
+   173→    const planStartMs = (() => {
+   174→      const started = (user as any)?.planStartedAt;
+   175→      if (started) return new Date(started).getTime();
+   176→      if (user?.planExpiresAt) {
+   177→        return new Date(user.planExpiresAt).getTime() - 45 * 24 * 60 * 60 * 1000;
+   178→      }
+   179→      return new Date(asc[0].createdAt).getTime();
+   180→    })();
+   181→
+   182→    let inPlan = asc.filter((c) => new Date(c.createdAt).getTime() >= planStartMs);
+   183→    if (inPlan.length < 2) inPlan = asc; // fallback: همه چکاپ‌ها
+   184→
+   185→    const hasBodyFat = inPlan.some((c) => c.bodyFatPercent != null);
+   186→    const points = inPlan.map((c) => ({
+   187→      date: new Date(c.createdAt).toLocaleDateString("fa-IR", {
+   188→        month: "short",
+   189→        day: "numeric",
+   190→      }),
+   191→      وزن: c.weight != null ? c.weight : undefined,
+   192→      چربی: c.bodyFatPercent != null ? c.bodyFatPercent : undefined,
+   193→    }));
+   194→    return { points, hasBodyFat };
+   195→  })();
+   196→  const chartData = checkupChart.points;
+   197→
+   198→  // ─── C3: گیت نمودار — استاندارد و بالاتر (tier >= 2) ───
+   199→  const chartUnlocked = planTierRank(user?.planName) >= 2;
+   200→
+   201→  return (
+   202→    <div className="px-4 py-4 space-y-4 max-w-md mx-auto">
+   203→      <div>
+   204→        <h2 className="text-2xl font-black">پیشرفت من</h2>
+   205→        <p className="text-sm text-muted-foreground">تحلیل جامع پیشرفت شما توسط فیتاپ هوشمند</p>
+   206→      </div>
+   207→
+   208→      {/* FIX: خطای بارگذاری — شفاف + تلاش مجدد (قبلاً خطای شبکه «عکسی ثبت نشده» جعل می‌کرد) */}
+   209→      {loadError && (
+   210→        <div className="rounded-2xl border border-red-200 bg-red-50 p-4 flex items-center justify-between gap-3">
+   211→          <p className="text-xs text-red-700 font-bold">{loadError}</p>
+   212→          <Button variant="outline" size="sm" onClick={load} className="shrink-0">
+   213→            تلاش مجدد
+   214→          </Button>
+   215→        </div>
+   216→      )}
+   217→
+   218→      {/* ═══ چکاپ دوره‌ای — بالاترین قسمت ═══ */}
+   219→      <CheckupSection />
+   220→
+   221→      {/* ═══ تحلیل جامع پیشرفت ═══ */}
+   222→      <Card className="p-5 border-2 border-orange-100 bg-gradient-to-br from-orange-50/50 to-white">
+   223→        <div className="flex items-center gap-2 mb-4">
+   224→          <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   225→            <Sparkles className="w-4 h-4 text-white" />
+   226→          </div>
+   227→          <h3 className="font-bold text-sm">تحلیل جامع فیتاپ هوشمند</h3>
+   228→        </div>
+   229→
+   230→        {/* اگر چکاپ دارد */}
+   231→        {lastCheckup ? (
+   232→          <div className="space-y-4">
+   233→            {/* Body Score */}
+   234→            {bodyScore != null && (
+   235→              <div className="text-center py-3 rounded-2xl bg-white border border-orange-100">
+   236→                <p className="text-[11px] text-slate-500 mb-1">امتیاز بدن شما</p>
+   237→                <p className="text-4xl font-black" style={{ color: bodyScore >= 70 ? "#10b981" : bodyScore >= 50 ? "#f59e0b" : "#ef4444" }}>
+   238→                  {toPersianDigits(bodyScore)}
+   239→                  <span className="text-lg text-slate-400">/۱۰۰</span>
+   240→                </p>
+   241→              </div>
+   242→            )}
+   243→
+   244→            {/* آمار کلیدی */}
+   245→            <div className="grid grid-cols-2 gap-2">
+   246→              {bodyFatPercent != null && (
+   247→                <MetricCard icon={Activity} label="درصد چربی بدن" value={`${toPersianDigits(bodyFatPercent)}٪`} color="text-rose-500" bg="bg-rose-50" />
+   248→              )}
+   249→              {leanBodyMass != null && (
+   250→                <MetricCard icon={Zap} label="وزن عضلانی" value={`${toPersianDigits(leanBodyMass)} kg`} color="text-emerald-500" bg="bg-emerald-50" />
+   251→              )}
+   252→              {currentWeight && (
+   253→                <MetricCard icon={Scale} label="وزن فعلی" value={`${toPersianDigits(currentWeight)} kg`} color="text-orange-500" bg="bg-orange-50" />
+   254→              )}
+   255→              {totalLost > 0 && (
+   256→                <MetricCard icon={TrendingDown} label="کاهش وزن" value={`${toPersianDigits(totalLost.toFixed(1))} kg`} color="text-cyan-500" bg="bg-cyan-50" />
+   257→              )}
+   258→            </div>
+   259→
+   260→            {/* تحلیل AI */}
+   261→            {lastCheckup.aiAnalysis && (
+   262→              <div className="p-3 rounded-xl bg-white border border-orange-100">
+   263→                <div className="flex items-center gap-1.5 mb-2">
+   264→                  <Activity className="w-3.5 h-3.5 text-orange-500" />
+   265→                  <p className="text-xs font-bold text-orange-600">تحلیل هوش مصنوعی</p>
+   266→                </div>
+   267→                <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap">
+   268→                  {lastAiAnalysis?.analysis || "—"}
+   269→                </p>
+   270→              </div>
+   271→            )}
+   272→
+   273→            {/* توصیه‌ها */}
+   274→            {lastCheckup.aiAnalysis && (
+   275→              <div className="p-3 rounded-xl bg-amber-50 border border-amber-100">
+   276→                <div className="flex items-center gap-1.5 mb-2">
+   277→                  <Award className="w-3.5 h-3.5 text-amber-500" />
+   278→                  <p className="text-xs font-bold text-amber-600">توصیه‌های فیتاپ</p>
+   279→                </div>
+   280→                {(() => {
+   281→                  // پارس امن (FE-M3)
+   282→                  const recs: string[] = lastAiAnalysis?.recommendations || [];
+   283→                  return recs.length > 0 ? (
+   284→                    <ul className="space-y-1">
+   285→                      {recs.slice(0, 3).map((r: string, i: number) => (
+   286→                        <li key={i} className="text-xs text-slate-600 flex gap-1.5">
+   287→                          <span className="text-amber-500 shrink-0">•</span>
+   288→                          {r}
+   289→                        </li>
+   290→                      ))}
+   291→                    </ul>
+   292→                  ) : null;
+   293→                })()}
+   294→              </div>
+   295→            )}
+   296→          </div>
+   297→        ) : (
+   298→          <div className="text-center py-6">
+   299→            <Activity className="w-10 h-10 text-slate-300 mx-auto mb-2" />
+   300→            <p className="text-xs text-slate-500">
+   301→              پس از انجام اولین چکاپ، تحلیل جامع پیشرفت شما در اینجا نمایش داده می‌شود
+   302→            </p>
+   303→          </div>
+   304→        )}
+   305→      </Card>
+   306→
+   307→      {/* ═══ دستاوردها ═══ */}
+   308→      {totalLost > 0 && (
+   309→        <motion.div
+   310→          initial={{ opacity: 0, scale: 0.9 }}
+   311→          animate={{ opacity: 1, scale: 1 }}
+   312→          className="p-4 rounded-2xl bg-gradient-to-l from-amber-500/20 to-orange-500/10 border border-amber-500/30 flex items-center gap-3"
+   313→        >
+   314→          <div className="w-12 h-12 rounded-xl bg-amber-500 flex items-center justify-center">
+   315→            <Trophy className="w-6 h-6 text-white" />
+   316→          </div>
+   317→          <div>
+   318→            <p className="font-bold text-sm">آفرین! {toPersianDigits(totalLost.toFixed(1))} کیلو کاهش وزن</p>
+   319→            <p className="text-xs text-muted-foreground">به مسیر موفقیت ادامه بده! 💪</p>
+   320→          </div>
+   321→        </motion.div>
+   322→      )}
+   323→
+   324→      {/* ═══ نمودار پیشرفت بر اساس چکاپ‌ها (C3 — جایگزین نمودار WeightLog) ═══ */}
+   325→      <Card className="p-4 border-2 border-orange-100 bg-gradient-to-br from-orange-50/40 to-white">
+   326→        <div className="flex items-center justify-between mb-3">
+   327→          <div className="flex items-center gap-1.5">
+   328→            <TrendingUp className="w-4 h-4 text-orange-500" />
+   329→            <h3 className="font-bold text-sm">روند پیشرفت بر اساس چکاپ‌ها</h3>
+   330→          </div>
+   331→          {/* راهنمای سریع سری‌های فعال */}
+   332→          {chartUnlocked && chartData.length >= 2 && (
+   333→            <div className="flex items-center gap-2 text-[10px] font-bold">
+   334→              <span className="flex items-center gap-1 text-amber-600">
+   335→                <span className="w-2.5 h-0.5 rounded-full bg-amber-500 inline-block" /> وزن
+   336→              </span>
+   337→              {checkupChart.hasBodyFat && (
+   338→                <span className="flex items-center gap-1 text-rose-500">
+   339→                  <span className="w-2.5 inline-block border-t-2 border-dashed border-rose-500" /> چربی ٪
+   340→                </span>
+   341→              )}
+   342→            </div>
+   343→          )}
+   344→        </div>
+   345→
+   346→        {!chartUnlocked ? (
+   347→          // ─── پلن اقتصادی: کارت قفل‌شده ───
+   348→          <div className="rounded-2xl border-2 border-dashed border-orange-200 bg-orange-50/60 p-5 text-center">
+   349→            <div
+   350→              className="w-12 h-12 rounded-2xl flex items-center justify-center mx-auto mb-3"
+   351→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   352→            >
+   353→              <Lock className="w-6 h-6 text-white" />
+   354→            </div>
+   355→            <p className="text-sm font-bold text-slate-800 mb-1">
+   356→              نمودار پیشرفت چکاپ‌ها در پلن استاندارد و بالاتر فعال است
+   357→            </p>
+   358→            <p className="text-[11px] text-slate-500 mb-3">
+   359→              با ثبت چکاپ‌های دوره‌ای، روند وزن و درصد چربی بدن شما در این نمودار رسم می‌شود.
+   360→            </p>
+   361→            <Button
+   362→              size="sm"
+   363→              onClick={() => setMainTab("plans")}
+   364→              className="rounded-xl text-white"
+   365→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   366→            >
+   367→              مشاهده پلن‌ها
+   368→            </Button>
+   369→          </div>
+   370→        ) : loading ? (
+   371→          <Skeleton className="h-48 rounded-xl" />
+   372→        ) : chartData.length < 2 ? (
+   373→          <div className="h-48 flex flex-col items-center justify-center text-muted-foreground">
+   374→            <Scale className="w-10 h-10 mb-2 opacity-40" />
+   375→            <p className="text-sm">هنوز چکاپ کافی برای نمودار نیست</p>
+   376→            <p className="text-[11px] mt-1">وزن و درصد چربی شما در چکاپ‌های دوره‌ای ثبت می‌شود</p>
+   377→          </div>
+   378→        ) : (
+   379→          <ResponsiveContainer width="100%" height={210}>
+   380→            <ComposedChart data={chartData} margin={{ top: 5, right: 5, left: -14, bottom: 5 }}>
+   381→              <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-muted/30" />
+   382→              <XAxis dataKey="date" tick={{ fontSize: 10, fill: "currentColor" }} className="text-muted-foreground" reversed />
+   383→              <YAxis
+   384→                yAxisId="weight"
+   385→                orientation="right"
+   386→                tick={{ fontSize: 10, fill: "#d97706" }}
+   387→                className="text-muted-foreground"
+   388→                domain={["dataMin - 2", "dataMax + 2"]}
+   389→                width={38}
+   390→              />
+   391→              {checkupChart.hasBodyFat && (
+   392→                <YAxis
+   393→                  yAxisId="bodyFat"
+   394→                  orientation="left"
+   395→                  tick={{ fontSize: 10, fill: "#e11d48" }}
+   396→                  domain={["dataMin - 2", "dataMax + 2"]}
+   397→                  width={32}
+   398→                />
+   399→              )}
+   400→              <Tooltip content={<CheckupChartTooltip />} />
+   401→              <Line
+   402→                yAxisId="weight"
+   403→                type="monotone"
+   404→                dataKey="وزن"
+   405→                name="وزن"
+   406→                stroke="#f59e0b"
+   407→                strokeWidth={3}
+   408→                dot={{ fill: "#f59e0b", r: 4 }}
+   409→                activeDot={{ r: 6 }}
+   410→                connectNulls
+   411→              />
+   412→              {checkupChart.hasBodyFat && (
+   413→                <Line
+   414→                  yAxisId="bodyFat"
+   415→                  type="monotone"
+   416→                  dataKey="چربی"
+   417→                  name="چربی بدن %"
+   418→                  stroke="#f43f5e"
+   419→                  strokeWidth={2}
+   420→                  strokeDasharray="6 4"
+   421→                  dot={{ fill: "#f43f5e", r: 3, strokeWidth: 0 }}
+   422→                  activeDot={{ r: 5 }}
+   423→                  connectNulls
+   424→                />
+   425→              )}
+   426→            </ComposedChart>
+   427→          </ResponsiveContainer>
+   428→        )}
+   429→      </Card>
+   430→
+   431→      {/* ═══ اندازه‌های بدن ═══ */}
+   432→      <Card className="p-4">
+   433→        <div className="flex items-center justify-between mb-3">
+   434→          <div className="flex items-center gap-2">
+   435→            <Ruler className="w-4 h-4 text-primary" />
+   436→            <h3 className="font-bold text-sm">اندازه‌های بدن</h3>
+   437→          </div>
+   438→          <Button size="sm" variant="outline" className="rounded-xl text-xs" onClick={() => setShowMeasurements((v) => !v)}>
+   439→            {showMeasurements ? "بستن" : "ثبت اندازه"}
+   440→          </Button>
+   441→        </div>
+   442→        {showMeasurements ? (
+   443→          <BodyMeasurementsForm
+   444→            values={bodyMeasurements}
+   445→            onSave={async (m) => {
+   446→              setBodyMeasurements(m);
+   447→              setShowMeasurements(false);
+   448→              // ─── FE-M7: ذخیره ماندگار در سرور (همان API مودال عکس بدن) ───
+   449→              // قبلاً فقط Zustand memory-only بود و با refresh از بین می‌رفت.
+   450→              try {
+   451→                const payload: Record<string, number> = {};
+   452→                if (m.waist) payload.waistMeasurement = m.waist;
+   453→                if (m.arm) payload.armMeasurement = m.arm;
+   454→                if (m.chest) payload.chestMeasurement = m.chest;
+   455→                if (m.hip) payload.hipMeasurement = m.hip;
+   456→                if (Object.keys(payload).length > 0) {
+   457→                  const res = await fetch("/api/checkup/baseline-measurements", {
+   458→                    method: "POST",
+   459→                    headers: { "Content-Type": "application/json" },
+   460→                    body: JSON.stringify(payload),
+   461→                  });
+   462→                  if (!res.ok) throw new Error();
+   463→                }
+   464→                toast.success("اندازه‌های بدن ثبت شد");
+   465→              } catch {
+   466→                toast.error("ذخیره اندازه‌ها در سرور ناموفق بود — دوباره تلاش کنید");
+   467→              }
+   468→            }}
+   469→          />
+   470→        ) : (
+   471→          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+   472→            <MeasurementChip label="دور کمر" value={bodyMeasurements.waist} unit="cm" />
+   473→            <MeasurementChip label="دور بازو" value={bodyMeasurements.arm} unit="cm" />
+   474→            <MeasurementChip label="دور سینه" value={bodyMeasurements.chest} unit="cm" />
+   475→            <MeasurementChip label="دور باسن" value={bodyMeasurements.hip} unit="cm" />
+   476→          </div>
+   477→        )}
+   478→      </Card>
+   479→
+   480→      {/* ═══ گالری پیشرفت ═══ */}
+   481→      <ProgressGallery photos={data?.photos || []} onRefresh={load} user={user} />
+   482→    </div>
+   483→  );
+   484→}
+   485→
+   486→// ═══ گالری پیشرفت — با آپلود عکس + تحلیل پیشرفت بدن ═══
+   487→function ProgressGallery({ photos, onRefresh, user }: {
+   488→  photos: { id: string; imageUrl: string; type: string; note: string; takenAt: string }[];
+   489→  onRefresh: () => void;
+   490→  user: any;
+   491→}) {
+   492→  const { setMainTab } = useAppStore();
+   493→  const [uploading, setUploading] = useState(false);
+   494→  const [selectedType, setSelectedType] = useState<"front" | "side" | "back">("front");
+   495→  // C2: تب فیلتر گالری — «همه» + سه زاویه؛ انتخاب زاویه، هدف آپلود را هم عوض می‌کند
+   496→  const [activeTab, setActiveTab] = useState<"all" | "front" | "side" | "back">("all");
+   497→  const [analyzing, setAnalyzing] = useState(false);
+   498→  const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+   499→  const fileInputRef = useRef<HTMLInputElement>(null);
+   500→  // حذف عکس با تأیید درون‌برنامه‌ای — confirm() مرورگر در WebView/iframe
+   501→  // مسدود است و همیشه false برمی‌گرداند → حذف عملاً غیرممکن بود
+   502→  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+   503→
+   504→  // C4: گیت استاندارد+ (قابلیت جدید progressAnalysis) — به‌جای advanced/ultimate هاردکد
+   505→  const canAnalyze = canAccess(user?.planName, "progressAnalysis");
+   506→  // C4: سهمیه ۳ تحلیل در طول اشتراک — از GET همان route
+   507→  const [remaining, setRemaining] = useState<number | null>(null);
+   508→
+   509→  const refreshRemaining = useCallback(async () => {
+   510→    try {
+   511→      const res = await fetch("/api/coach/analyze-body-progress", { cache: "no-store" });
+   512→      if (!res.ok) return;
+   513→      const d = await res.json();
+   514→      if (typeof d?.remaining === "number") setRemaining(d.remaining);
+   515→    } catch {}
+   516→  }, []);
+   517→
+   518→  useEffect(() => {
+   519→    refreshRemaining();
+   520→  }, [refreshRemaining]);
+   521→
+   522→  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+   523→    const file = e.target.files?.[0];
+   524→    if (!file) return;
+   525→    setUploading(true);
+   526→    try {
+   527→      const formData = new FormData();
+   528→      formData.append("image", file);
+   529→      formData.append("type", selectedType);
+   530→      const res = await fetch("/api/progress/photo", {
+   531→        method: "POST",
+   532→        body: formData,
+   533→      });
+   534→      if (!res.ok) {
+   535→        const err = await res.json().catch(() => ({}));
+   536→        throw new Error(err.error || "خطا در آپلود");
+   537→      }
+   538→      toast.success("عکس پیشرفت ثبت شد ✓");
+   539→      onRefresh();
+   540→    } catch (err) {
+   541→      toast.error(err instanceof Error ? err.message : "خطا در آپلود");
+   542→    } finally {
+   543→      setUploading(false);
+   544→      if (fileInputRef.current) fileInputRef.current.value = "";
+   545→    }
+   546→  }
+   547→
+   548→  async function handleDelete(id: string) {
+   549→    try {
+   550→      const res = await fetch(`/api/progress/photo?id=${id}`, { method: "DELETE" });
+   551→      if (!res.ok) throw new Error("خطا در حذف");
+   552→      toast.success("عکس حذف شد");
+   553→      onRefresh();
+   554→    } catch {
+   555→      toast.error("خطا در حذف");
+   556→    } finally {
+   557→      setDeleteTargetId(null);
+   558→    }
+   559→  }
+   560→
+   561→  async function handleAnalyzeProgress() {
+   562→    if (photos.length < 2) {
+   563→      toast.error("برای تحلیل پیشرفت حداقل ۲ عکس نیاز است");
+   564→      return;
+   565→    }
+   566→    setAnalyzing(true);
+   567→    setAnalysisResult(null);
+   568→    try {
+   569→      const res = await fetch("/api/coach/analyze-body-progress", {
+   570→        method: "POST",
+   571→        headers: { "Content-Type": "application/json" },
+   572→        // C4: تحلیل ۱۲ عکس آخر (قبلاً ۶)
+   573→        body: JSON.stringify({ photos: photos.slice(0, 12).map(p => ({ imageUrl: p.imageUrl, type: p.type, takenAt: p.takenAt })) }),
+   574→      });
+   575→      const data = await res.json().catch(() => ({}));
+   576→      if (!res.ok) {
+   577→        // 403 LIMIT_REACHED: پیام سرور (سهمیه ۳ تحلیلی) را مستقیم نشان بده
+   578→        throw new Error(data?.error || "خطا در تحلیل");
+   579→      }
+   580→      setAnalysisResult(data.analysis || "تحلیلی دریافت نشد.");
+   581→      refreshRemaining(); // سهمیه با هر تحلیل موفق کاهش می‌یابد
+   582→    } catch (err) {
+   583→      toast.error(err instanceof Error && err.message ? err.message : "خطا در تحلیل پیشرفت");
+   584→      refreshRemaining();
+   585→    } finally {
+   586→      setAnalyzing(false);
+   587→    }
+   588→  }
+   589→
+   590→  const typeLabel = (t: string) => t === "front" ? "جلو" : t === "side" ? "بغل" : t === "back" ? "پشت" : t === "custom" ? "آزاد" : t;
+   591→
+   592→  // C2: فیلتر گالری — «همه» همه عکس‌ها (شامل custom از مسیر body-analysis)؛
+   593→  // تب زاویه فقط همان زاویه را نشان می‌دهد. عکس‌ها از API نزولی (جدید → قدیم) می‌آیند.
+   594→  const filteredPhotos = activeTab === "all" ? photos : photos.filter((p) => p.type === activeTab);
+   595→
+   596→  // C2: انتخاب تب — زاویه انتخابی هم فیلتر است هم هدف آپلود؛ «همه» فقط فیلتر است
+   597→  // (آپلود با آخرین زاویه انتخاب‌شده — پیش‌فرض «جلو»).
+   598→  function selectTab(t: "all" | "front" | "side" | "back") {
+   599→    setActiveTab(t);
+   600→    if (t !== "all") setSelectedType(t);
+   601→  }
+   602→
+   603→  return (
+   604→    <Card className="p-4">
+   605→      <input
+   606→        ref={fileInputRef}
+   607→        type="file"
+   608→        accept="image/*"
+   609→        className="hidden"
+   610→        onChange={handleUpload}
+   611→      />
+   612→
+   613→      <div className="flex items-center justify-between mb-3">
+   614→        <div className="flex items-center gap-2">
+   615→          <Camera className="w-4 h-4 text-orange-500" />
+   616→          <h3 className="font-bold text-sm">گالری پیشرفت</h3>
+   617→          {photos.length > 0 && (
+   618→            <span className="text-[10px] px-2 py-0.5 rounded-full bg-orange-100 text-orange-600 font-bold">
+   619→              {toPersianDigits(photos.length)} عکس
+   620→            </span>
+   621→          )}
+   622→        </div>
+   623→        <span className="text-[11px] text-slate-400 flex items-center gap-1">
+   624→          🔒 خصوصی
+   625→        </span>
+   626→      </div>
+   627→
+   628→      {/* توضیحات */}
+   629→      <div className="p-3 rounded-xl bg-orange-50/50 border border-orange-100 mb-3">
+   630→        <p className="text-[11px] text-slate-600 leading-relaxed">
+   631→          📸 <strong>ثبت پیشرفت با عکس:</strong> هر چند وقت یک‌بار از بدن خود در ۳ زاویه (جلو، بغل، پشت) عکس بگیرید و اینجا آپلود کنید. تغییرات بدنی که در آینه نمی‌بینید، در عکس‌ها مشخص می‌شوند.
+   632→        </p>
+   633→        {canAnalyze ? (
+   634→          <p className="text-[11px] text-emerald-600 mt-1.5 leading-relaxed">
+   635→            ✨ <strong>تحلیل هوشمند پیشرفت:</strong> فیتاپ عکس‌های شما را مقایسه می‌کند و نقاط پیشرفت و بهبود را مشخص می‌کند (۳ بار در طول اشتراک).
+   636→          </p>
+   637→        ) : (
+   638→          <p className="text-[11px] text-amber-700 mt-1.5 leading-relaxed">
+   639→            ✨ <strong>تحلیل هوشمند پیشرفت:</strong> در پلن استاندارد و بالاتر فعال است — عکس‌هایتان را همین حالا ثبت کنید تا با ارتقا آماده تحلیل باشند.
+   640→          </p>
+   641→        )}
+   642→      </div>
+   643→
+   644→      {/* C2: تب‌های فیلتر (همه/جلو/بغل/پشت) + دکمه آپلود — تب زاویه = فیلتر + هدف آپلود */}
+   645→      <div className="mb-3">
+   646→        <div className="flex gap-2">
+   647→          <div className="flex-1 flex gap-1 p-1 rounded-xl bg-slate-100">
+   648→            {(["all", "front", "side", "back"] as const).map((t) => (
+   649→              <button
+   650→                key={t}
+   651→                onClick={() => selectTab(t)}
+   652→                className={`flex-1 py-1.5 rounded-lg text-xs font-bold transition ${
+   653→                  activeTab === t
+   654→                    ? "bg-white text-orange-600 shadow-sm"
+   655→                    : "text-slate-500"
+   656→                }`}
+   657→              >
+   658→                {t === "all" ? "همه" : typeLabel(t)}
+   659→              </button>
+   660→            ))}
+   661→          </div>
+   662→          <Button
+   663→            onClick={() => fileInputRef.current?.click()}
+   664→            disabled={uploading}
+   665→            className="rounded-xl text-white gap-1.5 shrink-0"
+   666→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   667→          >
+   668→            {uploading ? (
+   669→              <><Loader2 className="w-4 h-4 animate-spin" /> آپلود...</>
+   670→            ) : (
+   671→              <><Plus className="w-4 h-4" /> افزودن عکس</>
+   672→            )}
+   673→          </Button>
+   674→        </div>
+   675→        {activeTab === "all" && photos.length > 0 && (
+   676→          <p className="text-[10px] text-slate-400 mt-1.5">
+   677→            عکس جدید با زاویه «{typeLabel(selectedType)}» ثبت می‌شود — برای تغییر، تب زاویه را انتخاب کنید
+   678→          </p>
+   679→        )}
+   680→      </div>
+   681→
+   682→      {/* گالری عکس‌ها — فیلترشده بر اساس تب فعال (۳ ستون، جدیدترین اول) */}
+   683→      {photos.length > 0 ? (
+   684→        filteredPhotos.length > 0 ? (
+   685→          <div className="grid grid-cols-3 gap-2">
+   686→            {filteredPhotos.map((p) => (
+   687→              <div key={p.id} className="aspect-square rounded-xl overflow-hidden bg-slate-100 relative group">
+   688→                {/* eslint-disable-next-line @next/next/no-img-element */}
+   689→                <img src={p.imageUrl} alt={p.type} className="w-full h-full object-cover" />
+   690→                <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/70 to-transparent p-1.5">
+   691→                  <p className="text-[9px] text-white font-bold">{typeLabel(p.type)}</p>
+   692→                  <p className="text-[8px] text-white/80">
+   693→                    {new Date(p.takenAt).toLocaleDateString("fa-IR", { month: "short", day: "numeric" })}
+   694→                  </p>
+   695→                </div>
+   696→                <button
+   697→                  onClick={() => setDeleteTargetId(p.id)}
+   698→                  className="absolute top-1 left-1 w-6 h-6 rounded-full bg-red-500/90 text-white flex items-center justify-center opacity-60 md:opacity-0 md:group-hover:opacity-100 transition hover:bg-red-600"
+   699→                  aria-label="حذف عکس"
+   700→                  title="حذف عکس"
+   701→                >
+   702→                  <Trash2 className="w-3 h-3" />
+   703→                </button>
+   704→              </div>
+   705→            ))}
+   706→          </div>
+   707→        ) : (
+   708→          <div className="py-8 text-center text-slate-400">
+   709→            <Camera className="w-10 h-10 mx-auto mb-2 opacity-30" />
+   710→            <p className="text-xs">در زاویه «{typeLabel(activeTab)}» هنوز عکسی ثبت نشده</p>
+   711→            <p className="text-[10px] mt-1">تب «همه» را انتخاب کنید یا با دکمه «افزودن عکس» عکس این زاویه را اضافه کنید</p>
+   712→          </div>
+   713→        )
+   714→      ) : (
+   715→        <div className="py-8 text-center text-slate-400">
+   716→          <Camera className="w-12 h-12 mx-auto mb-2 opacity-30" />
+   717→          <p className="text-xs">هنوز عکسی ثبت نشده</p>
+   718→          <p className="text-[10px] mt-1">با دکمه «افزودن عکس» اولین عکس خود را اضافه کنید</p>
+   719→        </div>
+   720→      )}
+   721→
+   722→      {/* دکمه تحلیل پیشرفت — C4: استاندارد+ باز؛ پلن اقتصادی دکمه قفل‌شده (upsell) */}
+   723→      {(!canAnalyze || photos.length >= 2) && (
+   724→        <div className="mt-3">
+   725→          {canAnalyze ? (
+   726→            <Button
+   727→              onClick={handleAnalyzeProgress}
+   728→              disabled={analyzing}
+   729→              className="w-full rounded-xl text-white gap-2"
+   730→              style={{ background: "linear-gradient(135deg, #10b981, #14b8a6)" }}
+   731→            >
+   732→              {analyzing ? (
+   733→                <><Loader2 className="w-4 h-4 animate-spin" /> در حال تحلیل پیشرفت...</>
+   734→              ) : (
+   735→                <><Sparkles className="w-4 h-4" /> تحلیل هوشمند پیشرفت بدن</>
+   736→              )}
+   737→            </Button>
+   738→          ) : (
+   739→            <button
+   740→              onClick={() => {
+   741→                toast.info("تحلیل پیشرفت در پلن استاندارد و بالاتر فعال است");
+   742→                setMainTab("plans");
+   743→              }}
+   744→              className="w-full py-2.5 rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50/40 text-emerald-700 text-sm font-bold flex items-center justify-center gap-2 transition hover:bg-emerald-50"
+   745→            >
+   746→              <Lock className="w-4 h-4" /> تحلیل هوشمند پیشرفت بدن
+   747→            </button>
+   748→          )}
+   749→          {/* C4: سهمیه ۳ تحلیل در طول اشتراک + باقی‌مانده */}
+   750→          <p className="text-[10px] text-slate-400 mt-1.5 text-center">
+   751→            ۳ بار در طول اشتراک
+   752→            {remaining != null && ` — ${toPersianDigits(remaining)} تحلیل باقی‌مانده`}
+   753→          </p>
+   754→          {analysisResult && (
+   755→            <div className="mt-2 p-3 rounded-xl bg-emerald-50 border border-emerald-200">
+   756→              <p className="text-xs font-bold text-emerald-700 mb-1">تحلیل پیشرفت شما:</p>
+   757→              <p className="text-[11px] text-slate-700 leading-relaxed whitespace-pre-wrap">{analysisResult}</p>
+   758→            </div>
+   759→          )}
+   760→        </div>
+   761→      )}
+   762→
+   763→      <p className="text-[10px] text-slate-400 mt-3 text-center">
+   764→        تصاویر پیشرفت کاملاً خصوصی هستند و فقط برای شما نمایش داده می‌شوند.
+   765→      </p>
+   766→
+   767→      {/* تأیید حذف عکس — دیالوگ درون‌برنامه‌ای (جایگزین confirm) */}
+   768→      <AlertDialog open={!!deleteTargetId} onOpenChange={(o) => !o && setDeleteTargetId(null)}>
+   769→        <AlertDialogContent dir="rtl">
+   770→          <AlertDialogHeader>
+   771→            <AlertDialogTitle>حذف عکس پیشرفت</AlertDialogTitle>
+   772→            <AlertDialogDescription>
+   773→              این عکس برای همیشه حذف می‌شود. مطمئن هستید؟
+   774→            </AlertDialogDescription>
+   775→          </AlertDialogHeader>
+   776→          <AlertDialogFooter className="flex-row">
+   777→            <AlertDialogCancel>انصراف</AlertDialogCancel>
+   778→            <AlertDialogAction
+   779→              className="bg-red-500 text-white hover:bg-red-600"
+   780→              onClick={() => {
+   781→                if (deleteTargetId) handleDelete(deleteTargetId);
+   782→              }}
+   783→            >
+   784→              حذف
+   785→            </AlertDialogAction>
+   786→          </AlertDialogFooter>
+   787→        </AlertDialogContent>
+   788→      </AlertDialog>
+   789→    </Card>
+   790→  );
+   791→}
+   792→
+   793→// ─── کامپوننت‌های کمکی ───
+   794→
+   795→/**
+   796→ * C3: تولتیپ سفارشی RTL نمودار چکاپ‌ها — گرد، فارسی، با رنگ سری.
+   797→ * recharts خودش active/payload/label را پاس می‌دهد.
+   798→ */
+   799→function CheckupChartTooltip({ active, payload, label }: any) {
+   800→  if (!active || !payload?.length) return null;
+   801→  return (
+   802→    <div
+   803→      dir="rtl"
+   804→      className="rounded-xl border border-orange-200 bg-white/95 px-3 py-2 shadow-lg backdrop-blur-sm"
+   805→    >
+   806→      <p className="text-[10px] font-bold text-slate-500 mb-1 border-b border-orange-100 pb-1">{label}</p>
+   807→      {payload.map((p: any, i: number) => (
+   808→        <div key={i} className="flex items-center gap-2 text-[11px] leading-5">
+   809→          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: p.stroke || p.color }} />
+   810→          <span className="text-slate-600">{p.name}:</span>
+   811→          <span className="font-bold" style={{ color: p.stroke || p.color }}>
+   812→            {toPersianDigits(Math.round(Number(p.value) * 10) / 10)}
+   813→            {p.dataKey === "چربی" ? "٪" : ""}
+   814→          </span>
+   815→        </div>
+   816→      ))}
+   817→    </div>
+   818→  );
+   819→}
+   820→
+   821→function MetricCard({ icon: Icon, label, value, color, bg }: { icon: any; label: string; value: string; color: string; bg: string }) {
+   822→  return (
+   823→    <div className={`p-3 rounded-xl ${bg} text-center`}>
+   824→      <Icon className={`w-4 h-4 mx-auto mb-1 ${color}`} />
+   825→      <p className="text-lg font-black text-slate-900">{value}</p>
+   826→      <p className="text-[10px] text-slate-500">{label}</p>
+   827→    </div>
+   828→  );
+   829→}
+   830→
+   831→function MeasurementChip({ label, value, unit }: { label: string; value?: number; unit: string }) {
+   832→  return (
+   833→    <div className="p-2 rounded-xl bg-muted/40 text-center">
+   834→      <p className="text-[10px] text-muted-foreground mb-0.5">{label}</p>
+   835→      <p className="text-sm font-bold">
+   836→        {value ? `${toPersianDigits(value)}` : "—"}
+   837→        {value && <span className="text-[10px] text-muted-foreground mr-0.5">{unit}</span>}
+   838→      </p>
+   839→    </div>
+   840→  );
+   841→}
+   842→
+   843→function BodyMeasurementsForm({
+   844→  values,
+   845→  onSave,
+   846→}: {
+   847→  values: { waist?: number; arm?: number; chest?: number; hip?: number };
+   848→  onSave: (m: { waist?: number; arm?: number; chest?: number; hip?: number }) => void;
+   849→}) {
+   850→  const [waist, setWaist] = useState(values.waist?.toString() || "");
+   851→  const [arm, setArm] = useState(values.arm?.toString() || "");
+   852→  const [chest, setChest] = useState(values.chest?.toString() || "");
+   853→  const [hip, setHip] = useState(values.hip?.toString() || "");
+   854→
+   855→  return (
+   856→    <div className="space-y-3">
+   857→      <div className="grid grid-cols-2 gap-2">
+   858→        <div>
+   859→          <Label className="text-xs mb-1 block">دور کمر (cm)</Label>
+   860→          <Input type="number" value={waist} onChange={(e) => setWaist(e.target.value)} className="h-10 rounded-lg" inputMode="decimal" />
+   861→        </div>
+   862→        <div>
+   863→          <Label className="text-xs mb-1 block">دور بازو (cm)</Label>
+   864→          <Input type="number" value={arm} onChange={(e) => setArm(e.target.value)} className="h-10 rounded-lg" inputMode="decimal" />
+   865→        </div>
+   866→        <div>
+   867→          <Label className="text-xs mb-1 block">دور سینه (cm)</Label>
+   868→          <Input type="number" value={chest} onChange={(e) => setChest(e.target.value)} className="h-10 rounded-lg" inputMode="decimal" />
+   869→        </div>
+   870→        <div>
+   871→          <Label className="text-xs mb-1 block">دور باسن (cm)</Label>
+   872→          <Input type="number" value={hip} onChange={(e) => setHip(e.target.value)} className="h-10 rounded-lg" inputMode="decimal" />
+   873→        </div>
+   874→      </div>
+   875→      <Button
+   876→        className="w-full rounded-xl"
+   877→        onClick={() => onSave({
+   878→          waist: waist ? Number(waist) : undefined,
+   879→          arm: arm ? Number(arm) : undefined,
+   880→          chest: chest ? Number(chest) : undefined,
+   881→          hip: hip ? Number(hip) : undefined,
+   882→        })}
+   883→      >
+   884→        ذخیره اندازه‌ها
+   885→      </Button>
+   886→    </div>
+   887→  );
+   888→}
+   889→

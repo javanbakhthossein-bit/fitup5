@@ -1,0 +1,883 @@
+     1→// Prisma schema for Smart Coach Fitness App
+     2→// Persian RTL AI Fitness Coach
+     3→
+     4→generator client {
+     5→  provider = "prisma-client-js"
+     6→}
+     7→
+     8→datasource db {
+     9→  provider = "sqlite"
+    10→  url      = env("DATABASE_URL")
+    11→}
+    12→
+    13→// ===================== USER & AUTH =====================
+    14→model User {
+    15→  id              String       @id @default(cuid())
+    16→  mobile          String       @unique // شماره موبایل (11 رقمی)
+    17→  passwordHash    String       @default("") // برای کاربران OTP خالی است
+    18→  name            String?      // نام نمایشی
+    19→  role            String       @default("USER") // USER | ADMIN
+    20→  isBlocked       Boolean      @default(false)
+    21→  onboardingDone  Boolean      @default(false)
+    22→
+    23→  // --- Plan & Wallet (4-tier subscription system) ---
+    24→  planName        String?      // basic | standard | advanced | ultimate (null = بدون پلن فعال)
+    25→  planExpiresAt   DateTime?    // تاریخ انقضای پلن فعلی
+    26→  planStartedAt   DateTime?    // تاریخ شروع پلن فعلی
+    27→  walletBalance   Int          @default(0) // موجودی کیف پول به تومان
+    28→
+    29→  // --- AI usage counters (reset on new plan / tracked cumulatively) ---
+    30→  videoAnalysisUsed  Int       @default(0) // دفعات استفاده آنالیز ویدیویی (Ultimate)
+    31→  bloodTestUsed      Int       @default(0) // دفعات استفاده تحلیل آزمایش خون (Ultimate)
+    32→  bloodTestStatus    String?   // null = حالت اولیه | "waiting" = منتظر نتایج | "declined" = رد شده
+    33→  // وضعیت تعیین‌تکلیف ویدیو (Ultimate): null = هنوز تصمیم نگرفته | "uploaded" = آپلود شده | "skipped" = رد شده
+    34→  // این فیلد برای جلوگیری از ساخت زودهنگام برنامه استفاده می‌شود — تا کاربر تصمیم نگیرد، برنامه ساخته نمی‌شود.
+    35→  videoStatus        String?   // null | "uploaded" | "skipped"
+    36→
+    37→  // --- Activity tracking (رفع ریشه‌ای نوتیف «چند روزی نیستی») ---
+    38→  // آخرین بار که کاربر واقعاً اپ/سایت را باز کرده (auth/me در هر بازدید
+    39→  // لمس می‌کند؛ verify-otp در هر لاگین). سناریو re_engagement از این فیلد
+    40→  // به‌عنوان سیگنال اصلی «استفاده از اپ» استفاده می‌کند — قبلاً فقط ثبت
+    41→  // وزن/چکاپ/چت سنجیده می‌شد و کاربری که مدام اپ را باز می‌کرد ولی چیزی
+    42→  // ثبت نمی‌کرد، اشتباهی «غایب» تلقی می‌شد.
+    43→  lastActiveAt       DateTime? // null = هرگز (کاربر قدیمی قبل از این فیلد)
+    44→
+    45→  // --- PWA Install Tracking ---
+    46→  // تاریخ نصب برنامه روی دستگاه کاربر (اگر نصب کرده باشد)
+    47→  // برای جلوگیری از ارسال نوتیف نصب اپ به کاربرانی که قبلاً نصب کرده‌اند
+    48→  pwaInstalledAt     DateTime? // null = نصب نشده
+    49→
+    50→  // --- Terms & Conditions ---
+    51→  acceptedTermsVersion Int?     // شماره نسخه قوانینی که کاربر پذیرفته است
+    52→
+    53→  // --- Referral System (معرفی به دوست‌دار) ---
+    54→  referralCode       String?  @unique // کد معرفی منحصربه‌فرد (مثلاً FIT-A7X3K9)
+    55→  referredById       String?  // شناسه کاربری معرف (در صورت ورود با لینک معرفی)
+    56→  referralRewardPaid Boolean  @default(false) // آیا پاداش معرفی پرداخت شده است
+    57→
+    58→  createdAt       DateTime     @default(now())
+    59→  updatedAt       DateTime     @updatedAt
+    60→
+    61→  profile         OnboardingProfile?
+    62→  workoutPlans    WorkoutPlan[]
+    63→  mealPlans       MealPlan[]
+    64→  programRequests ProgramRequest[]
+    65→  weightLogs      WeightLog[]
+    66→  workoutDayStatuses WorkoutDayStatus[]
+    67→  progressPhotos  ProgressPhoto[]
+    68→  chatMessages    ChatMessage[]
+    69→  nikaMessages    NikaMessage[]
+    70→  notifications   Notification[]
+    71→  subscriptions   Subscription[]
+    72→  payments        Payment[]
+    73→  walletTxns      WalletTransaction[]
+    74→  articles        Article[]
+    75→  checkups        Checkup[]
+    76→  userDiscountCodes UserDiscountCode[]
+    77→  supportTickets  SupportTicket[]
+    78→  ticketReplies   TicketReply[]
+    79→  adminPermissions AdminPermission?
+    80→  analysisResults AnalysisResult[]
+    81→  errorLogs        ErrorLog[]
+    82→  foodLogs        FoodLog[]
+    83→  surveys         Survey[]
+    84→  adminNotes      UserAdminNote[]
+    85→}
+    86→
+    87→// ===================== ERROR LOGS (مدیریت خطاها) =====================
+    88→// ذخیره خطاهای client-side (window.onerror)، API route‌ها و server components
+    89→// برای بررسی ادمین و رفع باگ‌ها
+    90→model ErrorLog {
+    91→  id          String   @id @default(cuid())
+    92→  // نوع منبع خطا: "client" (window.onerror) | "api" (API routes) | "server" (server components)
+    93→  source      String   // "client" | "api" | "server"
+    94→  // کد وضعیت HTTP (برای خطاهای API) یا 0 برای خطاهای client
+    95→  statusCode  Int      @default(0)
+    96→  // پیام خطا (رشته واقعی خطا)
+    97→  message     String
+    98→  // Stack trace (در صورت موجود بودن)
+    99→  stack       String?
+   100→  // URL محل وقوع خطا (page URL یا API path)
+   101→  url         String   @default("")
+   102→  // HTTP method (برای خطاهای API)
+   103→  method      String?  // "GET" | "POST" | ...
+   104→  // شناسه کاربر در صورت لاگین بودن (nullable برای خطاهای ناشناس)
+   105→  userId      String?
+   106→  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+   107→  // اطلاعات مرورگر / User Agent
+   108→  userAgent   String?  @default("")
+   109→  // زمینه اضافی (JSON string — request body، query params و غیره)
+   110→  context     String?  @default("{}")
+   111→  // آیا این خطا توسط ادمین بررسی شده است
+   112→  reviewed    Boolean  @default(false)
+   113→  createdAt   DateTime @default(now())
+   114→
+   115→  @@index([source])
+   116→  @@index([createdAt])
+   117→  @@index([userId])
+   118→  @@index([reviewed])
+   119→}
+   120→
+   121→// ===================== ANALYSIS RESULTS (آزمایش خون / ویدیو / عکس بدن) =====================
+   122→// نتایج تحلیل آزمایش خون، ویدیو و عکس بدن برای نمایش در UI (رفرش صفحه اطلاعات را از بین نمی‌برد)
+   123→model AnalysisResult {
+   124→  id        String   @id @default(cuid())
+   125→  userId    String
+   126→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   127→  type      String   // "blood_test" | "video_analysis" | "body_photo"
+   128→  result    String   // JSON string with full analysis
+   129→  mediaUrl  String?  // URL of the analyzed media (if any)
+   130→  createdAt DateTime @default(now())
+   131→
+   132→  @@index([userId])
+   133→  @@index([type])
+   134→}
+   135→
+   136→// ===================== ADMIN PERMISSIONS (دسترسی مجزا ادمین) =====================
+   137→model AdminPermission {
+   138→  id          String   @id @default(cuid())
+   139→  userId      String   @unique
+   140→  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   141→  // دسترسی‌های مجزا — هر کدام true/false
+   142→  canViewDashboard   Boolean @default(true)
+   143→  canManageUsers     Boolean @default(true)
+   144→  canViewFinance     Boolean @default(true)
+   145→  canManagePrograms  Boolean @default(true)
+   146→  canManageCheckups  Boolean @default(true)
+   147→  canManageArticles  Boolean @default(true)
+   148→  canManageHeadCodes Boolean @default(true)
+   149→  canManageTerms     Boolean @default(true)
+   150→  canUseCopilot      Boolean @default(true)
+   151→  canManageAdmins    Boolean @default(false) // فقط سوپرادمین
+   152→  canManageTickets   Boolean @default(true)
+   153→  createdAt  DateTime @default(now())
+   154→  updatedAt  DateTime @updatedAt
+   155→}
+   156→
+   157→// ===================== SUPPORT TICKETS (تیکت پشتیبانی) =====================
+   158→model SupportTicket {
+   159→  id          String   @id @default(cuid())
+   160→  userId      String   // شناسه کاربر (ورزشکار) که تیکت را زده
+   161→  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   162→  subject     String   // موضوع تیکت
+   163→  category    String   @default("general") // general | technical | payment | program | bug
+   164→  priority    String   @default("normal") // low | normal | high | urgent
+   165→  status      String   @default("open") // open | answered | closed
+   166→  message     String   // متن تیکت
+   167→  adminReply  String?  // پاسخ مدیر (متن)
+   168→  repliedById String?  // شناسه ادمینی که پاسخ داده
+   169→  repliedAt   DateTime?
+   170→  createdAt   DateTime @default(now())
+   171→  updatedAt   DateTime @updatedAt
+   172→  replies     TicketReply[]
+   173→
+   174→  @@index([userId])
+   175→  @@index([status])
+   176→}
+   177→
+   178→model TicketReply {
+   179→  id          String   @id @default(cuid())
+   180→  ticketId    String
+   181→  ticket      SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+   182→  userId      String   // شناسه فرستنده (کاربر یا ادمین)
+   183→  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   184→  role        String   // user | admin
+   185→  message     String   // متن پاسخ
+   186→  createdAt   DateTime @default(now())
+   187→
+   188→  @@index([ticketId])
+   189→  @@index([userId])
+   190→}
+   191→
+   192→// ===================== ONBOARDING =====================
+   193→model OnboardingProfile {
+   194→  id              String   @id @default(cuid())
+   195→  userId          String   @unique
+   196→  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   197→
+   198→  gender          String   // male | female
+   199→  age             Int
+   200→  height          Int      // cm
+   201→  weight          Float    // kg
+   202→  targetWeight    Float?   // kg
+   203→  goal            String   // fat_loss | muscle_gain | endurance | fitness | strength
+   204→  activityLevel   String   // sedentary | light | moderate | active | very_active
+   205→  workoutDays     Int      // تعداد روزهای تمرین در هفته
+   206→  workoutDaysList String   @default("[]") // JSON array of specific weekday names (شنبه، یکشنبه، ...)
+   207→  workoutPlace    String   // gym | home | both
+   208→  equipment       String   // JSON array of available equipment
+   209→  diseases        String   @default("") // سوابق بیماری
+   210→  injuries        String   @default("") // آسیب‌دیدگی‌های مفصلی/عضلانی
+   211→  allergies       String   @default("") // حساسیت‌های غذایی
+   212→  dietType        String   @default("standard") // standard | vegetarian | vegan | keto
+   213→
+   214→  // --- Professional advanced fields (for pro athletes) ---
+   215→  trainingExperience   String?  // سابقه ورزشی: beginner | intermediate | advanced | pro
+   216→  previousTrainingType String?  // نوع تمرین قبلی (متن آزاد)
+   217→  drugAllergies        String?  // آلرژی‌های دارویی
+   218→  currentMedications   String?  // داروهای مصرفی فعلی
+   219→  maxLifts             String?  // حداکثر وزنه‌ها (اسکوات/پرس سینه/ددلیفت)
+   220→
+   221→  // --- NEW: Comprehensive professional onboarding fields (ONBOARDING-PLAN-UPGRADE) ---
+   222→  bodyFrame            String?  // small | medium | large — اندازه استخوان بدن (افکت روی وزن ایده‌آل)
+   223→  sleepHours           Int?     // 4-12 — میانگین ساعت خواب شبانه
+   224→  stressLevel          Int?     // 1-5 — سطح استرس روزانه
+   225→  waterHabit           Int?     // لیوان در روز — عادت فعلی نوشیدن آب
+   226→  targetDate           String?  // ISO date string — تاریخ هدف رسیدن به وزن هدف
+   227→  workoutTime          String?  // morning | afternoon | evening | night — ساعت ترجیحی تمرین
+   228→  medicalConditions    String?  // JSON array — شرایط پزشکی خاص (دیابت، فشار خون، تیروئید، قلب، ...)
+   229→  currentSupplements   String?  // مکمل‌های فعلی مصرفی (متن آزاد)
+   230→  dislikedFoods        String?  // غذاهای دوست‌نداشته/حذفی (متن آزاد، با کاما)
+   231→  preferredCuisine     String?  // persian | mediterranean | asian | mixed — سبک آشپزی ترجیحی
+   232→
+   233→  // Cached AI analysis text from /api/onboarding/analysis (skips regeneration on repeat visits).
+   234→  // Pass ?force=1 on the analysis endpoint to bypass the cache and regenerate.
+   235→  aiAnalysis           String?
+   236→
+   237→  // --- NEW: Body composition measurements (BODY-COMPOSITION-PRO) ---
+   238→  neckMeasurement      Float?  // cm — for US Navy body fat formula
+   239→  shoulderMeasurement  Float?  // cm
+   240→  calfMeasurement      Float?  // cm
+   241→  // اندازه‌های پایه آنبوردینگ (cm) — onboarding route و checkup fallback این
+   242→  // فیلدها را می‌نویسند/می‌خوانند؛ قبل از این مهاجرت در اسکیما غایب بودند و
+   243→  // ثبت اندازه‌ها (دور کمر الزایی!) با PrismaClientValidationError شکست می‌خورد.
+   244→  chestMeasurement     Float?  // cm
+   245→  armMeasurement       Float?  // cm
+   246→  waistMeasurement     Float?  // cm — for US Navy body fat formula
+   247→  hipMeasurement       Float?  // cm — for US Navy body fat formula (زنان)
+   248→  thighMeasurement     Float?  // cm
+   249→
+   250→  createdAt       DateTime @default(now())
+   251→  updatedAt       DateTime @updatedAt
+   252→}
+   253→
+   254→// ===================== SUBSCRIPTION & PAYMENT =====================
+   255→model Subscription {
+   256→  id            String   @id @default(cuid())
+   257→  userId        String
+   258→  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   259→  plan          String   // basic | standard | advanced | ultimate
+   260→  // status: active (در حال استفاده) | pending (خرید شده ولی پیش‌نیازها تکمیل نشده) | expired | cancelled
+   261→  // برای پلن‌های advanced/ultimate، وقتی کاربر خرید می‌کند اما هنوز عکس بدن/ویدیو/آزمایش خون را
+   262→  // آپلود نکرده، اشتراک با status="pending" و startDate/endDate=null ساخته می‌شود.
+   263→  // وقتی پیش‌نیازها تکمیل شد (ساخت برنامه در submit-body-analysis)، status به "active" تغییر
+   264→  // می‌کند و startDate=now، endDate=now+45day تنظیم می‌شود.
+   265→  // ۴۵ روز از زمان تکمیل پیش‌نیازها شروع می‌شود، نه از زمان خرید.
+   266→  status        String   @default("active") // active | pending | expired | cancelled
+   267→  startDate     DateTime? // null وقتی status=pending
+   268→  endDate       DateTime? // null وقتی status=pending
+   269→  // تاریخ لغو توسط ادمین — وقتی ادمین اشتراک را لغو می‌کند، این فیلد set می‌شود
+   270→  // و endDate اصلی حفظ می‌شود (دیگر overwrite نمی‌شود). برای نمایش بازه واقعی
+   271→  // برنامه به کاربر: از startDate تا cancelledAt (اگر لغو شده) یا endDate (اگر منقضی شده).
+   272→  cancelledAt   DateTime?
+   273→  durationDays  Int      @default(45) // طول دوره
+   274→  pricePaid     Int      // مبلغ پرداخت‌شده واقعی (با تخفیف)
+   275→  discountCode  String?  // کد تخفیف استفاده‌شده
+   276→  paymentId     String?  // شناسه Payment ایجادکننده این اشتراک (برای استرداد دقیق ادمین)
+   277→  createdAt     DateTime @default(now())
+   278→
+   279→  @@index([userId])
+   280→  @@index([status])
+   281→  @@index([cancelledAt])
+   282→}
+   283→
+   284→model Payment {
+   285→  id            String   @id @default(cuid())
+   286→  userId        String
+   287→  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   288→  amount        Int      // مبلغ نهایی به تومان (با تخفیف)
+   289→  originalAmount Int     @default(0) // مبلغ اصلی قبل از تخفیف
+   290→  plan          String   // basic | standard | advanced | ultimate
+   291→  paymentMethod String   @default("gateway") // gateway | wallet | mixed
+   292→  authority     String?  // کد مرجع درگاه/زرین‌پال
+   293→  refId         String?  // کد پیگیری
+   294→  status        String   @default("pending") // pending | success | failed | cancelled | refunded
+   295→  discountCode  String?  // کد تخفیف اعمال‌شده
+   296→  description   String   @default("")
+   297→  cardPan       String?  // شماره کارت ماسک‌شده (از زرین‌پال)
+   298→  cardHash      String?  // هش کارت SHA256 (از زرین‌پال)
+   299→  fee           Int?     // کارمزد تراکنش (از زرین‌پال)
+   300→  createdAt     DateTime @default(now())
+   301→  verifiedAt    DateTime?
+   302→
+   303→  @@index([userId])
+   304→  @@index([status])
+   305→}
+   306→
+   307→// ===================== WALLET (کیف پول) =====================
+   308→model WalletTransaction {
+   309→  id          String   @id @default(cuid())
+   310→  userId      String
+   311→  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   312→  type        String   // deposit | purchase | refund | bonus
+   313→  amount      Int      // مثبت برای افزایش، منفی برای کاهش
+   314→  balance     Int      // موجودی پس از تراکنش
+   315→  description String   @default("")
+   316→  refId       String?  // مرجع (paymentId و ...)
+   317→  createdAt   DateTime @default(now())
+   318→
+   319→  @@index([userId])
+   320→}
+   321→
+   322→// ===================== DISCOUNT CODES (کد تخفیف) =====================
+   323→model DiscountCode {
+   324→  id          String   @id @default(cuid())
+   325→  code        String   @unique
+   326→  type        String   // percent | fixed
+   327→  value       Int      // درصد یا مبلغ ثابت (تومان)
+   328→  maxUses     Int      @default(-1) // -1 = نامحدود
+   329→  usedCount   Int      @default(0)
+   330→  validFrom   DateTime @default(now())
+   331→  validUntil  DateTime?
+   332→  active      Boolean  @default(true)
+   333→  applicablePlans String @default("all") // all | comma-separated plan ids
+   334→  createdAt   DateTime @default(now())
+   335→}
+   336→
+   337→// ===================== PROGRAM REQUEST (پس از خرید) =====================
+   338→model ProgramRequest {
+   339→  id            String   @id @default(cuid())
+   340→  userId        String
+   341→  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   342→  plan          String   // standard | smart | vip
+   343→  billingPeriod String   // monthly | yearly
+   344→  status        String   @default("pending") // pending (در انتظار تولید) | generating | ready | failed
+   345→  paymentId     String?
+   346→  // شمارش تلاش‌های خودترمیم (watchdog) — اگر سرور وسط تولید ری‌استارت شود و
+   347→  // تولید یتیم شود، recovery حداکثر یک‌بار خودش تولید را دوباره شروع می‌کند.
+   348→  autoRetryCount Int     @default(0)
+   349→  createdAt     DateTime @default(now())
+   350→  updatedAt     DateTime @updatedAt
+   351→
+   352→  @@index([userId])
+   353→  @@index([status])
+   354→}
+   355→
+   356→// ===================== WORKOUT PLAN =====================
+   357→model WorkoutPlan {
+   358→  id        String   @id @default(cuid())
+   359→  userId    String
+   360→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   361→  weekIndex Int      @default(1) // هفته چندم برنامه
+   362→  content   String   // JSON: full weekly workout plan
+   363→  active    Boolean  @default(true)
+   364→  createdAt DateTime @default(now())
+   365→  updatedAt DateTime @updatedAt
+   366→
+   367→  @@index([userId])
+   368→}
+   369→
+   370→// ===================== MEAL PLAN =====================
+   371→model MealPlan {
+   372→  id        String   @id @default(cuid())
+   373→  userId    String
+   374→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   375→  dayLabel  String   @default("today") // which day
+   376→  content   String   // JSON: meals with calories & macros
+   377→  totalCal  Int      @default(0)
+   378→  active    Boolean  @default(true)
+   379→  createdAt DateTime @default(now())
+   380→  updatedAt DateTime @updatedAt
+   381→
+   382→  @@index([userId])
+   383→}
+   384→
+   385→// ===================== EXERCISE LIBRARY (Admin) =====================
+   386→model ExerciseLibrary {
+   387→  id          String   @id @default(cuid())
+   388→  name        String   // نام حرکت
+   389→  muscle      String   // عضله هدف
+   390→  category    String   // push | pull | legs | core | cardio | fullbody
+   391→  equipment   String   @default("") // تجهیزات لازم
+   392→  description String   @default("") // توضیحات نحوه انجام
+   393→  tips        String   @default("") // نکات ایمنی
+   394→  mediaUrl    String   @default("") // URL انیمیشن/ویدیو
+   395→  youtubeUrl  String   @default("") // URL امبد یوتیوب (https://www.youtube.com/embed/VIDEO_ID)
+   396→  difficulty  String   @default("intermediate") // beginner | intermediate | advanced
+   397→  createdAt   DateTime @default(now())
+   398→  updatedAt   DateTime @updatedAt
+   399→}
+   400→
+   401→// ===================== FOOD LIBRARY (Admin) =====================
+   402→model FoodLibrary {
+   403→  id          String   @id @default(cuid())
+   404→  name        String   // نام غذا
+   405→  category    String   // breakfast | lunch | dinner | snack
+   406→  calories    Int      // کالری در هر وعده
+   407→  protein     Float    @default(0) // گرم پروتئین
+   408→  carbs       Float    @default(0) // گرم کربوهیدرات
+   409→  fat         Float    @default(0) // گرم چربی
+   410→  servingSize String   @default("۱ وعده") // اندازه وعده
+   411→  imageUrl    String   @default("")
+   412→  isVegan     Boolean  @default(false)
+   413→  createdAt   DateTime @default(now())
+   414→  updatedAt   DateTime @updatedAt
+   415→}
+   416→
+   417→// ===================== FOOD LOG (غذاهای ثبت‌شده روزانه کاربر) =====================
+   418→// هر رکورد = یک غذای ثبت‌شده در یک وعده از یک روز مشخص برای کاربر.
+   419→// منبع ممکن است: انتخاب از FoodLibrary، ورود دستی، یا تحلیل عکس غذا (AI) باشد.
+   420→model FoodLog {
+   421→  id          String   @id @default(cuid())
+   422→  userId      String
+   423→  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   424→
+   425→  // اطلاعات غذا (denormalized — حتی اگر FoodLibrary تغییر کرد، ثبت تاریخی دست‌نخورده می‌ماند)
+   426→  name        String                       // نام غذا
+   427→  meal        String   @default("snack")   // breakfast | lunch | dinner | snack
+   428→  calories    Int      @default(0)         // کالری این وعده
+   429→  protein     Float    @default(0)         // گرم پروتئین
+   430→  carbs       Float    @default(0)         // گرم کربوهیدرات
+   431→  fat         Float    @default(0)         // گرم چربی
+   432→  servingSize String   @default("۱ وعده")  // اندازه/تعداد وعده (مثلاً "۱.۵ وعده" یا "۲۰۰ گرم")
+   433→
+   434→  // منبع غذا — برای تفکیک گزارش‌ها
+   435→  source      String   @default("manual")  // manual | library | ai_photo
+   436→  foodLibraryId String?                     // اگر از بانک غذاها انتخاب شده، شناسه آن
+   437→  imageUrl    String?                       // اگر از تحلیل عکس غذا آمده، URL عکس آپلودشده
+   438→
+   439→  // تاریخ ثبت — تاریخ «روز» جداگانه نگه داشته می‌شود تا فیلتر کردن روزانه سریع باشد
+   440→  logDate     DateTime @default(now())     // تاریخ دقیق ثبت
+   441→  day         DateTime @default(now())     // شروع روز میلادی (برای group-by روزانه)
+   442→
+   443→  createdAt   DateTime @default(now())
+   444→
+   445→  @@index([userId])
+   446→  @@index([userId, day])
+   447→}
+   448→
+   449→// ===================== PROGRESS TRACKING =====================
+   450→model WeightLog {
+   451→  id        String   @id @default(cuid())
+   452→  userId    String
+   453→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   454→  weight    Float    // kg
+   455→  note      String   @default("")
+   456→  loggedAt  DateTime @default(now())
+   457→
+   458→  @@index([userId])
+   459→}
+   460→
+   461→// وضعیت روزانه تمرین — برای مدیریت انعطاف‌پذیر روزهای تمرین/استراحت
+   462→// اگر کاربر روزی را تمرین کرد یا جابجا کرد، یک رکورد در این جدول ذخیره می‌شود
+   463→model WorkoutDayStatus {
+   464→  id          String   @id @default(cuid())
+   465→  userId      String
+   466→  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   467→  // روز هفته (شنبه، یکشنبه، ...)
+   468→  dayName     String
+   469→  // تاریخ دقیق آن روز (برای جلوگیری از تکرار در هفته‌های مختلف)
+   470→  weekStart   DateTime // تاریخ شروع هفته (شنبه آن هفته)
+   471→  // وضعیت: completed (تمرین انجام شد) | skipped (جابجا شد) | rest_as_planned (استراحت طبق برنامه)
+   472→  status      String   @default("completed")
+   473→  // اگر جابجا شد، به کدام روز منتقل شد
+   474→  movedTo     String?
+   475→  // چه روزی به‌جای آن تمرین شد (اگر روز استراحت را با تمرین جایگزین کرد)
+   476→  swappedFrom String?
+   477→  createdAt   DateTime @default(now())
+   478→
+   479→  @@unique([userId, dayName, weekStart])
+   480→  @@index([userId])
+   481→}
+   482→
+   483→model ProgressPhoto {
+   484→  id        String   @id @default(cuid())
+   485→  userId    String
+   486→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   487→  imageUrl  String
+   488→  type      String   // front | side | back
+   489→  note      String   @default("")
+   490→  takenAt   DateTime @default(now())
+   491→
+   492→  @@index([userId])
+   493→}
+   494→
+   495→// ===================== AI CHAT (مربی هوشمند) =====================
+   496→model ChatMessage {
+   497→  id            String   @id @default(cuid())
+   498→  userId        String
+   499→  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   500→  role          String   // user | assistant
+   501→  content       String
+   502→  mediaUrl      String?  // URL فایل مدیا (عکس/ویدیو) ارسال‌شده توسط کاربر
+   503→  mediaType     String?  // image | video — نوع مدیا
+   504→  programCycle  String?  // شناسه دوره برنامه (برای تفکیک تاریخچه بر اساس هر دوره)
+   505→  createdAt     DateTime @default(now())
+   506→
+   507→  @@index([userId])
+   508→  @@index([programCycle])
+   509→}
+   510→
+   511→// ===================== NIKA CHAT (دستیار فروش) =====================
+   512→model NikaMessage {
+   513→  id        String   @id @default(cuid())
+   514→  userId    String
+   515→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   516→  role      String   // user | assistant
+   517→  content   String
+   518→  createdAt DateTime @default(now())
+   519→
+   520→  @@index([userId])
+   521→}
+   522→
+   523→// ===================== NOTIFICATIONS =====================
+   524→model Notification {
+   525→  id        String   @id @default(cuid())
+   526→  userId    String
+   527→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   528→  type      String   // welcome | workout_reminder | water_reminder | subscription | achievement | system | upgrade | renewal | re_engagement | checkup | coach
+   529→  title     String
+   530→  body      String
+   531→  link      String?  // internal app path for clickable notifications (e.g. "?tab=plans")
+   532→  meta      String?  // JSON string for extra data
+   533→  read      Boolean  @default(false)
+   534→  createdAt DateTime @default(now())
+   535→
+   536→  @@index([userId])
+   537→  @@index([read])
+   538→}
+   539→
+   540→// ===================== AI CONFIG (Admin) =====================
+   541→model AiConfig {
+   542→  id            String   @id @default(cuid())
+   543→  key           String   @unique // coach_system_prompt | chat_system_prompt | nutrition_system_prompt
+   544→  value         String   // long text
+   545→  label         String   @default("")
+   546→  updatedAt     DateTime @updatedAt
+   547→}
+   548→
+   549→// ===================== ARTICLES (CMS) =====================
+   550→model Article {
+   551→  id          String   @id @default(cuid())
+   552→  title       String
+   553→  slug        String   @unique
+   554→  excerpt     String   @default("")
+   555→  content     String   // Markdown/HTML content with code blocks
+   556→  category    String   @default("general") // general | nutrition | training | motivation | news
+   557→  tags        String   @default("")
+   558→  status      String   @default("draft") // draft | published
+   559→  authorId    String?
+   560→  author      User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+   561→  revisions   ArticleRevision[]
+   562→  coverImage  String   @default("")
+   563→  // SEO fields (برای سئوی حرفه‌ای)
+   564→  seoTitle        String   @default("")
+   565→  seoDescription  String   @default("")
+   566→  metaKeywords    String   @default("")
+   567→  canonicalUrl    String   @default("")
+   568→  ogImage         String   @default("")
+   569→  robots          String   @default("index,follow") // index,follow | noindex,nofollow
+   570→  readingMinutes  Int      @default(3)
+   571→  // Scheduled publishing: اگر تنظیم شود، مقاله در زمان مشخص‌شده توسط cron انتشار، منتشر می‌شود.
+   572→  // فقط برای مقالاتی که status="draft" است معتبر است.
+   573→  scheduledAt     DateTime?
+   574→  // تاریخ انتشار واقعی مقاله — زمانی که مقاله از draft به published تبدیل می‌شود.
+   575→  // این تاریخ برای نمایش به کاربر و JSON-LD datePublished استفاده می‌شود (نه createdAt).
+   576→  // برای مقالات قدیمی که قبلاً منتشر شده‌اند، با createdAt backfill می‌شود.
+   577→  publishedAt     DateTime?
+   578→  views       Int      @default(0)
+   579→  createdAt   DateTime @default(now())
+   580→  updatedAt   DateTime @updatedAt
+   581→
+   582→  @@index([status])
+   583→  @@index([category])
+   584→  @@index([scheduledAt])
+   585→  @@index([publishedAt])
+   586→}
+   587→
+   588→// نسخه پشتیبان محتوای مقاله قبل از بازنویسی هوشمند (قابل بازیابی توسط ادمین)
+   589→model ArticleRevision {
+   590→  id          String   @id @default(cuid())
+   591→  articleId   String
+   592→  article     Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+   593→  title       String?
+   594→  excerpt     String?
+   595→  content     String
+   596→  seoTitle    String?
+   597→  seoDescription String?
+   598→  metaKeywords String?
+   599→  createdAt   DateTime @default(now())
+   600→
+   601→  @@index([articleId])
+   602→}
+   603→
+   604→// ===================== SITE SETTINGS (CMS) =====================
+   605→model SiteSetting {
+   606→  id        String   @id @default(cuid())
+   607→  key       String   @unique
+   608→  value     String
+   609→  label     String   @default("")
+   610→  updatedAt DateTime @updatedAt
+   611→}
+   612→
+   613→// ===================== TERMS & CONDITIONS =====================
+   614→model TermsVersion {
+   615→  id        String   @id @default(cuid())
+   616→  version   Int      @default(1)
+   617→  title     String   @default("شرایط و قوانین فیت‌آپ")
+   618→  content   String   // Full markdown/HTML content
+   619→  isActive  Boolean  @default(true)
+   620→  createdAt DateTime @default(now())
+   621→  updatedAt DateTime @updatedAt
+   622→}
+   623→
+   624→// ===================== HEAD CODE INJECTION (Analytics / Search Console / Pixels) =====================
+   625→model HeadCode {
+   626→  id        String   @id @default(cuid())
+   627→  name      String   // e.g. "Google Analytics", "Search Console", "Meta Pixel"
+   628→  type      String   // "analytics" | "search_console" | "pixel" | "custom"
+   629→  code      String   // The raw HTML/script tag to inject
+   630→  placement String   @default("head") // "head" | "body_start" | "body_end"
+   631→  isActive  Boolean  @default(true)
+   632→  createdAt DateTime @default(now())
+   633→  updatedAt DateTime @updatedAt
+   634→}
+   635→
+   636→// ===================== CHECKUP (چکاپ دوره‌ای) =====================
+   637→model Checkup {
+   638→  id              String   @id @default(cuid())
+   639→  userId          String
+   640→  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   641→  phaseNumber     Int      // which phase (1, 2, 3)
+   642→  isFinalCheckup  Boolean  @default(false)
+   643→  status          String   @default("pending_coach") // pending_coach | completed
+   644→
+   645→  // Athlete submission
+   646→  weight          Float
+   647→  chestMeasurement Float?  // cm
+   648→  armMeasurement  Float?   // cm
+   649→  waistMeasurement Float?  // cm
+   650→  hipMeasurement   Float?  // cm
+   651→  thighMeasurement Float?  // cm
+   652→  neckMeasurement  Float?  // cm — for US Navy body fat formula
+   653→
+   654→  // Calculated biometrics (computed locally)
+   655→  bodyFatPercent  Float?
+   656→  leanBodyMass    Float?
+   657→
+   658→  // Feedback
+   659→  fatigueLevel    Int      @default(3) // 1-5
+   660→  sleepQuality    Int      @default(3) // 1-5
+   661→  dietAdherence   Int      @default(3) // 1-5
+   662→  workoutAdherence Int     @default(3) // 1-5
+   663→  phaseCompleted  Boolean  @default(false)
+   664→  notes           String   @default("")
+   665→
+   666→  // AI Analysis (stored after AI processes)
+   667→  aiAnalysis      String?  // JSON string with bodyScore, analysis, recommendations
+   668→
+   669→  // Coach notes (for plans with human oversight)
+   670→  coachNotes      String?
+   671→
+   672→  createdAt       DateTime @default(now())
+   673→  updatedAt       DateTime @updatedAt
+   674→
+   675→  @@index([userId])
+   676→  @@index([status])
+   677→}
+   678→
+   679→// ===================== PER-USER DISCOUNT CODES (تخفیف اختصاصی تمدید) =====================
+   680→model UserDiscountCode {
+   681→  id          String   @id @default(cuid())
+   682→  userId      String
+   683→  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   684→  code        String   @unique
+   685→  type        String   // "percent" | "fixed"
+   686→  value       Int
+   687→  reason      String   @default("renewal_loyalty")
+   688→  isUsed      Boolean  @default(false)
+   689→  validUntil  DateTime?
+   690→  createdAt   DateTime @default(now())
+   691→
+   692→  @@index([userId])
+   693→}
+   694→
+   695→// ===================== OTP CODES (SMS OTP Login) =====================
+   696→model OtpCode {
+   697→  id        String   @id @default(cuid())
+   698→  mobile    String   // شماره موبایل (11 رقمی)
+   699→  code      String   // کد ۴ رقمی
+   700→  expiresAt DateTime // زمان انقضا (۱۰ دقیقه — پیامک‌رسان‌ها گاهی دیر می‌رسند)
+   701→  used      Boolean  @default(false) // آیا استفاده شده؟
+   702→  attempts Int      @default(0) // تعداد تلاش‌های ناموفق verify (ضد brute-force)
+   703→  createdAt DateTime @default(now())
+   704→
+   705→  @@index([mobile])
+   706→}
+   707→
+   708→// ===================== SEO AGENT (ایجنت سئو خودکار) =====================
+   709→// استراتژی سئوی ذخیره‌شده — بعد از هر اجرای موفق آپدیت می‌شود
+   710→model SeoStrategy {
+   711→  id              String   @id @default(cuid())
+   712→  version         Int      @default(1) // نسخه استراتژی
+   713→  isActive        Boolean  @default(true)
+   714→  // JSON کامل شامل: contentPillars, targetKeywords, clusters, contentCalendar, internalLinkMap
+   715→  content         String
+   716→  // خلاصه قابل نمایش در UI
+   717→  summary         String   @default("")
+   718→  // کلمات کلیدی هدف (comma-separated)
+   719→  targetKeywords  String   @default("")
+   720→  // صفحات و مقالات موجود در سایت (JSON) — برای لینک‌سازی دقیق
+   721→  siteMap         String   @default("[]")
+   722→  // تعداد مقالات برنامه‌ریزی‌شده
+   723→  plannedCount    Int      @default(0)
+   724→  // تنظیمات خودکارسازی
+   725→  autoMode        Boolean  @default(true)
+   726→  lastRunAt       DateTime?
+   727→  nextRunAt       DateTime?
+   728→  createdAt       DateTime @default(now())
+   729→  updatedAt       DateTime @updatedAt
+   730→}
+   731→
+   732→// صف مقالات برنامه‌ریزی‌شده توسط ایجنت سئو
+   733→model SeoArticlePlan {
+   734→  id              String   @id @default(cuid())
+   735→  // کلمه کلیدی هدف
+   736→  keyword         String
+   737→  // عنوان پیشنهادی مقاله
+   738→  title           String
+   739→  // slug پیشنهادی (انگلیسی)
+   740→  slug            String   @default("")
+   741→  // دسته‌بندی: training | nutrition | motivation | general | supplement | recovery
+   742→  category        String   @default("general")
+   743→  // خلاصه کوتاه
+   744→  excerpt         String   @default("")
+   745→  // pillar — کلاستر محتوایی که این مقاله به آن تعلق دارد
+   746→  pillar          String   @default("")
+   747→  // کلمات کلیدی ثانویه (comma-separated)
+   748→  secondaryKeywords String @default("")
+   749→  // لینک‌های داخلی پیشنهادی (JSON: [{slug, title, anchor}])
+   750→  internalLinks   String   @default("[]")
+   751→  // prompt پیشنهادی برای تصویر کاور
+   752→  coverImagePrompt String  @default("")
+   753→  // پرامپت‌های پیشنهادی برای تصاویر داخل مقاله (JSON array of strings)
+   754→  inlineImagePrompts String @default("[]")
+   755→  // وضعیت: planned | queued | generating | published | failed | skipped
+   756→  status          String   @default("planned")
+   757→  // شناسه مقاله ساخته‌شده (بعد از انتشار)
+   758→  articleId       String?
+   759→  // اولویت (هرچه بالاتر، زودتر تولید می‌شود)
+   760→  priority        Int      @default(50)
+   761→  // دلیل شکست (در صورت failed)
+   762→  errorMessage    String?
+   763→  // تعداد دفعات تلاش
+   764→  attempts        Int      @default(0)
+   765→  createdAt       DateTime @default(now())
+   766→  updatedAt       DateTime @updatedAt
+   767→
+   768→  @@index([status])
+   769→  @@index([pillar])
+   770→  @@index([keyword])
+   771→}
+   772→
+   773→// لاگ اجرای ایجنت سئو — هر بار اجرا یک رکورد
+   774→model SeoAgentRun {
+   775→  id              String   @id @default(cuid())
+   776→  // نوع اجرا: full (استراتژی + تولید) | continue (ادامه تولید) | strategy_only | analyze_only | content_refresh (آپدیت محتوا از سرچ کنسول)
+   777→  mode            String   @default("full")
+   778→  status          String   @default("running") // running | completed | failed | partial
+   779→  // تعداد مقالات درخواستی
+   780→  requestedCount  Int      @default(5)
+   781→  // تعداد مقالات موفق
+   782→  successCount    Int      @default(0)
+   783→  // تعداد خطاها
+   784→  failCount       Int      @default(0)
+   785→  // لاگ‌های اجرا (JSON array of {ts, level, msg})
+   786→  logs            String   @default("[]")
+   787→  // خلاصه نتایج (JSON)
+   788→  results         String   @default("{}")
+   789→  // مدت زمان اجرا (ms)
+   790→  durationMs      Int      @default(0)
+   791→  startedAt       DateTime @default(now())
+   792→  finishedAt      DateTime?
+   793→
+   794→  @@index([status])
+   795→  @@index([startedAt])
+   796→}
+   797→
+   798→// ===================== FEEDBACK (پیشنهادات و انتقادات) =====================
+   799→model Feedback {
+   800→  id        String   @id @default(cuid())
+   801→  message   String
+   802→  category  String   @default("suggestion") // suggestion | complaint | bug | other
+   803→  name      String?
+   804→  mobile    String?
+   805→  userId    String?
+   806→  reviewed  Boolean  @default(false)
+   807→  createdAt DateTime @default(now())
+   808→
+   809→  @@index([createdAt])
+   810→  @@index([reviewed])
+   811→}
+   812→
+   813→// ===================== PUSH SUBSCRIPTION (نوتیفیکیشن موبایل) =====================
+   814→model PushSubscription {
+   815→  id        String   @id @default(cuid())
+   816→  userId    String
+   817→  endpoint  String   @unique // URL پوش سرور (FCM/Apple/etc)
+   818→  p256dh    String   // کلید عمومی
+   819→  auth      String   // کلید احراز هویت
+   820→  userAgent String?  // نوع مرورگر/دستگاه
+   821→  createdAt DateTime @default(now())
+   822→
+   823→  @@index([userId])
+   824→}
+   825→
+   826→// ===================== SURVEY (نظرسنجی پایان پلن) =====================
+   827→// نظرسنجی که بعد از اتمام پلن به کاربر نشان داده می‌شود.
+   828→// شامل سوالات عمومی + سوالات اختصاصی پلن + نمرات ۱ تا ۵ + کامنت کلی.
+   829→// ratings به‌صورت JSON ذخیره می‌شود: { questionId: number }
+   830→// 例: { "overall_coach_quality": 5, "program_effectiveness": 4, "support_quality": 5 }
+   831→model Survey {
+   832→  id        String   @id @default(cuid())
+   833→  userId    String
+   834→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   835→  // نام پلنی که کاربر در زمان تکمیل نظرسنجی از آن استفاده می‌کرده
+   836→  planName  String   // basic | standard | advanced | ultimate
+   837→  // نمرات به‌صورت JSON: { questionId: 1..5 }
+   838→  ratings   String   // JSON string
+   839→  // کامنت کلی کاربر (متن آزاد)
+   840→  comment   String   @default("")
+   841→  createdAt DateTime @default(now())
+   842→
+   843→  @@index([userId])
+   844→  @@index([planName])
+   845→  @@index([createdAt])
+   846→}
+   847→
+   848→// ===================== USER ADMIN NOTES (توضیحات مدیر) =====================
+   849→// یادداشت‌های پایدار ادمین درباره هر کاربر (مثلاً محتوای تماس تلفنی) —
+   850→// همیشه ذخیره می‌مانند تا سال‌ها بعد هم تاریخچه قابل مرور باشد.
+   851→model UserAdminNote {
+   852→  id        String   @id @default(cuid())
+   853→  userId    String
+   854→  body      String   // متن یادداشت
+   855→  createdAt DateTime @default(now())
+   856→  updatedAt DateTime @updatedAt
+   857→  authorMobile String? // شماره ادمینی که نوشته (برای مرجع)
+   858→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   859→
+   860→  @@index([userId, createdAt])
+   861→}
+   862→
+   863→// ===================== OWN ANDROID APP RELEASES (اپ اختصاصی فیتاپ) =====================
+   864→// نسخه‌های اپ اندروید «اختصاصی» فیتاپ (WebView پنل کاربری) که فقط از خود سایت
+   865→// دانلود می‌شود (نه کافه‌بازار). اپ در هر اجرا /api/app/own/latest را صدا می‌زند؛
+   866→// اگر versionCode اپ < آخرین نسخه → مودال زیبای آپدیت (changelog + دکمه دانلود).
+   867→// فایل APK در uploads/apk/ ذخیره و از /api/app/own/download سرو می‌شود.
+   868→model OwnAppRelease {
+   869→  id          String   @id @default(cuid())
+   870→  versionName String            // نام نسخه نمایشی — مثلاً "1.0.0"
+   871→  versionCode Int               // کد نسخه صحیح صعودی — مثلاً 1
+   872→  changelog   String   @default("") // تغییرات نسخه (متن فارسی، چندخطی)
+   873→  fileName    String            // نام فایل ذخیره‌شده در uploads/apk
+   874→  fileSize    Int      @default(0) // حجم فایل (بایت)
+   875→  downloads   Int      @default(0) // تعداد دانلود (آمار داخلی)
+   876→  forceUpdate Boolean  @default(false) // آپدیت اجباری برای نسخه‌های قدیمی‌تر؟
+   877→  isActive    Boolean  @default(true)  // قابل عرضه است؟
+   878→  createdAt   DateTime @default(now())
+   879→
+   880→  @@index([versionCode])
+   881→  @@index([createdAt])
+   882→}
+   883→
