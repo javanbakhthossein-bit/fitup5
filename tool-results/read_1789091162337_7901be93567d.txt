@@ -1,0 +1,782 @@
+     1→import { NextRequest } from "next/server";
+     2→import { stat, readFile } from "fs/promises";
+     3→import { db } from "@/lib/db";
+     4→import { requireAuth, requirePlanCapability, apiError } from "@/lib/fitness/auth";
+     5→import { aiChat, analyzeChatMedia, extractVideoFramesAsDataUrls } from "@/lib/fitness/ai";
+     6→import { rateLimit, rateLimitResponse } from "@/lib/fitness/rate-limit";
+     7→import { fixPersianTypographySafe } from "@/lib/fitness/persian-typography";
+     8→import { savePrivateMediaFile, absolutePathForUploadUrl } from "@/lib/fitness/private-media";
+     9→import { compressVideoFileInPlace, formatBytes } from "@/lib/fitness/media-compress";
+    10→import { checkQuota, incrementQuota } from "@/lib/fitness/quota";
+    11→import { buildSportsProfileContext } from "@/lib/fitness/sports-profile-context";
+    12→import type { OnboardingData } from "@/lib/fitness/types";
+    13→
+    14→/** حداکثر تعداد فریم ویدیویی که کلاینت می‌تواند از مسیر multipart بفرستد */
+    15→const MAX_CLIENT_FRAMES = 8;
+    16→/** حداکثر طول هر فریم data URL از کلاینت (فریم‌ها ~۱۰۲۴px JPEG — مرز امن) */
+    17→const MAX_CLIENT_FRAME_CHARS = 2 * 1024 * 1024;
+    18→
+    19→/**
+    20→ * v71 سینک رسانه — پنجرهٔ جمع‌آوری تحلیل‌های کش‌شدهٔ جمنای:
+    21→ * اگر مدیای کاربر (عکس/ویدیو) در ۶ پیام آخر تاریخچه باشد، تحلیل متنیِ کش‌شده‌اش
+    22→ * (ChatMessage.mediaAnalysis) به پیام متنی بعدی تزریق می‌شود تا «عکس/ویدیو بعد
+    23→ * متن» همیشه توسط دیپ‌سیک و با آگاهی کامل از مدیا سینک بماند؛ پیام‌های قدیمی‌تر
+    24→ * فقط توضیح متنی دارند (کنترل هزینه — بدون کال ویژن تکراری).
+    25→ */
+    26→const MEDIA_SYNC_WINDOW = 6;
+    27→
+    28→/**
+    29→ * v70 — ذخیره فریم‌های ویدیو (data URL) روی دیسک برای استفادهٔ مجدد در پیام‌های بعدی.
+    30→ * خروجی: آرایهٔ URL نسبی (زیر uploads/chat/) — fail-safe: فریم خراب حذف می‌شود.
+    31→ */
+    32→async function saveFramesToDisk(dataUrls: string[]): Promise<string[]> {
+    33→  const urls: string[] = [];
+    34→  const stamp = Date.now();
+    35→  for (let i = 0; i < dataUrls.length; i++) {
+    36→    try {
+    37→      const parsed = parseDataUrl(dataUrls[i], "image/jpeg");
+    38→      const ext = parsed.mime === "image/png" ? "png" : parsed.mime === "image/webp" ? "webp" : "jpg";
+    39→      const buffer = Buffer.from(parsed.base64, "base64");
+    40→      if (buffer.length === 0) continue;
+    41→      const fileName = `chat-vframe-${stamp}-${Math.random().toString(36).slice(2, 8)}-${i}.${ext}`;
+    42→      const { url } = await savePrivateMediaFile("chat", fileName, buffer);
+    43→      urls.push(url);
+    44→    } catch (frameErr) {
+    45→      console.error("[chat] frame save failed (skipping):", frameErr);
+    46→    }
+    47→  }
+    48→  return urls;
+    49→}
+    50→
+    51→/**
+    52→ * v71 — بارگذاری مدیای یک پیام تاریخی به‌صورت data URL (برای تحلیل روی‌تقاضا).
+    53→ * عکس: فایل بهینه‌شده روی دیسک. ویدیو: فریم‌های ذخیره‌شده (v70) یا استخراج دوباره ffmpeg.
+    54→ * هیچ‌جا throw نمی‌کند — شکست یعنی آرایهٔ خالی.
+    55→ */
+    56→async function loadMediaDataUrls(m: {
+    57→  mediaUrl: string | null;
+    58→  mediaType: string | null;
+    59→  mediaFrames: string | null;
+    60→}): Promise<string[]> {
+    61→  try {
+    62→    if (!m.mediaUrl) return [];
+    63→    if (m.mediaType === "image") {
+    64→      const buf = await readFile(absolutePathForUploadUrl(m.mediaUrl));
+    65→      if (buf.length === 0) return [];
+    66→      const mime = m.mediaUrl.endsWith(".png") ? "image/png" : "image/webp";
+    67→      return [`data:${mime};base64,${buf.toString("base64")}`];
+    68→    }
+    69→    // ویدیو — اولویت: فریم‌های ذخیره‌شده (URL فایل) → استخراج دوباره از فایل
+    70→    let frameFileUrls: string[] = [];
+    71→    if (m.mediaFrames) {
+    72→      try {
+    73→        const parsedFrames = JSON.parse(m.mediaFrames);
+    74→        if (Array.isArray(parsedFrames)) frameFileUrls = parsedFrames.filter((u: unknown): u is string => typeof u === "string");
+    75→      } catch {
+    76→        // JSON خراب → فال‌بک به استخراج دوباره
+    77→      }
+    78→    }
+    79→    if (frameFileUrls.length === 0) {
+    80→      // extractVideoFramesAsDataUrls خودش data URL برمی‌گرداند
+    81→      return await extractVideoFramesAsDataUrls(absolutePathForUploadUrl(m.mediaUrl), 6);
+    82→    }
+    83→    const dataUrls: string[] = [];
+    84→    for (const u of frameFileUrls.slice(0, MAX_CLIENT_FRAMES)) {
+    85→      try {
+    86→        const buf = await readFile(absolutePathForUploadUrl(u));
+    87→        if (buf.length === 0) continue;
+    88→        const mime = u.endsWith(".png") ? "image/png" : u.endsWith(".webp") ? "image/webp" : "image/jpeg";
+    89→        dataUrls.push(`data:${mime};base64,${buf.toString("base64")}`);
+    90→      } catch {
+    91→        // فریم حذف‌شده از دیسک — رد شو
+    92→      }
+    93→    }
+    94→    return dataUrls;
+    95→  } catch (err) {
+    96→    console.error("[chat] loadMediaDataUrls failed:", err);
+    97→    return [];
+    98→  }
+    99→}
+   100→
+   101→function formatMediaAnalysisPart(
+   102→  m: { content: string; mediaType: string | null },
+   103→  analysis: string
+   104→): string {
+   105→  const kind = m.mediaType === "video" ? "ویدیو" : "عکس";
+   106→  const hasCaption = m.content && !m.content.startsWith("📷") && !m.content.startsWith("🎬");
+   107→  const cap = hasCaption ? ` (متن همراه: «${m.content.slice(0, 120)}»)` : "";
+   108→  return `• ${kind}${cap}: ${analysis}`;
+   109→}
+   110→
+   111→/**
+   112→ * v71 سینک رسانه (دیریکتیو مالک: «فقط تحلیل عکس/ویدیو جمنای است و بقیه دیپ‌سیک») —
+   113→ * به‌جای پیوست مجدد فایل مدیا به مدل ویژن (v70)، تحلیلِ متنیِ کش‌شدهٔ جمنای
+   114→ * (ChatMessage.mediaAnalysis) از ۶ پیام آخر جمع می‌شود تا به کال متنیِ دیپ‌سیک
+   115→ * تزریق شود — بدون هیچ هزینهٔ ویژن تکراری. اگر مدیای اخیر تحلیل کش‌شده نداشت
+   116→ * (پیام قدیمی‌تر از v71)، یک‌بار روی‌تقاضا تحلیل و کش می‌شود (بودجه: حداکثر ۱
+   117→ * تحلیل جدید در هر پیام — کنترل هزینه/زمان).
+   118→ */
+   119→async function collectHistoryMediaAnalyses(
+   120→  userId: string,
+   121→  history: {
+   122→    id: string;
+   123→    content: string;
+   124→    mediaUrl: string | null;
+   125→    mediaType: string | null;
+   126→    mediaFrames: string | null;
+   127→    mediaAnalysis: string | null;
+   128→  }[]
+   129→): Promise<string> {
+   130→  try {
+   131→    const recent = history.slice(-MEDIA_SYNC_WINDOW);
+   132→    const mediaMsgs = recent.filter((m) => m.mediaUrl && m.mediaType);
+   133→    if (mediaMsgs.length === 0) return "";
+   134→
+   135→    const parts: string[] = [];
+   136→    let onDemandBudget = 1;
+   137→    for (const m of mediaMsgs) {
+   138→      if (m.mediaAnalysis?.trim()) {
+   139→        parts.push(formatMediaAnalysisPart(m, m.mediaAnalysis.trim()));
+   140→        continue;
+   141→      }
+   142→      if (onDemandBudget <= 0) continue;
+   143→      onDemandBudget--;
+   144→      try {
+   145→        const dataUrls = await loadMediaDataUrls(m);
+   146→        if (dataUrls.length === 0) continue;
+   147→        const text = await analyzeChatMedia(
+   148→          m.mediaType === "video" ? "video-frames" : "image",
+   149→          dataUrls,
+   150→          m.content,
+   151→          userId
+   152→        );
+   153→        parts.push(formatMediaAnalysisPart(m, text));
+   154→        // کش روی همان پیام تاریخی — دفعات بعد بدون کال ویژن
+   155→        try {
+   156→          await db.chatMessage.update({ where: { id: m.id }, data: { mediaAnalysis: text } });
+   157→        } catch (cacheErr) {
+   158→          console.error("[chat] mediaAnalysis cache update failed:", cacheErr);
+   159→        }
+   160→      } catch (anErr) {
+   161→        console.error("[chat] on-demand media analysis failed (skipping):", anErr);
+   162→      }
+   163→    }
+   164→    if (parts.length === 0) return "";
+   165→    return `\n\n[تحلیل رسانه‌های اخیر کاربر در همین گفتگو — تولید مدل بینایی (جمنای) — برای مرجع تو:\n${parts.join("\n")}\nاگر پرسش فعلی دربارهٔ همین رسانه‌هاست، پاسخت را بر اساس این تحلیل‌ها بده؛ رسانه‌ها خودشان پیوست نشده‌اند و لازم نیست بگویی «نمی‌توانم ببینم».]`;
+   166→  } catch (err) {
+   167→    console.error("[chat] collectHistoryMediaAnalyses failed (continuing without sync):", err);
+   168→    return "";
+   169→  }
+   170→}
+   171→
+   172→/**
+   173→ * اعتبارسنجی videoUrl مسیر multipart — فقط فایل ذخیره‌شده توسط خود این سیستم
+   174→ * در uploads/chat/ پذیرفته می‌شود (بدون traversal) و باید واقعاً روی دیسک باشد.
+   175→ */
+   176→async function validateChatVideoUrl(userId: string, url: string): Promise<string | null> {
+   177→  if (!url.startsWith("/uploads/chat/")) return null;
+   178→  if (url.includes("..")) return null;
+   179→  // مالکیت: نام فایل ویدیوی مسیر multipart الگوی chat-video-{uid}-… دارد
+   180→  const fileName = url.split("/").pop() || "";
+   181→  if (!fileName.startsWith(`chat-video-${userId}-`)) return null;
+   182→  const filePath = absolutePathForUploadUrl(url);
+   183→  try {
+   184→    const st = await stat(filePath);
+   185→    if (!st.isFile() || st.size === 0) return null;
+   186→  } catch {
+   187→    return null;
+   188→  }
+   189→  return url;
+   190→}
+   191→
+   192→/**
+   193→ * پارس امن JSON محتوای برنامه از DB (L7) — ردیف خراب نباید کل مسیر چت را با 500 بکشد.
+   194→ */
+   195→function safeParsePlanContent(raw: string): Record<string, any> | null {
+   196→  try {
+   197→    const parsed = JSON.parse(raw);
+   198→    return parsed && typeof parsed === "object" ? parsed : null;
+   199→  } catch (e) {
+   200→    console.error("[chat] invalid plan JSON content in DB, skipping:", (e as Error).message);
+   201→    return null;
+   202→  }
+   203→}
+   204→
+   205→/**
+   206→ * پارس data URL به mime و base64.
+   207→ * پشتیبانی از هر دو فرمت:
+   208→ *  - "data:image/jpeg;base64,...."
+   209→ *  - raw base64 با mime جداگانه
+   210→ */
+   211→function parseDataUrl(value: string, fallbackMime = "image/jpeg"): { mime: string; base64: string } {
+   212→  const match = value.match(/^data:([^;]+);base64,(.+)$/);
+   213→  if (match) {
+   214→    return { mime: match[1], base64: match[2] };
+   215→  }
+   216→  return { mime: fallbackMime, base64: value };
+   217→}
+   218→
+   219→/** ذخیره فایل base64 رسانه چت در uploads/chat/ (خارج از public — سرو با احراز هویت) و بازگرداندن URL نسبی */
+   220→async function saveBase64File(
+   221→  base64: string,
+   222→  mime: string,
+   223→  kind: "image" | "video"
+   224→): Promise<{ url: string; mime: string; size: number }> {
+   225→  const buffer = Buffer.from(base64, "base64");
+   226→  const extMap: Record<string, string> = {
+   227→    "image/jpeg": "jpg",
+   228→    "image/jpg": "jpg",
+   229→    "image/png": "png",
+   230→    "image/webp": "webp",
+   231→    "image/gif": "gif",
+   232→    "image/avif": "avif",
+   233→    "video/mp4": "mp4",
+   234→    "video/webm": "webm",
+   235→    "video/quicktime": "mov",
+   236→    "video/x-matroska": "mkv",
+   237→  };
+   238→  const ext = extMap[mime] || (kind === "image" ? "jpg" : "mp4");
+   239→  const fileName = `chat-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+   240→  const { url } = await savePrivateMediaFile("chat", fileName, buffer);
+   241→  return { url, mime, size: buffer.length };
+   242→}
+   243→
+   244→/**
+   245→ * ذخیره عکس با کاهش حجم خودکار:
+   246→ *  - resize به حداکثر 1600px
+   247→ *  - تبدیل به WebP (کیفیت ۷۵)
+   248→ *  - حذف فایل اصلی (فقط نسخه بهینه‌شده نگه داشته می‌شود)
+   249→ *  - بازگرداندن URL و base64 بهینه‌شده برای ارسال به VLM
+   250→ *
+   251→ * Task 4-a: محدودیت پیکسل ورودی (~۶۰ مگاپیکسل) — عکس‌های خیلی بزرگ قبل از
+   252→ * decode کامل رد می‌شوند تا حافظه/پردازنده ایمن بماند؛ خطا → null (نه throw).
+   253→ */
+   254→const MAX_IMAGE_INPUT_PIXELS = 60_000_000;
+   255→
+   256→async function saveOptimizedImage(
+   257→  base64: string,
+   258→  mime: string
+   259→): Promise<{ url: string; mime: string; size: number; optimizedBase64: string } | null> {
+   260→  const sharp = (await import("sharp")).default;
+   261→  const buffer = Buffer.from(base64, "base64");
+   262→
+   263→  // کاهش حجم + resize + WebP (با محدودیت پیکسل — fail-safe)
+   264→  let processed: Buffer;
+   265→  try {
+   266→    processed = await sharp(buffer, { limitInputPixels: MAX_IMAGE_INPUT_PIXELS })
+   267→      .resize(1600, 1600, {
+   268→        fit: "inside",
+   269→        withoutEnlargement: true,
+   270→      })
+   271→      .webp({ quality: 75 })
+   272→      .toBuffer();
+   273→  } catch (err) {
+   274→    console.error("[chat] image optimization failed (too large/corrupt):", err);
+   275→    return null;
+   276→  }
+   277→
+   278→  const fileName = `chat-image-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.webp`;
+   279→  const { url } = await savePrivateMediaFile("chat", fileName, processed);
+   280→
+   281→  const optimizedBase64 = processed.toString("base64");
+   282→  return {
+   283→    url,
+   284→    mime: "image/webp",
+   285→    size: processed.length,
+   286→    optimizedBase64,
+   287→  };
+   288→}
+   289→
+   290→export async function GET() {
+   291→  try {
+   292→    const user = await requireAuth();
+   293→    // ─── H1: قبلاً asc + take 100 «قدیمی‌ترین» ۱۰۰ پیام را برمی‌گرداند — بعد از
+   294→    // ۱۰۰ پیام، پیام‌های جدید در تاریخچه هرگز نمایش داده نمی‌شدند. الگوی درست
+   295→    // (مثل POST): desc + take → آخرین پیام‌ها، سپس reverse برای ترتیب زمانی.
+   296→    const recentMessages = await db.chatMessage.findMany({
+   297→      where: { userId: user.id },
+   298→      orderBy: { createdAt: "desc" },
+   299→      take: 100,
+   300→    });
+   301→    const messages = recentMessages.reverse();
+   302→
+   303→    // اگر هیچ پیامی وجود ندارد → پیام خوش‌آمدگویی شخصی‌سازی شده بساز
+   304→    // (type annotation برای strict mode — قبلاً `= null` به‌تنهایی خطای TS می‌داد)
+   305→    let welcomeMessage: {
+   306→      id: string;
+   307→      role: string;
+   308→      content: string;
+   309→      mediaUrl: string | null;
+   310→      mediaType: string | null;
+   311→      createdAt: string;
+   312→    } | null = null;
+   313→    if (messages.length === 0) {
+   314→      // دریافت اطلاعات کاربر برای شخصی‌سازی
+   315→      const profile = await db.onboardingProfile.findUnique({ where: { userId: user.id } });
+   316→      const latestWeight = await db.weightLog.findFirst({
+   317→        where: { userId: user.id },
+   318→        orderBy: { loggedAt: "desc" },
+   319→        select: { weight: true },
+   320→      });
+   321→      const sub = await db.subscription.findFirst({
+   322→        where: { userId: user.id, status: "active" },
+   323→        orderBy: { endDate: "desc" },
+   324→      });
+   325→
+   326→      const userName = user.name || "ورزشکار";
+   327→      const goal = profile?.goal === "fat_loss" ? "کاهش چربی" :
+   328→                   profile?.goal === "cut" ? "کات (چربی‌سوزی با حفظ عضله)" :
+   329→                   profile?.goal === "muscle_gain" ? "عضله‌سازی" :
+   330→                   profile?.goal === "bulk" ? "افزایش حجم" :
+   331→                   profile?.goal === "endurance" ? "استقامت" :
+   332→                   profile?.goal === "strength" ? "قدرت" : "تناسب اندام";
+   333→      const currentWeight = latestWeight?.weight || profile?.weight || null;
+   334→      const planName = sub?.plan || user.planName || null;
+   335→
+   336→      welcomeMessage = {
+   337→        id: "welcome_coach",
+   338→        role: "assistant",
+   339→        content: `سلام ${userName} عزیز! 👋💪\n\nمن فیتاپ هوشمندتم — مربی شخصی تو که ۲۴ ساعته اینجام.\n\n` +
+   340→          `✅ هدف تو: ${goal}\n` +
+   341→          (currentWeight ? `✅ وزن فعلی: ${currentWeight} کیلو\n` : "") +
+   342→          (planName ? `✅ پلن: ${planName}\n` : "") +
+   343→          `\nهر سوالی درباره تمرین، تغذیه، مکمل، فرم حرکات یا هر چیز دیگه داری بپرس. حتی می‌تونی عکس از غذات بفرستی تا کالری‌ش رو بگم! 📸\n\n` +
+   344→          `🤖 من به تمام اطلاعات پروفایل تو دسترسی دارم — وزن، قد، هدف، آسیب‌دیدگی‌ها، تجهیزات و برنامه‌هات. پس کاملاً شخصی‌سازی شده جواب می‌دم.\n\n` +
+   345→          `شروع کنیم؟ 🚀`,
+   346→        mediaUrl: null,
+   347→        mediaType: null,
+   348→        createdAt: new Date().toISOString(),
+   349→      };
+   350→    }
+   351→
+   352→    return Response.json({
+   353→      messages: messages.length > 0 ? messages.map((m) => ({
+   354→        id: m.id,
+   355→        role: m.role,
+   356→        // v59 — ضد چسبیدگی در زمان خواندن، فقط برای پاسخ‌های مربی (URL-safe)
+   357→        content: m.role === "assistant" ? fixPersianTypographySafe(m.content) : m.content,
+   358→        mediaUrl: m.mediaUrl ?? null,
+   359→        mediaType: m.mediaType ?? null,
+   360→        createdAt: m.createdAt.toISOString(),
+   361→      })) : (welcomeMessage ? [welcomeMessage] : []),
+   362→    });
+   363→  } catch (e) {
+   364→    return apiError(e);
+   365→  }
+   366→}
+   367→
+   368→export async function POST(req: NextRequest) {
+   369→  try {
+   370→    // گیت پلن: چت با مربی هوشمند فقط برای پلن پیشرفته و حرفه‌ای
+   371→    const { userId } = await requirePlanCapability("aiChat");
+   372→    // ─── H2/H6: محدودیت نرخ — ۳۰ پیام در دقیقه برای هر کاربر ───
+   373→    const rl = rateLimit(`coach-chat:${userId}`, 30, 60_000);
+   374→    if (!rl.ok) {
+   375→      return rateLimitResponse(rl.retryAfterSec);
+   376→    }
+   377→    const user = await requireAuth();
+   378→    const body = await req.json();
+   379→    const message: string = typeof body.message === "string" ? body.message : "";
+   380→    const imageBase64: string | undefined = typeof body.imageBase64 === "string" ? body.imageBase64 : undefined;
+   381→    const videoBase64: string | undefined = typeof body.videoBase64 === "string" ? body.videoBase64 : undefined;
+   382→    // ─── مسیر multipart جدید (ویدیوهای بدون محدودیت حجم — Task 4-a) ───
+   383→    // کلاینت ابتدا POST /api/coach/chat/upload را صدا می‌زند (فایل ذخیره + فشرده‌سازی
+   384→    // + استخراج فریم + مصرف سهمیه) و بعد اینجا videoUrl/videoFrames را می‌فرستد.
+   385→    const clientVideoUrl: string | undefined = typeof body.videoUrl === "string" ? body.videoUrl : undefined;
+   386→    const clientVideoFrames: string[] | undefined = Array.isArray(body.videoFrames)
+   387→      ? body.videoFrames.filter((f: unknown): f is string => typeof f === "string")
+   388→      : undefined;
+   389→
+   390→    if (!message && !imageBase64 && !videoBase64 && !clientVideoUrl) {
+   391→      return Response.json({ error: "پیام خالی است." }, { status: 400 });
+   392→    }
+   393→
+   394→    // متغیرهای مدیا
+   395→    let imageUrl: string | null = null;
+   396→    let videoUrl: string | null = null;
+   397→    // v70 — URL فریم‌های ذخیره‌شده روی دیسک (برای سینک رسانه در پیام‌های بعدی)
+   398→    let frameUrls: string[] = [];
+   399→    // ─── v71 معماری دومرحله‌ای مالک: «تحلیل رسانه جمنای، نوشتن پاسخ دیپ‌سیک» ───
+   400→    // عکس/فریم‌ها اول با analyzeChatMedia (جمنای) تحلیل و کش می‌شوند؛ بعد متنِ
+   401→    // تحلیل به aiChat (دیپ‌سیک) تزریق می‌شود تا پاسخ نهایی را بنویسد. مدیا
+   402→    // هرگز مستقیم به کال پاسخ پیوست نمی‌شود (دیپ‌سیک تصویر نمی‌فهمد و پیام
+   403→    // متنی هم نباید به جمنای برود — دیریکتیو صریح مالک).
+   404→    let attachment: { dataUrls: string[]; kind: "image" | "video-frames" } | undefined;
+   405→    let imageAnalysisNote = ""; // تحلیل عکس شکست خورد → یادداشت صادقانه به مدل متنی
+   406→    let videoAnalysisNote = "";
+   407→
+   408→    // پردازش عکس (نیازمند قابلیت chatImageUpload)
+   409→    if (imageBase64) {
+   410→      // گیت پلن برای ارسال عکس در چت
+   411→      await requirePlanCapability("chatImageUpload");
+   412→      // اعتبارسنجی حجم — سقف فنی ۴۰ مگابایت base64 (~۳۰ مگابایت فایل) با پیام مهربان
+   413→      const MAX_IMG = 40 * 1024 * 1024; // base64 ~۱.۳۳x
+   414→      if (imageBase64.length > MAX_IMG) {
+   415→        return Response.json(
+   416→          { error: "حجم عکس خیلی زیاد است. لطفاً عکس کوچک‌تری انتخاب کن یا اسکرین‌شات با کیفیت پایین‌تر بگیر 🙏" },
+   417→          { status: 413 }
+   418→        );
+   419→      }
+   420→      const parsed = parseDataUrl(imageBase64, "image/jpeg");
+   421→      if (!parsed.mime.startsWith("image/")) {
+   422→        return Response.json({ error: "فقط فایل تصویری مجاز است." }, { status: 400 });
+   423→      }
+   424→      // ─── سهمیهٔ عکس چت (Task 4-a) — بعد از گیت پلن و قبل از پردازش ───
+   425→      const quota = await checkQuota(user.id, "chat_photo");
+   426→      if (!quota.allowed) {
+   427→        return Response.json(
+   428→          { error: quota.messageFa ?? "سهمیهٔ ارسال عکس تمام شده است.", code: quota.code },
+   429→          { status: 429 }
+   430→        );
+   431→      }
+   432→      // ─── بهینه‌سازی عکس با sharp: resize + WebP ───
+   433→      const saved = await saveOptimizedImage(parsed.base64, parsed.mime);
+   434→      if (!saved) {
+   435→        return Response.json(
+   436→          { error: "پردازش عکس ناموفق بود — حجم/ابعاد عکس خیلی زیاد است. عکس کوچک‌تری امتحان کن." },
+   437→          { status: 400 }
+   438→        );
+   439→      }
+   440→      imageUrl = saved.url;
+   441→
+   442→      // مصرف سهمیه — پردازش عکس موفق بود (فرقی نمی‌کند پاسخ AI بعداً درست شود یا نه)
+   443→      await incrementQuota(user.id, "chat_photo");
+   444→
+   445→      // پیوست مستقیم عکس بهینه‌شده به کال مربی (بدون VLM جدا)
+   446→      attachment = {
+   447→        dataUrls: [`data:${saved.mime};base64,${saved.optimizedBase64}`],
+   448→        kind: "image",
+   449→      };
+   450→    }
+   451→
+   452→    // پردازش ویدیو — مسیر قدیمی base64 (ویدیوهای <۱۲MB — دست‌نخورده)
+   453→    if (videoBase64) {
+   454→      // گیت پلن برای ارسال ویدیو در چت
+   455→      await requirePlanCapability("chatVideoUpload");
+   456→      // اعتبارسنجی حجم (حداکثر ۳۰ مگابایت قبل از base64 ≈ ۴۰ مگابایت base64)
+   457→      const MAX_VID = 40 * 1024 * 1024;
+   458→      if (videoBase64.length > MAX_VID) {
+   459→        return Response.json(
+   460→          { error: "حجم ویدیو برای ارسال مستقیم زیاد است. ویدیوهای بزرگ‌تر خودکار از مسیر آپلود جدید ارسال می‌شوند — دوباره تلاش کن." },
+   461→          { status: 413 }
+   462→        );
+   463→      }
+   464→      const parsed = parseDataUrl(videoBase64, "video/mp4");
+   465→      if (!parsed.mime.startsWith("video/")) {
+   466→        return Response.json({ error: "فقط فایل ویدیویی مجاز است." }, { status: 400 });
+   467→      }
+   468→      // ─── سهمیهٔ تحلیل ویدیو حرکات (Task 4-a) — قبل از استخراج فریم‌ها ───
+   469→      const quota = await checkQuota(user.id, "movement_video");
+   470→      if (!quota.allowed) {
+   471→        return Response.json(
+   472→          { error: quota.messageFa ?? "سهمیهٔ ارسال ویدیو تمام شده است.", code: quota.code },
+   473→          { status: 429 }
+   474→        );
+   475→      }
+   476→      const saved = await saveBase64File(parsed.base64, parsed.mime, "video");
+   477→      videoUrl = saved.url;
+   478→
+   479→      // ─── فشرده‌سازی درجا (Task 4-a — قانون مالک: همیشه نسخهٔ کم‌حجم نگه داشته شود) ───
+   480→      // هرگز throw نمی‌کند؛ در شکست نسخهٔ اصلی می‌ماند. فریم‌ها از نسخهٔ نهایی استخراج می‌شوند.
+   481→      try {
+   482→        const cmp = await compressVideoFileInPlace(absolutePathForUploadUrl(videoUrl));
+   483→        if (cmp.compressed) {
+   484→          console.log(`[chat] video compressed: ${formatBytes(cmp.sizeBefore)} → ${formatBytes(cmp.sizeAfter)}`);
+   485→        }
+   486→      } catch (cmpErr) {
+   487→        console.error("[chat] compression step failed (keeping original):", cmpErr);
+   488→      }
+   489→
+   490→      // ─── استخراج چند فریم کلیدی ویدیو با ffmpeg و پیوست مستقیم به کال مربی ───
+   491→      // مدل چندوجهی ویدیو نمی‌بیند؛ چند فریم از تایم‌لاین (به ترتیب زمانی) به
+   492→      // پیوست اضافه می‌شود تا مربی توالی حرکت را ببیند و فرم/تکنیک را تحلیل کند.
+   493→      try {
+   494→        const videoFilePath = absolutePathForUploadUrl(videoUrl);
+   495→        const frameDataUrls = await extractVideoFramesAsDataUrls(videoFilePath, 6);
+   496→        if (frameDataUrls.length > 0) {
+   497→          attachment = { dataUrls: frameDataUrls, kind: "video-frames" };
+   498→          // v70 — ذخیره فریم‌ها روی دیسک برای پیوست مجدد در پیام‌های بعدی (سینک رسانه)
+   499→          frameUrls = await saveFramesToDisk(frameDataUrls);
+   500→          // مصرف سهمیه — استخراج فریم موفق بود
+   501→          await incrementQuota(user.id, "movement_video");
+   502→        } else {
+   503→          videoAnalysisNote = `\n\n[کاربر ویدیو ارسال کرده است اما استخراج فریم از آن ناموفق بود. لطفاً از کاربر بخواه توضیح بدهد یا عکس بفرستد.]`;
+   504→        }
+   505→      } catch (err) {
+   506→        console.error("[chat] video frame extraction failed:", err);
+   507→        videoAnalysisNote = `\n\n[کاربر ویدیو ارسال کرده است اما استخراج فریم از آن ناموفق بود. لطفاً از کاربر بخواه توضیح بدهد یا عکس بفرستد.]`;
+   508→      }
+   509→    }
+   510→
+   511→    // پردازش ویدیو — مسیر multipart جدید (فریم‌ها در /api/coach/chat/upload آماده شده‌اند؛
+   512→    // سهمیه آنجا مصرف شده — اینجا فقط اعتبارسنجی مالکیت و اتصال فریم‌ها)
+   513→    if (clientVideoUrl && !videoBase64) {
+   514→      await requirePlanCapability("chatVideoUpload");
+   515→      const validUrl = await validateChatVideoUrl(user.id, clientVideoUrl);
+   516→      if (!validUrl) {
+   517→        return Response.json(
+   518→          { error: "فایل ویدیو پیدا نشد. لطفاً دوباره آپلود کن." },
+   519→          { status: 400 }
+   520→        );
+   521→      }
+   522→      videoUrl = validUrl;
+   523→      const frames = (clientVideoFrames ?? [])
+   524→        .filter((f) => f.startsWith("data:image/") && f.length <= MAX_CLIENT_FRAME_CHARS)
+   525→        .slice(0, MAX_CLIENT_FRAMES);
+   526→      if (frames.length > 0) {
+   527→        attachment = { dataUrls: frames, kind: "video-frames" };
+   528→        // v70 — ذخیره فریم‌های سمت کلاینت روی دیسک برای سینک رسانه در پیام‌های بعدی
+   529→        frameUrls = await saveFramesToDisk(frames);
+   530→      } else {
+   531→        videoAnalysisNote = `\n\n[کاربر ویدیو ارسال کرده است اما استخراج فریم از آن ناموفق بود. لطفاً از کاربر بخواه توضیح بدهد یا عکس بفرستد.]`;
+   532→      }
+   533→    }
+   534→
+   535→    // ذخیره پیام کاربر (با URL مدیا + فریم‌های ویدیوی ذخیره‌شده برای سینک بعدی)
+   536→    const userMsg = await db.chatMessage.create({
+   537→      data: {
+   538→        userId: user.id,
+   539→        role: "user",
+   540→        content: message || (imageUrl ? "📷 عکس" : videoUrl ? "🎬 ویدیو" : ""),
+   541→        mediaUrl: imageUrl ?? videoUrl,
+   542→        mediaType: imageUrl ? "image" : videoUrl ? "video" : null,
+   543→        mediaFrames: frameUrls.length > 0 ? JSON.stringify(frameUrls) : null,
+   544→      },
+   545→    });
+   546→
+   547→    // ─── v71 مرحلهٔ ۱: تحلیل رسانهٔ همین پیام توسط جمنای (فقط تحلیل) ───
+   548→    // خروجی: گزارش متنی که در mediaAnalysis کش می‌شود و به مرحلهٔ ۲ (دیپ‌سیک)
+   549→    // تزریق می‌شود. شکست تحلیل چت را نمی‌شکند — فقط یادداشت صادقانه می‌ماند.
+   550→    let currentMediaAnalysis = "";
+   551→    if (attachment) {
+   552→      try {
+   553→        currentMediaAnalysis = await analyzeChatMedia(attachment.kind, attachment.dataUrls, message, user.id);
+   554→        try {
+   555→          await db.chatMessage.update({ where: { id: userMsg.id }, data: { mediaAnalysis: currentMediaAnalysis } });
+   556→        } catch (cacheErr) {
+   557→          console.error("[chat] current media analysis cache failed:", cacheErr);
+   558→        }
+   559→      } catch (anErr) {
+   560→        console.error("[chat] analyzeChatMedia failed (continuing with note):", anErr);
+   561→        if (attachment.kind === "video-frames") {
+   562→          videoAnalysisNote = `\n\n[کاربر در همین پیام ویدیو ارسال کرده است اما تحلیل خودکار آن در دسترس نیست. لطفاً از کاربر بخواه حرکت را توضیح بدهد یا عکس بفرستد.]`;
+   563→        } else {
+   564→          imageAnalysisNote = `\n\n[کاربر در همین پیام عکس فرستاده است اما تحلیل خودکار تصویر در دسترس نیست. صادقانه بگو که در این لحظه امکان دیدن عکس را نداری و برای ادامهٔ کمک، اطلاعات لازم را بپرس.]`;
+   565→        }
+   566→      }
+   567→    }
+   568→
+   569→    // ساخت محتوای نهایی پیام کاربر (شامل یادداشت‌های شکست تحلیل در صورت وجود)
+   570→    let finalMessage = message;
+   571→    if (imageAnalysisNote) {
+   572→      finalMessage = `${message || "(بدون متن)"}${imageAnalysisNote}`;
+   573→    }
+   574→    if (videoAnalysisNote) {
+   575→      finalMessage = `${finalMessage}${message || imageAnalysisNote ? "\n\n" : ""}${videoAnalysisNote}`;
+   576→    }
+   577→
+   578→    // Load onboarding profile for context
+   579→    const profile = await db.onboardingProfile.findUnique({
+   580→      where: { userId: user.id },
+   581→    });
+   582→
+   583→    // Helper برای پارس کردن فیلدهای لیستی ذخیره‌شده به‌صورت JSON
+   584→    const safeParseList = (raw: string | null | undefined): string[] => {
+   585→      if (!raw) return [];
+   586→      const t = raw.trim();
+   587→      if (!t) return [];
+   588→      try {
+   589→        const p = JSON.parse(t);
+   590→        if (Array.isArray(p)) return p.map((x) => String(x));
+   591→        if (typeof p === "string") return p.split(",").map((s) => s.trim()).filter(Boolean);
+   592→        return [];
+   593→      } catch {
+   594→        return t.split(",").map((s) => s.trim()).filter(Boolean);
+   595→      }
+   596→    };
+   597→
+   598→    let onboarding: OnboardingData | null = null;
+   599→    if (profile) {
+   600→      // ─── buildUserContext() تمام فیلدها را می‌خواند. برای اینکه مربی هوشمند
+   601→      // همیشه به آخرین اطلاعات کاربر (شامل فیلدهای اختیاری حرفه‌ای) دسترسی داشته
+   602→      // باشد، تمام فیلدهای ذخیره‌شده در OnboardingProfile را اینجا می‌گذاریم. ───
+   603→      onboarding = {
+   604→        gender: profile.gender as OnboardingData["gender"],
+   605→        age: profile.age,
+   606→        height: profile.height,
+   607→        weight: profile.weight,
+   608→        targetWeight: profile.targetWeight ?? undefined,
+   609→        goal: profile.goal as OnboardingData["goal"],
+   610→        activityLevel: profile.activityLevel as OnboardingData["activityLevel"],
+   611→        workoutDays: profile.workoutDays,
+   612→        workoutDaysList: safeParseList(profile.workoutDaysList),
+   613→        workoutPlace: profile.workoutPlace as OnboardingData["workoutPlace"],
+   614→        equipment: safeParseList(profile.equipment),
+   615→        diseases: profile.diseases,
+   616→        injuries: profile.injuries,
+   617→        allergies: profile.allergies,
+   618→        dietType: profile.dietType as OnboardingData["dietType"],
+   619→        // Professional advanced fields
+   620→        trainingExperience: (profile.trainingExperience ?? undefined) as OnboardingData["trainingExperience"],
+   621→        previousTrainingType: profile.previousTrainingType ?? undefined,
+   622→        drugAllergies: profile.drugAllergies ?? undefined,
+   623→        currentMedications: profile.currentMedications ?? undefined,
+   624→        maxLifts: profile.maxLifts ?? undefined,
+   625→        // Comprehensive professional fields
+   626→        bodyFrame: (profile.bodyFrame ?? undefined) as OnboardingData["bodyFrame"],
+   627→        sleepHours: profile.sleepHours ?? undefined,
+   628→        stressLevel: profile.stressLevel ?? undefined,
+   629→        waterHabit: profile.waterHabit ?? undefined,
+   630→        targetDate: profile.targetDate ?? undefined,
+   631→        workoutTime: (profile.workoutTime ?? undefined) as OnboardingData["workoutTime"],
+   632→        medicalConditions: safeParseList(profile.medicalConditions) as OnboardingData["medicalConditions"],
+   633→        currentSupplements: profile.currentSupplements ?? undefined,
+   634→        dislikedFoods: profile.dislikedFoods ?? undefined,
+   635→        preferredCuisine: (profile.preferredCuisine ?? undefined) as OnboardingData["preferredCuisine"],
+   636→      };
+   637→    }
+   638→
+   639→    // ─── Build comprehensive athletic profile for long-term memory ───
+   640→    // فیتاپ هوشمند به تمام پرونده ورزشی کاربر دسترسی دارد.
+   641→    // خلاصه‌های برنامهٔ فعال (ارزان و خارج از پروندهٔ تاریخی) اینجا نگه داشته می‌شوند؛
+   642→    // وزن/چکاپ به buildSportsProfileContext منتقل شد (پوشش کامل‌تر با بودجهٔ سخت).
+   643→    const [workoutPlan, mealPlan, programRequests] = await Promise.all([
+   644→      db.workoutPlan.findFirst({ where: { userId: user.id, active: true }, orderBy: { createdAt: "desc" } }),
+   645→      db.mealPlan.findFirst({ where: { userId: user.id, active: true }, orderBy: { createdAt: "desc" } }),
+   646→      db.programRequest.findMany({ where: { userId: user.id }, orderBy: { createdAt: "desc" }, take: 3 }),
+   647→    ]);
+   648→
+   649→    // Build athletic profile context string
+   650→    const athleticProfile: string[] = [];
+   651→    if (workoutPlan) {
+   652→      // L7: پارس امن — ردیف خراب فقط این بخش کانتکست را حذف می‌کند نه کل چت را
+   653→      const wc = safeParsePlanContent(workoutPlan.content);
+   654→      if (wc) {
+   655→        athleticProfile.push(`\n📋 برنامه تمرینی فعلی:\n- هدف هفته: ${wc.weeklyGoal || "نامشخص"}\n- تعداد روزهای تمرین: ${wc.days?.length || 0}\n- نکات هفته: ${wc.notes?.slice(0, 100) || "ندارد"}`);
+   656→      }
+   657→    }
+   658→    if (mealPlan) {
+   659→      const mc = safeParsePlanContent(mealPlan.content);
+   660→      if (mc) {
+   661→        athleticProfile.push(`\n🍽 برنامه غذایی فعلی:\n- کالری هدف: ${mc.totalCalories || "نامشخص"} کالری\n- تعداد وعده‌ها: ${mc.meals?.length || 0}\n- پروتئین: ${mc.totalProtein || 0}g، کربو: ${mc.totalCarbs || 0}g، چربی: ${mc.totalFat || 0}g\n- آب روزانه: ${mc.waterLiters || 2.5} لیتر`);
+   662→        if (mc.supplements?.length) {
+   663→          athleticProfile.push(`\n💊 مکمل‌های فعلی: ${mc.supplements.map((s: any) => `${s.name} (${s.dose})`).join("، ")}`);
+   664→        }
+   665→      }
+   666→    }
+   667→    if (programRequests.length > 0) {
+   668→      athleticProfile.push(`\n📝 تاریخچه برنامه‌ها: ${programRequests.length} دوره تمرینی (${programRequests[0].status === "ready" ? "آماده" : programRequests[0].status === "pending" ? "در انتظار" : "نامشخص"})`);
+   669→    }
+   670→
+   671→    // ─── v53: پرونده ورزشی کامل و بودجه‌دار (تزریق تاریخچهٔ واقعی کاربر به مربی) ───
+   672→    // قبلاً فقط آخرین وزن + آخرین چکاپ به چت می‌رسید و تغذیهٔ ثبت‌شده (FoodLog) و
+   673→    // وضعیت تمرین‌های روزانه (DayCompletion/WorkoutDayStatus) هرگز به AI داده
+   674→    // نمی‌شد. حالا buildSportsProfileContext کل تاریخچه را می‌سازد:
+   675→    //   ۳۰ روز اخیر روزبه‌روز (کالری/درشت‌مغذی/وعده + تمرین + وزن) + جمع‌بندی
+   676→    //   ماهانه (ماه ۲ تا ۱۲) + خلاصهٔ فصلی قدیمی‌ترها + چکاپ‌ها + استریک.
+   677→    // سقف سخت ۹۰۰۰ کاراکتر: کاربر ۲ ساله هم پرامپت را منفجر نمی‌کند (قدیمی‌ترین
+   678→    // بخش‌ها مرحله‌به‌مرحله خلاصه می‌شوند).
+   679→    // پروفایل ثابت عمداً اینجا حذف شده (includeStaticProfile:false) چون aiChat
+   680→    // خودش buildUserContext را در system prompt تزریق می‌کند — دوباره‌گویی ممنوع.
+   681→    // شکست بیلدر هرگز چت را نمی‌شکند؛ فقط کانتکست تاریخی حذف می‌شود.
+   682→    let sportsFileCtx = "";
+   683→    try {
+   684→      sportsFileCtx = await buildSportsProfileContext(user.id, { includeStaticProfile: false });
+   685→    } catch (ctxErr) {
+   686→      console.error("[chat] buildSportsProfileContext failed (continuing without it):", ctxErr);
+   687→    }
+   688→    if (sportsFileCtx) {
+   689→      athleticProfile.push(sportsFileCtx);
+   690→    }
+   691→
+   692→    // Load recent history (last 15 messages for faster AI response)
+   693→    // ─── H3: قبلاً orderBy asc + take 15 «قدیمی‌ترین» ۱۵ پیام را می‌آورد (حافظه چت خراب بود).
+   694→    // الگوی درست: desc + take → آخرین پیام‌ها، سپس reverse برای ترتیب زمانی.
+   695→    // پیام جاری (userMsg) حذف می‌شود چون جداگانه به‌عنوان پیام آخر به AI پاس داده می‌شود.
+   696→    const recentHistory = await db.chatMessage.findMany({
+   697→      where: { userId: user.id, id: { not: userMsg.id } },
+   698→      orderBy: { createdAt: "desc" },
+   699→      take: 15,
+   700→    });
+   701→    const history = recentHistory.reverse();
+   702→
+   703→    // ─── v71 سینک رسانه — دیریکتیو مالک: «متن‌ها با دیپ‌سیک پاسخ داده بشه و
+   704→    // رسانه‌ها با جمنای تحلیل بشن و این تنوع با هم سینک باشه» ───
+   705→    // تحلیل‌های متنیِ کش‌شدهٔ جمنای (mediaAnalysis) از ۶ پیام آخر جمع می‌شود و
+   706→    // به کال متنیِ دیپ‌سیک تزریق می‌شود — بدون هیچ کال ویژن تکراری. مدیای اخیر
+   707→    // بدون کش (پیام قدیمی v70) یک‌بار روی‌تقاضا تحلیل و کش می‌شود (بودجه: ۱).
+   708→    const historyMediaAnalyses = await collectHistoryMediaAnalyses(
+   709→      user.id,
+   710→      history.map((h) => ({
+   711→        id: h.id,
+   712→        content: h.content,
+   713→        mediaUrl: h.mediaUrl,
+   714→        mediaType: h.mediaType,
+   715→        mediaFrames: h.mediaFrames,
+   716→        mediaAnalysis: h.mediaAnalysis,
+   717→      }))
+   718→    );
+   719→
+   720→    // Get AI response — pass user's plan tier + full athletic profile for comprehensive guidance
+   721→    // v71: پاسخ نهایی همیشه دیپ‌سیک (aiChat) — تحلیل جمنایِ مدیای همین پیام +
+   722→    // تحلیل‌های کش‌شدهٔ رسانه‌های قبلی، به‌صورت متن تزریق می‌شوند.
+   723→    const userPlan = (user.planName as any) ?? null;
+   724→    const fullContext = athleticProfile.join("\n");
+   725→    const mediaAnalysisForAi = [
+   726→      historyMediaAnalyses,
+   727→      currentMediaAnalysis
+   728→        ? `\n\n[تحلیل ${attachment?.kind === "image" ? "عکس" : "ویدیو"}ی که کاربر در همین پیام فرستاده است — تولید مدل بینایی (جمنای):\n${currentMediaAnalysis}]`
+   729→        : "",
+   730→    ].filter(Boolean).join("");
+   731→    let aiResponse: string;
+   732→    try {
+   733→      aiResponse = await aiChat(
+   734→        onboarding,
+   735→        history.map((h) => ({ role: h.role, content: h.content })),
+   736→        finalMessage + (fullContext ? `\n\n[سیستم - پرونده ورزشی کاربر]:\n${fullContext}` : ""),
+   737→        userPlan,
+   738→        mediaAnalysisForAi || null,
+   739→        user.id
+   740→      );
+   741→    } catch (err) {
+   742→      // ─── حذف ردیف پیام کاربر تا یتیم نماند (باگ ممیزی 2-b) ───
+   743→      // پیام کاربر قبل از کال AI ذخیره شده؛ اگر AI شکست بخورد و ردیف بماند،
+   744→      // بعد از رفرش پیام بی‌جواب ظاهر می‌شود و ارسال مجدد ردیف تکراری می‌سازد.
+   745→      // حذف best-effort — خطای حذف نباید خطای اصلی را بپوشاند.
+   746→      try {
+   747→        await db.chatMessage.delete({ where: { id: userMsg.id } });
+   748→      } catch (delErr) {
+   749→        console.error("[chat] failed to delete orphaned user message:", delErr);
+   750→      }
+   751→      throw err;
+   752→    }
+   753→
+   754→    // Save AI response
+   755→    // ─── Task 4-a: تولید TTS حذف شد — پاسخ فقط متن است ───
+   756→    const aiMsg = await db.chatMessage.create({
+   757→      data: { userId: user.id, role: "assistant", content: aiResponse },
+   758→    });
+   759→
+   760→    return Response.json({
+   761→      userMessage: {
+   762→        id: userMsg.id,
+   763→        role: userMsg.role,
+   764→        content: userMsg.content,
+   765→        mediaUrl: userMsg.mediaUrl ?? null,
+   766→        mediaType: userMsg.mediaType ?? null,
+   767→        createdAt: userMsg.createdAt.toISOString(),
+   768→      },
+   769→      aiMessage: {
+   770→        id: aiMsg.id,
+   771→        role: aiMsg.role,
+   772→        content: aiMsg.content,
+   773→        mediaUrl: null,
+   774→        mediaType: null,
+   775→        createdAt: aiMsg.createdAt.toISOString(),
+   776→      },
+   777→    });
+   778→  } catch (e) {
+   779→    return apiError(e);
+   780→  }
+   781→}
+   782→

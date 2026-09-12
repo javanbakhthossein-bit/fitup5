@@ -1,0 +1,931 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useEffect, useState } from "react";
+     4→     4→import { motion, AnimatePresence } from "framer-motion";
+     5→     5→import {
+     6→     6→  Dumbbell, Sparkles, ChevronLeft, ChevronRight, TrendingUp, Target,
+     7→     7→  Activity, Crown, RefreshCw, Flame, Beef, Wheat, Droplet,
+     8→     8→  Scale, Calendar, Ruler, Award, Heart, Bot, CalendarDays,
+     9→     9→} from "lucide-react";
+    10→    10→import { useAppStore } from "@/lib/fitness/store";
+    11→    11→import { Card } from "@/components/ui/card";
+    12→    12→import { Button } from "@/components/ui/button";
+    13→    13→import {
+    14→    14→  toPersianDigits, PLAN_LABELS,
+    15→    15→  formatToman, type Plan,
+    16→    16→} from "@/lib/fitness/types";
+    17→    17→import { usePlans } from "@/lib/fitness/use-plans";
+    18→    18→import { PurchaseModal } from "@/components/fitness/landing/sections/purchase-modal";
+    19→    19→import { toast } from "sonner";
+    20→    20→
+    21→    21→// ─────────────────────────────────────────────────────────────────────────────
+    22→    22→// Types returned by /api/onboarding/analysis
+    23→    23→// ─────────────────────────────────────────────────────────────────────────────
+    24→    24→interface MacroRec {
+    25→    25→  targetCalories: number;
+    26→    26→  protein_g: number;
+    27→    27→  carbs_g: number;
+    28→    28→  fat_g: number;
+    29→    29→  proteinPerKg: number;
+    30→    30→  deficitPercent: number;
+    31→    31→}
+    32→    32→
+    33→    33→interface Trajectory {
+    34→    34→  currentWeight: number;
+    35→    35→  targetWeight: number;
+    36→    36→  weeksToGoal: number;
+    37→    37→  weeklyRate: number;
+    38→    38→  weeklyCalorieAdjustment: number;
+    39→    39→}
+    40→    40→
+    41→    41→interface PlanRec {
+    42→    42→  recommendedPlan: Plan;
+    43→    43→  reason: string;
+    44→    44→}
+    45→    45→
+    46→    46→interface Measurements {
+    47→    47→  chest?: number;
+    48→    48→  arm?: number;
+    49→    49→  waist?: number;
+    50→    50→  hip?: number;
+    51→    51→  thigh?: number;
+    52→    52→  neck?: number;
+    53→    53→}
+    54→    54→
+    55→    55→interface BodyCompositionData {
+    56→    56→  bodyFatPercent: number;
+    57→    57→  leanBodyMass: number;
+    58→    58→  fatMass: number;
+    59→    59→  bodyFatCategory: string;
+    60→    60→  bodyFatColor: string;
+    61→    61→  muscleMassPercent: number | null;
+    62→    62→  muscleMass: number | null;
+    63→    63→}
+    64→    64→
+    65→    65→interface AnalysisResponse {
+    66→    66→  analysis: string;
+    67→    67→  bmi: number;
+    68→    68→  bmr: number;
+    69→    69→  tdee: number;
+    70→    70→  macros?: MacroRec;
+    71→    71→  trajectory?: Trajectory | null;
+    72→    72→  planRecommendation?: PlanRec;
+    73→    73→  measurements?: Measurements;
+    74→    74→  bodyComposition?: BodyCompositionData | null;
+    75→    75→  fromCache?: boolean;
+    76→    76→}
+    77→    77→
+    78→    78→// ─────────────────────────────────────────────────────────────────────────────
+    79→    79→// Macro ring — circular progress for protein/carbs/fat (pure SVG, no deps)
+    80→    80→// ─────────────────────────────────────────────────────────────────────────────
+    81→    81→function MacroRing({
+    82→    82→  label,
+    83→    83→  grams,
+    84→    84→  calories,
+    85→    85→  color,
+    86→    86→  icon,
+    87→    87→}: {
+    88→    88→  label: string;
+    89→    89→  grams: number;
+    90→    90→  calories: number;
+    91→    91→  color: string;
+    92→    92→  icon: React.ReactNode;
+    93→    93→}) {
+    94→    94→  const size = 84;
+    95→    95→  const stroke = 7;
+    96→    96→  const radius = (size - stroke) / 2;
+    97→    97→  const circumference = 2 * Math.PI * radius;
+    98→    98→  // Each macro is shown as a fraction of its calorie contribution vs the
+    99→    99→  // other two. This gives a sense of proportion rather than a fixed max.
+   100→   100→  // We just render a fully-stroked ring with the grams label inside.
+   101→   101→  const fillFraction = 0.78; // visual fill — purely aesthetic
+   102→   102→
+   103→   103→  return (
+   104→   104→    <div className="flex flex-col items-center gap-1.5">
+   105→   105→      <div className="relative" style={{ width: size, height: size }}>
+   106→   106→        <svg width={size} height={size} className="-rotate-90">
+   107→   107→          <circle
+   108→   108→            cx={size / 2}
+   109→   109→            cy={size / 2}
+   110→   110→            r={radius}
+   111→   111→            fill="none"
+   112→   112→            stroke="#f1f5f9"
+   113→   113→            strokeWidth={stroke}
+   114→   114→          />
+   115→   115→          <motion.circle
+   116→   116→            cx={size / 2}
+   117→   117→            cy={size / 2}
+   118→   118→            r={radius}
+   119→   119→            fill="none"
+   120→   120→            stroke={color}
+   121→   121→            strokeWidth={stroke}
+   122→   122→            strokeLinecap="round"
+   123→   123→            strokeDasharray={circumference}
+   124→   124→            initial={{ strokeDashoffset: circumference }}
+   125→   125→            animate={{ strokeDashoffset: circumference * (1 - fillFraction) }}
+   126→   126→            transition={{ duration: 1, ease: "easeOut" }}
+   127→   127→          />
+   128→   128→        </svg>
+   129→   129→        <div className="absolute inset-0 flex flex-col items-center justify-center">
+   130→   130→          <span className="text-slate-400">{icon}</span>
+   131→   131→          <span className="text-base font-black font-stat text-slate-900 leading-none">
+   132→   132→            {toPersianDigits(grams)}
+   133→   133→          </span>
+   134→   134→          <span className="text-[9px] text-slate-400">گرم</span>
+   135→   135→        </div>
+   136→   136→      </div>
+   137→   137→      <p className="text-xs font-bold text-slate-700">{label}</p>
+   138→   138→      <p className="text-[10px] text-slate-400">{toPersianDigits(calories)} کیلوکالری</p>
+   139→   139→    </div>
+   140→   140→  );
+   141→   141→}
+   142→   142→
+   143→   143→// ─────────────────────────────────────────────────────────────────────────────
+   144→   144→// Measurement chip
+   145→   145→// ─────────────────────────────────────────────────────────────────────────────
+   146→   146→function MeasurementChip({ label, value, unit = "سانتی‌متر" }: { label: string; value: number; unit?: string }) {
+   147→   147→  return (
+   148→   148→    <div className="rounded-2xl border-2 border-orange-100 bg-white p-3 text-center">
+   149→   149→      <p className="text-[10px] text-slate-500 mb-1">{label}</p>
+   150→   150→      <p className="text-lg font-black font-stat text-slate-900 leading-none">
+   151→   151→        {toPersianDigits(value)}
+   152→   152→      </p>
+   153→   153→      <p className="text-[9px] text-slate-400 mt-0.5">{unit}</p>
+   154→   154→    </div>
+   155→   155→  );
+   156→   156→}
+   157→   157→
+   158→   158→// ─────────────────────────────────────────────────────────────────────────────
+   159→   159→// صفحه انتظار جذاب و اختصاصی برای تحلیل هوشمند
+   160→   160→// ─────────────────────────────────────────────────────────────────────────────
+   161→   161→function AnalysisLoadingScreen({ userName }: { userName?: string | null }) {
+   162→   162→  const [step, setStep] = useState(0);
+   163→   163→  const steps = [
+   164→   164→    { icon: Scale, text: "تحلیل وزن و ترکیب بدن" },
+   165→   165→    { icon: Target, text: "بررسی هدف و سطح فعالیت" },
+   166→   166→    { icon: Activity, text: "محاسبه کالری و درشت‌مغذی‌ها" },
+   167→   167→    { icon: Dumbbell, text: "طراحی برنامه تمرینی اختصاصی" },
+   168→   168→    { icon: Sparkles, text: "تولید تحلیل هوشمند فیتاپ" },
+   169→   169→  ];
+   170→   170→
+   171→   171→  useEffect(() => {
+   172→   172→    const timer = setInterval(() => {
+   173→   173→      setStep((s) => Math.min(s + 1, steps.length - 1));
+   174→   174→    }, 2000);
+   175→   175→    return () => clearInterval(timer);
+   176→   176→  }, []);
+   177→   177→
+   178→   178→  return (
+   179→   179→    <div className="min-h-screen bg-gradient-to-b from-orange-50 via-white to-amber-50 flex flex-col items-center justify-center px-6">
+   180→   180→      {/* لوگو با انیمیشن */}
+   181→   181→      <motion.div
+   182→   182→        initial={{ scale: 0, opacity: 0 }}
+   183→   183→        animate={{ scale: 1, opacity: 1 }}
+   184→   184→        transition={{ type: "spring", stiffness: 200, damping: 15 }}
+   185→   185→        className="mb-8"
+   186→   186→      >
+   187→   187→        <div
+   188→   188→          className="w-24 h-24 rounded-3xl flex items-center justify-center overflow-hidden shadow-2xl"
+   189→   189→          style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   190→   190→        >
+   191→   191→          <motion.div
+   192→   192→            animate={{ y: [0, -6, 0] }}
+   193→   193→            transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+   194→   194→          >
+   195→   195→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   196→   196→            <img src="/fitup-logo.png" alt="فیتاپ" width={80} height={80} className="object-cover" style={{ width: 80, height: 80 }} />
+   197→   197→          </motion.div>
+   198→   198→        </div>
+   199→   199→      </motion.div>
+   200→   200→
+   201→   201→      {/* نام کاربر + پیام */}
+   202→   202→      <motion.h2
+   203→   203→        initial={{ opacity: 0, y: 10 }}
+   204→   204→        animate={{ opacity: 1, y: 0 }}
+   205→   205→        transition={{ delay: 0.3 }}
+   206→   206→        className="text-xl font-black text-slate-900 mb-2 text-center"
+   207→   207→      >
+   208→   208→        {userName ? `${userName} عزیز` : "ورزشکار گرامی"}
+   209→   209→      </motion.h2>
+   210→   210→      <motion.p
+   211→   211→        initial={{ opacity: 0 }}
+   212→   212→        animate={{ opacity: 1 }}
+   213→   213→        transition={{ delay: 0.5 }}
+   214→   214→        className="text-sm text-slate-500 mb-10 text-center max-w-xs"
+   215→   215→      >
+   216→   216→        فیتاپ هوشمند در حال تحلیل اطلاعات شما و طراحی برنامه اختصاصی شماست
+   217→   217→      </motion.p>
+   218→   218→
+   219→   219→      {/* مراحل تحلیل */}
+   220→   220→      <div className="w-full max-w-sm space-y-3">
+   221→   221→        {steps.map((s, i) => {
+   222→   222→          const Icon = s.icon;
+   223→   223→          const isDone = i < step;
+   224→   224→          const isActive = i === step;
+   225→   225→          return (
+   226→   226→            <motion.div
+   227→   227→              key={i}
+   228→   228→              initial={{ opacity: 0, x: 20 }}
+   229→   229→              animate={{ opacity: 1, x: 0 }}
+   230→   230→              transition={{ delay: 0.6 + i * 0.15 }}
+   231→   231→              className={`flex items-center gap-3 p-3 rounded-2xl transition-all ${
+   232→   232→                isActive
+   233→   233→                  ? "bg-white shadow-lg border-2 border-orange-200"
+   234→   234→                  : isDone
+   235→   235→                  ? "bg-emerald-50 border border-emerald-100"
+   236→   236→                  : "bg-white/50 border border-slate-100"
+   237→   237→              }`}
+   238→   238→            >
+   239→   239→              <div
+   240→   240→                className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-colors ${
+   241→   241→                  isDone
+   242→   242→                    ? "bg-emerald-500"
+   243→   243→                    : isActive
+   244→   244→                    ? "bg-gradient-to-br from-amber-500 to-orange-500"
+   245→   245→                    : "bg-slate-100"
+   246→   246→                }`}
+   247→   247→              >
+   248→   248→                {isDone ? (
+   249→   249→                  <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }}>
+   250→   250→                    <Sparkles className="w-5 h-5 text-white" />
+   251→   251→                  </motion.div>
+   252→   252→                ) : (
+   253→   253→                  <Icon className={`w-5 h-5 ${isActive ? "text-white" : "text-slate-400"}`} />
+   254→   254→                )}
+   255→   255→              </div>
+   256→   256→              <span
+   257→   257→                className={`text-sm font-medium transition-colors ${
+   258→   258→                  isDone ? "text-emerald-700" : isActive ? "text-slate-900" : "text-slate-400"
+   259→   259→                }`}
+   260→   260→              >
+   261→   261→                {s.text}
+   262→   262→              </span>
+   263→   263→              {isActive && (
+   264→   264→                <motion.div
+   265→   265→                  className="mr-auto"
+   266→   266→                  animate={{ rotate: 360 }}
+   267→   267→                  transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+   268→   268→                >
+   269→   269→                  <RefreshCw className="w-4 h-4 text-orange-500" />
+   270→   270→                </motion.div>
+   271→   271→              )}
+   272→   272→            </motion.div>
+   273→   273→          );
+   274→   274→        })}
+   275→   275→      </div>
+   276→   276→
+   277→   277→      {/* نوار پیشرفت */}
+   278→   278→      <motion.div
+   279→   279→        initial={{ opacity: 0 }}
+   280→   280→        animate={{ opacity: 1 }}
+   281→   281→        transition={{ delay: 1 }}
+   282→   282→        className="w-full max-w-xs mt-8"
+   283→   283→      >
+   284→   284→        <div className="h-1.5 bg-orange-100 rounded-full overflow-hidden">
+   285→   285→          <motion.div
+   286→   286→            className="h-full rounded-full"
+   287→   287→            style={{ background: "linear-gradient(90deg, #f59e0b, #f97316)" }}
+   288→   288→            animate={{ width: `${((step + 1) / steps.length) * 100}%` }}
+   289→   289→            transition={{ duration: 0.5 }}
+   290→   290→          />
+   291→   291→        </div>
+   292→   292→        <p className="text-[11px] text-slate-400 text-center mt-2">
+   293→   293→          لطفاً صبر کنید — این پردازش چند ثانیه طول می‌کشد
+   294→   294→        </p>
+   295→   295→      </motion.div>
+   296→   296→    </div>
+   297→   297→  );
+   298→   298→}
+   299→   299→
+   300→   300→// ─────────────────────────────────────────────────────────────────────────────
+   301→   301→// Main screen
+   302→   302→// ─────────────────────────────────────────────────────────────────────────────
+   303→   303→export function AnalysisScreen() {
+   304→   304→  const { user, setScreen, setMainTab, pendingPlanId, setPendingPlanId } = useAppStore();
+   305→   305→  const { plans: SUBSCRIPTION_PLANS } = usePlans();
+   306→   306→  const [data, setData] = useState<AnalysisResponse | null>(null);
+   307→   307→  const [loading, setLoading] = useState(true);
+   308→   308→  const [refreshing, setRefreshing] = useState(false);
+   309→   309→  const [purchasePlanId, setPurchasePlanId] = useState<Plan | null>(null);
+   310→   310→
+   311→   311→  // v15: تاریخ عضویت در فیتاپ — از فیلد memberSince پاسخ API (user.createdAt)
+   312→   312→  const memberSinceText = (() => {
+   313→   313→    const since = (data as any)?.memberSince as string | null | undefined;
+   314→   314→    if (!since) return null;
+   315→   315→    try {
+   316→   316→      return new Date(since).toLocaleDateString("fa-IR", { year: "numeric", month: "long", day: "numeric" });
+   317→   317→    } catch {
+   318→   318→      return null;
+   319→   319→    }
+   320→   320→  })();
+   321→   321→
+   322→   322→  async function loadAnalysis(force = false) {
+   323→   323→    if (force) setRefreshing(true);
+   324→   324→    try {
+   325→   325→      const url = force ? "/api/onboarding/analysis?force=1" : "/api/onboarding/analysis";
+   326→   326→      const res = await fetch(url);
+   327→   327→      const json = await res.json();
+   328→   328→      if (json.analysis) {
+   329→   329→        setData(json as AnalysisResponse);
+   330→   330→      }
+   331→   331→    } catch {
+   332→   332→      if (force) toast.error("خطا در بازخوانی تحلیل");
+   333→   333→    } finally {
+   334→   334→      setLoading(false);
+   335→   335→      setRefreshing(false);
+   336→   336→    }
+   337→   337→  }
+   338→   338→
+   339→   339→  useEffect(() => {
+   340→   340→    loadAnalysis();
+   341→   341→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   342→   342→  }, []);
+   343→   343→
+   344→   344→  // Resolve the pending plan object (if user came from landing)
+   345→   345→  const pendingPlan = pendingPlanId
+   346→   346→    ? SUBSCRIPTION_PLANS.find((p) => p.id === pendingPlanId) ?? null
+   347→   347→    : null;
+   348→   348→
+   349→   349→  // Resolve recommended plan object
+   350→   350→  const recommendedPlan = data?.planRecommendation
+   351→   351→    ? SUBSCRIPTION_PLANS.find((p) => p.id === data.planRecommendation!.recommendedPlan) ?? null
+   352→   352→    : null;
+   353→   353→
+   354→   354→  const bmi = data?.bmi ?? 0;
+   355→   355→  const bmiCategory = bmi < 18.5 ? "کم‌وزن" : bmi < 25 ? "وزن نرمال" : bmi < 30 ? "اضافه‌وزن" : "چاق";
+   356→   356→  const bmiColor = bmi < 18.5 ? "text-cyan-500" : bmi < 25 ? "text-emerald-500" : bmi < 30 ? "text-amber-500" : "text-red-500";
+   357→   357→
+   358→   358→  function openPurchase(planId: Plan) {
+   359→   359→    setPurchasePlanId(planId);
+   360→   360→  }
+   361→   361→
+   362→   362→  function handlePurchaseClose() {
+   363→   363→    setPurchasePlanId(null);
+   364→   364→    // Clear pendingPlanId once the user has gone through the purchase flow
+   365→   365→    setPendingPlanId(null);
+   366→   366→  }
+   367→   367→
+   368→   368→  if (loading && !data) {
+   369→   369→    return <AnalysisLoadingScreen userName={user?.name} />;
+   370→   370→  }
+   371→   371→
+   372→   372→  // ─── FE-M4: گارد حالت خالی/خطا ───
+   373→   373→  // قبلاً اگر fetch fail می‌شد یا analysis وجود نداشت، data=null ولی رندر
+   374→   374→  // ادامه می‌یافت و BMI=0 به‌عنوان «کم‌وزن» با توصیه‌های غلط نمایش داده می‌شد.
+   375→   375→  if (!data) {
+   376→   376→    return (
+   377→   377→      <div className="min-h-screen bg-white flex flex-col items-center justify-center px-6 text-center">
+   378→   378→        <div
+   379→   379→          className="w-16 h-16 rounded-2xl flex items-center justify-center mb-4"
+   380→   380→          style={{ background: "rgba(245,158,11,0.12)" }}
+   381→   381→        >
+   382→   382→          <Activity className="w-8 h-8 text-orange-500" />
+   383→   383→        </div>
+   384→   384→        <h2 className="text-lg font-black text-slate-900 mb-2">تحلیلی برای نمایش وجود ندارد</h2>
+   385→   385→        <p className="text-sm text-slate-500 mb-6 leading-relaxed max-w-xs">
+   386→   386→          تحلیل شما پیدا نشد یا در دریافت آن خطایی رخ داد. لطفاً دوباره تلاش کنید.
+   387→   387→        </p>
+   388→   388→        <div className="flex gap-2">
+   389→   389→          <Button
+   390→   390→            variant="outline"
+   391→   391→            className="rounded-xl"
+   392→   392→            onClick={() => {
+   393→   393→              setLoading(true);
+   394→   394→              loadAnalysis();
+   395→   395→            }}
+   396→   396→          >
+   397→   397→            <RefreshCw className="w-4 h-4" />
+   398→   398→            تلاش مجدد
+   399→   399→          </Button>
+   400→   400→          <Button
+   401→   401→            className="rounded-xl text-white"
+   402→   402→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   403→   403→            onClick={() => setScreen("landing")}
+   404→   404→          >
+   405→   405→            بازگشت
+   406→   406→          </Button>
+   407→   407→        </div>
+   408→   408→      </div>
+   409→   409→    );
+   410→   410→  }
+   411→   411→
+   412→   412→  return (
+   413→   413→    <div className="min-h-screen bg-white overflow-y-auto">
+   414→   414→      {/* Header */}
+   415→   415→      <div className="sticky top-0 z-10 bg-white/90 backdrop-blur-lg border-b border-orange-100 px-4 py-3 flex items-center justify-between">
+   416→   416→        <button onClick={() => setScreen("landing")} className="p-2 rounded-lg hover:bg-orange-50" aria-label="بازگشت">
+   417→   417→          {/* در RTL جهت بازگشت به راست است */}
+   418→   418→          <ChevronRight className="w-5 h-5 text-slate-600" />
+   419→   419→        </button>
+   420→   420→        <div className="flex items-center gap-2">
+   421→   421→          <div className="w-7 h-7 rounded-lg flex items-center justify-center overflow-hidden" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   422→   422→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   423→   423→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   424→   424→          </div>
+   425→   425→          <span className="font-black text-slate-900">فیتاپ</span>
+   426→   426→        </div>
+   427→   427→        <div className="w-9" />
+   428→   428→      </div>
+   429→   429→
+   430→   430→      <div className="max-w-2xl mx-auto px-4 py-6 space-y-5">
+   431→   431→        {/* Title */}
+   432→   432→        <motion.div
+   433→   433→          initial={{ opacity: 0, y: 20 }}
+   434→   434→          animate={{ opacity: 1, y: 0 }}
+   435→   435→          className="text-center"
+   436→   436→        >
+   437→   437→          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   438→   438→            <Sparkles className="w-8 h-8 text-white" />
+   439→   439→          </div>
+   440→   440→          <h1 className="text-2xl font-black text-slate-900 mb-2">
+   441→   441→            تحلیل اختصاصی شما
+   442→   442→          </h1>
+   443→   443→          <p className="text-sm text-slate-500">
+   444→   444→            {user?.name ? `${user.name} عزیز، ` : ""}فیتاپ هوشمند اطلاعات شما را تحلیل کرد
+   445→   445→          </p>
+   446→   446→          {/* v15: تاریخ عضویت در فیتاپ (درخواست مالک — آنبوردینگ باید کامل باشد) */}
+   447→   447→          {memberSinceText && (
+   448→   448→            <div className="inline-flex items-center gap-1.5 mt-3 px-3 py-1.5 rounded-full bg-orange-50 border border-orange-200 text-[11px] text-orange-700 font-bold">
+   449→   449→              <CalendarDays className="w-3.5 h-3.5" />
+   450→   450→              عضو فیتاپ از {memberSinceText}
+   451→   451→            </div>
+   452→   452→          )}
+   453→   453→        </motion.div>
+   454→   454→
+   455→   455→        {/* تحلیل فیتاپ هوشمند (مربی) — در اول صفحه */}
+   456→   456→        <motion.div
+   457→   457→          initial={{ opacity: 0, y: 20 }}
+   458→   458→          animate={{ opacity: 1, y: 0 }}
+   459→   459→          transition={{ delay: 0.05 }}
+   460→   460→        >
+   461→   461→          <Card className="p-5 border-2 border-orange-200 relative overflow-hidden">
+   462→   462→            {/* Background gradient */}
+   463→   463→            <div className="absolute -top-10 -left-10 w-32 h-32 rounded-full bg-orange-100/40 blur-2xl" />
+   464→   464→            <div className="absolute -bottom-10 -right-10 w-32 h-32 rounded-full bg-amber-100/40 blur-2xl" />
+   465→   465→
+   466→   466→            <div className="relative">
+   467→   467→              <div className="flex items-center gap-2.5 mb-4">
+   468→   468→                <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-md" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   469→   469→                  <Bot className="w-5 h-5 text-white" />
+   470→   470→                </div>
+   471→   471→                <div>
+   472→   472→                  <h3 className="font-bold text-slate-900">تحلیل فیتاپ هوشمند</h3>
+   473→   473→                  <p className="text-[10px] text-slate-500">مربی هوشمند شما</p>
+   474→   474→                </div>
+   475→   475→              </div>
+   476→   476→              {loading ? (
+   477→   477→                <div className="space-y-2">
+   478→   478→                  {[1, 2, 3, 4].map(i => (
+   479→   479→                    <div key={i} className="h-3 bg-orange-100 rounded animate-pulse" style={{ width: `${90 - i * 10}%` }} />
+   480→   480→                  ))}
+   481→   481→                </div>
+   482→   482→              ) : (
+   483→   483→                <div className="p-4 rounded-xl bg-gradient-to-br from-orange-50/50 to-amber-50/30 border border-orange-100/50">
+   484→   484→                  <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">{data?.analysis}</p>
+   485→   485→                </div>
+   486→   486→              )}
+   487→   487→            </div>
+   488→   488→          </Card>
+   489→   489→        </motion.div>
+   490→   490→
+   491→   491→        {/* Biometric cards */}
+   492→   492→        <motion.div
+   493→   493→          initial={{ opacity: 0, y: 20 }}
+   494→   494→          animate={{ opacity: 1, y: 0 }}
+   495→   495→          transition={{ delay: 0.1 }}
+   496→   496→          className="grid grid-cols-3 gap-3"
+   497→   497→        >
+   498→   498→          <Card className="p-4 text-center border-2 border-orange-100">
+   499→   499→            <p className="text-[10px] text-slate-500">شاخص BMI</p>
+   500→   500→            <p className={`text-2xl font-black font-stat ${bmiColor}`}>{toPersianDigits(bmi.toFixed(1))}</p>
+   501→   501→            <p className={`text-[10px] font-bold ${bmiColor}`}>{bmiCategory}</p>
+   502→   502→          </Card>
+   503→   503→          <Card className="p-4 text-center border-2 border-orange-100">
+   504→   504→            <p className="text-[10px] text-slate-500">متابولیسم (BMR)</p>
+   505→   505→            <p className="text-2xl font-black font-stat text-slate-900">{toPersianDigits(data?.bmr ?? 0)}</p>
+   506→   506→            <p className="text-[10px] text-slate-400">کیلوکالری</p>
+   507→   507→          </Card>
+   508→   508→          <Card className="p-4 text-center border-2 border-orange-100">
+   509→   509→            <p className="text-[10px] text-slate-500">کالری روزانه (TDEE)</p>
+   510→   510→            <p className="text-2xl font-black font-stat text-slate-900">{toPersianDigits(data?.tdee ?? 0)}</p>
+   511→   511→            <p className="text-[10px] text-slate-400">کیلوکالری</p>
+   512→   512→          </Card>
+   513→   513→        </motion.div>
+   514→   514→
+   515→   515→        {/* Weight goal trajectory card */}
+   516→   516→        {data?.trajectory && (
+   517→   517→          <motion.div
+   518→   518→            initial={{ opacity: 0, y: 20 }}
+   519→   519→            animate={{ opacity: 1, y: 0 }}
+   520→   520→            transition={{ delay: 0.18 }}
+   521→   521→          >
+   522→   522→            <Card className="p-5 border-2 border-orange-100">
+   523→   523→              <div className="flex items-center gap-2 mb-4">
+   524→   524→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   525→   525→                  <Target className="w-4 h-4 text-white" />
+   526→   526→                </div>
+   527→   527→                <h3 className="font-bold text-slate-900">مسیر رسیدن به وزن هدف</h3>
+   528→   528→              </div>
+   529→   529→
+   530→   530→              <div className="flex items-center justify-between mb-4">
+   531→   531→                <div className="text-center">
+   532→   532→                  <p className="text-[10px] text-slate-500 mb-1">وزن فعلی</p>
+   533→   533→                  <p className="text-xl font-black font-stat text-slate-900">
+   534→   534→                    {toPersianDigits(data.trajectory.currentWeight)}
+   535→   535→                  </p>
+   536→   536→                  <p className="text-[9px] text-slate-400">کیلوگرم</p>
+   537→   537→                </div>
+   538→   538→
+   539→   539→                {/* Progress bar */}
+   540→   540→                <div className="flex-1 mx-3 relative">
+   541→   541→                  <div className="h-2 bg-orange-100 rounded-full overflow-hidden">
+   542→   542→                    <motion.div
+   543→   543→                      initial={{ width: 0 }}
+   544→   544→                      animate={{ width: "100%" }}
+   545→   545→                      transition={{ duration: 1, ease: "easeOut" }}
+   546→   546→                      className="h-full rounded-full"
+   547→   547→                      style={{ background: "linear-gradient(90deg, #f59e0b, #f97316)" }}
+   548→   548→                    />
+   549→   549→                  </div>
+   550→   550→                  <div className="flex items-center justify-center mt-1">
+   551→   551→                    <Scale className="w-3 h-3 text-orange-500" />
+   552→   552→                  </div>
+   553→   553→                </div>
+   554→   554→
+   555→   555→                <div className="text-center">
+   556→   556→                  <p className="text-[10px] text-slate-500 mb-1">وزن هدف</p>
+   557→   557→                  <p className="text-xl font-black font-stat text-orange-600">
+   558→   558→                    {toPersianDigits(data.trajectory.targetWeight)}
+   559→   559→                  </p>
+   560→   560→                  <p className="text-[9px] text-slate-400">کیلوگرم</p>
+   561→   561→                </div>
+   562→   562→              </div>
+   563→   563→
+   564→   564→              <div className="grid grid-cols-3 gap-2">
+   565→   565→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   566→   566→                  <Calendar className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   567→   567→                  <p className="text-[10px] text-slate-500">زمان رسیدن به هدف</p>
+   568→   568→                  <p className="text-sm font-black font-stat text-slate-900">
+   569→   569→                    {toPersianDigits(data.trajectory.weeksToGoal)} هفته
+   570→   570→                  </p>
+   571→   571→                </div>
+   572→   572→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   573→   573→                  <TrendingUp className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   574→   574→                  <p className="text-[10px] text-slate-500">نرخ هفتگی</p>
+   575→   575→                  <p className="text-sm font-black font-stat text-slate-900">
+   576→   576→                    {data.trajectory.weeklyRate > 0 ? "+" : ""}
+   577→   577→                    {toPersianDigits(data.trajectory.weeklyRate.toFixed(2))} kg
+   578→   578→                  </p>
+   579→   579→                </div>
+   580→   580→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   581→   581→                  <Flame className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   582→   582→                  <p className="text-[10px] text-slate-500">تنظیم کالری روزانه</p>
+   583→   583→                  <p className="text-sm font-black font-stat text-slate-900">
+   584→   584→                    {data.trajectory.weeklyCalorieAdjustment > 0 ? "+" : ""}
+   585→   585→                    {toPersianDigits(data.trajectory.weeklyCalorieAdjustment)}
+   586→   586→                  </p>
+   587→   587→                </div>
+   588→   588→              </div>
+   589→   589→
+   590→   590→              <p className="mt-3 text-[11px] text-slate-500 text-center leading-relaxed">
+   591→   591→                این مسیر بر اساس نرخ ایمن{" "}
+   592→   592→                {data.trajectory.weeklyRate < 0
+   593→   593→                  ? `کاهش ${toPersianDigits(0.5)} کیلوگرم در هفته`
+   594→   594→                  : `افزایش ${toPersianDigits(0.25)} کیلوگرم در هفته`}{" "}
+   595→   595→                محاسبه شده است. روند تغییر وزن نرمال و پایدار است.
+   596→   596→              </p>
+   597→   597→            </Card>
+   598→   598→          </motion.div>
+   599→   599→        )}
+   600→   600→
+   601→   601→        {/* Body measurements card */}
+   602→   602→        {data?.measurements && Object.keys(data.measurements).length > 0 && (
+   603→   603→          <motion.div
+   604→   604→            initial={{ opacity: 0, y: 20 }}
+   605→   605→            animate={{ opacity: 1, y: 0 }}
+   606→   606→            transition={{ delay: 0.2 }}
+   607→   607→          >
+   608→   608→            <Card className="p-5 border-2 border-orange-100">
+   609→   609→              <div className="flex items-center gap-2 mb-4">
+   610→   610→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   611→   611→                  <Ruler className="w-4 h-4 text-white" />
+   612→   612→                </div>
+   613→   613→                <h3 className="font-bold text-slate-900">اندازه‌های بدن شما</h3>
+   614→   614→              </div>
+   615→   615→              <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+   616→   616→                {data.measurements.chest != null && (
+   617→   617→                  <MeasurementChip label="دور سینه" value={data.measurements.chest} />
+   618→   618→                )}
+   619→   619→                {data.measurements.arm != null && (
+   620→   620→                  <MeasurementChip label="دور بازو" value={data.measurements.arm} />
+   621→   621→                )}
+   622→   622→                {data.measurements.waist != null && (
+   623→   623→                  <MeasurementChip label="دور کمر" value={data.measurements.waist} />
+   624→   624→                )}
+   625→   625→                {data.measurements.hip != null && (
+   626→   626→                  <MeasurementChip label="دور باسن" value={data.measurements.hip} />
+   627→   627→                )}
+   628→   628→                {data.measurements.thigh != null && (
+   629→   629→                  <MeasurementChip label="دور ران" value={data.measurements.thigh} />
+   630→   630→                )}
+   631→   631→                {data.measurements.neck != null && (
+   632→   632→                  <MeasurementChip label="دور گردن" value={data.measurements.neck} />
+   633→   633→                )}
+   634→   634→              </div>
+   635→   635→            </Card>
+   636→   636→          </motion.div>
+   637→   637→        )}
+   638→   638→
+   639→   639→        {/* ─── NEW (BODY-COMPOSITION-PRO): Body Composition card ─── */}
+   640→   640→        {data?.bodyComposition && (
+   641→   641→          <motion.div
+   642→   642→            initial={{ opacity: 0, y: 20 }}
+   643→   643→            animate={{ opacity: 1, y: 0 }}
+   644→   644→            transition={{ delay: 0.22 }}
+   645→   645→          >
+   646→   646→            <Card className="p-5 border-2 border-orange-100">
+   647→   647→              <div className="flex items-center justify-between mb-4">
+   648→   648→                <div className="flex items-center gap-2">
+   649→   649→                  <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   650→   650→                    <Activity className="w-4 h-4 text-white" />
+   651→   651→                  </div>
+   652→   652→                  <h3 className="font-bold text-slate-900">ترکیب بدن شما</h3>
+   653→   653→                </div>
+   654→   654→              </div>
+   655→   655→
+   656→   656→              {/* 3 main stats */}
+   657→   657→              <div className="grid grid-cols-3 gap-2 mb-4">
+   658→   658→                {/* Body Fat % */}
+   659→   659→                <div
+   660→   660→                  className="rounded-2xl p-4 text-center border-2"
+   661→   661→                  style={{
+   662→   662→                    borderColor: data.bodyComposition.bodyFatColor + "60",
+   663→   663→                    background: data.bodyComposition.bodyFatColor + "10",
+   664→   664→                  }}
+   665→   665→                >
+   666→   666→                  <p className="text-[10px] text-slate-500 mb-1">درصد چربی بدن</p>
+   667→   667→                  <p
+   668→   668→                    className="text-3xl font-black font-stat leading-none"
+   669→   669→                    style={{ color: data.bodyComposition.bodyFatColor }}
+   670→   670→                  >
+   671→   671→                    {toPersianDigits(data.bodyComposition.bodyFatPercent.toFixed(1))}
+   672→   672→                    <span className="text-base">٪</span>
+   673→   673→                  </p>
+   674→   674→                  <p
+   675→   675→                    className="text-[10px] font-bold mt-1.5"
+   676→   676→                    style={{ color: data.bodyComposition.bodyFatColor }}
+   677→   677→                  >
+   678→   678→                    {data.bodyComposition.bodyFatCategory}
+   679→   679→                  </p>
+   680→   680→                </div>
+   681→   681→
+   682→   682→                {/* Lean Body Mass */}
+   683→   683→                <div className="rounded-2xl p-4 text-center border-2 border-orange-100 bg-white">
+   684→   684→                  <p className="text-[10px] text-slate-500 mb-1">جرم بدون چربی</p>
+   685→   685→                  <p className="text-3xl font-black font-stat text-slate-900 leading-none">
+   686→   686→                    {toPersianDigits(data.bodyComposition.leanBodyMass)}
+   687→   687→                  </p>
+   688→   688→                  <p className="text-[10px] text-slate-400 mt-1.5">کیلوگرم</p>
+   689→   689→                </div>
+   690→   690→
+   691→   691→                {/* Fat Mass */}
+   692→   692→                <div className="rounded-2xl p-4 text-center border-2 border-orange-100 bg-white">
+   693→   693→                  <p className="text-[10px] text-slate-500 mb-1">جرم چربی</p>
+   694→   694→                  <p className="text-3xl font-black font-stat text-slate-900 leading-none">
+   695→   695→                    {toPersianDigits(data.bodyComposition.fatMass)}
+   696→   696→                  </p>
+   697→   697→                  <p className="text-[10px] text-slate-400 mt-1.5">کیلوگرم</p>
+   698→   698→                </div>
+   699→   699→              </div>
+   700→   700→
+   701→   701→              {/* Muscle mass (estimated) */}
+   702→   702→              {data.bodyComposition.muscleMass != null && (
+   703→   703→                <div className="rounded-xl bg-orange-50/50 border border-orange-100 p-3 mb-3">
+   704→   704→                  <div className="flex items-center justify-between">
+   705→   705→                    <div className="flex items-center gap-2">
+   706→   706→                      <Heart className="w-4 h-4 text-orange-500" />
+   707→   707→                      <span className="text-xs font-bold text-slate-700">درصد عضله تقریبی</span>
+   708→   708→                    </div>
+   709→   709→                    <div className="flex items-baseline gap-1">
+   710→   710→                      <span className="text-lg font-black font-stat text-orange-600">
+   711→   711→                        {toPersianDigits(data.bodyComposition.muscleMassPercent?.toFixed(1) ?? "0")}
+   712→   712→                      </span>
+   713→   713→                      <span className="text-[10px] text-slate-500">٪</span>
+   714→   714→                      <span className="text-[10px] text-slate-400 ml-2">
+   715→   715→                        ({toPersianDigits(data.bodyComposition.muscleMass)} کیلوگرم)
+   716→   716→                      </span>
+   717→   717→                    </div>
+   718→   718→                  </div>
+   719→   719→                </div>
+   720→   720→              )}
+   721→   721→
+   722→   722→              {/* Scientific note */}
+   723→   723→              <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 flex items-start gap-2">
+   724→   724→                <Sparkles className="w-4 h-4 text-orange-500 shrink-0 mt-0.5" />
+   725→   725→                <p className="text-[11px] text-slate-600 leading-relaxed">
+   726→   726→                  محاسبه بر اساس <b>فرمول علمی US Navy</b> (Hodgdon & Beckett, 1984).
+   727→   727→                  این روش با اندازه‌گیری دور کمر، گردن و قد، معتبرترین تخمین بدون‌دستگاه چربی بدن را ارائه می‌دهد.
+   728→   728→                </p>
+   729→   729→              </div>
+   730→   730→            </Card>
+   731→   731→          </motion.div>
+   732→   732→        )}
+   733→   733→
+   734→   734→        {/* 🆕 v56: بنر انگیزشی بالای پلن پیشنهادی (درخواست مالک) — کاربر باید بداند این پکیج چه چیزی به او می‌دهد */}
+   735→   735→        <motion.div
+   736→   736→          initial={{ opacity: 0, y: 12 }}
+   737→   737→          animate={{ opacity: 1, y: 0 }}
+   738→   738→          transition={{ delay: 0.22 }}
+   739→   739→          className="rounded-2xl p-4 text-center relative overflow-hidden"
+   740→   740→          style={{ background: "linear-gradient(135deg, #fffbeb 0%, #ffedd5 100%)", border: "1px solid #fed7aa" }}
+   741→   741→        >
+   742→   742→          <div className="absolute -right-8 -top-8 w-24 h-24 rounded-full bg-orange-200/40 blur-xl" />
+   743→   743→          <div className="absolute -left-8 -bottom-8 w-24 h-24 rounded-full bg-amber-200/40 blur-xl" />
+   744→   744→          <div className="relative flex items-center justify-center gap-1.5 mb-1.5">
+   745→   745→            <Sparkles className="w-4 h-4 text-amber-500" />
+   746→   746→            <Sparkles className="w-4 h-4 text-orange-500" />
+   747→   747→            <Sparkles className="w-4 h-4 text-amber-500" />
+   748→   748→          </div>
+   749→   749→          <p className="relative text-sm sm:text-[15px] font-black leading-relaxed" style={{ color: "#9a3412" }}>
+   750→   750→            فیتاپ برات{" "}
+   751→   751→            <span className="underline decoration-orange-300 decoration-2 underline-offset-4" style={{ color: "#ea580c" }}>
+   752→   752→              برنامه بدنسازی و ورزشی مخصوص به خودتو
+   753→   753→            </span>{" "}
+   754→   754→            میده تا به هدفت برسی
+   755→   755→          </p>
+   756→   756→          <p className="relative text-[11px] text-orange-700/70 mt-1.5">
+   757→   757→            پلنت رو انتخاب کن، بقیه‌ش با ما — مسیر تناسب اندامت از همین‌جا شروع می‌شه 💪
+   758→   758→          </p>
+   759→   759→        </motion.div>
+   760→   760→
+   761→   761→        {/* Plan recommendation card */}
+   762→   762→        {data?.planRecommendation && recommendedPlan && (
+   763→   763→          <motion.div
+   764→   764→            initial={{ opacity: 0, y: 20 }}
+   765→   765→            animate={{ opacity: 1, y: 0 }}
+   766→   766→            transition={{ delay: 0.3 }}
+   767→   767→          >
+   768→   768→            <Card
+   769→   769→              className="p-5 border-2"
+   770→   770→              style={{ borderColor: "#fed7aa", background: "linear-gradient(135deg, #fffbeb 0%, #ffffff 60%)" }}
+   771→   771→            >
+   772→   772→              <div className="flex items-center gap-2 mb-3">
+   773→   773→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   774→   774→                  <Award className="w-4 h-4 text-white" />
+   775→   775→                </div>
+   776→   776→                <h3 className="font-bold text-slate-900">پلن پیشنهادی فیتاپ</h3>
+   777→   777→              </div>
+   778→   778→
+   779→   779→              {/* Recommended plan mini-card */}
+   780→   780→              <div
+   781→   781→                className="rounded-2xl p-4 mb-3 text-white relative overflow-hidden"
+   782→   782→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   783→   783→              >
+   784→   784→                <div className="absolute -left-6 -top-6 w-20 h-20 rounded-full bg-white/10" />
+   785→   785→                <div className="relative flex items-start justify-between gap-3">
+   786→   786→                  <div className="flex items-center gap-2">
+   787→   787→                    <div>
+   788→   788→                      <p className="font-black text-lg leading-tight">{recommendedPlan.label}</p>
+   789→   789→                      <p className="text-[11px] opacity-90">{recommendedPlan.tagline}</p>
+   790→   790→                    </div>
+   791→   791→                  </div>
+   792→   792→                  <div className="text-left">
+   793→   793→                    <p className="font-black font-stat text-lg leading-none">
+   794→   794→                      {toPersianDigits(formatToman(recommendedPlan.price))}
+   795→   795→                    </p>
+   796→   796→                    <p className="text-[10px] opacity-80">تومان</p>
+   797→   797→                  </div>
+   798→   798→                </div>
+   799→   799→                <div className="relative flex flex-wrap gap-1.5 mt-3">
+   800→   800→                  {recommendedPlan.features.slice(0, 3).map((f, i) => (
+   801→   801→                    <span key={i} className="text-[10px] px-2 py-0.5 rounded-full bg-white/15 backdrop-blur">
+   802→   802→                      ✓ {f}
+   803→   803→                    </span>
+   804→   804→                  ))}
+   805→   805→                </div>
+   806→   806→              </div>
+   807→   807→
+   808→   808→              <p className="text-xs text-slate-600 leading-relaxed mb-3">
+   809→   809→                {data.planRecommendation.reason}
+   810→   810→              </p>
+   811→   811→
+   812→   812→              <Button
+   813→   813→                onClick={() => openPurchase(recommendedPlan.id)}
+   814→   814→                className="w-full h-11 rounded-xl font-bold text-white"
+   815→   815→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   816→   816→              >
+   817→   817→                <Crown className="w-4 h-4" />
+   818→   818→                خرید پلن {PLAN_LABELS[recommendedPlan.id]}
+   819→   819→              </Button>
+   820→   820→
+   821→   821→              {/* ─── پلن‌های بالاتر — معرفی محو (دیریکتیو مالک v59) ─── */}
+   822→   822→              {/* قیف اصلی خریدِ پلن پیشنهادی است؛ پلن‌های بالاتر فقط «معرفی» می‌شوند
+   823→   823→                  (امکانات قوی‌تر برای وقتی بودجه رسید) — بدون رقابت قیمتِ همزمان.
+   824→   824→                  مقایسهٔ کامل در تب پلن‌ها آزاد است. */}
+   825→   825→              {(() => {
+   826→   826→                const others = SUBSCRIPTION_PLANS.filter((p) => p.id !== recommendedPlan.id);
+   827→   827→                if (others.length === 0) return null;
+   828→   828→                const stronger = others.filter((p) => p.price > recommendedPlan.price);
+   829→   829→                const strongerNames = stronger.map((p) => p.label).join("، ");
+   830→   830→                return (
+   831→   831→                  <div className="mt-3 rounded-xl bg-slate-50 border border-slate-100 p-3 flex items-start gap-2">
+   832→   832→                    <Sparkles className="w-3.5 h-3.5 text-orange-400 shrink-0 mt-0.5" />
+   833→   833→                    <p className="text-[11px] text-slate-500 leading-relaxed flex-1">
+   834→   834→                      {stronger.length > 0 ? (
+   835→   835→                        <>
+   836→   836→                          پلن‌های بالاتر ({strongerNames}) امکانات قوی‌تری دارند — مثل چت بی‌نهایت با مربی هوشمند،
+   837→   837→                          آنالیز عکس غذا و بدن و حالت باشگاه. هر وقت آماده بودی می‌تونی ارتقا بدی.
+   838→   838→                        </>
+   839→   839→                      ) : (
+   840→   840→                        <>پلن‌های دیگر هم برای نیازهای متفاوت موجودند — انتخاب با خود توست.</>
+   841→   841→                      )}{" "}
+   842→   842→                      <button
+   843→   843→                        onClick={() => { setMainTab("plans"); setScreen("main"); }}
+   844→   844→                        className="font-bold underline decoration-orange-300 underline-offset-2 hover:text-orange-600 transition"
+   845→   845→                      >
+   846→   846→                        مقایسه پلن‌ها
+   847→   847→                      </button>
+   848→   848→                    </p>
+   849→   849→                  </div>
+   850→   850→                );
+   851→   851→              })()}
+   852→   852→            </Card>
+   853→   853→          </motion.div>
+   854→   854→        )}
+   855→   855→
+   856→   856→        {/* Action buttons */}
+   857→   857→        <motion.div
+   858→   858→          initial={{ opacity: 0, y: 20 }}
+   859→   859→          animate={{ opacity: 1, y: 0 }}
+   860→   860→          transition={{ delay: 0.35 }}
+   861→   861→          className="space-y-3 pt-2"
+   862→   862→        >
+   863→   863→          <p className="text-center text-sm font-bold text-slate-700">مسیر بعدی شما؟</p>
+   864→   864→
+   865→   865→          {/* Pending plan CTA — primary */}
+   866→   866→          {pendingPlan && (
+   867→   867→            <button
+   868→   868→              onClick={() => openPurchase(pendingPlan.id)}
+   869→   869→              className="w-full p-5 rounded-2xl text-white shadow-xl shadow-orange-500/30 transition hover:scale-[1.02] flex items-center gap-4"
+   870→   870→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   871→   871→            >
+   872→   872→              <div className="w-12 h-12 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
+   873→   873→                <Crown className="w-6 h-6 text-white" />
+   874→   874→              </div>
+   875→   875→              <div className="flex-1 text-right">
+   876→   876→                <p className="font-black text-base">ادامه خرید پلن {pendingPlan.label}</p>
+   877→   877→                <p className="text-xs opacity-90">
+   878→   878→                  پلنی که انتخاب کردید — {toPersianDigits(formatToman(pendingPlan.price))} تومان
+   879→   879→                </p>
+   880→   880→              </div>
+   881→   881→              <ChevronLeft className="w-5 h-5" />
+   882→   882→            </button>
+   883→   883→          )}
+   884→   884→
+   885→   885→          {/* See all plans */}
+   886→   886→          <button
+   887→   887→            onClick={() => { setMainTab("plans"); setScreen("main"); }}
+   888→   888→            className="w-full p-5 rounded-2xl border-2 border-orange-200 bg-white text-slate-700 shadow-sm transition hover:scale-[1.02] hover:border-orange-300 flex items-center gap-4"
+   889→   889→          >
+   890→   890→            <div className="w-12 h-12 rounded-xl bg-orange-50 flex items-center justify-center shrink-0">
+   891→   891→              <Crown className="w-6 h-6 text-orange-500" />
+   892→   892→            </div>
+   893→   893→            <div className="flex-1 text-right">
+   894→   894→              <p className="font-black text-base">مشاهده همه پلن‌ها</p>
+   895→   895→              <p className="text-xs text-slate-500">۴ پلن متناسب با هر هدف و بودجه</p>
+   896→   896→            </div>
+   897→   897→            <ChevronLeft className="w-5 h-5 text-slate-400" />
+   898→   898→          </button>
+   899→   899→
+   900→   900→          {/* Go to dashboard */}
+   901→   901→          <button
+   902→   902→            onClick={() => { setMainTab("dashboard"); setScreen("main"); }}
+   903→   903→            className="w-full p-5 rounded-2xl border-2 border-slate-200 bg-white text-slate-700 shadow-sm transition hover:scale-[1.02] hover:border-slate-300 flex items-center gap-4"
+   904→   904→          >
+   905→   905→            <div className="w-12 h-12 rounded-xl bg-slate-50 flex items-center justify-center shrink-0">
+   906→   906→              <TrendingUp className="w-6 h-6 text-slate-500" />
+   907→   907→            </div>
+   908→   908→            <div className="flex-1 text-right">
+   909→   909→              <p className="font-black text-base">رفتن به داشبورد</p>
+   910→   910→              <p className="text-xs text-slate-500">از ابزارهای رایگان و امکانات پنل استفاده کنید</p>
+   911→   911→            </div>
+   912→   912→            <ChevronLeft className="w-5 h-5 text-slate-400" />
+   913→   913→          </button>
+   914→   914→        </motion.div>
+   915→   915→      </div>
+   916→   916→
+   917→   917→      {/* Purchase modal — user is already logged in at this point so checkout works */}
+   918→   918→      {purchasePlanId && (() => {
+   919→   919→        const plan = SUBSCRIPTION_PLANS.find((p) => p.id === purchasePlanId);
+   920→   920→        return plan ? (
+   921→   921→          <PurchaseModal
+   922→   922→            plan={plan}
+   923→   923→            onClose={handlePurchaseClose}
+   924→   924→            onNeedLogin={() => handlePurchaseClose()}
+   925→   925→          />
+   926→   926→        ) : null;
+   927→   927→      })()}
+   928→   928→    </div>
+   929→   929→  );
+   930→   930→}
+   931→   931→

@@ -1,0 +1,802 @@
+     1→     1→import OpenAI from "openai";
+     2→     2→import { db } from "@/lib/db";
+     3→     3→import type {
+     4→     4→  OnboardingData,
+     5→     5→  WorkoutPlanContent,
+     6→     6→  MealPlanContent,
+     7→     7→  Plan,
+     8→     8→} from "./types";
+     9→     9→import {
+    10→    10→  GOAL_LABELS, ACTIVITY_LABELS, GENDER_LABELS, WORKOUT_PLACE_LABELS, DIET_LABELS,
+    11→    11→  PERSIAN_WEEKDAYS, PLAN_LABELS, getCapabilities, TRAINING_EXPERIENCE_LABELS,
+    12→    12→  BODY_FRAME_LABELS, WORKOUT_TIME_LABELS, PREFERRED_CUISINE_LABELS, MEDICAL_CONDITION_LABELS,
+    13→    13→} from "./types";
+    14→    14→import { bloodTestPromptSummary } from "./blood-tests";
+    15→    15→import { execFile } from "child_process";
+    16→    16→import { promisify } from "util";
+    17→    17→import { writeFile, readFile, unlink, mkdir } from "fs/promises";
+    18→    18→import path from "path";
+    19→    19→import { tmpdir } from "os";
+    20→    20→import { logAiUsage } from "@/lib/fitness/costs";
+    21→    21→
+    22→    22→const execFileAsync = promisify(execFile);
+    23→    23→
+    24→    24→// AvalAI OpenAI-compatible client — lazy initialization
+    25→    25→// در زمان build ساخته نمی‌شود تا خطای Missing credentials ندهد
+    26→    26→let _avalaiClient: OpenAI | null = null;
+    27→    27→
+    28→    28→export function getAvalaiClient(): OpenAI {
+    29→    29→  if (!_avalaiClient) {
+    30→    30→    _avalaiClient = new OpenAI({
+    31→    31→      apiKey: process.env.AVALAI_API_KEY || "placeholder-for-build",
+    32→    32→      baseURL: process.env.AVALAI_BASE_URL || "https://api.avalai.ir/v1",
+    33→    33→      // ⚠️ بدون این دو گزینه، تایم‌اوت پیش‌فرض SDK ۱۰ دقیقه است و کال‌های کند
+    34→    34→      // (که کلادفلرِ جلوی api.avalai.ir با 504 می‌کُشد) کل مسیر تولید برنامه را قفل می‌کنند.
+    35→    35→      timeout: 165_000, // ۱۶۵ ثانیه — تست واقعی AvalAI: تولید برنامه کامل با reasoning low ≈ ۹۷-۱۱۰s؛ سقف گیت‌وی بالاتر از ۱۱۰s است
+    36→    36→      maxRetries: 1, // یک retry خودکار برای خطاهای گذرا (429/5xx) — نه بیشتر، تا سریع fail شود
+    37→    37→    });
+    38→    38→  }
+    39→    39→  return _avalaiClient;
+    40→    40→}
+    41→    41→
+    42→    42→export const TEXT_MODEL = process.env.AVALAI_TEXT_MODEL || "gemini-3.8-flash";
+    43→    43→export const VISION_MODEL = process.env.AVALAI_VISION_MODEL || "gemini-3.8-flash";
+    44→    44→
+    45→    45→// ═══════════════════════════════════════════════════════════════════════════
+    46→    46→// v42 — مدل‌های فال‌بک سراسری (دیریکتیو مالک):
+    47→    47→// «همهٔ قسمت‌های هوش مصنوعی باید درست کار کنند. برای مدل ویژن اگر یک درصد نشد
+    48→    48→//  مدل gemini-3.5-flash و برای ال‌ال‌ام هم اگر یک درصد نشد مدل دیپسیک 4 فلش.»
+    49→    49→//   • درخواست‌های متنی (LLM):  gemini-3.8-flash → deepseek-v4-flash
+    50→    50→//   • درخواست‌های تصویری (Vision): gemini-3.8-flash → gemini-3.5-flash
+    51→    51→// تشخیص ویژن خودکار است (پیام شامل image_url باشد) — لازم نیست هر call-site
+    52→    52→// دستی مشخص کند. هر شکستِ نهایی (پاسخ خالی/نامعتبر، 4xx، 5xx، تایم‌اوت) بعد از
+    53→    53→// اتمام تلاش‌های همان مدل، به مدل فال‌بک می‌رود — در createResilientCompletion
+    54→    54→// و createChatCompletionWithRetry (دو نقطهٔ تماس تنها با avalaiClient در سیستم،
+    55→    55→// علاوه بر مسیر تولید برنامه که فال‌بک اختصاصی خودش را دارد).
+    56→    56→// ═══════════════════════════════════════════════════════════════════════════
+    57→    57→export const FALLBACK_VISION_MODEL =
+    58→    58→  process.env.AVALAI_FALLBACK_VISION_MODEL || "gemini-3.5-flash";
+    59→    59→export const FALLBACK_TEXT_MODEL =
+    60→    60→  process.env.AVALAI_FALLBACK_TEXT_MODEL || "deepseek-v4-flash";
+    61→    61→
+    62→    62→// ═══════════════════════════════════════════════════════════════════════
+    63→    63→// v58 — مدل اختصاصی چت نیکا و تحلیل آنبوردینگ (دیریکتیو مالک):
+    64→    64→// «مدل LLM نیکا و تحلیل آنبوردینگ بشود deepseek-v4-flash با همان کلید API
+    65→    65→//  فعلی (AvalAI) — تمام بقیهٔ LLMها همان قبلی بمانند.»
+    66→    66→//
+    67→    67→// deepseek-v4-flash → به‌طور خودکار به DeepSeek-V4-Flash-0731 روت می‌شود
+    68→    68→// (MoE با ۲۸۴B پارامتر کل / ۱۳B فعال + speculative decoding از نوع DSpark،
+    69→    69→// پنجرهٔ زمینهٔ ۱M توکن، خروجی ساختاریافته/فراخوانی ابزار/کش پرامپت/استریمینگ
+    70→    70→// بومی — از طریق همان کلید و baseURL فعلی AvalAI با /v1/chat/completions).
+    71→    71→//
+    72→    72→//   • چت نیکا: reasoning_effort=low (پاسخ سریع فروش/راهنما — تجربهٔ چت)
+    73→    73→//   • تحلیل آنبوردینگ: سطح پیش‌فرض (low) — تحلیل ۳ پاراگرافی سریع
+    74→    74→//
+    75→    75→// فال‌بک هر دو: اگر deepseek به هر دلیلی نشد → TEXT_MODEL (gemini-3.8-flash)
+    76→    76→// تا کاربر هرگز بدون پاسخ نماند (دیریکتیو «اگر یک درصد نشد…»). این فال‌بک
+    77→    77→// صریح با پارامتر داخلی fallback_model پاس داده می‌شود (هرگز به API نمی‌رود).
+    78→    78→// ═══════════════════════════════════════════════════════════════════════
+    79→    79→export const NIKA_MODEL = process.env.AVALAI_NIKA_MODEL || "deepseek-v4-flash";
+    80→    80→export const ONBOARDING_ANALYSIS_MODEL =
+    81→    81→  process.env.AVALAI_ONBOARDING_MODEL || "deepseek-v4-flash";
+    82→    82→
+    83→    83→// ═══════════════════════════════════════════════════════════════════════
+    84→    84→// v69 — مدل وظایف متنی عمومی (دیریکتیو مالک):
+    85→    85→// «بررسی جامع کن که تحلیل انبوردینگ و چت نیکا حتماً از DeepSeek 4 Flash
+    86→    86→//  استفاده کنن تا هزینه‌هام مدیریت بشه — ۸۰٪ مصرف ۲۴ساعت اخیر gemini بوده
+    87→    87→//  در حالی که باید برعکس باشه.»
+    88→    88→//
+    89→    89→// ریشه‌یابی: نیکا/آنبوردینگ از v58 واقعاً deepseek بودند؛ اما مسیرهای متنیِ
+    90→    90→// پرمصرفِ دیگر (چت مربی هوشمند پنل بدون عکس، تحلیل چکاپ، تحلیل جامع، تحلیل
+    91→    91→// تاریخچهٔ برنامه، جایگزین غذا، تحلیل اندازه‌های اولیه، دستیار مدیر، تحلیل
+    92→    92→// نظرسنجی) هنوز از TEXT_MODEL (gemini-3.8-flash — گران‌ترِ ~۴ برابری) استفاده
+    93→    93→// می‌کردند و کل سهم مصرف را به gemini می‌بردند.
+    94→    94→//
+    95→    95→// v69: همهٔ وظایف «متنی» (بدون تصویر) به deepseek-v4-flash منتقل شدند؛
+    96→    96→// فال‌بک صریح‌شان gemini-3.8-flash است تا هیچ مسیری بدون پاسخ نماند.
+    97→    97→// دست‌نخورده (ضروری برای کارکرد درست / deepseek قابلیت‌شان را ندارد):
+    98→    98→//   • تولید برنامهٔ تمرینی/غذایی — gemini-3.8-flash (دیریکتیو v40 مالک)
+    99→    99→//   • تمام درخواست‌های ویژن (عکس غذا/بدن/ویدیو/چت با عکس) — gemini-3.8/3.5
+   100→   100→//   • TTS و تولید تصویر — مدل‌های صوتی/تصویری
+   101→   101→//   • سئو/تولید مقاله (seo-report/seo-agent/content-refresh) — gemini-3.8
+   102→   102→// ═══════════════════════════════════════════════════════════════════════
+   103→   103→export const TEXT_TASK_MODEL = process.env.AVALAI_TEXT_TASK_MODEL || "deepseek-v4-flash";
+   104→   104→
+   105→   105→/** تشخیص درخواست ویژن — آیا بعضی پیام‌ها شامل تصویر (image_url) هستند؟ */
+   106→   106→function isVisionRequest(params: Record<string, unknown>): boolean {
+   107→   107→  const messages = params.messages;
+   108→   108→  if (!Array.isArray(messages)) return false;
+   109→   109→  return messages.some((m) => {
+   110→   110→    if (!m || typeof m !== "object") return false;
+   111→   111→    const content = (m as { content?: unknown }).content;
+   112→   112→    if (!Array.isArray(content)) return false;
+   113→   113→    return content.some(
+   114→   114→      (p) =>
+   115→   115→        p &&
+   116→   116→        typeof p === "object" &&
+   117→   117→        (p as { type?: unknown }).type === "image_url"
+   118→   118→    );
+   119→   119→  });
+   120→   120→}
+   121→   121→
+   122→   122→/**
+   123→   123→ * مدل فال‌بک مناسب این درخواست — null یعنی فال‌بک معنا ندارد
+   124→   124→ * (خودِ درخواست از قبل روی مدل فال‌بک است یا مدل فال‌بک تنظیم نشده).
+   125→   125→ */
+   126→   126→function fallbackModelFor(params: Record<string, unknown>): string | null {
+   127→   127→  const model = typeof params.model === "string" ? params.model : TEXT_MODEL;
+   128→   128→  // v58 — اولویت با فال‌بکِ صریحِ همان فراخوانی (fallback_model — مثل چت نیکا
+   129→   129→  // و تحلیل آنبوردینگ که مدل اصلی deepseek است و فال‌بک‌شان gemini)؛ بعد تشخیص
+   130→   130→  // خودکار ویژن/متن. این پارامتر داخلی است و هرگز به API ارسال نمی‌شود.
+   131→   131→  const explicit =
+   132→   132→    typeof params.fallback_model === "string" ? params.fallback_model.trim() : "";
+   133→   133→  const fb = explicit || (isVisionRequest(params) ? FALLBACK_VISION_MODEL : FALLBACK_TEXT_MODEL);
+   134→   134→  return fb && fb !== model ? fb : null;
+   135→   135→}
+   136→   136→
+   137→   137→/**
+   138→   138→ * ساخت پارامترهای نسخهٔ فال‌بک — فقط مدل عوض می‌شود؛ برای مقصد gemini-3.x،
+   139→   139→ * reasoning_effort (اگر هست) هم‌زمان به extra_body.thinkingConfig هم برده
+   140→   140→ * می‌شود (هم‌سان با buildPlanParams) تا سطح استدلال در پروکسی gemini گم نشود.
+   141→   141→ */
+   142→   142→function withFallbackModel(
+   143→   143→  params: Record<string, unknown>,
+   144→   144→  fallbackModel: string
+   145→   145→): Record<string, unknown> {
+   146→   146→  const next: Record<string, unknown> = { ...params, model: fallbackModel };
+   147→   147→  const effort = next.reasoning_effort;
+   148→   148→  if (effort && isGemini3Model(fallbackModel)) {
+   149→   149→    const prevExtra = (next.extra_body ?? {}) as Record<string, unknown>;
+   150→   150→    const prevConfig = (prevExtra.generationConfig ?? {}) as Record<string, unknown>;
+   151→   151→    next.extra_body = {
+   152→   152→      ...prevExtra,
+   153→   153→      generationConfig: {
+   154→   154→        ...prevConfig,
+   155→   155→        thinkingConfig: { ...(prevConfig.thinkingConfig as object | undefined), thinkingLevel: effort },
+   156→   156→      },
+   157→   157→    };
+   158→   158→  }
+   159→   159→  return next;
+   160→   160→}
+   161→   161→
+   162→   162→/**
+   163→   163→ * تبدیل عدد میلادی به سال هجری شمسی (تقریبی، برای نمایش سال کافی است).
+   164→   164→ * الگوریتم: سال میلادی - 621 (با تنظیم برای قبل/بعد از نوروز).
+   165→   165→ * مثال: 2026 - 621 = 1405
+   166→   166→ */
+   167→   167→function gregorianToJalaliYear(gYear: number): number {
+   168→   168→  const now = new Date();
+   169→   169→  // نوروز معمولاً 20 یا 21 مارس است. اگر قبل از 21 مارس هستیم، سال شمسی یکی کمتر است.
+   170→   170→  const mar21 = new Date(gYear, 2, 21); // ماه 2 = مارس (0-indexed)
+   171→   171→  return now >= mar21 ? gYear - 621 : gYear - 622;
+   172→   172→}
+   173→   173→
+   174→   174→/**
+   175→   175→ * دایرکتیو سیستم — شامل برند و سال جاری.
+   176→   176→ *
+   177→   177→ * این دایرکتیو به‌صورت پویا ساخته می‌شود تا سال جاری همیشه درست باشد
+   178→   178→ * (میلادی و هجری شمسی). مدل هرگز نباید سال قدیمی (مثلاً ۱۴۰۳، ۱۴۰۴، 2024، 2025)
+   179→   179→ * را در محتوای مقالات، پاسخ‌ها یا هر جای سیستم استفاده کند.
+   180→   180→ *
+   181→   181→ * قوانین:
+   182→   182→ *  - برند: «فیتاپ» (فارسی) یا «FitUp» (انگلیسی) — ممنوع: fitup، fittap، ...
+   183→   183→ *  - سال جاری: همیشه به‌صورت پویا محاسبه می‌شود (میلادی + شمسی).
+   184→   184→ */
+   185→   185→export function getSystemDirectives(): string {
+   186→   186→  const now = new Date();
+   187→   187→  const gYear = now.getFullYear();
+   188→   188→  const jYear = gregorianToJalaliYear(gYear);
+   189→   189→  // تبدیل به اعداد فارسی
+   190→   190→  const faGYear = String(gYear).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+   191→   191→  const faJYear = String(jYear).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+   192→   192→
+   193→   193→  return `قوانین مهم سیستم:
+   194→   194→
+   195→   195→۱) برند: نام این پلتفرم در متن فارسی همیشه و فقط «فیتاپ» نوشته می‌شود و در متن انگلیسی همیشه «FitUp» (با F و U بزرگ). هرگز نام برند را به‌صورت fitup، Fitup، fittup، Fittup، fittap یا Fittap ننویس.
+   196→   196→
+   197→   197→۲) سال جاری: ${faJYear} هجری شمسی و ${faGYear} میلادی است. سال را فقط جایی به کار ببر که واقعاً لازم است:
+   198→   198→- ❌ هرگز سال را به تایتل (عنوان) مقالات، عناوین سئو (seoTitle) یا هدینگ‌ها اضافه نکن، مگر اینکه کلمه کلیدی اصلی خودش شامل سال باشد (مثلاً «بهترین اپلیکیشن بدنسازی ۲۰۲۶»).
+   199→   199→- ❌ سال را به عنوان یک پسوند خودکار به هر موضوعی اضافه نکن (مثلاً «راهنمای کامل پرس سینه در سال ۱۴۰۵» اشتباه است).
+   200→   200→- ✅ فقط وقتی در متن بدنه به یک رویداد، آمار یا تاریخ مشخص اشاره می‌کنی و سال برای درک آن ضروری است، از سال جاری استفاده کن.
+   201→   201→- ✅ اگر کاربر مستقیماً درباره سال می‌پرسد یا مقاله درباره یک موضوع time-sensitive (مثل «بهترین اپلیکیشن‌های ${faGYear}») است، سال جاری را ذکر کن.
+   202→   202→- ⚠️ هرگز از سال‌های قدیمی (۱۴۰۳، ۱۴۰۴، 1403، 1404، 2024، 2025) استفاده نکن.
+   203→   203→
+   204→   204→`;
+   205→   205→}
+   206→   206→
+   207→   207→/**
+   208→   208→ * @deprecated از `withSystemDirectives` استفاده کنید.
+   209→   209→ * برای backward compatibility نگه داشته شده است.
+   210→   210→ */
+   211→   211→export const BRAND_DIRECTIVE = getSystemDirectives();
+   212→   212→
+   213→   213→/**
+   214→   214→ * تزریق دایرکتیو سیستم (برند + سال جاری) به ابتدای یک system prompt.
+   215→   215→ * اگر prompt قبلاً تزریق شده باشد، دوباره تزریق نمی‌کند.
+   216→   216→ *
+   217→   217→ * @deprecated از `withSystemDirectives` استفاده کنید.
+   218→   218→ * برای backward compatibility نگه داشته شده است.
+   219→   219→ */
+   220→   220→export function withBrandDirective(systemPrompt: string): string {
+   221→   221→  return withSystemDirectives(systemPrompt);
+   222→   222→}
+   223→   223→
+   224→   224→/**
+   225→   225→ * تزریق دایرکتیو سیستم (برند + سال جاری) به ابتدای یک system prompt.
+   226→   226→ * اگر prompt قبلاً تزریق شده باشد، دوباره تزریق نمی‌کند.
+   227→   227→ *
+   228→   228→ * این تابع تمام دایرکتیوهای سیستمی را شامل می‌شود:
+   229→   229→ *  - قانون برند (فیتاپ / FitUp)
+   230→   230→ *  - قانون سال جاری (میلادی و شمسی)
+   231→   231→ */
+   232→   232→export function withSystemDirectives(systemPrompt: string): string {
+   233→   233→  const directives = getSystemDirectives();
+   234→   234→  if (!systemPrompt) return directives;
+   235→   235→  // چک کردن idempotency: اگر prompt با "قوانین مهم سیستم:" شروع می‌شود، یعنی قبلاً تزریق شده.
+   236→   236→  if (systemPrompt.startsWith("قوانین مهم سیستم:")) return systemPrompt;
+   237→   237→  // backward compatibility: اگر با دایرکتیو قدیمی برند شروع شده، کل دایرکتیو جدید را جایگزین می‌کنیم
+   238→   238→  if (systemPrompt.startsWith("قانون مهم برند:")) {
+   239→   239→    // حذف دایرکتیو قدیمی و تزریق جدید
+   240→   240→    const withoutOldDirective = systemPrompt.replace(/^قانون مهم برند:[^\n]*\n\n/, "");
+   241→   241→    return directives + withoutOldDirective;
+   242→   242→  }
+   243→   243→  return directives + systemPrompt;
+   244→   244→}
+   245→   245→
+   246→   246→/**
+   247→   247→ * آیا مدل از خانواده gemini-3.x است؟
+   248→   248→ * این مدل‌ها نیاز به پارامترهای مخصوص دارند (thinkingConfig، maxOutputTokens).
+   249→   249→ * شامل gemini-3.0، gemini-3.5، gemini-3.6، gemini-3.7 و غیره.
+   250→   250→ */
+   251→   251→export function isGemini3Model(model: string): boolean {
+   252→   252→  const m = model.toLowerCase();
+   253→   253→  return m.startsWith("gemini-3") || m.includes("gemini-3.5") || m.includes("gemini-3.0") || m.includes("gemini-3.6") || m.includes("gemini-3.7");
+   254→   254→}
+   255→   255→
+   256→   256→/**
+   257→   257→ * آیا مدل از خانواده deepseek-v4 است؟
+   258→   258→ * این مدل‌ها از پارامتر reasoning_effort (low | high | max) پشتیبانی می‌کنند.
+   259→   259→ * deepseek-v4-flash (DeepSeek-V4-Flash-0731) نمونه‌ای از این خانواده است.
+   260→   260→ */
+   261→   261→export function isDeepseekV4Model(model: string): boolean {
+   262→   262→  const m = model.toLowerCase();
+   263→   263→  return m.startsWith("deepseek-v4") || m.includes("deepseek-v4");
+   264→   264→}
+   265→   265→
+   266→   266→/**
+   267→   267→ * Proxy هوشمند برای avalaiClient.
+   268→   268→ *
+   269→   269→ * این Proxy تمام کال‌های `chat.completions.create` را intercept می‌کند و به‌صورت
+   270→   270→ * خودکار پارامترهای مخصوص هر مدل را اضافه می‌کند:
+   271→   271→ *
+   272→   272→ *  - مدل‌های gemini-3.x (gemini-3.8-flash، gemini-3.5-flash و ...):
+   273→   273→ *    max_tokens و temperature را به generationConfig منتقل می‌کند و
+   274→   274→ *    thinkingConfig.thinkingLevel = "low" اضافه می‌کند (دیریکتیو: تفکر LOW — سرعت).
+   275→   275→ *
+   276→   276→ *  - مدل‌های deepseek-v4 (deepseek-v4-flash / DeepSeek-V4-Flash-0731):
+   277→   277→ *    reasoning_effort = "low" اضافه می‌کند (دیریکتیو: تفکر LOW — سرعت).
+   278→   278→ *    این مدل از reasoning_effort با مقادیر low | high | max پشتیبانی می‌کند، اما
+   279→   279→ *    "max" باعث تفکر بیش از ~۱۰۰ ثانیه و 504 کلادفلر/تایم‌اوت می‌شد.
+   280→   280→ *
+   281→   281→ *  - برای مدل‌های دیگر: رفتار استاندارد OpenAI حفظ می‌شود.
+   282→   282→ *
+   283→   283→ * مهم: تابع `create` در OpenAI SDK به `this._client` وابسته است. اگر آن را bind
+   284→   284→ * نکنیم، خطای "Cannot read properties of undefined (reading '_client')" رخ می‌دهد.
+   285→   285→ * بنابراین `originalCreate` را قبل از wrap کردن به `completionsObj` bind می‌کنیم.
+   286→   286→ */
+   287→   287→function wrapCreateWithGemini3Support<T extends (...args: any[]) => any>(
+   288→   288→  originalCreate: T,
+   289→   289→  thisArg: any
+   290→   290→): T {
+   291→   291→  // bind کردن به thisArg (completions object) تا this._client در دسترس باشد
+   292→   292→  const boundCreate = originalCreate.bind(thisArg) as T;
+   293→   293→  return ((async (params: any, options?: any) => {
+   294→   294→    const model: string = params?.model || TEXT_MODEL;
+   295→   295→    const isGemini3 = isGemini3Model(model);
+   296→   296→    const isDeepseekV4 = isDeepseekV4Model(model);
+   297→   297→
+   298→   298→    if (isGemini3) {
+   299→   299→      // برای gemini-3.x: پارامترها به generationConfig منتقل شوند
+   300→   300→      // thinkingLevel پیش‌فرض "low" است (دیریکتیو کاربر: تفکر LOW — سرعت)،
+   301→   301→      // اما اگر caller مقدار دیگری (مثلاً "high" برای تولید برنامه) داده باشد،
+   302→   302→      // آن مقدار محترم شمرده می‌شود و override نمی‌شود.
+   303→   303→      const callerThinkingLevel = (params as any)?.extra_body?.generationConfig?.thinkingConfig?.thinkingLevel;
+   304→   304→      const thinkingLevel = typeof callerThinkingLevel === "string" && callerThinkingLevel
+   305→   305→        ? callerThinkingLevel
+   306→   306→        : "low";
+   307→   307→      const generationConfig: Record<string, unknown> = {
+   308→   308→        thinkingConfig: { thinkingLevel },
+   309→   309→      };
+   310→   310→      if (params?.max_tokens != null) {
+   311→   311→        generationConfig.maxOutputTokens = params.max_tokens;
+   312→   312→      }
+   313→   313→      if (params?.temperature != null) {
+   314→   314→        generationConfig.temperature = params.temperature;
+   315→   315→      }
+   316→   316→      if (params?.top_p != null) {
+   317→   317→        generationConfig.topP = params.top_p;
+   318→   318→      }
+   319→   319→
+   320→   320→      // حذف پارامترهای top-level که gemini-3.x نمی‌پذیرد
+   321→   321→      const { max_tokens, temperature, top_p, ...rest } = params;
+   322→   322→
+   323→   323→      // ادغام با extra_body موجود (اگر کاربر قبلاً چیزی فرستاده)
+   324→   324→      const existingExtraBody = (params as any).extra_body || {};
+   325→   325→      const mergedParams = {
+   326→   326→        ...rest,
+   327→   327→        extra_body: {
+   328→   328→          ...existingExtraBody,
+   329→   329→          generationConfig: {
+   330→   330→            ...(existingExtraBody.generationConfig || {}),
+   331→   331→            ...generationConfig,
+   332→   332→          },
+   333→   333→        },
+   334→   334→      };
+   335→   335→
+   336→   336→      return boundCreate(mergedParams, options);
+   337→   337→    }
+   338→   338→
+   339→   339→    if (isDeepseekV4) {
+   340→   340→      // برای deepseek-v4-flash: reasoning_effort = "low" اضافه کن (تفکر سبک — دیریکتیو کاربر: LOW).
+   341→   341→      // ⚠️ مقدار قبلی "max" باعث تفکر بیش از ~۱۰۰ ثانیه و 504 کلادفلر/تایم‌اوت ۱۰ دقیقه‌ای می‌شد.
+   342→   342→      // اگر کاربر قبلاً reasoning_effort تنظیم کرده، آن را override نمی‌کنیم.
+   343→   343→      if (params?.reasoning_effort == null) {
+   344→   344→        return boundCreate({ ...params, reasoning_effort: "low" }, options);
+   345→   345→      }
+   346→   346→      return boundCreate(params, options);
+   347→   347→    }
+   348→   348→
+   349→   349→    // برای مدل‌های دیگر: بدون تغییر
+   350→   350→    return boundCreate(params, options);
+   351→   351→  }) as unknown as T);
+   352→   352→}
+   353→   353→
+   354→   354→/**
+   355→   355→ * فراخوانی LLM با retry دستی برای تولید برنامه‌های تمرینی/غذایی.
+   356→   356→ *
+   357→   357→ * چرا: گیت‌وی api.avalai.ir (کلادفلر) برای پاسخ‌های طولانیِ تولید برنامه
+   358→   358→ * (خروجی JSON بزرگ ≈ ۳۰KB) به‌صورت ناپایدار 504 Gateway Timeout می‌دهد
+   359→   359→ * (تست واقعی: پاسخ‌های ۹۷-۱۱۰ ثانیه‌ای گاهی رد می‌شوند، گاهی در ۶۳s قطع).
+   360→   360→ * SDK خودش maxRetries دارد ولی خطاهای HTML-دار 504 را همیشه retry نمی‌کند؛
+   361→   361→ * اینجا تا ۳ تلاش با backoff کوتاه انجام می‌شود (فقط برای خطاهای گذرا).
+   362→   362→ *
+   363→   363→ * planTimeoutMs: تولید برنامه در پس‌زمینه انجام می‌شود (نه داخل request کاربر)
+   364→   364→ * پس می‌توانیم timeout بلندتری گذاشت — تفکر high ممکن است ۲-۴ دقیقه طول بکشد.
+   365→   365→ *
+   366→   366→ * fallbackParams: اگر همه تلاش‌ها با پارامتر اصلی (مثلاً تفکر high) شکست خوردند،
+   367→   367→ * یک تلاش نهایی با پارامتر جایگزین (تفکر low) انجام می‌شود — کیفیت در اولویت
+   368→   368→ * است ولی کاربر هرگز بدون برنامه نمی‌ماند.
+   369→   369→ */
+   370→   370→/**
+   371→   371→ * اعتبارسنج محتوای پاسخ — null/رشتهٔ خالی یعنی OK، رشتهٔ فارسی یعنی توضیح خطا.
+   372→   372→ * v39: زنجیرهٔ تفکر فقط روی «پاسخِ واقعاً قابل‌استفاده» توقف می‌کند، نه هر پاسخ 200.
+   373→   373→ */
+   374→   374→export type PlanContentValidator = (text: string) => string | null;
+   375→   375→
+   376→   376→export async function createPlanCompletionWithRetry(
+   377→   377→  params: Record<string, unknown>,
+   378→   378→  logTag: string,
+   379→   379→  maxAttempts = 3,
+   380→   380→  opts?: {
+   381→   381→    timeoutMs?: number;
+   382→   382→    fallbackParams?: Record<string, unknown>;
+   383→   383→    validateContent?: PlanContentValidator;
+   384→   384→    userId?: string | null; // v70 حسابداری
+   385→   385→  }
+   386→   386→): Promise<string> {
+   387→   387→  let lastErr: unknown = null;
+   388→   388→  // v58 — پارامتر داخلی fallback_model قبل از ارسال حذف می‌شود (هرگز به API نمی‌رود)
+   389→   389→  const apiParams: Record<string, unknown> = { ...params };
+   390→   390→  delete apiParams.fallback_model;
+   391→   391→  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+   392→   392→    const attemptStartedAt = Date.now(); // v70 حسابداری — اندازه‌گیری تأخیر
+   393→   393→    try {
+   394→   394→      const completion = await avalaiClient.chat.completions.create(apiParams as any, {
+   395→   395→        maxRetries: 0, // retry دستی اینجا — دوباره‌کاری نکن
+   396→   396→        ...(opts?.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+   397→   397→      });
+   398→   398→      // ─── v39-fix: پاسخ «خالی» دیگر موفقیت حساب نمی‌شود ───
+   399→   399→      // باگ ریشه‌ای تولید برنامه: AvalAI با 200 و content:null برمی‌گشت
+   400→   400→      // (مدل تفکری gemini-3.8، کل بودجهٔ خروجی را با reasoning می‌خورد و
+   401→   401→      // صفر توکن متن تولید می‌کرد → finish_reason=length) و کد قدیمی
+   402→   402→      // `content || ""` آن را «موفق» می‌گرفت → زنجیره همان لحظه متوقف،
+   403→   403→      // بدون سقوط به سطح تفکر بعدی و بدون فال‌بک مدل → «برنامه خالی».
+   404→   404→      const choice: any = (completion as any)?.choices?.[0];
+   405→   405→      const rawContent = choice?.message?.content;
+   406→   406→      const text = typeof rawContent === "string" ? rawContent : "";
+   407→   407→      if (!text.trim()) {
+   408→   408→        const usage: any = (completion as any)?.usage || {};
+   409→   409→        const cd = usage.completion_tokens_details || {};
+   410→   410→        const diag = `finish_reason=${choice?.finish_reason || "?"} completion_tokens=${usage.completion_tokens ?? "?"} reasoning=${cd.reasoning_tokens ?? "?"} text=${cd.text_tokens ?? "?"}`;
+   411→   411→        console.error(`[${logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (${diag})`);
+   412→   412→        // قطعی است؛ تلاش دوباره با همین پارامترها بی‌فایده → سطح بعدی زنجیره
+   413→   413→        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (${diag})`);
+   414→   414→        break;
+   415→   415→      }
+   416→   416→      if (choice?.finish_reason === "length") {
+   417→   417→        // متن هست ولی سقف خروجی خورده — احتمالاً JSON بریده؛ هنوز برمی‌گردانیم
+   418→   418→        // چون ممکن است JSON کامل باشد و فقط توضیح انتهایی بریده شده باشد.
+   419→   419→        console.warn(`[${logTag}] attempt ${attempt}: finish_reason=length (len=${text.length}) — may be truncated`);
+   420→   420→      }
+   421→   421→      if (opts?.validateContent) {
+   422→   422→        const vErr = opts.validateContent(text);
+   423→   423→        if (vErr) {
+   424→   424→          console.error(
+   425→   425→            `[${logTag}] attempt ${attempt}/${maxAttempts}: validation failed — ${vErr} (len=${text.length}, finish_reason=${choice?.finish_reason || "?"}, head=${text.slice(0, 160).replace(/\s+/g, " ")})`
+   426→   426→          );
+   427→   427→          lastErr = new Error(vErr);
+   428→   428→          if (attempt === maxAttempts) break;
+   429→   429→          await new Promise((r) => setTimeout(r, 2000));
+   430→   430→          continue; // پاسخ نامعتبر می‌تواند تصادفی باشد → retry همان سطح
+   431→   431→        }
+   432→   432→      }
+   433→   433→      // ─── v70 حسابداری — لاگ مصرف AI (best-effort؛ زنجیرهٔ برنامه گران‌ترین مسیر است
+   434→   434→      // و تا امروز هیچ ردیفی در داشبورد حسابداری نمی‌گذاشت) ───
+   435→   435→      try {
+   436→   436→        const usage: any = (completion as any)?.usage;
+   437→   437→        if (usage && typeof usage === "object") {
+   438→   438→          const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+   439→   439→          const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+   440→   440→          await logAiUsage({
+   441→   441→            route: logTag.split("(fallback")[0],
+   442→   442→            model: String(apiParams.model ?? TEXT_MODEL),
+   443→   443→            promptTokens,
+   444→   444→            completionTokens,
+   445→   445→            totalTokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens,
+   446→   446→            latencyMs: Date.now() - attemptStartedAt,
+   447→   447→            userId: opts?.userId ?? null,
+   448→   448→          });
+   449→   449→        }
+   450→   450→      } catch {
+   451→   451→        // هرگز جریان اصلی را نمی‌شکند
+   452→   452→      }
+   453→   453→      return text;
+   454→   454→    } catch (err) {
+   455→   455→      lastErr = err;
+   456→   456→      const msg = String((err as Error)?.message || err);
+   457→   457→      const retriable = /50[234]|429|timed out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up/i.test(msg);
+   458→   458→      console.error(`[${logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}):`, msg.slice(0, 200));
+   459→   459→      if (!retriable || attempt === maxAttempts) break;
+   460→   460→      await new Promise((r) => setTimeout(r, 3000)); // backoff کوتاه
+   461→   461→    }
+   462→   462→  }
+   463→   463→
+   464→   464→  // تلاش نهایی با پارامتر جایگزین (مثلاً تفکر low) — بهتر از هیچ برنامه‌ای نیست
+   465→   465→  if (opts?.fallbackParams) {
+   466→   466→    console.warn(`[${logTag}] falling back to alternate params (e.g. low thinking)...`);
+   467→   467→    const fbStartedAt = Date.now();
+   468→   468→    try {
+   469→   469→      const completion = await avalaiClient.chat.completions.create(opts.fallbackParams as any, {
+   470→   470→        maxRetries: 0,
+   471→   471→        ...(opts?.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+   472→   472→      });
+   473→   473→      const choice: any = (completion as any)?.choices?.[0];
+   474→   474→      const rawContent = choice?.message?.content;
+   475→   475→      const text = typeof rawContent === "string" ? rawContent : "";
+   476→   476→      if (text.trim() && (!opts.validateContent || !opts.validateContent(text))) {
+   477→   477→        // v70 حسابداری — لاگ مصرف تلاش جایگزین
+   478→   478→        try {
+   479→   479→          const usage: any = (completion as any)?.usage;
+   480→   480→          if (usage && typeof usage === "object") {
+   481→   481→            const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+   482→   482→            const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+   483→   483→            await logAiUsage({
+   484→   484→              route: logTag.split("(fallback")[0],
+   485→   485→              model: String((opts.fallbackParams as Record<string, unknown>).model ?? TEXT_MODEL),
+   486→   486→              promptTokens,
+   487→   487→              completionTokens,
+   488→   488→              totalTokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens,
+   489→   489→              latencyMs: Date.now() - fbStartedAt,
+   490→   490→              userId: opts?.userId ?? null,
+   491→   491→            });
+   492→   492→          }
+   493→   493→        } catch {}
+   494→   494→        return text;
+   495→   495→      }
+   496→   496→      console.error(`[${logTag}] fallback attempt returned empty/invalid content (finish_reason=${choice?.finish_reason || "?"})`);
+   497→   497→      lastErr = new Error("پاسخ خالی/نامعتبر از مدل (fallbackParams)");
+   498→   498→    } catch (err) {
+   499→   499→      lastErr = err;
+   500→   500→      console.error(`[${logTag}] fallback attempt failed:`, String((err as Error)?.message || err).slice(0, 200));
+   501→   501→    }
+   502→   502→  }
+   503→   503→
+   504→   504→  console.error(`[${logTag}] all attempts failed:`, lastErr);
+   505→   505→  throw lastErr instanceof Error
+   506→   506→    ? lastErr
+   507→   507→    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+   508→   508→}
+   509→   509→
+   510→   510→// ═══════════════════════════════════════════════════════════════════════════
+   511→   511→// زنجیرهٔ تولید برنامه‌های تمرینی/تغذیه/مکمل — دیریکتیو مالک (v40):
+   512→   512→// «با gemini-3.8-flash ساخته بشه؛ در بدترین حالت با میزان تفکر high.
+   513→   513→//  اولویت رو بذار رو اون و اگر یک درصد نشد از DeepSeek 4 Flash استفاده کن»
+   514→   514→// مدل gemini-3.8-flash از تلاش استدلالی قابل‌تنظیم پشتیبانی می‌کند. زنجیره:
+   515→   515→//   گام ۱ — gemini-3.8-flash با thinkingLevel=high (۲ تلاش برای خطاهای گذرای گیت‌وی)
+   516→   516→//   گام ۲ — deepseek-v4-flash با reasoning_effort=high (۲ تلاش) — فقط اگر
+   517→   517→//           گام ۱ به‌هرشکلی شکست خورد (پاسخ خالی/نامعتبر، 400 دائمی، 504/تایم‌اوت پایدار)
+   518→   518→//
+   519→   519→// بودجه‌بندی زمان: watchdog تولید برنامه STUCK_GENERATION_WINDOW_MS=۵۰ دقیقه است؛
+   520→   520→// سقف هر تلاش ۲۷۰ ثانیه → بدترین حالت (۲×gemini + ۲×deepseek) ≈ ۱۸ دقیقه < ۵۰ ✓
+   521→   521→// (تمرینی و غذایی موازی اجرا می‌شوند و هر دو از همین بودجه استفاده می‌کنند.)
+   522→   522→//
+   523→   523→// چرا max حذف شد؟ تست واقعی v39: تفکر max بودجهٔ خروجی را با reasoning می‌بلعید
+   524→   524→// (finish_reason=length، متن خالی/بریده) — همان ریشهٔ «برنامه خالی»؛ تفکر high
+   525→   525→// کیفیت نزدیک max می‌دهد بدون آن مشکل (curl واقعی: finish=stop + JSON کامل).
+   526→   526→// چرا low حذف شد؟ دیریکتیو مالک: بدترین حالتِ تفکر باید high بماند — به‌جای
+   527→   527→// پایین‌آوردن سطح، مدل عوض می‌شود (deepseek-v4-flash با high تست‌شده ✓).
+   528→   528→const PLAN_ATTEMPT_TIMEOUT_MS = 270_000; // ۴.۵ دقیقه برای هر تلاش
+   529→   529→
+   530→   530→// v39-fix: بودجهٔ صریح خروجی برای تولید برنامه.
+   531→   531→// بدون این، AvalAI برای gemini-3.8 یک بودجهٔ پیش‌فرض کوچک اعمال می‌کند که
+   532→   532→// reasoning (تفکر max/high) به‌تنهایی آن را می‌بلعد → content:null → «برنامه خالی».
+   533→   533→// تست واقعی (سپتامبر ۲۰۲۶): maxOutputTokens=65536 پذیرفته می‌شود و reasoning+JSON
+   534→   534→// بزرگ (~۲۵هزار توکن) را با هم جا می‌دهد. برای gemini-3.x پروکسیِ پایین‌تر این
+   535→   535→// مقدار را به generationConfig.maxOutputTokens منتقل می‌کند.
+   536→   536→const PLAN_MAX_OUTPUT_TOKENS = 65536;
+   537→   537→
+   538→   538→/**
+   539→   539→ * ساخت پارامترهای chat.completions برای تولید برنامه با سطح تفکر مشخص.
+   540→   540→ * v40: پارامتر model اضافه شد — فال‌بک deepseek-v4-flash هم با همین سازنده
+   541→   541→ * ساخته می‌شود تا reasoning_effort=high بگیرد (پروکسیِ پایین‌تر مقدار non-null
+   542→   542→ * را override نمی‌کند) و extra_bodyِ تفکرِ gemini فقط برای gemini-3.x ست شود.
+   543→   543→ */
+   544→   544→function buildPlanParams(
+   545→   545→  systemPrompt: string,
+   546→   546→  userPrompt: string,
+   547→   547→  thinkingLevel: string,
+   548→   548→  model: string = TEXT_MODEL
+   549→   549→): Record<string, unknown> {
+   550→   550→  return {
+   551→   551→    model,
+   552→   552→    messages: [
+   553→   553→      { role: "system", content: systemPrompt },
+   554→   554→      { role: "user", content: userPrompt },
+   555→   555→    ],
+   556→   556→    // v39-fix: بودجهٔ صریح خروجی (جلوگیری از بلعیده‌شدن بودجه توسط reasoning)
+   557→   557→    max_tokens: PLAN_MAX_OUTPUT_TOKENS,
+   558→   558→    // برای مدل‌های deepseek-v4 (reasoning_effort پشتیبانی می‌کنند)
+   559→   559→    reasoning_effort: thinkingLevel,
+   560→   560→    // برای مدل‌های gemini-3.x (thinkingLevel از طریق generationConfig)
+   561→   561→    ...(isGemini3Model(model)
+   562→   562→      ? { extra_body: { generationConfig: { thinkingConfig: { thinkingLevel } } } }
+   563→   563→      : {}),
+   564→   564→  };
+   565→   565→}
+   566→   566→
+   567→   567→/**
+   568→   568→ * فراخوانی LLM برای تولید برنامه — دیریکتیو مالک (v40):
+   569→   569→ * «برنامه با gemini-3.8-flash ساخته بشه؛ در بدترین حالت با میزان تفکر high؛
+   570→   570→ *  اگر یک درصد نشد، از DeepSeek 4 Flash استفاده کن.»
+   571→   571→ *
+   572→   572→ * گام ۱: gemini-3.8-flash با thinkingLevel=high — ۲ تلاش برای خطاهای گذرای
+   573→   573→ *        گیت‌وی (504/429/timeout)؛ خطای دائمی (400) و پاسخ خالی/نامعتبر
+   574→   574→ *        بلافاصله به گام ۲ می‌روند.
+   575→   575→ * گام ۲: deepseek-v4-flash با reasoning_effort=high — ۲ تلاش (تست واقعی curl:
+   576→   576→ *        finish=stop + JSON کامل در ~۶.۵ ثانیه). AVALAI_FALLBACK_TEXT_MODEL
+   577→   577→ *        اگر ست شده باشد جایگزین deepseek پیش‌فرض می‌شود.
+   578→   578→ *
+   579→   579→ * v39→v40: زنجیرهٔ قدیمی max→high→low حذف شد — max بودجهٔ خروجی را می‌بلعید
+   580→   580→ * (ریشهٔ «برنامه خالی») و low کیفیت را پایین می‌آورد؛ حالا سطح تفکر هرگز از
+   581→   581→ * high پایین نمی‌آید و به‌جای آن مدل تعویض می‌شود.
+   582→   582→ */
+   583→   583→export async function generatePlanContent(
+   584→   584→  systemPrompt: string,
+   585→   585→  userPrompt: string,
+   586→   586→  logTag: string,
+   587→   587→  validateContent?: PlanContentValidator
+   588→   588→): Promise<string> {
+   589→   589→  const chain: Array<{ level: string; attempts: number }> = [
+   590→   590→    { level: "high", attempts: 2 }, // دیریکتیو مالک: تفکر high — پایین‌تر نمی‌آییم
+   591→   591→  ];
+   592→   592→  let lastErr: unknown = null;
+   593→   593→  for (const step of chain) {
+   594→   594→    try {
+   595→   595→      return await createPlanCompletionWithRetry(
+   596→   596→        buildPlanParams(systemPrompt, userPrompt, step.level),
+   597→   597→        logTag,
+   598→   598→        step.attempts,
+   599→   599→        // پاسخ فقط وقتی «موفق» است که واقعاً قابل‌استفاده باشد —
+   600→   600→        // وگرنه زنجیره به مدل فال‌بک می‌رود
+   601→   601→        { timeoutMs: PLAN_ATTEMPT_TIMEOUT_MS, validateContent }
+   602→   602→      );
+   603→   603→    } catch (err) {
+   604→   604→      lastErr = err;
+   605→   605→      console.warn(
+   606→   606→        `[${logTag}] gemini-3.8-flash (thinking=${step.level}) failed — switching to fallback model:`,
+   607→   607→        String((err as Error)?.message || err).slice(0, 180)
+   608→   608→      );
+   609→   609→    }
+   610→   610→  }
+   611→   611→
+   612→   612→  // ─── گام ۲: فال‌بک مدل — DeepSeek 4 Flash (دیریکتیو مالک v40) ───
+   613→   613→  // با همان سطح تفکر high (reasoning_effort=high) — آخرین خط دفاعی قبل از
+   614→   614→  // «ناموفق»؛ پرامپت‌ها و اعتبارسنج دست‌نخورده می‌مانند، فقط موتور عوض می‌شود.
+   615→   615→  const fallbackModel = process.env.AVALAI_FALLBACK_TEXT_MODEL || "deepseek-v4-flash";
+   616→   616→  if (fallbackModel && fallbackModel !== TEXT_MODEL) {
+   617→   617→    console.warn(
+   618→   618→      `[${logTag}] primary model exhausted — trying fallback model "${fallbackModel}" (thinking=high)...`
+   619→   619→    );
+   620→   620→    try {
+   621→   621→      return await createPlanCompletionWithRetry(
+   622→   622→        buildPlanParams(systemPrompt, userPrompt, "high", fallbackModel),
+   623→   623→        `${logTag}(fallback:${fallbackModel})`,
+   624→   624→        2,
+   625→   625→        { timeoutMs: PLAN_ATTEMPT_TIMEOUT_MS, validateContent }
+   626→   626→      );
+   627→   627→    } catch (err) {
+   628→   628→      lastErr = err;
+   629→   629→      console.error(`[${logTag}] fallback model also failed:`, String((err as Error)?.message || err).slice(0, 200));
+   630→   630→    }
+   631→   631→  }
+   632→   632→
+   633→   633→  throw lastErr instanceof Error
+   634→   634→    ? lastErr
+   635→   635→    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+   636→   636→}
+   637→   637→
+   638→   638→/**
+   639→   639→ * فراخوانی چت با retry سبک برای خطاهای گذرا — برای چت‌ها و تحلیل‌های سریع.
+   640→   640→ *
+   641→   641→ * چرا: گیت‌وی api.avalai.ir (ArvanCloud) به‌صورت ناپایدار درخواست‌ها را بعد از
+   642→   642→ * ~۳۰ ثانیه با 504 (صفحه HTML کلادفلر) می‌کُشد. تست واقعی: چت نیکا/مربی گاهی
+   643→   643→ * در اولین تلاش 504 می‌خورد و در تلاش دوم همان لحظه جواب می‌دهد. بدون retry،
+   644→   644→ * کاربر خطای «ارتباط برقرار نشد» می‌بیند در حالی که یک تلاش دیگر کافی بود.
+   645→   645→ *
+   646→   646→ * فقط خطاهای گذرا (502/503/504/429/timeout/شبکه) retry می‌شوند؛
+   647→   647→ * خطاهای دائمی (401 کلید غلط، 400 پارامتر غلط) بلافاصله fail می‌شوند.
+   648→   648→ *
+   649→   649→ * v42: بعد از اتمام همهٔ تلاش‌های مدل اول، درخواست با مدل فال‌بک تکرار می‌شود
+   650→   650→ * (ویژن → gemini-3.5-flash، متن → deepseek-v4-flash — دیریکتیو مالک).
+   651→   651→ * چت نیکا/مربی، تحلیل عکس غذا/بدن و تحلیل ویدیو از این تابع استفاده می‌کنند.
+   652→   652→ *
+   653→   653→ * v70 حسابداری: هر تلاشِ موفق در AiUsageLog ثبت می‌شود (قبلاً این تابع — که
+   654→   654→ * چت نیکا/مربی و «همهٔ» تحلیل‌های ویژن از آن می‌گذرد — صفر لاگ مصرف می‌گذاشت
+   655→   655→ * و داشبورد حسابداری مصرف‌کننده‌های اصلی بودجه را نمی‌دید).
+   656→   656→ */
+   657→   657→export async function createChatCompletionWithRetry(
+   658→   658→  params: Record<string, unknown>,
+   659→   659→  logTag: string,
+   660→   660→  maxAttempts = 3,
+   661→   661→  opts?: { userId?: string | null }
+   662→   662→): Promise<string> {
+   663→   663→  try {
+   664→   664→    return await chatCompletionWithRetryAttempt(params, logTag, maxAttempts, opts?.userId);
+   665→   665→  } catch (primaryErr) {
+   666→   666→    // ─── v42 دیریکتیو مالک: هر شکستِ نهایی مدل اول → مدل فال‌بک ───
+   667→   667→    // ویژن → gemini-3.5-flash | متن → deepseek-v4-flash (خودکار)
+   668→   668→    const fb = fallbackModelFor(params);
+   669→   669→    if (!fb) throw primaryErr;
+   670→   670→    console.warn(
+   671→   671→      `[${logTag}] primary model exhausted — falling back to "${fb}" (v42 directive)...`
+   672→   672→    );
+   673→   673→    return await chatCompletionWithRetryAttempt(
+   674→   674→      withFallbackModel(params, fb),
+   675→   675→      `${logTag}(fallback:${fb})`,
+   676→   676→      maxAttempts,
+   677→   677→      opts?.userId
+   678→   678→    );
+   679→   679→  }
+   680→   680→}
+   681→   681→
+   682→   682→async function chatCompletionWithRetryAttempt(
+   683→   683→  params: Record<string, unknown>,
+   684→   684→  logTag: string,
+   685→   685→  maxAttempts: number,
+   686→   686→  userId?: string | null
+   687→   687→): Promise<string> {
+   688→   688→  let lastErr: unknown = null;
+   689→   689→  // v58 — پارامتر داخلی fallback_model قبل از ارسال حذف می‌شود (هرگز به API نمی‌رود)
+   690→   690→  const apiParams: Record<string, unknown> = { ...params };
+   691→   691→  delete apiParams.fallback_model;
+   692→   692→  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+   693→   693→    const attemptStartedAt = Date.now(); // v70 حسابداری — اندازه‌گیری تأخیر
+   694→   694→    try {
+   695→   695→      const completion = await avalaiClient.chat.completions.create(apiParams as any, {
+   696→   696→        maxRetries: 0, // retry دستی اینجا
+   697→   697→      });
+   698→   698→      // v39: پاسخ خالی (content:null — مدل تفکری بودجه را با reasoning می‌خورد)
+   699→   699→      // دیگر موفقیت نیست؛ مثل خطای گذرا retry می‌شود (چت سریع است)
+   700→   700→      const choice: any = (completion as any)?.choices?.[0];
+   701→   701→      const rawContent = choice?.message?.content;
+   702→   702→      const text = typeof rawContent === "string" ? rawContent : "";
+   703→   703→      if (!text.trim()) {
+   704→   704→        const usage: any = (completion as any)?.usage || {};
+   705→   705→        const cd = usage.completion_tokens_details || {};
+   706→   706→        console.error(
+   707→   707→          `[${logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (finish_reason=${choice?.finish_reason || "?"}, reasoning=${cd.reasoning_tokens ?? "?"}, text=${cd.text_tokens ?? "?"})`
+   708→   708→        );
+   709→   709→        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (finish_reason=${choice?.finish_reason || "?"})`);
+   710→   710→        if (attempt === maxAttempts) break;
+   711→   711→        await new Promise((r) => setTimeout(r, 2500));
+   712→   712→        continue;
+   713→   713→      }
+   714→   714→      // ─── v70 حسابداری — لاگ مصرف AI (best-effort؛ هرگز جریان اصلی نمی‌شکند) ───
+   715→   715→      try {
+   716→   716→        const usage: any = (completion as any)?.usage;
+   717→   717→        if (usage && typeof usage === "object") {
+   718→   718→          const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+   719→   719→          const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+   720→   720→          await logAiUsage({
+   721→   721→            route: logTag.split("(fallback")[0], // برچسب ثابت مسیر — بدون پسوند فال‌بک
+   722→   722→            model: String(apiParams.model ?? TEXT_MODEL), // مدل واقعی همین تلاش موفق
+   723→   723→            promptTokens,
+   724→   724→            completionTokens,
+   725→   725→            totalTokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens,
+   726→   726→            latencyMs: Date.now() - attemptStartedAt,
+   727→   727→            userId: userId ?? null,
+   728→   728→          });
+   729→   729→        }
+   730→   730→      } catch {
+   731→   731→        // لاگ مصرف هرگز نباید پاسخ چت را بشکند
+   732→   732→      }
+   733→   733→      return text;
+   734→   734→    } catch (err) {
+   735→   735→      lastErr = err;
+   736→   736→      const msg = String((err as Error)?.message || err);
+   737→   737→      const retriable = /50[234]|429|timed out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up/i.test(msg);
+   738→   738→      console.error(`[${logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}):`, msg.slice(0, 200));
+   739→   739→      if (!retriable || attempt === maxAttempts) break;
+   740→   740→      await new Promise((r) => setTimeout(r, 2500)); // backoff کوتاه
+   741→   741→    }
+   742→   742→  }
+   743→   743→  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+   744→   744→}
+   745→   745→
+   746→   746→/* ═══════════════════════════════════════════════════════════════════════════
+   747→   747→ * v41 — سپر سراسری فراخوانی AI برای «همهٔ» امکانات سیستم
+   748→   748→ * ═══════════════════════════════════════════════════════════════════════════
+   749→   749→ * درس v39/v40: gemini-3.8-flash مدل تفکری است — بدون بودجهٔ خروجیِ صریح،
+   750→   750→ * reasoning بودجهٔ پیش‌فرض AvalAI را می‌خورد و با 200 و content:null برمی‌گردد.
+   751→   751→ * تولید برنامه این سپر را گرفت؛ اما ۱۲ نقطهٔ دیگر (سئوی هوشمند، تحلیل‌ها،
+   752→   752→ * دستیار مدیر و…) مستقیم avalaiClient را صدا می‌زدند — همه به این تابع
+   753→   753→ * منتقل شدند: بودجهٔ صریح + retry خطاهای گذرا + تشخیص پاسخ خالی + اعتبارسنج.
+   754→   754→ */
+   755→   755→
+   756→   756→export interface ResilientCompletionOptions {
+   757→   757→  /** برچسب لاگ — مثل "content-refresh" */
+   758→   758→  logTag: string;
+   759→   759→  /**
+   760→   760→   * بودجهٔ صریح خروجی (max_tokens). برای gemini-3.x پروکسی آن را به
+   761→   761→   * generationConfig.maxOutputTokens می‌برد. پیش‌فرض ۸۱۹۲ — برای خروجی‌های بزرگ
+   762→   762→   * (بازنویسی مقالهٔ کامل) مقدار بالاتر بدهید (مثل 65536).
+   763→   763→   */
+   764→   764→  maxTokens?: number;
+   765→   765→  temperature?: number;
+   766→   766→  /** سقف زمانی هر تلاش (میلی‌ثانیه) — پیش‌فرض بدون سقف SDK */
+   767→   767→  timeoutMs?: number;
+   768→   768→  /** تعداد تلاش‌ها برای خطای گذرا/پاسخ خالی (پیش‌فرض ۳) */
+   769→   769→  maxAttempts?: number;
+   770→   770→  /** اعتبارسنج محتوا — رشتهٔ فارسی = توضیح خطا → retry؛ null = پذیرفتن */
+   771→   771→  validateContent?: PlanContentValidator;
+   772→   772→  /** مدل — پیش‌فرض TEXT_MODEL؛ برای تحلیل تصویر VISION_MODEL بدهید */
+   773→   773→  model?: string;
+   774→   774→  /** استدلال صریح (برای deepseek: reasoning_effort؛ اگر ست نشود پروکسی پیش‌فرض را می‌گذارد) */
+   775→   775→  reasoningEffort?: string;
+   776→   776→  /**
+   777→   777→   * v52 حسابداری — شناسهٔ مسیر برای لاگ مصرف AiUsageLog (پیش‌فرض: همان logTag).
+   778→   778→   * اختیاری — فراخوانی‌های فعلی بدون تغییر کار می‌کنند.
+   779→   779→   */
+   780→   780→  routeTag?: string;
+   781→   781→  /** v52 حسابداری — کاربر مرتبط با این فراخوانی (اختیاری — برای لاگ مصرف) */
+   782→   782→  userId?: string;
+   783→   783→}
+   784→   784→
+   785→   785→/**
+   786→   786→ * فراخوانی محافظت‌شدهٔ chat.completions — همهٔ نقاط AI باید از این استفاده کنند
+   787→   787→ * نه از avalaiClient مستقیم. رفتار: retry خطاهای گذرا (502/503/504/429/timeout)،
+   788→   788→ * retry پاسخ خالی (content:null)، اعتبارسنجی اختیاری محتوا، لاگ تشخیصی کامل.
+   789→   789→ * v42: بعد از اتمام تلاش‌های مدل اول، مدل فال‌بک (ویژن → gemini-3.5-flash،
+   790→   790→ * متن → deepseek-v4-flash) امتحان می‌شود — دیریکتیو مالک «اگر یک درصد نشد…».
+   791→   791→ */
+   792→   792→export async function createResilientCompletion(
+   793→   793→  params: Record<string, unknown>,
+   794→   794→  opts: ResilientCompletionOptions
+   795→   795→): Promise<string> {
+   796→   796→  try {
+   797→   797→    return await resilientCompletionAttempt(params, opts);
+   798→   798→  } catch (primaryErr) {
+   799→   799→    // ─── v42 دیریکتیو مالک: هر شکستِ نهایی مدل اول → مدل فال‌بک ───
+   800→   800→    // ویژن → gemini-3.5-flash | متن → deepseek-v4-flash (تشخیص خودکار با image_url)
+
+[showing lines 1-800 of 2002; use offset=801 with limit to continue reading]

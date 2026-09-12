@@ -1,0 +1,804 @@
+     1→/**
+     2→ * جریان‌های پیامکی سیستمی فیتاپ — v32
+     3→ * هر تابع یک سناریوی پیامک با قالب تأییدشدهٔ sms.ir است.
+     4→ * دداپ ابدی و ثبت لاگ داخل sendTemplateSms انجام می‌شود (smsir.ts).
+     5→ *
+     6→ * نکتهٔ مهم: اگر متغیر env قالب تنظیم نشده باشد یا SMSIR_API_KEY نباشد،
+     7→ * ارسال بی‌صدا skip می‌شود و هیچ جریان کسب‌وکاری نمی‌شکند.
+     8→ */
+     9→
+    10→import {
+    11→  normalizeMobileForSmsIr,
+    12→  sendTemplateSms,
+    13→  type SendTemplateSmsResult,
+    14→  type SmsTemplateKey,
+    15→} from "@/lib/fitness/smsir";
+    16→
+    17→/**
+    18→ * نام کوچک امن برای پارامتر NAME قالب‌ها — v48: حداکثر ۲۵ کاراکتر
+    19→ * (سقف رسمی sms.ir برای مقدار هر پارامتر — خطای 114). گارد مرکزی
+    20→ * sendTemplateSms هم کوتاه‌سازی/حذف را تضمین می‌کند.
+    21→ * دیریکتیو مالک: اگر نام ثبت نشده باشد رشتهٔ خالی برمی‌گردد (نه «کاربر»)
+    22→ * و گارد sendTemplateSms ارسال را مدیریت می‌کند تا هیچ پیامکی با نام جعلی نرود.
+    23→ */
+    24→export function smsFirstName(name: string | null | undefined): string {
+    25→  const first = String(name || "")
+    26→    .replace(/[\r\n\t]/g, " ")
+    27→    .trim()
+    28→    .split(/\s+/)[0] || "";
+    29→  return first.slice(0, 25);
+    30→}
+    31→
+    32→export interface SmsUserTarget {
+    33→  id: string;
+    34→  name?: string | null;
+    35→  mobile: string;
+    36→}
+    37→
+    38→/**
+    39→ * قالب 669068 — کاربر وارد شده، موبایلش ثبت شده و کد OTP گرفته ولی
+    40→ * آنبوردینگ را تکمیل نکرده. ۳۰ دقیقه بعد از ثبت موبایل و خروج ارسال می‌شود.
+    41→ * متغیر: NAME (نام کاربر)
+    42→ * 🩹 v43 — دیریکتیو جدید مالک: برای کاربری که آنبوردینگ را تکمیل نکرده و
+    43→ * نام ندارد، پیامک بفرست و به‌جای نام «ورزشکار» بنویس — نه NAME خالی، نه
+    44→ * skip. (گارد مرکزی sendTemplateSms هم همین fallback را برای این قالب
+    45→ * تضمین می‌کند؛ اینجا صریح نوشته شده تا خوانا باشد.)
+    46→ */
+    47→export async function sendOnboardingNudgeSms(user: SmsUserTarget): Promise<SendTemplateSmsResult> {
+    48→  const res = await sendTemplateSms({
+    49→    key: "onboarding_nudge",
+    50→    templateEnvKey: "onboarding_nudge",
+    51→    mobile: user.mobile,
+    52→    params: [{ name: "NAME", value: smsFirstName(user.name) || "ورزشکار" }],
+    53→    userId: user.id,
+    54→  });
+    55→  return res;
+    56→}
+    57→
+    58→/**
+    59→ * قالب 461291 — کاربر آنبوردینگ را تکمیل کرده ولی پلن نخریده.
+    60→ * ۲۴ ساعت بعد از تکمیل آنبوردینگ و عدم خرید ارسال می‌شود.
+    61→ * متغیرها: NAME + CODE (کد تخفیف اختصاصی یک‌بارمصرفِ خرید اول)
+    62→ */
+    63→export async function sendOnboardingWinbackSms(
+    64→  user: SmsUserTarget,
+    65→  discountCode: string
+    66→): Promise<SendTemplateSmsResult> {
+    67→  const res = await sendTemplateSms({
+    68→    key: "onboarding_winback",
+    69→    templateEnvKey: "onboarding_winback",
+    70→    mobile: user.mobile,
+    71→    params: [
+    72→      { name: "NAME", value: smsFirstName(user.name) },
+    73→      { name: "CODE", value: discountCode },
+    74→    ],
+    75→    userId: user.id,
+    76→  });
+    77→  return res;
+    78→}
+    79→
+    80→/**
+    81→ * قالب 663678 — برنامه ورزشی کاربر آماده شد و روی پنل قرار گرفت.
+    82→ * متغیر: NAME
+    83→ *
+    84→ * 🩹 v66 — فیکس باگ «پیامک کلاً ارسال نمیشه»: کلید دداپ قبلاً ثابت
+    85→ * ("program_ready") بود → هر کاربر فقط اولین برنامهٔ عمرش پیامک می‌گرفت و
+    86→ * همهٔ برنامه‌های بعدی (تمدید ۴۵ روزه، تولید مجدد ادمین، watchdog) با
+    87→ * already_sent رد می‌شدند. حالا کلید بر «هر چرخهٔ تولید» یکتاست
+    88→ * (program_ready_{programRequestId}) — هر برنامهٔ جدید یک پیامک.
+    89→ */
+    90→export async function sendProgramReadySms(
+    91→  user: SmsUserTarget,
+    92→  dedupeSuffix?: string
+    93→): Promise<SendTemplateSmsResult> {
+    94→  const res = await sendTemplateSms({
+    95→    key: `program_ready${dedupeSuffix ? `_${dedupeSuffix}` : ""}`,
+    96→    templateEnvKey: "program_ready",
+    97→    mobile: user.mobile,
+    98→    params: [{ name: "NAME", value: smsFirstName(user.name) }],
+    99→    userId: user.id,
+   100→  });
+   101→  return res;
+   102→}
+   103→
+   104→/**
+   105→ * قالب 761137 — چکاپ کاربر فرا رسیده (همزمان با نوتیف چکاپ).
+   106→ * متغیر: NAME
+   107→ *
+   108→ * 🩹 v66 — همان باگ program_ready: کلید ثابت یعنی چکاپ‌های روز ۱۵/۳۰/۴۰ فقط
+   109→ * «یک بار در عمر» پیامک می‌رفتند و در دورهٔ بعدی ۴۵ روزه هرگز. کلید حالا
+   110→ * بر (شروع دوره + شمارهٔ چکاپ) یکتاست — checkup_reminder_{cycle}_{phase}.
+   111→ */
+   112→export async function sendCheckupReminderSms(
+   113→  user: SmsUserTarget,
+   114→  dedupeSuffix?: string
+   115→): Promise<SendTemplateSmsResult> {
+   116→  const res = await sendTemplateSms({
+   117→    key: `checkup_reminder${dedupeSuffix ? `_${dedupeSuffix}` : ""}`,
+   118→    templateEnvKey: "checkup_reminder",
+   119→    mobile: user.mobile,
+   120→    params: [{ name: "NAME", value: smsFirstName(user.name) }],
+   121→    userId: user.id,
+   122→  });
+   123→  return res;
+   124→}
+   125→
+   126→/**
+   127→ * قالب 184777 — یک روز تا انقضای پلن (v37 — درخواست مالک)
+   128→ * متن قالب: «پلن فعلی شما فردا منقضی میشود. از لینک زیر میتوانید مبلغ تمدید را
+   129→ * پرداخت کنید تا پلن جدید بصورت خودکار برایتان فعال شود. https://fittup.ir/#LINK#»
+   130→ * متغیرها: NAME + LINK (بخش انتهای لینک تمدید مجزا — renew?t=...)
+   131→ * دداپ: کلید plan_expiring_{subscriptionId} — هر چرخهٔ اشتراک فقط یک بار.
+   132→ */
+   133→export async function sendPlanExpiringSoonSms(
+   134→  user: SmsUserTarget,
+   135→  renewLink: string,
+   136→  dedupeSuffix?: string
+   137→): Promise<SendTemplateSmsResult> {
+   138→  const key = `plan_expiring${dedupeSuffix ? `_${dedupeSuffix}` : ""}`;
+   139→  const attempts: Array<Array<{ name: string; value: string }>> = [
+   140→    [
+   141→      { name: "NAME", value: smsFirstName(user.name) },
+   142→      { name: "LINK", value: renewLink },
+   143→    ],
+   144→    [{ name: "NAME", value: smsFirstName(user.name) }],
+   145→    [],
+   146→  ];
+   147→  let last: SendTemplateSmsResult = { sent: false, error: "no attempt" };
+   148→  for (const params of attempts) {
+   149→    last = await sendTemplateSms({
+   150→      key,
+   151→      templateEnvKey: "plan_expiring_soon",
+   152→      mobile: user.mobile,
+   153→      params,
+   154→      userId: user.id,
+   155→    });
+   156→    if (last.sent) return last;
+   157→    if (
+   158→      last.skipped === "already_sent" ||
+   159→      last.skipped === "no_template" ||
+   160→      last.skipped === "invalid_mobile" ||
+   161→      last.skipped === "no_name"
+   162→    ) {
+   163→      return last;
+   164→    }
+   165→  }
+   166→  return last;
+   167→}
+   168→
+   169→/**
+   170→ * قالب 322780 — پلن کاربر منقضی شد (v37 — متن جدید با لینک تمدید مجزا)
+   171→ * متن قالب: «پلن فعلی شما منقضی شده، برای تمدید و دریافت برنامه جدید وارد
+   172→ * لینک زیر شوید و پرداخت را تکمیل کنید. https://fittup.ir/#LINK#»
+   173→ * متغیرها: NAME + LINK (لینک تمدید مجزا — صفحهٔ /renew بدون نیاز به لاگین)
+   174→ * دداپ: کلید plan_expired_{subscriptionId} — هر چرخهٔ اشتراک یک پیامک.
+   175→ */
+   176→export async function sendPlanExpiredSms(
+   177→  user: SmsUserTarget,
+   178→  renewLink?: string,
+   179→  dedupeSuffix?: string
+   180→): Promise<SendTemplateSmsResult> {
+   181→  const key = `plan_expired${dedupeSuffix ? `_${dedupeSuffix}` : ""}`;
+   182→  const fullName = smsFirstName(user.name);
+   183→  const attempts: Array<Array<{ name: string; value: string }>> =
+   184→    renewLink
+   185→      ? [
+   186→          [
+   187→            { name: "NAME", value: fullName },
+   188→            { name: "LINK", value: renewLink },
+   189→          ],
+   190→          [{ name: "NAME", value: fullName }],
+   191→          [],
+   192→        ]
+   193→      : [[{ name: "NAME", value: fullName }], []];
+   194→  let last: SendTemplateSmsResult = { sent: false, error: "no attempt" };
+   195→  for (const params of attempts) {
+   196→    last = await sendTemplateSms({
+   197→      key,
+   198→      templateEnvKey: "plan_expired",
+   199→      mobile: user.mobile,
+   200→      params,
+   201→      userId: user.id,
+   202→    });
+   203→    if (last.sent) return last;
+   204→    if (
+   205→      last.skipped === "already_sent" ||
+   206→      last.skipped === "no_template" ||
+   207→      last.skipped === "invalid_mobile" ||
+   208→      last.skipped === "no_name"
+   209→    ) {
+   210→      return last;
+   211→    }
+   212→  }
+   213→  return last;
+   214→}
+   215→
+   216→/**
+   217→ * قالب 852193 — دعوت دوست (کاربر نام و شمارهٔ دوستش را وارد می‌کند).
+   218→ * متغیرها: NAME (نام دوست/دعوت‌شونده) + LINK (بخش انتهای لینک دعوت دعوت‌کننده —
+   219→ * قالب به‌صورت https://fittup.ir/#LINK# است، پس LINK = «?ref=FIT-XXXXXX»)
+   220→ * ⚠️ این سناریو user-triggered است؛ دداپ به‌صورت (mobile, invite_friend_{inviterId})
+   221→ * است تا هر دعوت‌کننده فقط یک بار بتواند به یک شماره دعوت بفرستد.
+   222→ */
+   223→export async function sendInviteFriendSms(opts: {
+   224→  inviterUserId: string;
+   225→  friendMobile: string;
+   226→  friendName: string;
+   227→  referralCode: string;
+   228→}): Promise<SendTemplateSmsResult> {
+   229→  const res = await sendTemplateSms({
+   230→    key: `invite_friend_${opts.inviterUserId}`,
+   231→    templateEnvKey: "invite_friend",
+   232→    mobile: opts.friendMobile,
+   233→    params: [
+   234→      { name: "NAME", value: smsFirstName(opts.friendName) },
+   235→      // v56: لینک هوشمند — قبلاً «?ref=...» خام بود که همیشه مرورگر باز می‌کرد
+   236→      // (شکایت مالک). حالا مسیر /go با intent:// اول اپ را صدا می‌زند و در
+   237→      // نبود اپ به وب برمی‌گردد. متن قالب در پنل ثابت است: fittup.ir/#LINK#
+   238→      { name: "LINK", value: `go/plans?ref=${opts.referralCode}` },
+   239→    ],
+   240→    userId: opts.inviterUserId,
+   241→  });
+   242→  return res;
+   243→}
+   244→
+   245→/**
+   246→ * قالب 604678 — ۷۲ ساعت (۳ روز) از انقضای پلن گذشته و تمدید نکرده (v37).
+   247→ * متن قالب: «سه روزه که پلن شما منقضی شده و تمدید نکردید. نکنه از هدفت جا بمونی.
+   248→ * کد تخفیف: #CODE# لینک تمدید: https://fittup.ir/#LINK#»
+   249→ * متغیرها: NAME + CODE (کد تخفیف اختصاصی) + LINK (لینک تمدید مجزا)
+   250→ * دقیقاً همزمان با نوتیف renewal_late (هر دو در پنجرهٔ ۷۲ ساعت) ارسال می‌شود.
+   251→ * دداپ: کلید expired_winback_{subscriptionId} — هر چرخهٔ انقضا یک بار.
+   252→ */
+   253→export async function sendExpiredWinbackSms(
+   254→  user: SmsUserTarget,
+   255→  discountCode: string,
+   256→  renewLink?: string,
+   257→  dedupeSuffix?: string
+   258→): Promise<SendTemplateSmsResult> {
+   259→  const key = `expired_winback${dedupeSuffix ? `_${dedupeSuffix}` : ""}`;
+   260→  const attempts: Array<Array<{ name: string; value: string }>> = [
+   261→    renewLink
+   262→      ? [
+   263→          { name: "NAME", value: smsFirstName(user.name) },
+   264→          { name: "CODE", value: discountCode },
+   265→          { name: "LINK", value: renewLink },
+   266→        ]
+   267→      : [
+   268→          { name: "NAME", value: smsFirstName(user.name) },
+   269→          { name: "CODE", value: discountCode },
+   270→        ],
+   271→    [
+   272→      { name: "NAME", value: smsFirstName(user.name) },
+   273→      { name: "CODE", value: discountCode },
+   274→    ],
+   275→    [{ name: "NAME", value: smsFirstName(user.name) }],
+   276→  ];
+   277→  let last: SendTemplateSmsResult = { sent: false, error: "no attempt" };
+   278→  for (const params of attempts) {
+   279→    last = await sendTemplateSms({
+   280→      key,
+   281→      templateEnvKey: "expired_winback",
+   282→      mobile: user.mobile,
+   283→      params,
+   284→      userId: user.id,
+   285→    });
+   286→    if (last.sent) return last;
+   287→    if (
+   288→      last.skipped === "already_sent" ||
+   289→      last.skipped === "no_template" ||
+   290→      last.skipped === "invalid_mobile" ||
+   291→      last.skipped === "no_name"
+   292→    ) {
+   293→      return last;
+   294→    }
+   295→  }
+   296→  return last;
+   297→}
+   298→
+   299→/**
+   300→ * قالب 612964 — پیامک خوش‌آمدگویی خرید (v47 — دیریکتیو مالک)
+   301→ * دقیقاً ۸ روز بعد از ثبت شماره موبایل در سایت، برای کاربری که هنوز
+   302→ * چیزی نخریده ارسال می‌شود و کاربر را به صفحهٔ پلن‌ها برمی‌گرداند.
+   303→ *
+   304→ * متن قالب (پنل sms.ir — لینک ثابت دارد، متغیر LINK ندارد):
+   305→ *   #NAME# عزیز / با فیتاپ زندگی ورزشیتو متحول کن. / ... / کد تخفیف: #CODE#
+   306→ *   لینک: https://fittup.ir/go/plans   ← لینک هوشمند: اپ نصب بود → اپ باز می‌شود
+   307→ *
+   308→ * دیریکتیو صریح مالک برای NAME:
+   309→ *   «اگر کاربر آنبوردینگ رو تکمیل نکرده بود بجای متغیر نیم باید بنویسی
+   310→ *    ورزشکار و در صورت تکمیل اسمش رو.»
+   311→ * → اینجا NAME صریح پر می‌شود + گارد مرکزی sendTemplateSms هم برای همین
+   312→ *   قالب fallback «ورزشکار» را تضمین می‌کند.
+   313→ *
+   314→ * CODE: کد تخفیف اختصاصی کاربر (reason=welcome_offer، درصد از تنظیم
+   315→ * welcome_offer_discount_percent — پیش‌فرض ۳۰٪، قابل تغییر در پنل مدیر).
+   316→ * دداپ: کلید welcome_offer — هر کاربر فقط یک بار در عمر سیستم.
+   317→ */
+   318→export async function sendWelcomeOfferSms(
+   319→  user: SmsUserTarget,
+   320→  discountCode: string,
+   321→  displayName: string
+   322→): Promise<SendTemplateSmsResult> {
+   323→  const res = await sendTemplateSms({
+   324→    key: "welcome_offer",
+   325→    templateEnvKey: "welcome_offer",
+   326→    mobile: user.mobile,
+   327→    params: [
+   328→      { name: "NAME", value: displayName || "ورزشکار" },
+   329→      { name: "CODE", value: discountCode },
+   330→    ],
+   331→    userId: user.id,
+   332→  });
+   333→  return res;
+   334→}
+   335→
+   336→/**
+   337→ * قالب 883325 — تقویت تمدید (v47 — دیریکتیو مالک)
+   338→ * ۸ روز از انقضای پلن گذشته و کاربر تمدید نکرده — همان خانوادهٔ 604678 ولی
+   339→ * دیرتر و با لینک هوشمند: کاربر را به «بخش تمدید» با قیمت‌های تخفیف‌خورده
+   340→ * می‌برد (متن بخش تمدید با این پیامک سینک است).
+   341→ *
+   342→ * متن قالب (پنل sms.ir):
+   343→ *   فیتاپ / #NAME# عزیز / ۸ روز از زمان تمدید پلنت گذشته، ...
+   344→ *   کد تخفیف: #CODE# / لینک: https://fittup.ir/#LINK#
+   345→ * → LINK = «go/renew?t=...» (نسبی؛ دامنه در متن قالب است) — صفحهٔ /go اپ را
+   346→ *   باز می‌کند و اگر اپ نبود مستقیم به تمدید وب fallback می‌شود.
+   347→ *
+   348→ * CODE: همان کد renewal_loyalty کاربر (ensureRenewalDiscountCode) — پس
+   349→ * درصد پیامک و صفحهٔ تمدید همیشه یکی است. درصد از تنظیم
+   350→ * expiry_discount_percent (پیش‌فرض ۳۰٪ v47، قابل تغییر در پنل مدیر).
+   351→ * دداپ: کلید renewal_boost_{cycleId} — هر چرخهٔ انقضا فقط یک بار.
+   352→ */
+   353→export async function sendRenewalBoostSms(
+   354→  user: SmsUserTarget,
+   355→  discountCode: string,
+   356→  renewLink: string,
+   357→  dedupeSuffix?: string
+   358→): Promise<SendTemplateSmsResult> {
+   359→  const key = `renewal_boost${dedupeSuffix ? `_${dedupeSuffix}` : ""}`;
+   360→  const attempts: Array<Array<{ name: string; value: string }>> = [
+   361→    [
+   362→      { name: "NAME", value: smsFirstName(user.name) },
+   363→      { name: "CODE", value: discountCode },
+   364→      { name: "LINK", value: renewLink },
+   365→    ],
+   366→    [
+   367→      { name: "NAME", value: smsFirstName(user.name) },
+   368→      { name: "CODE", value: discountCode },
+   369→    ],
+   370→    [{ name: "NAME", value: smsFirstName(user.name) }],
+   371→  ];
+   372→  let last: SendTemplateSmsResult = { sent: false, error: "no attempt" };
+   373→  for (const params of attempts) {
+   374→    last = await sendTemplateSms({
+   375→      key,
+   376→      templateEnvKey: "renewal_boost",
+   377→      mobile: user.mobile,
+   378→      params,
+   379→      userId: user.id,
+   380→    });
+   381→    if (last.sent) return last;
+   382→    if (
+   383→      last.skipped === "already_sent" ||
+   384→      last.skipped === "no_template" ||
+   385→      last.skipped === "invalid_mobile" ||
+   386→      last.skipped === "no_name"
+   387→    ) {
+   388→      return last;
+   389→    }
+   390→  }
+   391→  return last;
+   392→}
+   393→
+   394→/**
+   395→ * پیامک «برنامه آماده شد» (قالب 663678) با واکشی خودکار کاربر.
+   396→ * در همهٔ نقاطی که وضعیت ProgramRequest به ready می‌رسد صدا زده می‌شود:
+   397→ * تولید پس‌زمینه، recover watchdog، تایید ادمین، تمدید/فعال‌سازی ادمین.
+   398→ *
+   399→ * v66 — cycleKey (شناسهٔ ProgramRequest) الزاماً پاس داده شود تا دداپ
+   400→ * «هر برنامه یک پیامک» باشد نه «یک پیامک در عمر کاربر».
+   401→ */
+   402→export async function notifyProgramReadySms(
+   403→  userId: string,
+   404→  cycleKey?: string
+   405→): Promise<void> {
+   406→  try {
+   407→    const user = await (await import("@/lib/db")).db.user.findUnique({
+   408→      where: { id: userId },
+   409→      select: { id: true, name: true, mobile: true },
+   410→    });
+   411→    if (!user) return;
+   412→    await sendProgramReadySms(user, cycleKey);
+   413→  } catch (e) {
+   414→    console.warn("[notifyProgramReadySms] failed (non-blocking):", e);
+   415→  }
+   416→}
+   417→
+   418→// ═══════════════════════════════════════════════════════════════════════════
+   419→// پیامک‌های خرید موفق (v33) — بلافاصله بعد از تأیید پرداخت درگاه
+   420→// ═══════════════════════════════════════════════════════════════════════════
+   421→// درخواست مالک: «به محض خرید، یعنی کاربر تا درگاه پرداخت پرداختش رو انجام داد
+   422→// و سایت ما دریافتش کرد، این پیامک ارسال بشه.»
+   423→//
+   424→//   423726 → پلن پیشرفته  (advanced)
+   425→//   612405 → پلن حرفه‌ای  (ultimate)
+   426→//   565185 → پلن اقتصادی + استاندارد (basic / standard — هر دو یک قالب)
+   427→//
+   428→// نقطهٔ اتصال: deliverPlanPayment در payment-delivery.ts (پس از موفقیت تراکنش
+   429→// و نوتیف خرید موفق). خرید کیف‌پول هم از همین مسیر می‌گذارد.
+   430→// FIX (v51 — اصلاح کامنت کهنه v36): خرید کافه‌بازار هم از v36 به بعد همان
+   431→// جریان درگاه را دارد و پیامک خرید می‌فرستد (api/payment/bazaar/purchase →
+   432→// notifyPlanPurchaseSms) — جملهٔ قدیمی «خرید بازار پیامک نمی‌فرستد» منسوخ است.
+   433→//
+   434→// دداپ: کلید یکتا = purchase_{planId}_{paymentId} →
+   435→//   - verify تکراری همان پرداخت هرگز دوباره نمی‌فرستد (همان کلید، status=sent)
+   436→//   - تمدید/خرید بعدی کلید جدید دارد → پیامک جدید می‌رود (هر خرید موفق یک پیامک)
+   437→//
+   438→// خودترمیم پارامتر: مالک متغیرهای این سه قالب را اعلام نکرده است. تلاش اول با
+   439→// NAME فرستاده می‌شود؛ اگر قالب متغیر نداشته باشد و sms.ir خطا بدهد، تلاش دوم
+   440→// بدون هیچ پارامتری انجام می‌شود — در هر دو حالت پیامک تحویل می‌شود.
+   441→
+   442→/** نگاشت planId → templateEnvKey پیامک خرید (null = پلن ناشناخته، بی‌صدا) */
+   443→export function purchaseSmsTemplateForPlan(planId: string): SmsTemplateKey | null {
+   444→  switch (planId) {
+   445→    case "advanced":
+   446→      return "purchase_advanced"; // 423726
+   447→    case "ultimate":
+   448→      return "purchase_ultimate"; // 612405
+   449→    case "basic":
+   450→    case "standard":
+   451→      return "purchase_basic"; // 565185 — هر دو پلن یک قالب
+   452→    default:
+   453→      return null;
+   454→  }
+   455→}
+   456→
+   457→/**
+   458→ * ارسال پیامک خرید موفق برای کاربر/پلن/پرداخت داده‌شده.
+   459→ * غیرمسدودکننده و بی‌خطر — هر خطایی فقط log می‌شود و هرگز تأثیری روی
+   460→ * تحویل پلن ندارد.
+   461→ */
+   462→export async function notifyPlanPurchaseSms(
+   463→  userId: string,
+   464→  planId: string,
+   465→  paymentId: string
+   466→): Promise<void> {
+   467→  try {
+   468→    const templateEnvKey = purchaseSmsTemplateForPlan(planId);
+   469→    if (!templateEnvKey) return;
+   470→
+   471→    const user = await (await import("@/lib/db")).db.user.findUnique({
+   472→      where: { id: userId },
+   473→      select: { id: true, name: true, mobile: true },
+   474→    });
+   475→    if (!user?.mobile) return;
+   476→
+   477→    const key = `purchase_${planId}_${paymentId}`;
+   478→
+   479→    // تلاش ۱ — با NAME (اگر قالب متغیر داشته باشد درست پر می‌شود)
+   480→    const first = await sendTemplateSms({
+   481→      key,
+   482→      templateEnvKey,
+   483→      mobile: user.mobile,
+   484→      params: [{ name: "NAME", value: smsFirstName(user.name) }],
+   485→      userId,
+   486→    });
+   487→    if (first.sent) return;
+   488→
+   489→    // already_sent → verify تکراری همان پرداخت (طبیعی، پیامک قبلاً رفته)
+   490→    // no_template / invalid_mobile / no_name → خطای پیکربندی/ورودی؛ تلاش مجدد بی‌فایده
+   491→    if (
+   492→      first.skipped === "already_sent" ||
+   493→      first.skipped === "no_template" ||
+   494→      first.skipped === "invalid_mobile" ||
+   495→      first.skipped === "no_name"
+   496→    ) {
+   497→      return;
+   498→    }
+   499→
+   500→    // تلاش ۲ (خودترمیم) — احتمالاً قالب متغیر ندارد و خطای پارامتر خورده؛
+   501→    // بدون هیچ پارامتری دوباره تلاش کن (داپ: رکورد failed به sent ارتقا می‌یابد)
+   502→    await sendTemplateSms({
+   503→      key,
+   504→      templateEnvKey,
+   505→      mobile: user.mobile,
+   506→      params: [],
+   507→      userId,
+   508→    });
+   509→  } catch (e) {
+   510→    console.warn("[notifyPlanPurchaseSms] failed (non-blocking):", e);
+   511→  }
+   512→}
+   513→
+   514→// ═══════════════════════════════════════════════════════════════════════════
+   515→// پیامک‌های v36 — ارتقای پلن + شارژ کیف پول
+   516→// ═══════════════════════════════════════════════════════════════════════════
+   517→// درخواست مالک (v36):
+   518→//   • قالب 275042 — ارتقا از اقتصادی/استاندارد به پیشرفته/حرفه‌ای
+   519→//     متن: «فیتاپ\n#NAME# عزیز\nپلن شما از #PLANBASE# به #PLANUPDATE# تغییر کرد.
+   520→//           برای تکمیل پیش نیازهای طراحی برنامه به داشبورد خود مراجعه کنید.»
+   521→//   • قالب 324322 — فقط ارتقا از اقتصادی به استاندارد (همان الگوی متغیرها)
+   522→//   • قالب 556023 — شارژ کیف پول بعد از تأیید پرداخت توسط سایت
+   523→//
+   524→// نام پلن‌ها از PLAN_LABELS (فارسی): اقتصادی / استاندارد / پیشرفته / حرفه‌ای
+   525→
+   526→/** انتخاب قالب ارتقا بر اساس پلن پایه و پلن جدید (null = سناریوی ارتقا نیست) */
+   527→export function planUpgradeSmsTemplateFor(
+   528→  basePlanId: string,
+   529→  newPlanId: string
+   530→): SmsTemplateKey | null {
+   531→  const premium: string[] = ["advanced", "ultimate"];
+   532→  if (["basic", "standard"].includes(basePlanId) && premium.includes(newPlanId)) {
+   533→    return "plan_upgrade_premium"; // 275042
+   534→  }
+   535→  if (basePlanId === "basic" && newPlanId === "standard") {
+   536→    return "plan_upgrade_standard"; // 324322
+   537→  }
+   538→  return null;
+   539→}
+   540→
+   541→/**
+   542→ * ارسال پیامک ارتقای پلن (قالب 275042 / 324322) — از مسیر تحویل پرداخت صدا زده می‌شود
+   543→ * وقتی کاربر با اشتراک فعالِ پلن دیگری، پلن بالاتری خریده است.
+   544→ * دداپ: کلید یکتا = plan_upgrade_{newPlanId}_{paymentId}
+   545→ * غیرمسدودکننده و بی‌خطر — هر خطایی فقط log می‌شود.
+   546→ */
+   547→export async function notifyPlanUpgradeSms(
+   548→  userId: string,
+   549→  basePlanId: string,
+   550→  newPlanId: string,
+   551→  paymentId: string
+   552→): Promise<void> {
+   553→  try {
+   554→    const templateEnvKey = planUpgradeSmsTemplateFor(basePlanId, newPlanId);
+   555→    if (!templateEnvKey) return;
+   556→
+   557→    const { PLAN_LABELS } = await import("@/lib/fitness/types");
+   558→    const baseLabel = PLAN_LABELS[basePlanId as keyof typeof PLAN_LABELS] ?? basePlanId;
+   559→    const newLabel = PLAN_LABELS[newPlanId as keyof typeof PLAN_LABELS] ?? newPlanId;
+   560→
+   561→    const user = await (await import("@/lib/db")).db.user.findUnique({
+   562→      where: { id: userId },
+   563→      select: { id: true, name: true, mobile: true },
+   564→    });
+   565→    if (!user?.mobile) return;
+   566→
+   567→    const key = `plan_upgrade_${newPlanId}_${paymentId}`;
+   568→    const fullParams = [
+   569→      { name: "NAME", value: smsFirstName(user.name) },
+   570→      { name: "PLANBASE", value: baseLabel },
+   571→      { name: "PLANUPDATE", value: newLabel },
+   572→    ];
+   573→
+   574→    // تلاش ۱ — با هر سه متغیر (الگوی اعلام‌شدهٔ مالک)
+   575→    const first = await sendTemplateSms({
+   576→      key,
+   577→      templateEnvKey,
+   578→      mobile: user.mobile,
+   579→      params: fullParams,
+   580→      userId,
+   581→    });
+   582→    if (first.sent) return;
+   583→    if (
+   584→      first.skipped === "already_sent" ||
+   585→      first.skipped === "no_template" ||
+   586→      first.skipped === "invalid_mobile" ||
+   587→      first.skipped === "no_name"
+   588→    ) {
+   589→      return;
+   590→    }
+   591→
+   592→    // تلاش ۲ (خودترمیم) — قالب متغیر ندارد → بدون پارامتر
+   593→    await sendTemplateSms({ key, templateEnvKey, mobile: user.mobile, params: [], userId });
+   594→  } catch (e) {
+   595→    console.warn("[notifyPlanUpgradeSms] failed (non-blocking):", e);
+   596→  }
+   597→}
+   598→
+   599→/**
+   600→ * ارسال پیامک شارژ کیف پول (قالب 556023) — بعد از تأیید پرداخت توسط سایت.
+   601→ * متغیر قالب در پنل اعلام نشده → نردبان خودترمیم:
+   602→ *   [NAME + AMOUNT] → [NAME] → []  (اولین ترکیبِ موفق تحویل می‌شود)
+   603→ * دداپ: کلید یکتا = wallet_topup_{paymentId} — verify تکراری هرگز دوباره نمی‌فرستد.
+   604→ */
+   605→export async function notifyWalletTopupSms(
+   606→  userId: string,
+   607→  amountToman: number,
+   608→  paymentId: string
+   609→): Promise<void> {
+   610→  try {
+   611→    const user = await (await import("@/lib/db")).db.user.findUnique({
+   612→      where: { id: userId },
+   613→      select: { id: true, name: true, mobile: true },
+   614→    });
+   615→    if (!user?.mobile) return;
+   616→
+   617→    const key = `wallet_topup_${paymentId}`;
+   618→    const attempts: Array<Array<{ name: string; value: string }>> = [
+   619→      [
+   620→        { name: "NAME", value: smsFirstName(user.name) },
+   621→        { name: "AMOUNT", value: amountToman.toLocaleString("en-US") },
+   622→      ],
+   623→      [{ name: "NAME", value: smsFirstName(user.name) }],
+   624→      [],
+   625→    ];
+   626→
+   627→    for (const params of attempts) {
+   628→      const res = await sendTemplateSms({
+   629→        key,
+   630→        templateEnvKey: "wallet_topup",
+   631→        mobile: user.mobile,
+   632→        params,
+   633→        userId,
+   634→      });
+   635→      if (res.sent) return;
+   636→      if (
+   637→        res.skipped === "already_sent" ||
+   638→        res.skipped === "no_template" ||
+   639→        res.skipped === "invalid_mobile" ||
+   640→        res.skipped === "no_name"
+   641→      ) {
+   642→        return;
+   643→      }
+   644→      // خطای پارامتر احتمالی → ترکیب بعدی
+   645→    }
+   646→  } catch (e) {
+   647→    console.warn("[notifyWalletTopupSms] failed (non-blocking):", e);
+   648→  }
+   649→}
+   650→
+   651→// ═══════════════════════════════════════════════════════════════════════════
+   652→// v53 — پیامک «ترک درگاه پرداخت» (سناریوی abandoned_cart — درخواست مالک)
+   653→// ═══════════════════════════════════════════════════════════════════════════
+   654→// کاربری که پرداخت درگاه (زرین‌پال) را شروع کرده و رها کرده، با «کد ۲۴۸۹۴۵»
+   655→// (درصد از SiteSetting abandoned_cart_discount_percent — پیش‌فرض ۱۰٪) و
+   656→// اعتبار ۲ ساعت به صفحهٔ پلن‌ها برمی‌گردد. کد نمایشی همیشه «248945» است ولی
+   657→// کد داخلی یکتا (248945-XXXXX) در UserDiscountCode با reason=abandoned_cart
+   658→// ساخته می‌شود (notifications.ensureAbandonedCartCode).
+   659→//
+   660→// متن دقیق (NAME/LINK جایگزین می‌شوند — درصد داخل متن از تنظیم ساخته می‌شود
+   661→// و «دو ساعت» ثابت می‌ماند):
+   662→//
+   663→//   فیتاپ
+   664→//   #NAME# عزیز
+   665→//   با 10 درصد تخفیف تا دو ساعت آینده میتونی خریدتو نهایی کنی و برنامه بدنسازی مختص به خودتو بگیری.
+   666→//
+   667→//   لینک پرداخت:
+   668→//   https://fittup.ir/#LINK#
+   669→//
+   670→//   هر بدنی فیتاپ میخواد!
+   671→//
+   672→// ارسال فقط با قالب (v61 — دیریکتیو مالک: «همهٔ پیامک‌ها تحویل قالبی است نه
+   673→// بولک»؛ خط خدماتی +98500033003 با bulk کار نمی‌کند — مسیر متن آزاد حذف شد):
+   674→//   قالب از env SMSIR_ABANDONED_CART_TEMPLATE_ID (۲۴۸۹۴۵) یا SiteSetting
+   675→//   abandoned_cart_sms_template_id با نردبان خودترمیم [NAME+LINK] → [NAME] → [].
+   676→//   شکست قالب → رکورد failed در SmsLog (sweep بعدی دوباره تلاش می‌کند).
+   677→// دداپ ابدی: SmsLog (mobile, key) — key = abandoned_cart_{paymentId}
+   678→// (داپ دائمی per-payment؛ حتی بعد از ری‌استارت/بک‌فیل هرگز تکراری نمی‌شود).
+   679→
+   680→// v61 — تابع ساخت «متن آزاد» پیامک (bulk) حذف شد: پیامک ترک خرید فقط با
+   681→// قالب ۲۴۸۹۴۵ پنل sms.ir ارسال می‌شود (متن قالب داخل پنل تعریف شده است).
+   682→
+   683→export interface AbandonedCartSmsOptions {
+   684→  user: SmsUserTarget;
+   685→  /** کلید دداپ — abandoned_cart_{paymentId} */
+   686→  dedupeKey: string;
+   687→  /** لینک کوتاه نسبی مثل r/XXXXXXXX (خروجی createSmsShortLink) */
+   688→  link: string;
+   689→  /** v61 — با حذف مسیر متن آزاد دیگر استفاده نمی‌شود (برای سازگاری call-site) */
+   690→  percent?: number;
+   691→  /** شناسه قالب sms.ir (env/SiteSetting) — قالبی الزامی است (v61) */
+   692→  templateId: string | null;
+   693→}
+   694→
+   695→export interface AbandonedCartSmsResult {
+   696→  sent: boolean;
+   697→  /** کدام مسیر تحویل داد (v61: فقط قالب — bulk حذف شد) */
+   698→  via?: "template";
+   699→  /** already_sent = دداپ قبلی (هرگز دوباره نفرست) */
+   700→  skipped?: "already_sent" | "invalid_mobile";
+   701→  error?: string;
+   702→}
+   703→
+   704→/** رکورد failed در SmsLog (best-effort — هرگز نتیجهٔ ارسال را تغییر نمی‌دهد) */
+   705→async function recordAbandonedCartFailure(
+   706→  normalizedMobile: string,
+   707→  dedupeKey: string,
+   708→  templateId: string,
+   709→  userId: string | null | undefined,
+   710→  error: string
+   711→): Promise<void> {
+   712→  try {
+   713→    const { db } = await import("@/lib/db");
+   714→    await db.smsLog.upsert({
+   715→      where: { mobile_key: { mobile: normalizedMobile, key: dedupeKey } },
+   716→      create: {
+   717→        mobile: normalizedMobile,
+   718→        key: dedupeKey,
+   719→        templateId: templateId || "template",
+   720→        userId: userId ?? null,
+   721→        status: "failed",
+   722→        error,
+   723→      },
+   724→      update: {
+   725→        status: "failed",
+   726→        error,
+   727→      },
+   728→    });
+   729→  } catch (e) {
+   730→    console.warn("[sendAbandonedCartSms] failed-record upsert error:", e);
+   731→  }
+   732→}
+   733→
+   734→/**
+   735→ * ارسال پیامک ترک درگاه — فقط با قالب sms.ir (نردبان خودترمیم پارامترها).
+   736→ * v61: مسیر bulk/متن آزاد حذف شد (دیریکتیو مالک + خط خدماتی که bulk را
+   737→ * پشتیبانی نمی‌کند). شکست قالب = رکورد failed و تلاشِ sweep بعدی.
+   738→ */
+   739→export async function sendAbandonedCartSms(
+   740→  opts: AbandonedCartSmsOptions
+   741→): Promise<AbandonedCartSmsResult> {
+   742→  const { user, dedupeKey, link, templateId } = opts;
+   743→
+   744→  const normalized = normalizeMobileForSmsIr(user.mobile);
+   745→  if (!/^9\d{9}$/.test(normalized)) {
+   746→    return { sent: false, skipped: "invalid_mobile", error: `شماره نامعتبر: ${normalized}` };
+   747→  }
+   748→
+   749→  const name = smsFirstName(user.name);
+   750→
+   751→  // ─── مسیر واحد — قالب sms.ir (v61: قالبی الزامی؛ bulk حذف شد) ───
+   752→  const templateIdSafe = templateId?.trim() || "";
+   753→  if (!templateIdSafe) {
+   754→    const noTpl =
+   755→      "شناسه قالب ترک خرید تنظیم نیست (SMSIR_ABANDONED_CART_TEMPLATE_ID یا SiteSetting: abandoned_cart_sms_template_id) — پیامک قالبی ارسال نشد.";
+   756→    console.warn(`[sendAbandonedCartSms] (key=${dedupeKey}) ${noTpl}`);
+   757→    await recordAbandonedCartFailure(normalized, dedupeKey, "", user.id, noTpl);
+   758→    return { sent: false, error: noTpl };
+   759→  }
+   760→
+   761→  // نردبان خودترمیم پارامترهای قالب: [NAME+LINK] → [NAME] → []
+   762→  const attempts: Array<Array<{ name: string; value: string }>> = [
+   763→    [
+   764→      { name: "NAME", value: name },
+   765→      { name: "LINK", value: link },
+   766→    ],
+   767→    [{ name: "NAME", value: name }],
+   768→    [],
+   769→  ];
+   770→  let last: SendTemplateSmsResult = { sent: false, error: "no attempt" };
+   771→  for (const params of attempts) {
+   772→    last = await sendTemplateSms({
+   773→      key: dedupeKey,
+   774→      templateEnvKey: undefined,
+   775→      templateIdOverride: templateIdSafe,
+   776→      mobile: user.mobile,
+   777→      params,
+   778→      userId: user.id,
+   779→    });
+   780→    if (last.sent) return { sent: true, via: "template" };
+   781→    if (last.skipped === "already_sent" || last.skipped === "invalid_mobile") {
+   782→      return {
+   783→        sent: false,
+   784→        skipped: last.skipped === "invalid_mobile" ? "invalid_mobile" : "already_sent",
+   785→        error: last.error,
+   786→      };
+   787→    }
+   788→    // no_template / no_name / خطای درگاه → رانگ بعدی نردبان
+   789→  }
+   790→
+   791→  // ─── شکست نهایی قالب — رکورد failed برای دیده‌شدن؛ sweep بعدی دوباره تلاش می‌کند ───
+   792→  // (sendTemplateSms خودش در هر تلاش رکورد ثبت می‌کند؛ این upsert فقط گارانتی
+   793→  //  می‌کند که حتماً یک رکورد failed با آخرین خطا موجود باشد.)
+   794→  await recordAbandonedCartFailure(
+   795→    normalized,
+   796→    dedupeKey,
+   797→    templateIdSafe,
+   798→    user.id,
+   799→    last.error ?? "abandoned_cart sms failed"
+   800→  );
+   801→
+   802→  return { sent: false, error: last.error ?? "abandoned_cart sms failed" };
+   803→}
+   804→

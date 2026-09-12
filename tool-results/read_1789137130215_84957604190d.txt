@@ -1,0 +1,1177 @@
+     1→"use client";
+     2→
+     3→// ─────────────────────────────────────────────────────────────────────────────
+     4→// صفحهٔ تحلیل آنبوردینگ — بازطراحی هنری v64 (دیریکتیو مالک)
+     5→//
+     6→// تغییر بزرگ این نسخه: «پلن پیشنهادی» تک‌قطنه حذف شد؛ به‌جای آن ۴ پلن
+     7→// (اقتصادی/استاندارد/پیشرفته/حرفه‌ای) با کارت‌های کوچک شیک، تفاوت‌ها و
+     8→// مزیت‌های هر کدام نمایش داده می‌شود و کاربر همان‌جا انتخاب و خرید می‌کند.
+     9→// چرا: خیلی از کاربران آنبوردینگ را کامل می‌کنند ولی به خرید نمی‌رسند —
+    10→// این صفحه ویترین فروش است و باید هنرمندانه، جذاب و کاملاً موبایل‌پسند باشد.
+    11→// ─────────────────────────────────────────────────────────────────────────────
+    12→
+    13→import { useEffect, useState } from "react";
+    14→import { motion } from "framer-motion";
+    15→import {
+    16→  Dumbbell, Sparkles, ChevronRight, TrendingUp, Target,
+    17→  Activity, Crown, RefreshCw, Flame, Beef, Wheat, Droplet,
+    18→  Scale, Calendar, Ruler, Heart, Bot, CalendarDays,
+    19→  Zap, ShieldCheck, Infinity as InfinityIcon, Star,
+    20→} from "lucide-react";
+    21→import { useAppStore } from "@/lib/fitness/store";
+    22→import { Card } from "@/components/ui/card";
+    23→import { Button } from "@/components/ui/button";
+    24→import {
+    25→  toPersianDigits,
+    26→  formatToman,
+    27→  type Plan,
+    28→  type SubscriptionPlan,
+    29→} from "@/lib/fitness/types";
+    30→import { usePlans } from "@/lib/fitness/use-plans";
+    31→import { PurchaseModal } from "@/components/fitness/landing/sections/purchase-modal";
+    32→import { toast } from "sonner";
+    33→
+    34→// ─────────────────────────────────────────────────────────────────────────────
+    35→// Types returned by /api/onboarding/analysis
+    36→// ─────────────────────────────────────────────────────────────────────────────
+    37→interface MacroRec {
+    38→  targetCalories: number;
+    39→  protein_g: number;
+    40→  carbs_g: number;
+    41→  fat_g: number;
+    42→  proteinPerKg: number;
+    43→  deficitPercent: number;
+    44→}
+    45→
+    46→interface Trajectory {
+    47→  currentWeight: number;
+    48→  targetWeight: number;
+    49→  weeksToGoal: number;
+    50→  weeklyRate: number;
+    51→  weeklyCalorieAdjustment: number;
+    52→}
+    53→
+    54→interface PlanRec {
+    55→  recommendedPlan: Plan;
+    56→  reason: string;
+    57→}
+    58→
+    59→interface Measurements {
+    60→  chest?: number;
+    61→  arm?: number;
+    62→  waist?: number;
+    63→  hip?: number;
+    64→  thigh?: number;
+    65→  neck?: number;
+    66→}
+    67→
+    68→interface BodyCompositionData {
+    69→  bodyFatPercent: number;
+    70→  leanBodyMass: number;
+    71→  fatMass: number;
+    72→  bodyFatCategory: string;
+    73→  bodyFatColor: string;
+    74→  muscleMassPercent: number | null;
+    75→  muscleMass: number | null;
+    76→}
+    77→
+    78→interface AnalysisResponse {
+    79→  analysis: string;
+    80→  bmi: number;
+    81→  bmr: number;
+    82→  tdee: number;
+    83→  macros?: MacroRec;
+    84→  trajectory?: Trajectory | null;
+    85→  planRecommendation?: PlanRec;
+    86→  measurements?: Measurements;
+    87→  bodyComposition?: BodyCompositionData | null;
+    88→  fromCache?: boolean;
+    89→}
+    90→
+    91→// ─────────────────────────────────────────────────────────────────────────────
+    92→// هویت بصری هر پلن — v68 بازطراحی وسواسی (دیریکتیو مالک)
+    93→//
+    94→// مشکلات گزارش‌شده روی نسخهٔ v66: ① دکمه‌های «انتخاب و خرید» در یک ردیف
+    95→// نبودند ② کارت‌ها کم‌ارتفاع بودند ③ برچسب «محبوب‌ترین/کامل‌ترین» (absolute
+    96→// گوشهٔ کارت) روی کلمهٔ «پیشرفته/حرفه‌ای» می‌افتاد.
+    97→//
+    98→// راه‌حل ساختاری:
+    99→//  • برچسب هر پلن به یک «ردیف ثابت» در بالای کارت رفت — ارتفاع یکسان روی هر
+   100→//    ۴ کارت ⇒ دیگر هیچ برچسبی روی نام پلن نمی‌افتد و ردیف‌ها هم‌تراز می‌مانند
+   101→//  • بلوک قیمت + دکمهٔ CTA با mt-auto به کف کارت چسبیده ⇒ هر ۴ دکمه دقیقاً
+   102→//    در یک ردیف (در ۲×۲ موبایل و ۴ستونهٔ دسکتاپ)
+   103→//  • headline داخل کادر ملایم با min-height دوخطی ⇒ متن‌ها هم‌تراز
+   104→//  • padding عمودی بیشتر + خط‌چین جداکنندهٔ قیمت ⇒ کارت بلندتر و نفس‌دار
+   105→// ─────────────────────────────────────────────────────────────────────────────
+   106→const PLAN_VISUALS: Record<
+   107→  Plan,
+   108→  {
+   109→    accent: string; // رنگ اصلی پلن (قیمت/آیکون‌چیپ/متن headline)
+   110→    iconBg: string; // پس‌زمینهٔ چیپ آیکون
+   111→    tint: string; // پس‌زمینهٔ کادر headline
+   112→    border: string; // حاشیهٔ کارت
+   113→    headline: string; // تفاوت اصلی — یک جملهٔ فروشی
+   114→    chip: string; // برچسب ردیف بالای کارت (همیشه در جریان — ضد تداخل)
+   115→    chipIcon?: React.ReactNode; // آیکون کوچک داخل برچسب
+   116→    chipStyle: React.CSSProperties; // استایل برچسب
+   117→  }
+   118→> = {
+   119→  basic: {
+   120→    accent: "#64748b",
+   121→    iconBg: "linear-gradient(135deg, #f8fafc, #e2e8f0)",
+   122→    tint: "#f8fafc",
+   123→    border: "#e2e8f0",
+   124→    headline: "برنامهٔ تمرین و تغذیهٔ اختصاصی بر اساس تحلیل بدن شما",
+   125→    chip: "شروع هوشمند",
+   126→    chipStyle: {
+   127→      background: "#f8fafc",
+   128→      color: "#64748b",
+   129→      border: "1px solid #e2e8f0",
+   130→    },
+   131→  },
+   132→  standard: {
+   133→    accent: "#d97706",
+   134→    iconBg: "linear-gradient(135deg, #fef3c7, #fde68a)",
+   135→    tint: "#fffbeb",
+   136→    border: "#fde68a",
+   137→    headline: "مکمل اختصاصی، چکاپ دوره‌ای و داشبورد پیشرفته",
+   138→    chip: "بهترین ارزش",
+   139→    chipStyle: {
+   140→      background: "#fffbeb",
+   141→      color: "#b45309",
+   142→      border: "1px solid #fde68a",
+   143→    },
+   144→  },
+   145→  advanced: {
+   146→    accent: "#ea580c",
+   147→    iconBg: "linear-gradient(135deg, #ffedd5, #fed7aa)",
+   148→    tint: "#fff7ed",
+   149→    border: "#fed7aa",
+   150→    headline: "چت نامحدود با فیتاپ، حالت باشگاه و تحلیل عکس غذا و بدن",
+   151→    chip: "محبوب‌ترین",
+   152→    chipIcon: <Star className="w-2.5 h-2.5 fill-current" />,
+   153→    chipStyle: {
+   154→      background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   155→      color: "#ffffff",
+   156→      boxShadow: "0 4px 12px -4px rgba(249, 115, 22, 0.5)",
+   157→    },
+   158→  },
+   159→  ultimate: {
+   160→    accent: "#b45309",
+   161→    iconBg: "linear-gradient(135deg, #fef9c3, #fde68a)",
+   162→    tint: "#fefce8",
+   163→    border: "#e9b949",
+   164→    headline: "آنالیز ویدیویی بدن، اصلاح تکنیک حرکات و تحلیل آزمایش خون",
+   165→    chip: "کامل‌ترین",
+   166→    chipIcon: <Crown className="w-2.5 h-2.5" />,
+   167→    chipStyle: {
+   168→      background: "linear-gradient(135deg, #1c1917, #292524)",
+   169→      color: "#e9b949",
+   170→      border: "1px solid rgba(217, 164, 65, 0.55)",
+   171→      boxShadow: "0 4px 12px -4px rgba(120, 84, 12, 0.45)",
+   172→    },
+   173→  },
+   174→};
+   175→
+   176→// ─────────────────────────────────────────────────────────────────────────────
+   177→// Macro ring — circular progress for protein/carbs/fat (pure SVG, no deps)
+   178→// ─────────────────────────────────────────────────────────────────────────────
+   179→function MacroRing({
+   180→  label,
+   181→  grams,
+   182→  calories,
+   183→  color,
+   184→  icon,
+   185→}: {
+   186→  label: string;
+   187→  grams: number;
+   188→  calories: number;
+   189→  color: string;
+   190→  icon: React.ReactNode;
+   191→}) {
+   192→  const size = 84;
+   193→  const stroke = 7;
+   194→  const radius = (size - stroke) / 2;
+   195→  const circumference = 2 * Math.PI * radius;
+   196→  const fillFraction = 0.78; // visual fill — purely aesthetic
+   197→
+   198→  return (
+   199→    <div className="flex flex-col items-center gap-1.5">
+   200→      <div className="relative" style={{ width: size, height: size }}>
+   201→        <svg width={size} height={size} className="-rotate-90">
+   202→          <circle
+   203→            cx={size / 2}
+   204→            cy={size / 2}
+   205→            r={radius}
+   206→            fill="none"
+   207→            stroke="#f1f5f9"
+   208→            strokeWidth={stroke}
+   209→          />
+   210→          <motion.circle
+   211→            cx={size / 2}
+   212→            cy={size / 2}
+   213→            r={radius}
+   214→            fill="none"
+   215→            stroke={color}
+   216→            strokeWidth={stroke}
+   217→            strokeLinecap="round"
+   218→            strokeDasharray={circumference}
+   219→            initial={{ strokeDashoffset: circumference }}
+   220→            animate={{ strokeDashoffset: circumference * (1 - fillFraction) }}
+   221→            transition={{ duration: 1, ease: "easeOut" }}
+   222→          />
+   223→        </svg>
+   224→        <div className="absolute inset-0 flex flex-col items-center justify-center">
+   225→          <span className="text-slate-400">{icon}</span>
+   226→          <span className="text-base font-black font-stat text-slate-900 leading-none">
+   227→            {toPersianDigits(grams)}
+   228→          </span>
+   229→          <span className="text-[9px] text-slate-400">گرم</span>
+   230→        </div>
+   231→      </div>
+   232→      <p className="text-xs font-bold text-slate-700">{label}</p>
+   233→      <p className="text-[10px] text-slate-400">{toPersianDigits(calories)} کیلوکالری</p>
+   234→    </div>
+   235→  );
+   236→}
+   237→
+   238→// ─────────────────────────────────────────────────────────────────────────────
+   239→// Measurement chip
+   240→// ─────────────────────────────────────────────────────────────────────────────
+   241→function MeasurementChip({ label, value, unit = "سانتی‌متر" }: { label: string; value: number; unit?: string }) {
+   242→  return (
+   243→    <div className="rounded-2xl border-2 border-orange-100 bg-white p-3 text-center">
+   244→      <p className="text-[10px] text-slate-500 mb-1">{label}</p>
+   245→      <p className="text-lg font-black font-stat text-slate-900 leading-none">
+   246→        {toPersianDigits(value)}
+   247→      </p>
+   248→      <p className="text-[9px] text-slate-400 mt-0.5">{unit}</p>
+   249→    </div>
+   250→  );
+   251→}
+   252→
+   253→// ─────────────────────────────────────────────────────────────────────────────
+   254→// v68 — کارت پلن صفحهٔ تحلیل — بازطراحی وسواسی (دیریکتیو مالک)
+   255→// ساختار هم‌تراز: ردیف برچسب (ارتفاع ثابت) → نام+آیکون → کادر headline
+   256→// (min-height دوشن) → بلوک قیمت چسبیده به کف (mt-auto) → دکمهٔ CTA.
+   257→// نتیجه: برچسب هرگز روی نام نمی‌افتد، هر ۴ دکمه دقیقاً یک ردیف، کارت بلندتر.
+   258→// ─────────────────────────────────────────────────────────────────────────────
+   259→function PlanMiniCard({
+   260→  plan,
+   261→  index,
+   262→  onBuy,
+   263→}: {
+   264→  plan: SubscriptionPlan;
+   265→  index: number;
+   266→  onBuy: () => void;
+   267→}) {
+   268→  const v = PLAN_VISUALS[plan.id];
+   269→  const isPopular = plan.id === "advanced";
+   270→  const isUltimate = plan.id === "ultimate";
+   271→
+   272→  return (
+   273→    <motion.div
+   274→      initial={{ opacity: 0, y: 16 }}
+   275→      animate={{ opacity: 1, y: 0 }}
+   276→      transition={{ delay: 0.08 + index * 0.06, type: "spring", stiffness: 130, damping: 17 }}
+   277→      className="relative h-full"
+   278→    >
+   279→      <div
+   280→        className={`relative h-full rounded-[1.4rem] bg-white overflow-hidden flex flex-col transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${
+   281→          isPopular ? "ring-2 ring-orange-300/80" : ""
+   282→        }`}
+   283→        style={{
+   284→          border: `1px solid ${isPopular ? "#fdba74" : v.border}`,
+   285→          boxShadow: isPopular
+   286→            ? "0 14px 30px -14px rgba(249, 115, 22, 0.35)"
+   287→            : "0 6px 18px -12px rgba(15, 23, 42, 0.12)",
+   288→        }}
+   289→      >
+   290→        {/* ردیف برچسب — ارتفاع ثابت روی هر ۴ کارت ⇒ برچسب هرگز روی نام نمی‌افتد */}
+   291→        <div className="flex items-center justify-center h-8 sm:h-9 pt-2.5 sm:pt-3 shrink-0">
+   292→          <span
+   293→            className="inline-flex items-center gap-1 text-[9px] sm:text-[10px] font-black px-2.5 py-1 rounded-full leading-none"
+   294→            style={v.chipStyle}
+   295→          >
+   296→            {v.chipIcon}
+   297→            {v.chip}
+   298→          </span>
+   299→        </div>
+   300→
+   301→        {/* نام + آیکون — همیشه زیر ردیف برچسب، بدون تداخل */}
+   302→        <div className="px-3 sm:px-4 mt-1.5 flex items-center gap-2.5">
+   303→          <div
+   304→            className="w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0"
+   305→            style={{ background: v.iconBg }}
+   306→            aria-hidden
+   307→          >
+   308→            {plan.icon}
+   309→          </div>
+   310→          <div className="min-w-0">
+   311→            <p className="font-black text-[14px] sm:text-base text-slate-900 leading-tight">
+   312→              پلن {plan.label}
+   313→            </p>
+   314→            <p className="text-[9px] sm:text-[10px] text-slate-400 truncate">{plan.tagline}</p>
+   315→          </div>
+   316→        </div>
+   317→
+   318→        {/* headline — کادر ملایم با min-height دوشن ⇒ متن‌های ۴ کارت هم‌تراز */}
+   319→        <div
+   320→          className="mx-3 sm:mx-4 mt-2.5 rounded-xl px-2.5 py-2 min-h-[48px] sm:min-h-[52px] flex items-center"
+   321→          style={{ background: v.tint }}
+   322→        >
+   323→          <p className="text-[10px] sm:text-[11px] font-bold leading-snug text-start" style={{ color: v.accent }}>
+   324→            {v.headline}
+   325→          </p>
+   326→        </div>
+   327→
+   328→        {/* بلوک قیمت — با mt-auto به کف کارت چسبیده ⇒ هم‌ترازی کامل کارت‌ها */}
+   329→        <div className="mt-auto px-3 sm:px-4 pt-3">
+   330→          <div className="border-t border-dashed border-slate-200 pt-2.5 flex flex-wrap items-end justify-between gap-x-1.5 gap-y-1.5">
+   331→            <div className="flex items-baseline gap-1">
+   332→              <span
+   333→                className="text-xl sm:text-2xl font-black font-stat leading-none"
+   334→                style={{ color: v.accent }}
+   335→              >
+   336→                {toPersianDigits(formatToman(plan.price))}
+   337→              </span>
+   338→              <span className="text-[10px] text-slate-400">تومان</span>
+   339→            </div>
+   340→            <span
+   341→              className="text-[9px] sm:text-[10px] font-black px-2 py-0.5 rounded-md shrink-0 mb-0.5"
+   342→              style={{ background: v.iconBg, color: v.accent }}
+   343→            >
+   344→              پکیج {toPersianDigits(plan.durationDays)} روزه
+   345→            </span>
+   346→          </div>
+   347→        </div>
+   348→
+   349→        {/* CTA — آخرین ردیف همهٔ کارت‌ها ⇒ هر ۴ دکمه در یک ردیف */}
+   350→        <div className="px-3 sm:px-4 pb-3.5 sm:pb-4 pt-2.5">
+   351→          <button
+   352→            onClick={onBuy}
+   353→            className={`w-full h-10 sm:h-11 rounded-xl font-black text-[11px] sm:text-[13px] flex items-center justify-center gap-1.5 transition-all hover:scale-[1.03] active:scale-[0.98] ${
+   354→              isUltimate ? "text-amber-200" : "text-white"
+   355→            }`}
+   356→            style={
+   357→              isUltimate
+   358→                ? {
+   359→                    background: "linear-gradient(135deg, #1c1917, #292524)",
+   360→                    border: "1.5px solid rgba(217, 164, 65, 0.65)",
+   361→                    color: "#e9b949",
+   362→                    boxShadow: "0 8px 20px -10px rgba(217, 164, 65, 0.5)",
+   363→                  }
+   364→                : isPopular
+   365→                  ? {
+   366→                      background: "linear-gradient(135deg, #f59e0b, #f97316)",
+   367→                      boxShadow: "0 10px 22px -10px rgba(249, 115, 22, 0.55)",
+   368→                    }
+   369→                  : {
+   370→                      background: "linear-gradient(135deg, #fff7ed, #ffedd5)",
+   371→                      border: `1px solid ${v.border}`,
+   372→                      color: v.accent,
+   373→                    }
+   374→            }
+   375→            aria-label={`خرید پلن ${plan.label}`}
+   376→          >
+   377→            <Zap className="w-3.5 h-3.5" />
+   378→            انتخاب و خرید
+   379→          </button>
+   380→        </div>
+   381→      </div>
+   382→    </motion.div>
+   383→  );
+   384→}
+   385→
+   386→// ─────────────────────────────────────────────────────────────────────────────
+   387→// صفحه انتظار جذاب و اختصاصی برای تحلیل هوشمند
+   388→// ─────────────────────────────────────────────────────────────────────────────
+   389→function AnalysisLoadingScreen({ userName }: { userName?: string | null }) {
+   390→  const [step, setStep] = useState(0);
+   391→  const steps = [
+   392→    { icon: Scale, text: "تحلیل وزن و ترکیب بدن" },
+   393→    { icon: Target, text: "بررسی هدف و سطح فعالیت" },
+   394→    { icon: Activity, text: "محاسبه کالری و درشت‌مغذی‌ها" },
+   395→    { icon: Dumbbell, text: "طراحی برنامه تمرینی اختصاصی" },
+   396→    { icon: Sparkles, text: "تولید تحلیل هوشمند فیتاپ" },
+   397→  ];
+   398→
+   399→  useEffect(() => {
+   400→    const timer = setInterval(() => {
+   401→      setStep((s) => Math.min(s + 1, steps.length - 1));
+   402→    }, 2000);
+   403→    return () => clearInterval(timer);
+   404→  }, []);
+   405→
+   406→  return (
+   407→    <div className="min-h-screen bg-gradient-to-b from-orange-50 via-white to-amber-50 flex flex-col items-center justify-center px-6">
+   408→      {/* لوگو با انیمیشن */}
+   409→      <motion.div
+   410→        initial={{ scale: 0, opacity: 0 }}
+   411→        animate={{ scale: 1, opacity: 1 }}
+   412→        transition={{ type: "spring", stiffness: 200, damping: 15 }}
+   413→        className="mb-8"
+   414→      >
+   415→        <div
+   416→          className="w-24 h-24 rounded-3xl flex items-center justify-center overflow-hidden shadow-2xl"
+   417→          style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   418→        >
+   419→          <motion.div
+   420→            animate={{ y: [0, -6, 0] }}
+   421→            transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+   422→          >
+   423→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   424→            <img src="/fitup-logo.png" alt="فیتاپ" width={80} height={80} className="object-cover" style={{ width: 80, height: 80 }} />
+   425→          </motion.div>
+   426→        </div>
+   427→      </motion.div>
+   428→
+   429→      {/* نام کاربر + پیام */}
+   430→      <motion.h2
+   431→        initial={{ opacity: 0, y: 10 }}
+   432→        animate={{ opacity: 1, y: 0 }}
+   433→        transition={{ delay: 0.3 }}
+   434→        className="text-xl font-black text-slate-900 mb-2 text-center"
+   435→      >
+   436→        {userName ? `${userName} عزیز` : "ورزشکار گرامی"}
+   437→      </motion.h2>
+   438→      <motion.p
+   439→        initial={{ opacity: 0 }}
+   440→        animate={{ opacity: 1 }}
+   441→        transition={{ delay: 0.5 }}
+   442→        className="text-sm text-slate-500 mb-10 text-center max-w-xs"
+   443→      >
+   444→        فیتاپ هوشمند در حال تحلیل اطلاعات شما و طراحی برنامه اختصاصی شماست
+   445→      </motion.p>
+   446→
+   447→      {/* مراحل تحلیل */}
+   448→      <div className="w-full max-w-sm space-y-3">
+   449→        {steps.map((s, i) => {
+   450→          const Icon = s.icon;
+   451→          const isDone = i < step;
+   452→          const isActive = i === step;
+   453→          return (
+   454→            <motion.div
+   455→              key={i}
+   456→              initial={{ opacity: 0, x: 20 }}
+   457→              animate={{ opacity: 1, x: 0 }}
+   458→              transition={{ delay: 0.6 + i * 0.15 }}
+   459→              className={`flex items-center gap-3 p-3 rounded-2xl transition-all ${
+   460→                isActive
+   461→                  ? "bg-white shadow-lg border-2 border-orange-200"
+   462→                  : isDone
+   463→                  ? "bg-emerald-50 border border-emerald-100"
+   464→                  : "bg-white/50 border border-slate-100"
+   465→              }`}
+   466→            >
+   467→              <div
+   468→                className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-colors ${
+   469→                  isDone
+   470→                    ? "bg-emerald-500"
+   471→                    : isActive
+   472→                    ? "bg-gradient-to-br from-amber-500 to-orange-500"
+   473→                    : "bg-slate-100"
+   474→                }`}
+   475→              >
+   476→                {isDone ? (
+   477→                  <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }}>
+   478→                    <Sparkles className="w-5 h-5 text-white" />
+   479→                  </motion.div>
+   480→                ) : (
+   481→                  <Icon className={`w-5 h-5 ${isActive ? "text-white" : "text-slate-400"}`} />
+   482→                )}
+   483→              </div>
+   484→              <span
+   485→                className={`text-sm font-medium transition-colors ${
+   486→                  isDone ? "text-emerald-700" : isActive ? "text-slate-900" : "text-slate-400"
+   487→                }`}
+   488→              >
+   489→                {s.text}
+   490→              </span>
+   491→              {isActive && (
+   492→                <motion.div
+   493→                  className="mr-auto"
+   494→                  animate={{ rotate: 360 }}
+   495→                  transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+   496→                >
+   497→                  <RefreshCw className="w-4 h-4 text-orange-500" />
+   498→                </motion.div>
+   499→              )}
+   500→            </motion.div>
+   501→          );
+   502→        })}
+   503→      </div>
+   504→
+   505→      {/* نوار پیشرفت */}
+   506→      <motion.div
+   507→        initial={{ opacity: 0 }}
+   508→        animate={{ opacity: 1 }}
+   509→        transition={{ delay: 1 }}
+   510→        className="w-full max-w-xs mt-8"
+   511→      >
+   512→        <div className="h-1.5 bg-orange-100 rounded-full overflow-hidden">
+   513→          <motion.div
+   514→            className="h-full rounded-full"
+   515→            style={{ background: "linear-gradient(90deg, #f59e0b, #f97316)" }}
+   516→            animate={{ width: `${((step + 1) / steps.length) * 100}%` }}
+   517→            transition={{ duration: 0.5 }}
+   518→          />
+   519→        </div>
+   520→        <p className="text-[11px] text-slate-400 text-center mt-2">
+   521→          لطفاً صبر کنید — این پردازش چند ثانیه طول می‌کشد
+   522→        </p>
+   523→      </motion.div>
+   524→    </div>
+   525→  );
+   526→}
+   527→
+   528→// ─────────────────────────────────────────────────────────────────────────────
+   529→// Main screen
+   530→// ─────────────────────────────────────────────────────────────────────────────
+   531→export function AnalysisScreen() {
+   532→  const { user, setScreen, setMainTab, pendingPlanId, setPendingPlanId } = useAppStore();
+   533→  const { plans: SUBSCRIPTION_PLANS } = usePlans();
+   534→  const [data, setData] = useState<AnalysisResponse | null>(null);
+   535→  const [loading, setLoading] = useState(true);
+   536→  const [refreshing, setRefreshing] = useState(false);
+   537→  const [purchasePlanId, setPurchasePlanId] = useState<Plan | null>(null);
+   538→
+   539→  // v15: تاریخ عضویت در فیتاپ — از فیلد memberSince پاسخ API (user.createdAt)
+   540→  const memberSinceText = (() => {
+   541→    const since = (data as any)?.memberSince as string | null | undefined;
+   542→    if (!since) return null;
+   543→    try {
+   544→      return new Date(since).toLocaleDateString("fa-IR", { year: "numeric", month: "long", day: "numeric" });
+   545→    } catch {
+   546→      return null;
+   547→    }
+   548→  })();
+   549→
+   550→  // ═══ v63 — ضد باگ «تحلیل شما پیدا نشد» در مرورگر درون‌برنامه‌ای اینستاگرام ═══
+   551→  // ریشه: تولید تحلیل همگام داخل GET است (چند ثانیه تا چند دقیقه) و WebView
+   552→  // اینستا fetchهای طولانی را قطع می‌کند؛ قبلاً فقط «یک» fetch بی‌retry بود و
+   553→  // هر قطع‌شدن مستقیم به کارت خطا می‌رفت — کاربر باید چند بار دستی «تلاش مجدد»
+   554→  // می‌زد تا یکی از دورهای تولید کامل می‌شد.
+   555→  // حالا: timeout ۲۵ثانیه‌ای هر تلاش + auto-retry با مکث (تا ۱۰ دور ≈ چند
+   556→  // دقیقه صبر) — سمت سرور هم همهٔ درخواست‌های هم‌زمان به «یک» تولید در-جریان
+   557→  // می‌پیوندند (قفل مشترک) پس هر retry هزینهٔ AI اضافه ندارد و به‌محض
+   558→  // آماده‌شدن تحلیل، همان لحظه نمایش داده می‌شود — بدون هیچ لمسی.
+   559→  const ANALYSIS_MAX_ATTEMPTS = 10;
+   560→  const ANALYSIS_ATTEMPT_TIMEOUT_MS = 25_000;
+   561→
+   562→  async function fetchAnalysisOnce(url: string): Promise<{ ok: boolean; permanentFail: boolean; json: any }> {
+   563→    const controller = new AbortController();
+   564→    const timer = setTimeout(() => controller.abort(), ANALYSIS_ATTEMPT_TIMEOUT_MS);
+   565→    try {
+   566→      const res = await fetch(url, { signal: controller.signal });
+   567→      const json = await res.json().catch(() => null);
+   568→      if (res.ok && json?.analysis) return { ok: true, permanentFail: false, json };
+   569→      // خطاهای دائمی — retry بی‌فایده است (پروفایل نبود / سشن نیست)
+   570→      if (res.status === 400 || res.status === 401) {
+   571→        return { ok: false, permanentFail: true, json };
+   572→      }
+   573→      return { ok: false, permanentFail: false, json };
+   574→    } catch {
+   575→      // abort / network — قابل‌retry
+   576→      return { ok: false, permanentFail: false, json: null };
+   577→    } finally {
+   578→      clearTimeout(timer);
+   579→    }
+   580→  }
+   581→
+   582→  async function loadAnalysis(force = false) {
+   583→    if (force) setRefreshing(true);
+   584→    try {
+   585→      const url = force ? "/api/onboarding/analysis?force=1" : "/api/onboarding/analysis";
+   586→      for (let attempt = 1; attempt <= ANALYSIS_MAX_ATTEMPTS; attempt++) {
+   587→        const { ok, permanentFail, json } = await fetchAnalysisOnce(url);
+   588→        if (ok) {
+   589→          setData(json as AnalysisResponse);
+   590→          return;
+   591→        }
+   592→        if (permanentFail) break;
+   593→        // مکث بین تلاش‌ها (backoff ملایم) — در طول retryها صفحهٔ «در حال تحلیل»
+   594→        // جذاب نشان داده می‌شود، نه کارت خطا
+   595→        if (attempt < ANALYSIS_MAX_ATTEMPTS) {
+   596→          await new Promise((r) => setTimeout(r, attempt <= 4 ? 2_500 : 6_000));
+   597→        }
+   598→      }
+   599→      if (force) toast.error("خطا در بازخوانی تحلیل");
+   600→    } finally {
+   601→      setLoading(false);
+   602→      setRefreshing(false);
+   603→    }
+   604→  }
+   605→
+   606→  useEffect(() => {
+   607→    loadAnalysis();
+   608→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   609→  }, []);
+   610→
+   611→  // Resolve the pending plan object (if user came from landing)
+   612→  const pendingPlan = pendingPlanId
+   613→    ? SUBSCRIPTION_PLANS.find((p) => p.id === pendingPlanId) ?? null
+   614→    : null;
+   615→
+   616→  const bmi = data?.bmi ?? 0;
+   617→  const bmiCategory = bmi < 18.5 ? "کم‌وزن" : bmi < 25 ? "وزن نرمال" : bmi < 30 ? "اضافه‌وزن" : "چاق";
+   618→  const bmiColor = bmi < 18.5 ? "text-cyan-500" : bmi < 25 ? "text-emerald-500" : bmi < 30 ? "text-amber-500" : "text-red-500";
+   619→
+   620→  function openPurchase(planId: Plan) {
+   621→    setPurchasePlanId(planId);
+   622→  }
+   623→
+   624→  function handlePurchaseClose() {
+   625→    setPurchasePlanId(null);
+   626→    // Clear pendingPlanId once the user has gone through the purchase flow
+   627→    setPendingPlanId(null);
+   628→  }
+   629→
+   630→  if (loading && !data) {
+   631→    return <AnalysisLoadingScreen userName={user?.name} />;
+   632→  }
+   633→
+   634→  // ─── FE-M4: گارد حالت خالی/خطا ───
+   635→  // قبلاً اگر fetch fail می‌شد یا analysis وجود نداشت، data=null ولی رندر
+   636→  // ادامه می‌یافت و BMI=0 به‌عنوان «کم‌وزن» با توصیه‌های غلط نمایش داده می‌شد.
+   637→  if (!data) {
+   638→    return (
+   639→      <div className="min-h-screen bg-white flex flex-col items-center justify-center px-6 text-center">
+   640→        <div
+   641→          className="w-16 h-16 rounded-2xl flex items-center justify-center mb-4"
+   642→          style={{ background: "rgba(245,158,11,0.12)" }}
+   643→        >
+   644→          <Activity className="w-8 h-8 text-orange-500" />
+   645→        </div>
+   646→        <h2 className="text-lg font-black text-slate-900 mb-2">تحلیلی برای نمایش وجود ندارد</h2>
+   647→        <p className="text-sm text-slate-500 mb-6 leading-relaxed max-w-xs">
+   648→          تحلیل شما پیدا نشد یا در دریافت آن خطایی رخ داد. لطفاً دوباره تلاش کنید.
+   649→        </p>
+   650→        <div className="flex gap-2">
+   651→          <Button
+   652→            variant="outline"
+   653→            className="rounded-xl"
+   654→            onClick={() => {
+   655→              setLoading(true);
+   656→              loadAnalysis();
+   657→            }}
+   658→          >
+   659→            <RefreshCw className="w-4 h-4" />
+   660→            تلاش مجدد
+   661→          </Button>
+   662→          <Button
+   663→            className="rounded-xl text-white"
+   664→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   665→            onClick={() => setScreen("landing")}
+   666→          >
+   667→            بازگشت
+   668→          </Button>
+   669→        </div>
+   670→      </div>
+   671→    );
+   672→  }
+   673→
+   674→  return (
+   675→    <div className="min-h-screen bg-white overflow-y-auto relative">
+   676→      {/* ─── پس‌زمینهٔ تزئینی هنری (v64) ─── */}
+   677→      <div className="pointer-events-none absolute inset-x-0 top-0 h-72 bg-gradient-to-b from-orange-50 via-amber-50/50 to-transparent" />
+   678→      <div className="pointer-events-none absolute -top-20 -right-24 w-72 h-72 rounded-full bg-orange-100/30 blur-3xl" />
+   679→      <div className="pointer-events-none absolute top-64 -left-28 w-80 h-80 rounded-full bg-amber-100/25 blur-3xl" />
+   680→
+   681→      {/* Header */}
+   682→      <div className="sticky top-0 z-10 bg-white/85 backdrop-blur-lg border-b border-orange-100/80 px-4 py-3 flex items-center justify-between">
+   683→        <button onClick={() => setScreen("landing")} className="p-2 rounded-lg hover:bg-orange-50 transition" aria-label="بازگشت">
+   684→          {/* در RTL جهت بازگشت به راست است */}
+   685→          <ChevronRight className="w-5 h-5 text-slate-600" />
+   686→        </button>
+   687→        <div className="flex items-center gap-2">
+   688→          <div className="w-7 h-7 rounded-lg flex items-center justify-center overflow-hidden shadow-sm" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   689→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   690→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   691→          </div>
+   692→          <span className="font-black text-slate-900">فیتاپ</span>
+   693→        </div>
+   694→        <div className="w-9" />
+   695→      </div>
+   696→
+   697→      <div className="relative max-w-2xl mx-auto px-4 py-6 space-y-5">
+   698→        {/* Title */}
+   699→        <motion.div
+   700→          initial={{ opacity: 0, y: 20 }}
+   701→          animate={{ opacity: 1, y: 0 }}
+   702→          className="text-center"
+   703→        >
+   704→          <motion.div
+   705→            initial={{ scale: 0.6, opacity: 0 }}
+   706→            animate={{ scale: 1, opacity: 1 }}
+   707→            transition={{ type: "spring", stiffness: 180, damping: 14 }}
+   708→            className="w-16 h-16 rounded-[1.4rem] flex items-center justify-center mx-auto mb-4 shadow-xl shadow-orange-500/25"
+   709→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   710→          >
+   711→            <Sparkles className="w-8 h-8 text-white" />
+   712→          </motion.div>
+   713→          <h1 className="text-2xl font-black text-slate-900 mb-2">
+   714→            تحلیل اختصاصی شما
+   715→          </h1>
+   716→          <p className="text-sm text-slate-500">
+   717→            {user?.name ? `${user.name} عزیز، ` : ""}فیتاپ هوشمند اطلاعات شما را تحلیل کرد
+   718→          </p>
+   719→          {/* v15: تاریخ عضویت در فیتاپ (درخواست مالک — آنبوردینگ باید کامل باشد) */}
+   720→          {memberSinceText && (
+   721→            <div className="inline-flex items-center gap-1.5 mt-3 px-3 py-1.5 rounded-full bg-orange-50 border border-orange-200 text-[11px] text-orange-700 font-bold">
+   722→              <CalendarDays className="w-3.5 h-3.5" />
+   723→              عضو فیتاپ از {memberSinceText}
+   724→            </div>
+   725→          )}
+   726→        </motion.div>
+   727→
+   728→        {/* تحلیل فیتاپ هوشمند (مربی) — در اول صفحه */}
+   729→        <motion.div
+   730→          initial={{ opacity: 0, y: 20 }}
+   731→          animate={{ opacity: 1, y: 0 }}
+   732→          transition={{ delay: 0.05 }}
+   733→        >
+   734→          <Card className="p-5 border-2 border-orange-200 relative overflow-hidden shadow-lg shadow-orange-500/5">
+   735→            {/* Background gradient */}
+   736→            <div className="absolute -top-10 -left-10 w-32 h-32 rounded-full bg-orange-100/40 blur-2xl" />
+   737→            <div className="absolute -bottom-10 -right-10 w-32 h-32 rounded-full bg-amber-100/40 blur-2xl" />
+   738→
+   739→            <div className="relative">
+   740→              <div className="flex items-center gap-2.5 mb-4">
+   741→                <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-md" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   742→                  <Bot className="w-5 h-5 text-white" />
+   743→                </div>
+   744→                <div>
+   745→                  <h3 className="font-bold text-slate-900">تحلیل فیتاپ هوشمند</h3>
+   746→                  <p className="text-[10px] text-slate-500">مربی هوشمند شما</p>
+   747→                </div>
+   748→              </div>
+   749→              {loading ? (
+   750→                <div className="space-y-2">
+   751→                  {[1, 2, 3, 4].map(i => (
+   752→                    <div key={i} className="h-3 bg-orange-100 rounded animate-pulse" style={{ width: `${90 - i * 10}%` }} />
+   753→                  ))}
+   754→                </div>
+   755→              ) : (
+   756→                <div className="p-4 rounded-xl bg-gradient-to-br from-orange-50/50 to-amber-50/30 border border-orange-100/50">
+   757→                  <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">{data?.analysis}</p>
+   758→                </div>
+   759→              )}
+   760→            </div>
+   761→          </Card>
+   762→        </motion.div>
+   763→
+   764→        {/* Biometric cards */}
+   765→        <motion.div
+   766→          initial={{ opacity: 0, y: 20 }}
+   767→          animate={{ opacity: 1, y: 0 }}
+   768→          transition={{ delay: 0.1 }}
+   769→          className="grid grid-cols-3 gap-3"
+   770→        >
+   771→          <Card className="p-4 text-center border-2 border-orange-100 shadow-sm">
+   772→            <p className="text-[10px] text-slate-500">شاخص BMI</p>
+   773→            <p className={`text-2xl font-black font-stat ${bmiColor}`}>{toPersianDigits(bmi.toFixed(1))}</p>
+   774→            <p className={`text-[10px] font-bold ${bmiColor}`}>{bmiCategory}</p>
+   775→          </Card>
+   776→          <Card className="p-4 text-center border-2 border-orange-100 shadow-sm">
+   777→            <p className="text-[10px] text-slate-500">متابولیسم (BMR)</p>
+   778→            <p className="text-2xl font-black font-stat text-slate-900">{toPersianDigits(data?.bmr ?? 0)}</p>
+   779→            <p className="text-[10px] text-slate-400">کیلوکالری</p>
+   780→          </Card>
+   781→          <Card className="p-4 text-center border-2 border-orange-100 shadow-sm">
+   782→            <p className="text-[10px] text-slate-500">کالری روزانه (TDEE)</p>
+   783→            <p className="text-2xl font-black font-stat text-slate-900">{toPersianDigits(data?.tdee ?? 0)}</p>
+   784→            <p className="text-[10px] text-slate-400">کیلوکالری</p>
+   785→          </Card>
+   786→        </motion.div>
+   787→
+   788→        {/* 🆕 v64 — کالری هدف و درشت‌مغذی‌ها (حلقه‌های SVG) — قبلاً در API بود ولی نمایش داده نمی‌شد */}
+   789→        {data?.macros && (
+   790→          <motion.div
+   791→            initial={{ opacity: 0, y: 20 }}
+   792→            animate={{ opacity: 1, y: 0 }}
+   793→            transition={{ delay: 0.14 }}
+   794→          >
+   795→            <Card className="p-5 border-2 border-orange-100 shadow-sm">
+   796→              <div className="flex items-center gap-2 mb-4">
+   797→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   798→                  <Flame className="w-4 h-4 text-white" />
+   799→                </div>
+   800→                <h3 className="font-bold text-slate-900">کالری و درشت‌مغذی پیشنهادی</h3>
+   801→              </div>
+   802→
+   803→              <div className="rounded-2xl p-4 mb-4 text-center relative overflow-hidden" style={{ background: "linear-gradient(135deg, #fff7ed, #fffbeb)", border: "1px solid #fed7aa" }}>
+   804→                <p className="text-[11px] text-slate-500 mb-1">کالری هدف روزانه</p>
+   805→                <p className="text-3xl font-black font-stat text-orange-600 leading-none">
+   806→                  {toPersianDigits(formatToman(data.macros.targetCalories))}
+   807→                </p>
+   808→                <p className="text-[10px] text-slate-400 mt-1">کیلوکالری در روز</p>
+   809→              </div>
+   810→
+   811→              <div className="grid grid-cols-3 gap-2">
+   812→                <MacroRing label="پروتئین" grams={data.macros.protein_g} calories={data.macros.protein_g * 4} color="#f97316" icon={<Beef className="w-3.5 h-3.5" />} />
+   813→                <MacroRing label="کربوهیدرات" grams={data.macros.carbs_g} calories={data.macros.carbs_g * 4} color="#f59e0b" icon={<Wheat className="w-3.5 h-3.5" />} />
+   814→                <MacroRing label="چربی" grams={data.macros.fat_g} calories={data.macros.fat_g * 9} color="#d97706" icon={<Droplet className="w-3.5 h-3.5" />} />
+   815→              </div>
+   816→            </Card>
+   817→          </motion.div>
+   818→        )}
+   819→
+   820→        {/* Weight goal trajectory card */}
+   821→        {data?.trajectory && (
+   822→          <motion.div
+   823→            initial={{ opacity: 0, y: 20 }}
+   824→            animate={{ opacity: 1, y: 0 }}
+   825→            transition={{ delay: 0.18 }}
+   826→          >
+   827→            <Card className="p-5 border-2 border-orange-100 shadow-sm">
+   828→              <div className="flex items-center gap-2 mb-4">
+   829→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   830→                  <Target className="w-4 h-4 text-white" />
+   831→                </div>
+   832→                <h3 className="font-bold text-slate-900">مسیر رسیدن به وزن هدف</h3>
+   833→              </div>
+   834→
+   835→              <div className="flex items-center justify-between mb-4">
+   836→                <div className="text-center">
+   837→                  <p className="text-[10px] text-slate-500 mb-1">وزن فعلی</p>
+   838→                  <p className="text-xl font-black font-stat text-slate-900">
+   839→                    {toPersianDigits(data.trajectory.currentWeight)}
+   840→                  </p>
+   841→                  <p className="text-[9px] text-slate-400">کیلوگرم</p>
+   842→                </div>
+   843→
+   844→                {/* Progress bar */}
+   845→                <div className="flex-1 mx-3 relative">
+   846→                  <div className="h-2 bg-orange-100 rounded-full overflow-hidden">
+   847→                    <motion.div
+   848→                      initial={{ width: 0 }}
+   849→                      animate={{ width: "100%" }}
+   850→                      transition={{ duration: 1, ease: "easeOut" }}
+   851→                      className="h-full rounded-full"
+   852→                      style={{ background: "linear-gradient(90deg, #f59e0b, #f97316)" }}
+   853→                    />
+   854→                  </div>
+   855→                  <div className="flex items-center justify-center mt-1">
+   856→                    <Scale className="w-3 h-3 text-orange-500" />
+   857→                  </div>
+   858→                </div>
+   859→
+   860→                <div className="text-center">
+   861→                  <p className="text-[10px] text-slate-500 mb-1">وزن هدف</p>
+   862→                  <p className="text-xl font-black font-stat text-orange-600">
+   863→                    {toPersianDigits(data.trajectory.targetWeight)}
+   864→                  </p>
+   865→                  <p className="text-[9px] text-slate-400">کیلوگرم</p>
+   866→                </div>
+   867→              </div>
+   868→
+   869→              <div className="grid grid-cols-3 gap-2">
+   870→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   871→                  <Calendar className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   872→                  <p className="text-[10px] text-slate-500">زمان رسیدن به هدف</p>
+   873→                  <p className="text-sm font-black font-stat text-slate-900">
+   874→                    {toPersianDigits(data.trajectory.weeksToGoal)} هفته
+   875→                  </p>
+   876→                </div>
+   877→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   878→                  <TrendingUp className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   879→                  <p className="text-[10px] text-slate-500">نرخ هفتگی</p>
+   880→                  <p className="text-sm font-black font-stat text-slate-900">
+   881→                    {data.trajectory.weeklyRate > 0 ? "+" : ""}
+   882→                    {toPersianDigits(data.trajectory.weeklyRate.toFixed(2))} kg
+   883→                  </p>
+   884→                </div>
+   885→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   886→                  <Flame className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   887→                  <p className="text-[10px] text-slate-500">تنظیم کالری روزانه</p>
+   888→                  <p className="text-sm font-black font-stat text-slate-900">
+   889→                    {data.trajectory.weeklyCalorieAdjustment > 0 ? "+" : ""}
+   890→                    {toPersianDigits(data.trajectory.weeklyCalorieAdjustment)}
+   891→                  </p>
+   892→                </div>
+   893→              </div>
+   894→
+   895→              <p className="mt-3 text-[11px] text-slate-500 text-center leading-relaxed">
+   896→                این مسیر بر اساس نرخ ایمن{" "}
+   897→                {data.trajectory.weeklyRate < 0
+   898→                  ? `کاهش ${toPersianDigits(0.5)} کیلوگرم در هفته`
+   899→                  : `افزایش ${toPersianDigits(0.25)} کیلوگرم در هفته`}{" "}
+   900→                محاسبه شده است. روند تغییر وزن نرمال و پایدار است.
+   901→              </p>
+   902→            </Card>
+   903→          </motion.div>
+   904→        )}
+   905→
+   906→        {/* Body measurements card */}
+   907→        {data?.measurements && Object.keys(data.measurements).length > 0 && (
+   908→          <motion.div
+   909→            initial={{ opacity: 0, y: 20 }}
+   910→            animate={{ opacity: 1, y: 0 }}
+   911→            transition={{ delay: 0.2 }}
+   912→          >
+   913→            <Card className="p-5 border-2 border-orange-100 shadow-sm">
+   914→              <div className="flex items-center gap-2 mb-4">
+   915→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   916→                  <Ruler className="w-4 h-4 text-white" />
+   917→                </div>
+   918→                <h3 className="font-bold text-slate-900">اندازه‌های بدن شما</h3>
+   919→              </div>
+   920→              <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+   921→                {data.measurements.chest != null && (
+   922→                  <MeasurementChip label="دور سینه" value={data.measurements.chest} />
+   923→                )}
+   924→                {data.measurements.arm != null && (
+   925→                  <MeasurementChip label="دور بازو" value={data.measurements.arm} />
+   926→                )}
+   927→                {data.measurements.waist != null && (
+   928→                  <MeasurementChip label="دور کمر" value={data.measurements.waist} />
+   929→                )}
+   930→                {data.measurements.hip != null && (
+   931→                  <MeasurementChip label="دور باسن" value={data.measurements.hip} />
+   932→                )}
+   933→                {data.measurements.thigh != null && (
+   934→                  <MeasurementChip label="دور ران" value={data.measurements.thigh} />
+   935→                )}
+   936→                {data.measurements.neck != null && (
+   937→                  <MeasurementChip label="دور گردن" value={data.measurements.neck} />
+   938→                )}
+   939→              </div>
+   940→            </Card>
+   941→          </motion.div>
+   942→        )}
+   943→
+   944→        {/* Body Composition card */}
+   945→        {data?.bodyComposition && (
+   946→          <motion.div
+   947→            initial={{ opacity: 0, y: 20 }}
+   948→            animate={{ opacity: 1, y: 0 }}
+   949→            transition={{ delay: 0.22 }}
+   950→          >
+   951→            <Card className="p-5 border-2 border-orange-100 shadow-sm">
+   952→              <div className="flex items-center justify-between mb-4">
+   953→                <div className="flex items-center gap-2">
+   954→                  <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   955→                    <Activity className="w-4 h-4 text-white" />
+   956→                  </div>
+   957→                  <h3 className="font-bold text-slate-900">ترکیب بدن شما</h3>
+   958→                </div>
+   959→              </div>
+   960→
+   961→              {/* 3 main stats */}
+   962→              <div className="grid grid-cols-3 gap-2 mb-4">
+   963→                {/* Body Fat % */}
+   964→                <div
+   965→                  className="rounded-2xl p-4 text-center border-2"
+   966→                  style={{
+   967→                    borderColor: data.bodyComposition.bodyFatColor + "60",
+   968→                    background: data.bodyComposition.bodyFatColor + "10",
+   969→                  }}
+   970→                >
+   971→                  <p className="text-[10px] text-slate-500 mb-1">درصد چربی بدن</p>
+   972→                  <p
+   973→                    className="text-3xl font-black font-stat leading-none"
+   974→                    style={{ color: data.bodyComposition.bodyFatColor }}
+   975→                  >
+   976→                    {toPersianDigits(data.bodyComposition.bodyFatPercent.toFixed(1))}
+   977→                    <span className="text-base">٪</span>
+   978→                  </p>
+   979→                  <p
+   980→                    className="text-[10px] font-bold mt-1.5"
+   981→                    style={{ color: data.bodyComposition.bodyFatColor }}
+   982→                  >
+   983→                    {data.bodyComposition.bodyFatCategory}
+   984→                  </p>
+   985→                </div>
+   986→
+   987→                {/* Lean Body Mass */}
+   988→                <div className="rounded-2xl p-4 text-center border-2 border-orange-100 bg-white">
+   989→                  <p className="text-[10px] text-slate-500 mb-1">جرم بدون چربی</p>
+   990→                  <p className="text-3xl font-black font-stat text-slate-900 leading-none">
+   991→                    {toPersianDigits(data.bodyComposition.leanBodyMass)}
+   992→                  </p>
+   993→                  <p className="text-[10px] text-slate-400 mt-1.5">کیلوگرم</p>
+   994→                </div>
+   995→
+   996→                {/* Fat Mass */}
+   997→                <div className="rounded-2xl p-4 text-center border-2 border-orange-100 bg-white">
+   998→                  <p className="text-[10px] text-slate-500 mb-1">جرم چربی</p>
+   999→                  <p className="text-3xl font-black font-stat text-slate-900 leading-none">
+  1000→                    {toPersianDigits(data.bodyComposition.fatMass)}
+  1001→                  </p>
+  1002→                  <p className="text-[10px] text-slate-400 mt-1.5">کیلوگرم</p>
+  1003→                </div>
+  1004→              </div>
+  1005→
+  1006→              {/* Muscle mass (estimated) */}
+  1007→              {data.bodyComposition.muscleMass != null && (
+  1008→                <div className="rounded-xl bg-orange-50/50 border border-orange-100 p-3 mb-3">
+  1009→                  <div className="flex items-center justify-between">
+  1010→                    <div className="flex items-center gap-2">
+  1011→                      <Heart className="w-4 h-4 text-orange-500" />
+  1012→                      <span className="text-xs font-bold text-slate-700">درصد عضله تقریبی</span>
+  1013→                    </div>
+  1014→                    <div className="flex items-baseline gap-1">
+  1015→                      <span className="text-lg font-black font-stat text-orange-600">
+  1016→                        {toPersianDigits(data.bodyComposition.muscleMassPercent?.toFixed(1) ?? "0")}
+  1017→                      </span>
+  1018→                      <span className="text-[10px] text-slate-500">٪</span>
+  1019→                      <span className="text-[10px] text-slate-400 ml-2">
+  1020→                        ({toPersianDigits(data.bodyComposition.muscleMass)} کیلوگرم)
+  1021→                      </span>
+  1022→                    </div>
+  1023→                  </div>
+  1024→                </div>
+  1025→              )}
+  1026→
+  1027→              {/* Scientific note */}
+  1028→              <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 flex items-start gap-2">
+  1029→                <Sparkles className="w-4 h-4 text-orange-500 shrink-0 mt-0.5" />
+  1030→                <p className="text-[11px] text-slate-600 leading-relaxed">
+  1031→                  محاسبه بر اساس <b>فرمول علمی US Navy</b> (Hodgdon & Beckett, 1984).
+  1032→                  این روش با اندازه‌گیری دور کمر، گردن و قد، معتبرترین تخمین بدون‌دستگاه چربی بدن را ارائه می‌دهد.
+  1033→                </p>
+  1034→              </div>
+  1035→            </Card>
+  1036→          </motion.div>
+  1037→        )}
+  1038→
+  1039→        {/* ═══ v64 — ویترین ۴ پلن (بدون «پلن پیشنهادی» — دیریکتیو مالک) ═══ */}
+  1040→        {/* کاربر باید همان‌جا پلنش را ببیند، مقایسه کند، انتخاب و خرید کند.
+  1041→            کارت‌ها کوچک، شیک و هنرمندانه‌اند با هویت بصری مستقل برای هر پلن. */}
+  1042→        {SUBSCRIPTION_PLANS.length > 0 && (
+  1043→          <motion.section
+  1044→            initial={{ opacity: 0, y: 24 }}
+  1045→            animate={{ opacity: 1, y: 0 }}
+  1046→            transition={{ delay: 0.28 }}
+  1047→            aria-label="انتخاب پلن"
+  1048→            className="relative"
+  1049→          >
+  1050→            {/* سرصفحهٔ سادهٔ برند-محور (v66: قبلاً سه آیکون تزئینی بود — شلوغ) */}
+  1051→            <div className="relative text-center pt-3 pb-2 mb-3 overflow-hidden rounded-[1.75rem]" style={{ background: "linear-gradient(150deg, #fffbeb 0%, #ffedd5 55%, #fee2cf22 100%)", border: "1px solid #fed7aa" }}>
+  1052→              <div className="absolute -top-8 -right-8 w-28 h-28 rounded-full bg-orange-200/40 blur-2xl" />
+  1053→              <div className="absolute -bottom-10 -left-8 w-28 h-28 rounded-full bg-amber-200/40 blur-2xl" />
+  1054→              <div className="relative px-4 py-3">
+  1055→                <div className="inline-flex items-center justify-center w-10 h-10 rounded-2xl mb-1.5" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+  1056→                  <Crown className="w-5 h-5 text-white" />
+  1057→                </div>
+  1058→                <h2 className="text-lg sm:text-xl font-black text-slate-900">
+  1059→                  پلنت رو انتخاب کن،{" "}
+  1060→                  <span
+  1061→                    style={{
+  1062→                      background: "linear-gradient(135deg, #f59e0b, #f97316)",
+  1063→                      WebkitBackgroundClip: "text",
+  1064→                      backgroundClip: "text",
+  1065→                      WebkitTextFillColor: "transparent",
+  1066→                    }}
+  1067→                  >
+  1068→                    بقیه‌ش با ما
+  1069→                  </span>
+  1070→                </h2>
+  1071→                <p className="text-[11px] sm:text-xs text-orange-800/70 mt-1.5 max-w-md mx-auto leading-relaxed">
+  1072→                  هر ۴ پلن شامل برنامهٔ تمرینی و غذایی کاملاً شخصی‌سازی‌شده بر اساس همین تحلیل است —
+  1073→                  تفاوت در عمق امکانات و همراهی فیتاپ در طول مسیر است
+  1074→                </p>
+  1075→              </div>
+  1076→            </div>
+  1077→
+  1078→            {/* ۴ کارت پلن — ۲×۲ موبایل / ۴ ستون دسکتاپ */}
+  1079→            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3 items-stretch pt-1">
+  1080→              {SUBSCRIPTION_PLANS.map((plan, i) => (
+  1081→                <PlanMiniCard
+  1082→                  key={plan.id}
+  1083→                  plan={plan}
+  1084→                  index={i}
+  1085→                  onBuy={() => openPurchase(plan.id)}
+  1086→                />
+  1087→              ))}
+  1088→            </div>
+  1089→
+  1090→            {/* چیپ‌های اعتماد */}
+  1091→            <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 mt-4">
+  1092→              <span className="inline-flex items-center gap-1 text-[10px] text-slate-500 font-bold">
+  1093→                <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
+  1094→                پرداخت امن زرین‌پال
+  1095→              </span>
+  1096→              <span className="inline-flex items-center gap-1 text-[10px] text-slate-500 font-bold">
+  1097→                <Zap className="w-3.5 h-3.5 text-amber-500" />
+  1098→                فعال‌سازی آنی پس از خرید
+  1099→              </span>
+  1100→              <span className="inline-flex items-center gap-1 text-[10px] text-slate-500 font-bold">
+  1101→                <InfinityIcon className="w-3.5 h-3.5 text-orange-400" />
+  1102→                پشتیبانی در تمام مسیر
+  1103→              </span>
+  1104→            </div>
+  1105→
+  1106→            {/* لینک مقایسهٔ کامل */}
+  1107→            <button
+  1108→              onClick={() => { setMainTab("plans"); setScreen("main"); }}
+  1109→              className="mt-3 w-full py-3 rounded-2xl border-2 border-dashed border-orange-200 bg-white/60 text-orange-600 text-xs font-black flex items-center justify-center gap-1.5 hover:bg-orange-50 hover:border-orange-300 transition"
+  1110→            >
+  1111→              <Scale className="w-4 h-4" />
+  1112→              مقایسهٔ کامل امکانات ۴ پلن
+  1113→            </button>
+  1114→          </motion.section>
+  1115→        )}
+  1116→
+  1117→        {/* Action buttons */}
+  1118→        <motion.div
+  1119→          initial={{ opacity: 0, y: 20 }}
+  1120→          animate={{ opacity: 1, y: 0 }}
+  1121→          transition={{ delay: 0.35 }}
+  1122→          className="space-y-3 pt-2"
+  1123→        >
+  1124→          <p className="text-center text-sm font-bold text-slate-700">مسیر بعدی شما؟</p>
+  1125→
+  1126→          {/* Pending plan CTA — primary */}
+  1127→          {pendingPlan && (
+  1128→            <button
+  1129→              onClick={() => openPurchase(pendingPlan.id)}
+  1130→              className="w-full p-5 rounded-2xl text-white shadow-xl shadow-orange-500/30 transition hover:scale-[1.02] flex items-center gap-4"
+  1131→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+  1132→            >
+  1133→              <div className="w-12 h-12 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
+  1134→                <Crown className="w-6 h-6 text-white" />
+  1135→              </div>
+  1136→              <div className="flex-1 text-right">
+  1137→                <p className="font-black text-base">ادامه خرید پلن {pendingPlan.label}</p>
+  1138→                <p className="text-xs opacity-90">
+  1139→                  پلنی که انتخاب کردید — {toPersianDigits(formatToman(pendingPlan.price))} تومان
+  1140→                </p>
+  1141→              </div>
+  1142→              <ChevronRight className="w-5 h-5 rotate-180" />
+  1143→            </button>
+  1144→          )}
+  1145→
+  1146→          {/* Go to dashboard */}
+  1147→          <button
+  1148→            onClick={() => { setMainTab("dashboard"); setScreen("main"); }}
+  1149→            className="w-full p-5 rounded-2xl border-2 border-slate-200 bg-white text-slate-700 shadow-sm transition hover:scale-[1.02] hover:border-slate-300 flex items-center gap-4"
+  1150→          >
+  1151→            <div className="w-12 h-12 rounded-xl bg-slate-50 flex items-center justify-center shrink-0">
+  1152→              <TrendingUp className="w-6 h-6 text-slate-500" />
+  1153→            </div>
+  1154→            <div className="flex-1 text-right">
+  1155→              <p className="font-black text-base">رفتن به داشبورد</p>
+  1156→              <p className="text-xs text-slate-500">از ابزارهای رایگان و امکانات پنل استفاده کنید</p>
+  1157→            </div>
+  1158→            <ChevronRight className="w-5 h-5 rotate-180 text-slate-400" />
+  1159→          </button>
+  1160→        </motion.div>
+  1161→      </div>
+  1162→
+  1163→      {/* Purchase modal — user is already logged in at this point so checkout works */}
+  1164→      {purchasePlanId && (() => {
+  1165→        const plan = SUBSCRIPTION_PLANS.find((p) => p.id === purchasePlanId);
+  1166→        return plan ? (
+  1167→          <PurchaseModal
+  1168→            plan={plan}
+  1169→            onClose={handlePurchaseClose}
+  1170→            onNeedLogin={() => handlePurchaseClose()}
+  1171→          />
+  1172→        ) : null;
+  1173→      })()}
+  1174→    </div>
+  1175→  );
+  1176→}
+  1177→

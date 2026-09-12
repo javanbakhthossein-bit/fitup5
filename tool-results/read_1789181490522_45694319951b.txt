@@ -1,0 +1,1636 @@
+     1→"use client";
+     2→
+     3→import {
+     4→  useCallback,
+     5→  useEffect,
+     6→  useLayoutEffect,
+     7→  useMemo,
+     8→  useRef,
+     9→  useState,
+    10→  type ReactNode,
+    11→} from "react";
+    12→import { motion } from "framer-motion";
+    13→import ReactMarkdown from "react-markdown";
+    14→import remarkGfm from "remark-gfm";
+    15→import {
+    16→  Send,
+    17→  Sparkles,
+    18→  Dumbbell,
+    19→  Salad,
+    20→  RotateCcw,
+    21→  Bot,
+    22→  ImageIcon,
+    23→  Video,
+    24→  Lock,
+    25→  X,
+    26→  Loader2,
+    27→  Mic,
+    28→  Square,
+    29→  Plus,
+    30→  UtensilsCrossed,
+    31→  Check,
+    32→} from "lucide-react";
+    33→import { useAppStore } from "@/lib/fitness/store";
+    34→import { Button } from "@/components/ui/button";
+    35→import { Skeleton } from "@/components/ui/skeleton";
+    36→import { InlineVideoPreview } from "@/components/fitness/inline-video-preview";
+    37→import { UpgradeBanner } from "@/components/fitness/upgrade-banner";
+    38→import {
+    39→  canAccess,
+    40→  toPersianDigits,
+    41→  PLAN_LABELS,
+    42→  type ChatMessageDto,
+    43→  type Plan,
+    44→  type WorkoutPlanContent,
+    45→  type MealPlanContent,
+    46→} from "@/lib/fitness/types";
+    47→import { useVoiceRecorder } from "@/lib/fitness/use-voice-recorder";
+    48→import {
+    49→  ApiError,
+    50→  fetchJson,
+    51→  fetchJsonOrThrow,
+    52→  SERVER_UNREACHABLE_MESSAGE,
+    53→} from "@/lib/fitness/fetch-json";
+    54→import { createVideoThumbnail } from "@/lib/fitness/video-thumbnail";
+    55→import { useQuotaSummary, type QuotaSummary } from "@/lib/fitness/use-quota-summary";
+    56→import { toast } from "sonner";
+    57→
+    58→const QUICK_PROMPTS = [
+    59→  { icon: Dumbbell, text: "یکی از حرکات امروز را سخت‌تر کن" },
+    60→  { icon: Salad, text: "یک میان‌وعده کم‌کالری پیشنهاد بده" },
+    61→  { icon: RotateCcw, text: "جایگزینی برای اسکوات بده" },
+    62→];
+    63→
+    64→/** آستانهٔ ارسال ویدیو: بالاتر از این → مسیر multipart بدون محدودیت حجم (Task 4-a) */
+    65→const VIDEO_MULTIPART_THRESHOLD = 12 * 1024 * 1024;
+    66→/** سقف فنی سمت کلاینت — با سقف مسیر multipart هم‌خوان (۵۰۰ مگابایت) */
+    67→const VIDEO_CLIENT_HARD_CAP = 500 * 1024 * 1024;
+    68→/** Task 4-a — فیکس اسکرول: در رندر اول فقط ۳۰ پیام آخر، قدیمی‌ترها با اسکرول به بالا */
+    69→const INITIAL_VISIBLE_MESSAGES = 30;
+    70→const LOAD_OLDER_STEP = 20;
+    71→
+    72→/** id یکتا برای پیام‌های موقت — پسوند تصادفی برای جلوگیری از تصادم id (FE-L6) */
+    73→function tempId(prefix: string): string {
+    74→  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    75→}
+    76→
+    77→// ═══════════════════════════════════════════════════════════════
+    78→//  v73.4 — پروتکل APPLY_SWAP (توافق‌شده با همکار — دقیقاً همین):
+    79→//  اگر انتهای متن پاسخ AI خط دقیق
+    80→//  [APPLY_SWAP type=exercise|food from="..." to="..." day="..."]
+    81→//  باشد → خط از حباب حذف و به‌جایش دکمهٔ «اعمال این جایگزینی در برنامهٔ من»
+    82→//  نمایش داده می‌شود. پیام‌های قدیمی (تاریخچه) هم همین پارس را می‌گیرند.
+    83→// ═══════════════════════════════════════════════════════════════
+    84→
+    85→interface ParsedApplySwap {
+    86→  type: "exercise" | "food";
+    87→  from: string;
+    88→  to: string;
+    89→  day?: string;
+    90→  /** متن پاسخ بدون خط directive */
+    91→  remainder: string;
+    92→}
+    93→
+    94→function parseApplySwapDirective(content: string): ParsedApplySwap | null {
+    95→  if (!content || content.length > 12000) return null;
+    96→  const idx = content.lastIndexOf("[APPLY_SWAP ");
+    97→  if (idx < 0) return null;
+    98→  const tail = content.slice(idx);
+    99→  const m = tail.match(
+   100→    /^\[APPLY_SWAP type=(exercise|food) from="([^"]*)" to="([^"]*)"(?: day="([^"]*)")?\][ \t\r\n]*$/
+   101→  );
+   102→  if (!m) return null;
+   103→  const from = (m[2] ?? "").trim();
+   104→  const to = (m[3] ?? "").trim();
+   105→  if (!from || !to) return null;
+   106→  return {
+   107→    type: m[1] as "exercise" | "food",
+   108→    from,
+   109→    to,
+   110→    day: (m[4] ?? "").trim() || undefined,
+   111→    remainder: content.slice(0, idx).trimEnd(),
+   112→  };
+   113→}
+   114→
+   115→/** پارامترهای poll پیام‌های pending (تحلیل مدیا در پس‌زمینه — v73.4) */
+   116→const PENDING_POLL_INTERVAL_MS = 4_000;
+   117→const PENDING_POLL_MAX_MS = 5 * 60_000; // حداکثر ۵ دقیقه
+   118→
+   119→/**
+   120→ * v57 — شناسهٔ حباب «پیشنهاد دستیار تغذیه» — بعد از اولین تحلیل عکس غذا در چت،
+   121→ * یک‌بار در هر سشن به‌صورت حباب اختصاصی (با دکمهٔ رفتن به دستیار) نشان داده
+   122→ * می‌شود تا کاربر بداند تحلیلِ تاریخچه‌دار از کجا انجام می‌شود (درخواست مالک).
+   123→ */
+   124→const FOOD_TIP_MESSAGE_ID = "fitup-food-assistant-tip";
+   125→const FOOD_TIP_SESSION_FLAG = "fitup_food_tip_shown_v1";
+   126→
+   127→/** تبدیل File به Data URL برای ارسال به سرور */
+   128→function fileToDataUrl(file: File): Promise<string> {
+   129→  return new Promise((resolve, reject) => {
+   130→    const reader = new FileReader();
+   131→    reader.onload = () => resolve(reader.result as string);
+   132→    reader.onerror = reject;
+   133→    reader.readAsDataURL(file);
+   134→  });
+   135→}
+   136→
+   137→/** قالب‌بندی زمان پیام به فارسی */
+   138→function formatTime(iso: string): string {
+   139→  try {
+   140→    return new Date(iso).toLocaleTimeString("fa-IR", {
+   141→      hour: "2-digit",
+   142→      minute: "2-digit",
+   143→    });
+   144→  } catch {
+   145→    return "";
+   146→  }
+   147→}
+   148→
+   149→/** حجم فایل به‌صورت فارسی و خوانا (برای چیپ پیش‌نمایش ویدیو) */
+   150→function formatFileSizeFa(bytes: number): string {
+   151→  if (!bytes || bytes <= 0) return "۰";
+   152→  const mb = bytes / (1024 * 1024);
+   153→  if (mb >= 1) return `${toPersianDigits(mb >= 10 ? Math.round(mb) : Math.round(mb * 10) / 10)} مگابایت`;
+   154→  return `${toPersianDigits(Math.max(1, Math.round(bytes / 1024)))} کیلوبایت`;
+   155→}
+   156→
+   157→/** آزادسازی امن blob URL — روی مقدار غیر blob بی‌اثر است */
+   158→function revokeObjectUrl(url: string | null | undefined): void {
+   159→  if (url && url.startsWith("blob:")) {
+   160→    try {
+   161→      URL.revokeObjectURL(url);
+   162→    } catch {}
+   163→  }
+   164→}
+   165→
+   166→/**
+   167→ * آپلود ویدیو با XMLHttpRequest — برای دریافت درصد پیشرفت واقعی آپلود
+   168→ * (fetch هنوز upload progress قابل‌اعتماد ندارد). مسیر نسبی — بدون پورت.
+   169→ */
+   170→function uploadVideoWithProgress(
+   171→  file: File,
+   172→  onProgress: (pct: number) => void
+   173→): Promise<{ mediaUrl: string; frames: string[] }> {
+   174→  return new Promise((resolve, reject) => {
+   175→    const xhr = new XMLHttpRequest();
+   176→    xhr.open("POST", "/api/coach/chat/upload");
+   177→    xhr.responseType = "json";
+   178→    xhr.timeout = 10 * 60_000; // آپلود فایل‌های بزرگ — ۱۰ دقیقه
+   179→    xhr.upload.onprogress = (e) => {
+   180→      if (e.lengthComputable && e.total > 0) {
+   181→        onProgress(Math.min(99, Math.round((e.loaded / e.total) * 100)));
+   182→      }
+   183→    };
+   184→    xhr.onload = () => {
+   185→      const data = xhr.response as
+   186→        | { mediaUrl?: string; frames?: string[]; error?: string }
+   187→        | null;
+   188→      if (xhr.status >= 200 && xhr.status < 300 && data?.mediaUrl) {
+   189→        onProgress(100);
+   190→        resolve({
+   191→          mediaUrl: data.mediaUrl,
+   192→          frames: Array.isArray(data.frames) ? data.frames : [],
+   193→        });
+   194→      } else {
+   195→        reject(
+   196→          new Error(
+   197→            (data && data.error) ||
+   198→              "آپلود ویدیو ناموفق بود. دوباره تلاش کن."
+   199→          )
+   200→        );
+   201→      }
+   202→    };
+   203→    xhr.onerror = () => reject(new Error(SERVER_UNREACHABLE_MESSAGE));
+   204→    xhr.ontimeout = () =>
+   205→      reject(new Error("آپلود ویدیو بیش از حد طول کشید. دوباره تلاش کن."));
+   206→    const fd = new FormData();
+   207→    fd.append("file", file);
+   208→    xhr.send(fd);
+   209→  });
+   210→}
+   211→
+   212→export function SmartCoachChatView({ variant = "page" }: { variant?: "page" | "panel" }) {
+   213→  const { user, chatMessages, setChatMessages, addChatMessage, setOverlay } =
+   214→    useAppStore();
+   215→  const [input, setInput] = useState("");
+   216→  const [loading, setLoading] = useState(true);
+   217→  const [sending, setSending] = useState(false);
+   218→  const [error, setError] = useState(false);
+   219→  const scrollRef = useRef<HTMLDivElement>(null);
+   220→
+   221→  // ─── Task 4-a — سهمیه‌ها (بنر شیشه‌ای بالای پیام‌ها) ───
+   222→  const planName = (user?.planName ?? null) as Plan | null;
+   223→  const canChat = canAccess(planName, "aiChatQuestions");
+   224→  const { summary: quotaSummary, refresh: refreshQuota } = useQuotaSummary(
+   225→    !!user && canChat
+   226→  );
+   227→
+   228→  // قابلیت صوتی — ضبط ویس و تبدیل به متن (ASR — دست‌نخورده)
+   229→  const { isRecording, isProcessing, error: voiceError, startRecording, stopRecording } = useVoiceRecorder((text) => {
+   230→    setInput((prev) => (prev ? prev + " " + text : text));
+   231→    lastWasVoiceRef.current = true; // علامت‌گذاری: این پیام از ویس بود
+   232→    toast.success("پیام صوتی تبدیل به متن شد 🎤 — دکمه ارسال را بزنید");
+   233→  });
+   234→
+   235→  // نمایش خطای میکروفون
+   236→  useEffect(() => {
+   237→    if (voiceError) toast.error(voiceError);
+   238→  }, [voiceError]);
+   239→
+   240→  // tracking: آیا آخرین پیام ارسالی از طریق ویس بود؟
+   241→  const lastWasVoiceRef = useRef(false);
+   242→  const inputRef = useRef<HTMLTextAreaElement>(null);
+   243→  const imageInputRef = useRef<HTMLInputElement>(null);
+   244→  const videoInputRef = useRef<HTMLInputElement>(null);
+   245→
+   246→  // پیش‌نمایش مدیای انتخاب‌شده قبل از ارسال
+   247→  const [selectedImage, setSelectedImage] = useState<string | null>(null); // data URL
+   248→  // ─── Task 4-a: ویدیو با blob URL + File + poster کانواسی ───
+   249→  const [selectedVideo, setSelectedVideo] = useState<string | null>(null); // blob URL (پیش‌نمایش فوری)
+   250→  const [selectedVideoFile, setSelectedVideoFile] = useState<File | null>(null);
+   251→  const [selectedVideoPoster, setSelectedVideoPoster] = useState<string | null>(null);
+   252→  const selectedVideoUrlRef = useRef<string | null>(null);
+   253→  const videoSelectionSeqRef = useRef(0); // نسل انتخاب — جلوگیری از overwrite poster قدیمی
+   254→  // درصد پیشرفت آپلود multipart (null = در حال آپلود نیستیم)
+   255→  const [uploadPct, setUploadPct] = useState<number | null>(null);
+   256→
+   257→  // ─── منوی بازشدنی دکمه + (انتخاب عکس/ویدیو) ───
+   258→  const [showUploadMenu, setShowUploadMenu] = useState(false);
+   259→
+   260→  // آزادسازی blob URL هنگام unmount — نشت حافظه نماند
+   261→  useEffect(() => {
+   262→    return () => {
+   263→      revokeObjectUrl(selectedVideoUrlRef.current);
+   264→      selectedVideoUrlRef.current = null;
+   265→    };
+   266→  }, []);
+   267→
+   268→  // ─── Task 4-a — فیکس اسکرول چت ───
+   269→  // قبلاً کل تاریخچه رندر می‌شد و بعد smooth-scroll به پایین — کاربر اول
+   270→  // پیام‌های قدیمی را می‌دید و صفحه «سریع اسکرول» می‌شد. حالا:
+   271→  //   الف) فقط ۳۰ پیام آخر در رندر اول + بارگذاری lazy قدیمی‌ترها (۲۰تایی)
+   272→  //   ب) اسکرول اولیه behavior:"auto" در useLayoutEffect — فقط یک‌بار
+   273→  //   ج) smooth فقط برای پیام‌های جدید بعد از اسکرول اولیه
+   274→  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_MESSAGES);
+   275→  const didInitialScrollRef = useRef(false);
+   276→  const loadingOlderRef = useRef(false);
+   277→  const prevScrollHeightRef = useRef(0);
+   278→  const topSentinelRef = useRef<HTMLDivElement | null>(null);
+   279→
+   280→  const visibleMessages = useMemo(
+   281→    () => chatMessages.slice(Math.max(0, chatMessages.length - visibleCount)),
+   282→    [chatMessages, visibleCount]
+   283→  );
+   284→  const hasOlder = chatMessages.length > visibleCount;
+   285→
+   286→  const loadOlderMessages = useCallback(() => {
+   287→    if (chatMessages.length <= visibleCount) return;
+   288→    loadingOlderRef.current = true;
+   289→    prevScrollHeightRef.current = scrollRef.current?.scrollHeight ?? 0;
+   290→    setVisibleCount((c) => Math.min(c + LOAD_OLDER_STEP, chatMessages.length));
+   291→  }, [chatMessages.length, visibleCount]);
+   292→
+   293→  // حفظ موقعیت اسکرول بعد از prepend پیام‌های قدیمی‌تر (بدون پرش)
+   294→  useLayoutEffect(() => {
+   295→    if (!loadingOlderRef.current) return;
+   296→    loadingOlderRef.current = false;
+   297→    const el = scrollRef.current;
+   298→    if (!el) return;
+   299→    const delta = el.scrollHeight - prevScrollHeightRef.current;
+   300→    if (delta > 0) el.scrollTop += delta;
+   301→  }, [visibleCount]);
+   302→
+   303→  // IntersectionObserver بالای لیست — نزدیک شدن به بالا → بارگذاری قدیمی‌ترها
+   304→  // v59 — گارد مرورگر: بدون IO، صفحه‌بندی نادیده گرفته می‌شود (کرش مرز خطا نشود)
+   305→  useEffect(() => {
+   306→    const el = topSentinelRef.current;
+   307→    const container = scrollRef.current;
+   308→    if (!el || !container || loading || !hasOlder) return;
+   309→    if (typeof IntersectionObserver === "undefined") return;
+   310→    const observer = new IntersectionObserver(
+   311→      (entries) => {
+   312→        for (const entry of entries) {
+   313→          if (entry.isIntersecting) loadOlderMessages();
+   314→        }
+   315→      },
+   316→      { root: container, rootMargin: "160px 0px 0px 0px", threshold: 0 }
+   317→    );
+   318→    observer.observe(el);
+   319→    return () => observer.disconnect();
+   320→  }, [loading, hasOlder, loadOlderMessages]);
+   321→
+   322→  // بارگذاری تاریخچه چت از سرور — تابع جدا تا دکمه «تلاش مجدد» در بنر خطا
+   323→  // هم بتواند همان منطق را اجرا کند (قبلاً فقط داخل useEffect یک‌باره بود)
+   324→  const loadHistory = useCallback(async () => {
+   325→    setLoading(true);
+   326→    try {
+   327→      // fetchJson: پاسخ HTML (خطای گیت‌وی/سرور در حال ری‌استارت) → خطای فارسی
+   328→      const { res, data } = await fetchJson<{ messages?: ChatMessageDto[] }>(
+   329→        "/api/coach/chat",
+   330→        { cache: "no-store" }
+   331→      );
+   332→      if (!res.ok) throw new Error();
+   333→      setChatMessages(data.messages || []);
+   334→      setError(false);
+   335→    } catch {
+   336→      setError(true);
+   337→    } finally {
+   338→      setLoading(false);
+   339→    }
+   340→  }, [setChatMessages]);
+   341→
+   342→  // بارگذاری اولیه تاریخچه چت از سرور (یک‌بار در mount)
+   343→  useEffect(() => {
+   344→    loadHistory();
+   345→  }, [loadHistory]);
+   346→
+   347→  // ─── v73.4 — poll پیام‌های pending (دوفازی مدیا: تحلیل پس‌زمینه) ───
+   348→  // پاسخ POST برای پیام مدیا‌دار فوری برمی‌گردد (placeholder با content خالی) و
+   349→  // تحلیل در پس‌زمینهٔ سرور ادامه دارد. این poll هر ۴ ثانیه messages کامل را
+   350→  // می‌گیرد؛ به‌محض آنکه پیام assistant با همان id محتوا گرفت، آن را نمایش
+   351→  // می‌دهد و poll را تمام می‌کند (سقف ۵ دقیقه). بعد از رفرش صفحه هم کار می‌کند
+   352→  // چون GET خودش placeholderهای pending را برمی‌گرداند.
+   353→  const mountedRef = useRef(true);
+   354→  const pendingPollsRef = useRef<Set<string>>(new Set());
+   355→
+   356→  useEffect(() => {
+   357→    mountedRef.current = true;
+   358→    return () => {
+   359→      mountedRef.current = false;
+   360→    };
+   361→  }, []);
+   362→
+   363→  const startPendingPoll = useCallback(
+   364→    (messageId: string) => {
+   365→      if (!messageId || pendingPollsRef.current.has(messageId)) return;
+   366→      pendingPollsRef.current.add(messageId);
+   367→      void (async () => {
+   368→        const deadline = Date.now() + PENDING_POLL_MAX_MS;
+   369→        try {
+   370→          while (Date.now() < deadline) {
+   371→            await new Promise((r) => setTimeout(r, PENDING_POLL_INTERVAL_MS));
+   372→            if (!mountedRef.current) return;
+   373→            try {
+   374→              const { res, data } = await fetchJson<{ messages?: ChatMessageDto[] }>(
+   375→                "/api/coach/chat",
+   376→                { cache: "no-store" }
+   377→              );
+   378→              if (!res.ok) continue; // خطای موقت سرور — تا ددلاین ادامه بده
+   379→              const target = (data.messages || []).find((m) => m.id === messageId);
+   380→              if (!target) return; // پیام از تاریخچه حذف شده — poll بی‌معنی است
+   381→              if (target.content && target.content.trim().length > 0) {
+   382→                // پاسخ آماده شد → همان حباب placeholder پر می‌شود
+   383→                setChatMessages((prev) => {
+   384→                  if (prev.some((m) => m.id === messageId)) {
+   385→                    return prev.map((m) =>
+   386→                      m.id === messageId
+   387→                        ? { ...m, content: target.content, createdAt: target.createdAt }
+   388→                        : m
+   389→                    );
+   390→                  }
+   391→                  // حباب در لیست محلی نبود (مثلاً بعد از خطای بارگذاری) → اضافه شود
+   392→                  return [
+   393→                    ...prev,
+   394→                    {
+   395→                      id: target.id,
+   396→                      role: target.role,
+   397→                      content: target.content,
+   398→                      mediaUrl: target.mediaUrl ?? null,
+   399→                      mediaType: target.mediaType ?? null,
+   400→                      createdAt: target.createdAt,
+   401→                    },
+   402→                  ];
+   403→                });
+   404→                return;
+   405→              }
+   406→            } catch {
+   407→              // خطای شبکه — تا ددلاین ادامه بده
+   408→            }
+   409→          }
+   410→          // تایم‌اوت ۵ دقیقه — کاربر راهنمایی می‌شود؛ بعد از تکمیل سمت سرور،
+   411→          // رفرش/بازگشت به صفحه پاسخ کامل را نشان می‌دهد
+   412→          if (mountedRef.current) {
+   413→            setChatMessages((prev) =>
+   414→              prev.map((m) =>
+   415→                m.id === messageId && !m.content
+   416→                  ? {
+   417→                      ...m,
+   418→                      content:
+   419→                        "⏳ پاسخ به این پیام بیش از حد انتظار طول کشید. چند لحظه دیگر صفحه را دوباره باز کن یا پیام را دوباره بفرست.",
+   420→                    }
+   421→                  : m
+   422→              )
+   423→            );
+   424→          }
+   425→        } finally {
+   426→          pendingPollsRef.current.delete(messageId);
+   427→        }
+   428→      })();
+   429→    },
+   430→    [setChatMessages]
+   431→  );
+   432→
+   433→  // بعد از رفرش صفحه: placeholderهای pending موجود در تاریخچه دوباره poll می‌شوند
+   434→  useEffect(() => {
+   435→    if (loading) return;
+   436→    for (const m of chatMessages) {
+   437→      if (
+   438→        m.role === "assistant" &&
+   439→        m.content === "" &&
+   440→        m.id !== FOOD_TIP_MESSAGE_ID
+   441→      ) {
+   442→        startPendingPoll(m.id);
+   443→      }
+   444→    }
+   445→  }, [loading, chatMessages, startPendingPoll]);
+   446→
+   447→  // اسکرول اولیه — یک‌بار، بلافاصله بعد از اولین رندر پیام‌ها، بدون انیمیشن (auto)
+   448→  useLayoutEffect(() => {
+   449→    if (loading || chatMessages.length === 0) return;
+   450→    if (didInitialScrollRef.current) return;
+   451→    didInitialScrollRef.current = true;
+   452→    const el = scrollRef.current;
+   453→    if (el) el.scrollTop = el.scrollHeight;
+   454→  }, [loading, chatMessages.length]);
+   455→
+   456→  // اسکرول smooth فقط برای پیام‌های جدید بعد از اسکرول اولیه:
+   457→  //  • وقتی کاربر خودش ارسال می‌کند (sending=true) همیشه دنبال کن
+   458→  //  • وقتی پیام جدید می‌آید، فقط اگر کاربر نزدیک پایین است — مزاحم
+   459→  //    خواندن تاریخچهٔ بالا نشو
+   460→  useEffect(() => {
+   461→    if (!didInitialScrollRef.current) return;
+   462→    const el = scrollRef.current;
+   463→    if (!el) return;
+   464→    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+   465→    if (sending || distanceFromBottom < 300) {
+   466→      el.scrollTo({
+   467→        top: el.scrollHeight,
+   468→        behavior: "smooth",
+   469→      });
+   470→    }
+   471→  }, [chatMessages.length, sending]);
+   472→
+   473→  // Auto-resize textarea تا حداکثر ۱۲۰px
+   474→  useEffect(() => {
+   475→    const el = inputRef.current;
+   476→    if (!el) return;
+   477→    el.style.height = "auto";
+   478→    el.style.height = Math.min(el.scrollHeight, 120) + "px";
+   479→  }, [input]);
+   480→
+   481→  async function handleImageSelect(e: React.ChangeEvent<HTMLInputElement>) {
+   482→    const file = e.target.files?.[0];
+   483→    e.target.value = "";
+   484→    if (!file) return;
+   485→    if (!file.type.startsWith("image/")) {
+   486→      toast.error("فقط فایل تصویری مجاز است.");
+   487→      return;
+   488→    }
+   489→    // Task 4-a: محدودیت حجم کلاینت حذف شد — عکس در سرور خودکار کاهش می‌یابد
+   490→    // (سقف فنی سمت سرور ~۳۰ مگابایت فایل / ۴۰ مگابایت base64 با پیام مهربان)
+   491→    if (file.size > 500 * 1024 * 1024) {
+   492→      toast.error("این فایل خیلی بزرگ است — عکس معقول‌تری انتخاب کن 🙏");
+   493→      return;
+   494→    }
+   495→    try {
+   496→      const dataUrl = await fileToDataUrl(file);
+   497→      setSelectedImage(dataUrl);
+   498→      clearVideoDraft(); // فقط یک مدیا همزمان
+   499→    } catch {
+   500→      toast.error("خطا در پردازش عکس. دوباره تلاش کنید.");
+   501→    }
+   502→  }
+   503→
+   504→  async function handleVideoSelect(e: React.ChangeEvent<HTMLInputElement>) {
+   505→    const file = e.target.files?.[0];
+   506→    e.target.value = "";
+   507→    if (!file) return;
+   508→    if (!file.type.startsWith("video/")) {
+   509→      toast.error("فقط فایل ویدیویی مجاز است.");
+   510→      return;
+   511→    }
+   512→    if (file.size > VIDEO_CLIENT_HARD_CAP) {
+   513→      toast.error("حجم ویدیو بیش از حد فنی مجاز (۵۰۰ مگابایت) است.");
+   514→      return;
+   515→    }
+   516→    try {
+   517→      // ─── Task 4-a: پیش‌نمایش با blob URL (فوری) + poster کانواسی (تضمینی) ───
+   518→      // قبلاً data URL کامل در <video preload="metadata"> تا کلیک فقط سیاه بود.
+   519→      const seq = ++videoSelectionSeqRef.current;
+   520→      revokeObjectUrl(selectedVideoUrlRef.current);
+   521→      const blobUrl = URL.createObjectURL(file);
+   522→      selectedVideoUrlRef.current = blobUrl;
+   523→      setSelectedVideo(blobUrl);
+   524→      setSelectedVideoFile(file);
+   525→      setSelectedVideoPoster(null);
+   526→      setSelectedImage(null); // فقط یک مدیا همزمان
+   527→      const poster = await createVideoThumbnail(blobUrl);
+   528→      if (videoSelectionSeqRef.current === seq && poster) {
+   529→        setSelectedVideoPoster(poster);
+   530→      }
+   531→    } catch {
+   532→      toast.error("خطا در پردازش ویدیو. دوباره تلاش کنید.");
+   533→    }
+   534→  }
+   535→
+   536→  /** پاک‌کردن پیش‌نویس ویدیو + آزادسازی blob URL */
+   537→  function clearVideoDraft() {
+   538→    videoSelectionSeqRef.current += 1;
+   539→    revokeObjectUrl(selectedVideoUrlRef.current);
+   540→    selectedVideoUrlRef.current = null;
+   541→    setSelectedVideoFile(null);
+   542→    setSelectedVideoPoster(null);
+   543→    setSelectedVideo(null);
+   544→  }
+   545→
+   546→  function handleRemoveMedia() {
+   547→    setSelectedImage(null);
+   548→    clearVideoDraft();
+   549→  }
+   550→
+   551→  function handleImageBtn() {
+   552→    if (canAccess(planName, "chatImageUpload")) {
+   553→      imageInputRef.current?.click();
+   554→    } else {
+   555→      toast.info("برای ارسال عکس باید پلن خود را به پیشرفته ارتقا دهید");
+   556→      setOverlay("subscription");
+   557→    }
+   558→  }
+   559→
+   560→  function handleVideoBtn() {
+   561→    if (canAccess(planName, "chatVideoUpload")) {
+   562→      videoInputRef.current?.click();
+   563→    } else {
+   564→      // v60 — «آنالیز فرم حرکات» همین‌جاست: کاربر با ارسال ویدیوی اجرای حرکت،
+   565→      // فرم حرکاتش را بررسی و اصلاح می‌کند (پلن حرفه‌ای).
+   566→      toast.info("آنالیز فرم حرکات اینجاست — ویدیوی اجرای حرکتت رو بفرست تا فرمت رو اصلاح کنیم (نیازمند پلن حرفه‌ای)");
+   567→      setOverlay("subscription");
+   568→    }
+   569→  }
+   570→
+   571→  const canSendImage = canAccess(planName, "chatImageUpload");
+   572→  const canSendVideo = canAccess(planName, "chatVideoUpload");
+   573→
+   574→  async function send(text?: string) {
+   575→    const message = (text ?? input).trim();
+   576→    if ((!message && !selectedImage && !selectedVideoFile) || sending) return;
+   577→    if (!canChat) {
+   578→      toast.info("برای چت با فیتاپ باید پلن خود را ارتقا دهید");
+   579→      setOverlay("subscription");
+   580→      return;
+   581→    }
+   582→    setInput("");
+   583→    setSending(true);
+   584→
+   585→    // ─── مقادیر مدیا قبل از ارسال — برای بازگرداندن در خطا ───
+   586→    const imageData = selectedImage;
+   587→    const videoFile = selectedVideoFile;
+   588→    const videoPreviewUrl = selectedVideo; // blob URL برای پیش‌نمایش پیام موقت
+   589→    const videoPoster = selectedVideoPoster;
+   590→
+   591→    // ساخت پیام موقت با مدیا برای نمایش فوری
+   592→    // (ویدیو با blob URL + poster فوراً فریم اول را نشان می‌دهد — Task 4-a)
+   593→    const tempUserMsg: ChatMessageDto = {
+   594→      id: tempId("temp"),
+   595→      role: "user",
+   596→      content:
+   597→        message ||
+   598→        (selectedImage ? "📷 عکس" : videoFile ? "🎬 ویدیو" : ""),
+   599→      mediaUrl: selectedImage ?? videoPreviewUrl,
+   600→      mediaType: selectedImage ? "image" : videoFile ? "video" : null,
+   601→      createdAt: new Date().toISOString(),
+   602→    };
+   603→    addChatMessage(tempUserMsg);
+   604→
+   605→    setSelectedImage(null);
+   606→    clearVideoDraft();
+   607→
+   608→    try {
+   609→      let videoBase64: string | undefined;
+   610→      let uploadedVideoUrl: string | undefined;
+   611→      let uploadedFrames: string[] | undefined;
+   612→
+   613→      if (videoFile) {
+   614→        if (videoFile.size > VIDEO_MULTIPART_THRESHOLD) {
+   615→          // ─── Task 4-a: ویدیوهای بزرگ → مسیر multipart بدون محدودیت حجم ───
+   616→          // ابتدا آپلود (ذخیره + فشرده‌سازی + استخراج فریم + مصرف سهمیه)،
+   617→          // سپس POST چت با videoUrl/videoFrames.
+   618→          setUploadPct(0);
+   619→          try {
+   620→            const up = await uploadVideoWithProgress(videoFile, (p) =>
+   621→              setUploadPct(p)
+   622→            );
+   623→            uploadedVideoUrl = up.mediaUrl;
+   624→            uploadedFrames = up.frames;
+   625→          } finally {
+   626→            setUploadPct(null);
+   627→          }
+   628→        } else {
+   629→          // مسیر قدیمی base64 (<۱۲MB) — دست‌نخورده
+   630→          videoBase64 = await fileToDataUrl(videoFile);
+   631→        }
+   632→      }
+   633→
+   634→      // fetchJsonOrThrow: پاسخ HTML (۵۰۲ گیت‌وی / تایم‌اوت درخواست‌های بلند ویدیو)
+   635→      // → پیام فارسی «ارتباط با سرور برقرار نشد...» به‌جای «Unexpected token '<'»
+   636→      // v73.4 — clientId: همان tempId پیام موقت → idempotency سمت سرور (فیکس دبل‌سند)
+   637→      const data = await fetchJsonOrThrow<any>(
+   638→        "/api/coach/chat",
+   639→        {
+   640→          method: "POST",
+   641→          headers: { "Content-Type": "application/json" },
+   642→          body: JSON.stringify({
+   643→            message,
+   644→            clientId: tempUserMsg.id,
+   645→            imageBase64: imageData || undefined,
+   646→            videoBase64,
+   647→            videoUrl: uploadedVideoUrl,
+   648→            videoFrames: uploadedFrames,
+   649→            isVoice: lastWasVoiceRef.current, // آیا پیام از طریق ویس بود؟
+   650→          }),
+   651→        },
+   652→        "خطا در ارتباط با سرور"
+   653→      );
+   654→
+   655→      // ─── v57: حباب پیشنهاد «دستیار تغذیه» — درخواست مالک ───
+   656→      // تحلیل غذا در چت انجام می‌شود ولی در تاریخچهٔ غذایی ثبت نمی‌شود؛ کاربر
+   657→      // بعد از اولین تحلیل عکس غذا، یک‌بار در سشن، پیشنهاد اختصاصی می‌گیرد.
+   658→      // v59 — گارد storage: getItem در حالت خصوصی می‌تواند throw کند
+   659→      let foodTipShown = false;
+   660→      try {
+   661→        foodTipShown = !!window.sessionStorage.getItem(FOOD_TIP_SESSION_FLAG);
+   662→      } catch {}
+   663→      const shouldPushFoodTip =
+   664→        !!imageData && !videoFile && typeof window !== "undefined" && !foodTipShown;
+   665→      if (shouldPushFoodTip) {
+   666→        try {
+   667→          window.sessionStorage.setItem(FOOD_TIP_SESSION_FLAG, "1");
+   668→        } catch {}
+   669→      }
+   670→
+   671→      // ─── v73.4 — فیکس باگ کلوژر: به‌جای ساخت آرایه از chatMessages زمان render
+   672→      // (که stale می‌ماند و پیام را دوبار نمایش می‌داد)، آپدیت functional روی
+   673→      // آخرین state انجام می‌شود + حذف هر ردیف تکراری سروری (idempotent replay).
+   674→      setChatMessages((prev) => {
+   675→        const next: ChatMessageDto[] = [];
+   676→        for (const m of prev) {
+   677→          if (m.id === tempUserMsg.id) continue; // پیام موقت → نسخهٔ سروری می‌آید
+   678→          if (data.userMessage && m.id === data.userMessage.id) continue;
+   679→          if (data.aiMessage && m.id === data.aiMessage.id) continue;
+   680→          next.push(m);
+   681→        }
+   682→        if (data.userMessage) next.push(data.userMessage as ChatMessageDto);
+   683→        if (data.aiMessage) next.push(data.aiMessage as ChatMessageDto);
+   684→        if (shouldPushFoodTip) {
+   685→          next.push({
+   686→            id: FOOD_TIP_MESSAGE_ID,
+   687→            role: "assistant",
+   688→            content: "", // محتوا در FoodAssistantTipBubble رندر می‌شود
+   689→            createdAt: new Date().toISOString(),
+   690→          });
+   691→        }
+   692→        return next;
+   693→      });
+   694→
+   695→      // blob پیش‌نمایش دیگر لازم نیست (پیام نهایی URL سروری دارد)
+   696→      if (videoPreviewUrl !== selectedVideoUrlRef.current) {
+   697→        revokeObjectUrl(videoPreviewUrl);
+   698→      }
+   699→
+   700→      // به‌روزرسانی سهمیه‌ها بعد از ارسال موفق عکس/ویدیو (Task 4-a)
+   701→      if (imageData || videoFile) refreshQuota();
+   702→
+   703→      // ─── v56/v73.4 — راهنمایی کاربر به «دستیار تغذیه» بعد از ارسال عکس غذا ───
+   704→      // (تحلیل خودِ عکس حالا در پس‌زمینه انجام می‌شود و نتیجه در حباب pending می‌آید)
+   705→      if (imageData && !videoFile) {
+   706→        toast.info("عکس دریافت شد — تحلیل در جریان است ⏳", {
+   707→          description:
+   708→            "از این به بعد تحلیل عکس غذا را از «دستیار تغذیه» انجام بده تا در تاریخچهٔ غذایی‌ات ثبت شود و برنامه‌ات دقیق‌تر پیگیری بشه 🍽",
+   709→          action: {
+   710→            label: "رفتن به دستیار تغذیه",
+   711→            onClick: () => useAppStore.getState().setMainTab("nutrition"),
+   712→          },
+   713→          duration: 10000,
+   714→        });
+   715→      }
+   716→
+   717→      // ─── v73.4 — دوفازی مدیا: پاسخ فوری با pending=true → poll تا تکمیل تحلیل ───
+   718→      if (data.pending && data.aiMessage?.id) {
+   719→        startPendingPoll(data.aiMessage.id);
+   720→      }
+   721→    } catch (e) {
+   722→      // v73.4 — functional update (فیکس باگ کلوژر)
+   723→      setChatMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id));
+   724→      // ─── بازیابی متن تایپ‌شده و پیوست‌ها ───
+   725→      // قبلاً پیام کاربر (متن + عکس/ویدیو) با خطای شبکه «برای همیشه» از دست
+   726→      // می‌رفت و کاربر مجبور بود از اول تایپ/انتخاب کند — حالا مقادیر pre-send
+   727→      // به input و پیش‌نمایش مدیا برمی‌گردند (فقط اگر کاربر در این بین چیزی
+   728→      // جدید تایپ/انتخاب نکرده باشد تا کار تازه‌اش دوباره‌کاری نشود).
+   729→      if (message) setInput((prev) => prev || message);
+   730→      if (imageData) setSelectedImage((prev) => prev ?? imageData);
+   731→      if (videoFile) {
+   732→        videoSelectionSeqRef.current += 1;
+   733→        selectedVideoUrlRef.current = videoPreviewUrl; // blob هنوز زنده است — revoke نشده
+   734→        setSelectedVideoFile(videoFile);
+   735→        setSelectedVideo(videoPreviewUrl);
+   736→        setSelectedVideoPoster(videoPoster);
+   737→      }
+   738→      const errMsg =
+   739→        e instanceof Error ? e.message : "خطا در ارتباط با سرور";
+   740→      // پیام سهمیه (۴۲۹) در toast هم نمایش داده می‌شود تا فوری دیده شود
+   741→      if (e instanceof ApiError && e.status === 429) {
+   742→        toast.error(errMsg);
+   743→      }
+   744→      addChatMessage({
+   745→        id: tempId("err"),
+   746→        role: "assistant",
+   747→        content: `⚠️ ${errMsg}`,
+   748→        createdAt: new Date().toISOString(),
+   749→      });
+   750→      // همگام‌سازی سهمیه بعد از خطا (مثلاً ۴۲۹ — شمارنده سرور ممکن است تغییر کرده باشد)
+   751→      refreshQuota();
+   752→    } finally {
+   753→      setSending(false);
+   754→      lastWasVoiceRef.current = false; // reset برای پیام بعدی
+   755→      inputRef.current?.focus();
+   756→    }
+   757→  }
+   758→
+   759→  function handleKeyDown(e: React.KeyboardEvent) {
+   760→    if (e.key === "Enter" && !e.shiftKey) {
+   761→      e.preventDefault();
+   762→      send();
+   763→    }
+   764→  }
+   765→
+   766→  // اگر کاربر به چت دسترسی ندارد (Basic/Standard) → بنر ارتقا
+   767→  // 🩹 v48 (باگ بحرانی مالک): اگر user هنوز null است (لحظهٔ لود/refresh داده)،
+   768→  // هرگز بنر «قفل است» نشان نده — همان UI عادی چت می‌ماند و refreshUserIfNeeded
+   769→  // (main-app — mount/foreground) ظرف کمتر از یک ثانیه دسترسی واقعی را برمی‌گرداند.
+   770→  // قبلاً بنر قفل لحظه‌ای/مsometimes پایدار برای دارندگان پلن حرفه‌ای می‌آمد.
+   771→  if (!loading && user && !canChat) {
+   772→    return (
+   773→      <div className={variant === "panel" ? "px-4 py-4 h-full overflow-y-auto custom-scrollbar" : "px-4 py-4 max-w-md mx-auto"}>
+   774→        <UpgradeBanner
+   775→          featureLabel="فیتاپ"
+   776→          requiredPlan="advanced"
+   777→          description="با ارتقا به پلن پیشرفته، به فیتاپ با دسترسی کامل به داده‌های آنبوردینگ، آزمایش خون و اهداف شما دسترسی پیدا کن. برنامه تمرینی هفتگی، کالری دقیق، مکمل‌ها و پاسخ فنی — همه در ۲۴ ساعت شبانه‌روز."
+   778→          icon={<img src="/fitup-logo.png" alt="فیتاپ" className="w-8 h-8 rounded-lg object-cover" />}
+   779→        />
+   780→        <div className="mt-4 p-3 rounded-2xl bg-orange-50 border border-orange-100 text-center">
+   781→          <p className="text-xs text-slate-600 mb-2">
+   782→            💡 در عوض می‌تونی با «نیکا» چت کنی — راهنمای فروش و پشتیبانی
+   783→          </p>
+   784→          <Button
+   785→            size="sm"
+   786→            variant="outline"
+   787→            className="rounded-xl"
+   788→            onClick={() => useAppStore.getState().setChatMode("nika")}
+   789→          >
+   790→            <Bot className="w-4 h-4 text-orange-500" /> رفتن به چت نیکا
+   791→          </Button>
+   792→        </div>
+   793→      </div>
+   794→    );
+   795→  }
+   796→
+   797→  const containerClass =
+   798→    variant === "panel"
+   799→      ? "flex flex-col h-full w-full bg-white"
+   800→      : "flex flex-col h-[calc(100dvh-4rem)] max-w-2xl lg:max-w-4xl mx-auto bg-white";
+   801→
+   802→  return (
+   803→    <div
+   804→      className={containerClass}
+   805→      dir="rtl"
+   806→    >
+   807→      {/* فایل‌های مخفی برای انتخاب عکس/ویدیو */}
+   808→      <input
+   809→        ref={imageInputRef}
+   810→        type="file"
+   811→        accept="image/*"
+   812→        className="hidden"
+   813→        onChange={handleImageSelect}
+   814→      />
+   815→      <input
+   816→        ref={videoInputRef}
+   817→        type="file"
+   818→        accept="video/*"
+   819→        className="hidden"
+   820→        onChange={handleVideoSelect}
+   821→      />
+   822→
+   823→      {/* هدر فیتاپ — تم سفید حرفه‌ای */}
+   824→      <header className="flex items-center gap-3 px-4 py-3 border-b border-orange-100 bg-white/95 backdrop-blur-md sticky top-0 z-10">
+   825→        <div className="relative shrink-0">
+   826→          <div className="w-10 h-10 rounded-full flex items-center justify-center shadow-md bg-gradient-to-br from-amber-500 to-orange-600 overflow-hidden">
+   827→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   828→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   829→          </div>
+   830→          <span className="absolute bottom-0 left-0 w-3 h-3 rounded-full bg-emerald-500 border-2 border-white" />
+   831→        </div>
+   832→        <div className="flex-1 min-w-0">
+   833→          <h3 className="font-bold text-sm text-slate-900 truncate">
+   834→            فیتاپ
+   835→          </h3>
+   836→          <p className="text-[11px] text-emerald-600 flex items-center gap-1">
+   837→            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+   838→            آنلاین — دسترسی کامل به پرونده شما
+   839→          </p>
+   840→        </div>
+   841→        <div className="w-9 h-9 rounded-xl bg-orange-50 flex items-center justify-center shrink-0">
+   842→          <Sparkles className="w-5 h-5 text-orange-500" />
+   843→        </div>
+   844→      </header>
+   845→
+   846→      {/* ─── Task 4-a — بنر سهمیه (زیر هدر، بالای پیام‌ها) ─── */}
+   847→      {quotaSummary && (
+   848→        <CoachQuotaBanner
+   849→          summary={quotaSummary}
+   850→          planName={planName}
+   851→          onUpgrade={() => setOverlay("subscription")}
+   852→        />
+   853→      )}
+   854→
+   855→      {/* پیام‌ها */}
+   856→      <div
+   857→        ref={scrollRef}
+   858→        className="flex-1 overflow-y-auto custom-scrollbar px-3 sm:px-4 py-4 space-y-3 bg-orange-50/40"
+   859→      >
+   860→        {loading ? (
+   861→          <div className="space-y-3">
+   862→            <Skeleton className="h-16 w-3/4 rounded-2xl" />
+   863→            <Skeleton className="h-20 w-3/4 rounded-2xl mr-auto" />
+   864→          </div>
+   865→        ) : chatMessages.length === 0 ? (
+   866→          <div className="flex flex-col items-center justify-center h-full text-center px-4">
+   867→            <motion.div
+   868→              initial={{ scale: 0 }}
+   869→              animate={{ scale: 1 }}
+   870→              transition={{ type: "spring" }}
+   871→              className="w-20 h-20 rounded-3xl flex items-center justify-center shadow-lg mb-4 bg-gradient-to-br from-amber-500 to-orange-600 overflow-hidden"
+   872→            >
+   873→              {/* eslint-disable-next-line @next/next/no-img-element */}
+   874→              <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   875→            </motion.div>
+   876→            <h3 className="font-bold text-lg text-slate-900 mb-1">
+   877→              فیتاپ آماده‌ست 💪
+   878→            </h3>
+   879→            <p className="text-sm text-slate-500 mb-6 max-w-xs leading-relaxed">
+   880→              من به تمام اطلاعات آنبوردینگ، آزمایش خون و اهداف تو دسترسی دارم.
+   881→              هر سوال فنی ورزشی یا تغذیه‌ای بپرس، برنامه تمرینی، مکمل یا کالری
+   882→              دقیق بخواه.
+   883→            </p>
+   884→            <div className="w-full max-w-sm space-y-2">
+   885→              {QUICK_PROMPTS.map((p, i) => (
+   886→                <button
+   887→                  key={i}
+   888→                  onClick={() => send(p.text)}
+   889→                  className="w-full bg-white border border-orange-100 rounded-2xl p-3 hover:border-orange-300 transition text-right text-sm flex items-center gap-3"
+   890→                >
+   891→                  <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 bg-orange-50">
+   892→                    <p.icon className="w-4 h-4 text-orange-500" />
+   893→                  </div>
+   894→                  <span className="text-slate-700 flex-1">{p.text}</span>
+   895→                </button>
+   896→              ))}
+   897→            </div>
+   898→          </div>
+   899→        ) : (
+   900→          <>
+   901→            {/* ─── Task 4-a — بارگذاری lazy پیام‌های قدیمی‌تر ─── */}
+   902→            {hasOlder && (
+   903→              <div ref={topSentinelRef} className="flex justify-center pb-1">
+   904→                <button
+   905→                  onClick={loadOlderMessages}
+   906→                  className="px-3 py-1.5 rounded-full bg-white/85 border border-orange-100 text-[10px] font-bold text-orange-500 hover:bg-orange-50 transition shadow-sm"
+   907→                >
+   908→                  پیام‌های قدیمی‌تر
+   909→                </button>
+   910→              </div>
+   911→            )}
+   912→            {visibleMessages.map((msg) =>
+   913→              msg.id === FOOD_TIP_MESSAGE_ID ? (
+   914→                <FoodAssistantTipBubble key={msg.id} />
+   915→              ) : (
+   916→                <CoachBubble key={msg.id} message={msg} />
+   917→              )
+   918→            )}
+   919→            {sending && <CoachTyping />}
+   920→          </>
+   921→        )}
+   922→      </div>
+   923→
+   924→      {/* ورودی */}
+   925→      <div className="border-t border-orange-100 bg-white p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+   926→        {error && (
+   927→          <div className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2 mb-2 text-center border border-red-200 flex items-center justify-between gap-2">
+   928→            <span className="flex-1">خطا در بارگذاری تاریخچه چت</span>
+   929→            {/* تلاش مجدد — همان منطق بارگذاری اولیه تاریخچه را اجرا می‌کند */}
+   930→            <button
+   931→              onClick={loadHistory}
+   932→              disabled={loading}
+   933→              className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white border border-red-200 text-red-600 font-bold hover:bg-red-50 transition disabled:opacity-50"
+   934→              aria-label="تلاش مجدد"
+   935→            >
+   936→              <RotateCcw className="w-3.5 h-3.5" />
+   937→              تلاش مجدد
+   938→            </button>
+   939→          </div>
+   940→        )}
+   941→
+   942→        {/* پیش‌نمایش مدیای انتخاب‌شده */}
+   943→        {(selectedImage || selectedVideoFile) && (
+   944→          <div className="mb-2 flex items-center gap-2">
+   945→            <div className="relative inline-block">
+   946→              {selectedImage ? (
+   947→                <img
+   948→                  src={selectedImage}
+   949→                  alt="پیش‌نمایش عکس"
+   950→                  className="w-16 h-16 object-cover rounded-xl border border-orange-200"
+   951→                />
+   952→              ) : (
+   953→                /* ─── Task 4-a: پیش‌نمایش ویدیو با blob URL + poster کانواسی —
+   954→                   فریم اول بلافاصله بعد از انتخاب دیده می‌شود، بدون پلی ─── */
+   955→                <video
+   956→                  src={selectedVideo ? `${selectedVideo}#t=0.1` : undefined}
+   957→                  poster={selectedVideoPoster ?? undefined}
+   958→                  className="w-16 h-16 object-cover rounded-xl border border-orange-200 bg-slate-900"
+   959→                  muted
+   960→                  preload="metadata"
+   961→                  playsInline
+   962→                />
+   963→              )}
+   964→              {selectedVideoFile && (
+   965→                <span className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded-full bg-slate-900/85 text-white text-[8px] font-bold whitespace-nowrap" dir="rtl">
+   966→                  {formatFileSizeFa(selectedVideoFile.size)}
+   967→                </span>
+   968→              )}
+   969→              <button
+   970→                onClick={handleRemoveMedia}
+   971→                className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-red-500 text-white flex items-center justify-center shadow-md"
+   972→                aria-label="حذف مدیا"
+   973→                title="حذف"
+   974→              >
+   975→                <X className="w-3.5 h-3.5" />
+   976→              </button>
+   977→            </div>
+   978→            <span className="text-xs text-slate-500">آماده ارسال</span>
+   979→          </div>
+   980→        )}
+   981→
+   982→        {/* ─── ردیزاین input چت — دکمه + (آپلود) + میکروفون + textarea + ارسال ─── */}
+   983→        <div className="flex items-end gap-2 relative">
+   984→          {/* دکمه + (باز کردن منوی آپلود) */}
+   985→          <div className="relative shrink-0">
+   986→            <button
+   987→              onClick={() => setShowUploadMenu(!showUploadMenu)}
+   988→              disabled={sending}
+   989→              className={`w-11 h-11 rounded-full flex items-center justify-center transition shrink-0 ${
+   990→                showUploadMenu
+   991→                  ? "bg-orange-500 text-white"
+   992→                  : "bg-orange-50 hover:bg-orange-100 text-orange-500"
+   993→              }`}
+   994→              title="آپلود فایل"
+   995→              aria-label="آپلود فایل"
+   996→              aria-expanded={showUploadMenu}
+   997→            >
+   998→              <Plus className={`w-5 h-5 transition-transform ${showUploadMenu ? "rotate-45" : ""}`} />
+   999→            </button>
+  1000→
+  1001→            {/* منوی بازشدنی — انتخاب عکس/ویدیو */}
+  1002→            {showUploadMenu && (
+  1003→              <>
+  1004→                {/* بستن منو با کلیک خارج */}
+  1005→                <div
+  1006→                  className="fixed inset-0 z-40"
+  1007→                  onClick={() => setShowUploadMenu(false)}
+  1008→                />
+  1009→                <motion.div
+  1010→                  initial={{ opacity: 0, scale: 0.9, y: 10 }}
+  1011→                  animate={{ opacity: 1, scale: 1, y: 0 }}
+  1012→                  className="absolute bottom-14 right-0 z-50 bg-white rounded-2xl shadow-2xl border border-orange-100 p-1.5 min-w-[160px]"
+  1013→                >
+  1014→                  {/* گزینه عکس */}
+  1015→                  <button
+  1016→                    onClick={() => {
+  1017→                      setShowUploadMenu(false);
+  1018→                      handleImageBtn();
+  1019→                    }}
+  1020→                    disabled={!canSendImage || sending}
+  1021→                    className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl transition text-sm ${
+  1022→                      canSendImage
+  1023→                        ? "hover:bg-orange-50 text-slate-700"
+  1024→                        : "text-slate-300 cursor-not-allowed"
+  1025→                    }`}
+  1026→                  >
+  1027→                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${canSendImage ? "bg-orange-100 text-orange-500" : "bg-slate-100 text-slate-300"}`}>
+  1028→                      {canSendImage ? <ImageIcon className="w-4 h-4" /> : <Lock className="w-3.5 h-3.5" />}
+  1029→                    </div>
+  1030→                    <div className="text-right">
+  1031→                      <p className="font-bold text-xs">عکس</p>
+  1032→                      {!canSendImage && <p className="text-[9px] text-slate-400">نیازمند پلن پیشرفته</p>}
+  1033→                    </div>
+  1034→                  </button>
+  1035→                  {/* گزینه ویدیو */}
+  1036→                  <button
+  1037→                    onClick={() => {
+  1038→                      setShowUploadMenu(false);
+  1039→                      handleVideoBtn();
+  1040→                    }}
+  1041→                    disabled={!canSendVideo || sending}
+  1042→                    className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl transition text-sm ${
+  1043→                      canSendVideo
+  1044→                        ? "hover:bg-orange-50 text-slate-700"
+  1045→                        : "text-slate-300 cursor-not-allowed"
+  1046→                    }`}
+  1047→                  >
+  1048→                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${canSendVideo ? "bg-orange-100 text-orange-500" : "bg-slate-100 text-slate-300"}`}>
+  1049→                      {canSendVideo ? <Video className="w-4 h-4" /> : <Lock className="w-3.5 h-3.5" />}
+  1050→                    </div>
+  1051→                    <div className="text-right">
+  1052→                      <p className="font-bold text-xs">ویدیو</p>
+  1053→                      {canSendVideo ? (
+  1054→                        <p className="text-[9px] text-slate-400">بدون محدودیت حجم — خودکار فشرده می‌شود</p>
+  1055→                      ) : (
+  1056→                        // v60 — دیریکتیو مالک: وقتی قفل است، کاربر باید بفهمد
+  1057→                        // «آنالیز فرم حرکات» همین‌جاست (ارسال ویدیوی اجرای حرکت)
+  1058→                        <p className="text-[9px] text-amber-500 font-medium">آنالیز فرم حرکات اینجاست — نیازمند پلن حرفه‌ای</p>
+  1059→                      )}
+  1060→                    </div>
+  1061→                  </button>
+  1062→                </motion.div>
+  1063→              </>
+  1064→            )}
+  1065→          </div>
+  1066→
+  1067→          {/* دکمه میکروفون — ضبط ویس */}
+  1068→          <button
+  1069→            onClick={isRecording ? stopRecording : startRecording}
+  1070→            disabled={sending || isProcessing}
+  1071→            className={`w-11 h-11 rounded-full flex items-center justify-center transition shrink-0 ${
+  1072→              isRecording
+  1073→                ? "bg-red-500 text-white animate-pulse"
+  1074→                : isProcessing
+  1075→                ? "bg-orange-100 text-orange-500"
+  1076→                : "bg-orange-50 hover:bg-orange-100 text-orange-500"
+  1077→            }`}
+  1078→            title={isRecording ? "توقف ضبط" : "ارسال پیام صوتی"}
+  1079→            aria-label={isRecording ? "توقف ضبط" : "ارسال پیام صوتی"}
+  1080→          >
+  1081→            {isProcessing ? (
+  1082→              <Loader2 className="w-5 h-5 animate-spin" />
+  1083→            ) : isRecording ? (
+  1084→              <Square className="w-5 h-5 fill-white" />
+  1085→            ) : (
+  1086→              <Mic className="w-5 h-5" />
+  1087→            )}
+  1088→          </button>
+  1089→
+  1090→          {/* textarea auto-resize */}
+  1091→          <div className="flex-1 relative">
+  1092→            <textarea
+  1093→              ref={inputRef}
+  1094→              value={input}
+  1095→              onChange={(e) => setInput(e.target.value)}
+  1096→              onKeyDown={handleKeyDown}
+  1097→              placeholder="سوال تخصصی از فیتاپ..."
+  1098→              rows={1}
+  1099→              className="w-full resize-none rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 focus:border-orange-400 max-h-[120px] transition"
+  1100→              disabled={sending || loading}
+  1101→            />
+  1102→          </div>
+  1103→
+  1104→          {/* دکمه ارسال — هنگام آپلود multipart درصد پیشرفت نشان می‌دهد (Task 4-a) */}
+  1105→          <button
+  1106→            onClick={() => send()}
+  1107→            disabled={
+  1108→              (!input.trim() && !selectedImage && !selectedVideoFile) || sending
+  1109→            }
+  1110→            className="w-11 h-11 rounded-full flex items-center justify-center shrink-0 text-white shadow-md transition disabled:opacity-40 disabled:cursor-not-allowed hover:scale-105 active:scale-95 bg-gradient-to-br from-amber-500 to-orange-600"
+  1111→            aria-label="ارسال پیام"
+  1112→          >
+  1113→            {uploadPct !== null ? (
+  1114→              <span className="text-[10px] font-bold leading-none" dir="rtl">
+  1115→                {toPersianDigits(uploadPct)}٪
+  1116→              </span>
+  1117→            ) : sending ? (
+  1118→              <Loader2 className="w-5 h-5 animate-spin" />
+  1119→            ) : (
+  1120→              <Send className="w-5 h-5 -rotate-180" />
+  1121→            )}
+  1122→          </button>
+  1123→        </div>
+  1124→      </div>
+  1125→    </div>
+  1126→  );
+  1127→}
+  1128→
+  1129→// ═══════════════════════════════════════════════════════════════
+  1130→//  Task 4-a — بنر سهمیه‌ها (شیشه‌ای، بالای پیام‌ها)
+  1131→// ═══════════════════════════════════════════════════════════════
+  1132→
+  1133→function QuotaMiniBar({ pct, tone }: { pct: number; tone: "orange" | "emerald" | "amber" }) {
+  1134→  const gradients: Record<typeof tone, string> = {
+  1135→    orange: "from-amber-500 to-orange-600",
+  1136→    emerald: "from-emerald-500 to-emerald-600",
+  1137→    amber: "from-amber-400 to-amber-600",
+  1138→  };
+  1139→  return (
+  1140→    <div className="h-1 w-full rounded-full bg-slate-100 overflow-hidden">
+  1141→      <div
+  1142→        className={`h-full rounded-full bg-gradient-to-r ${gradients[tone]}`}
+  1143→        style={{ width: `${Math.max(4, Math.min(100, pct))}%` }}
+  1144→      />
+  1145→    </div>
+  1146→  );
+  1147→}
+  1148→
+  1149→function QuotaChip({
+  1150→  icon,
+  1151→  label,
+  1152→  value,
+  1153→  dailyValue,
+  1154→  pct,
+  1155→  tone,
+  1156→  tip,
+  1157→  open,
+  1158→  onToggle,
+  1159→}: {
+  1160→  icon: ReactNode;
+  1161→  label: string;
+  1162→  /** مقدار «مصرف/سقف» با ارقام فارسی */
+  1163→  value: string;
+  1164→  /** متن اختیاری روزانه — فقط عکس چت */
+  1165→  dailyValue?: string;
+  1166→  pct: number;
+  1167→  tone: "orange" | "emerald" | "amber";
+  1168→  tip: string;
+  1169→  open: boolean;
+  1170→  onToggle: () => void;
+  1171→}) {
+  1172→  return (
+  1173→    <div className="relative shrink-0">
+  1174→      <button
+  1175→        onClick={onToggle}
+  1176→        aria-expanded={open}
+  1177→        className="flex items-center gap-2 rounded-xl border border-orange-100 bg-white/80 px-2 py-1.5 text-right transition hover:border-orange-300 hover:bg-orange-50/70"
+  1178→      >
+  1179→        <span className="w-6 h-6 rounded-lg bg-orange-50 border border-orange-100 flex items-center justify-center shrink-0">
+  1180→          {icon}
+  1181→        </span>
+  1182→        <span className="flex flex-col gap-[3px] min-w-[68px]">
+  1183→          <span className="flex items-center gap-1 leading-none">
+  1184→            <span className="text-[10px] font-bold text-slate-700">{label}</span>
+  1185→            <span className="text-[10px] font-medium text-slate-400" dir="ltr">
+  1186→              {value}
+  1187→            </span>
+  1188→          </span>
+  1189→          {dailyValue && (
+  1190→            <span className="text-[8px] text-slate-400 leading-none">{dailyValue}</span>
+  1191→          )}
+  1192→          <QuotaMiniBar pct={pct} tone={tone} />
+  1193→        </span>
+  1194→      </button>
+  1195→      {open && (
+  1196→        <>
+  1197→          <div className="fixed inset-0 z-40" onClick={onToggle} />
+  1198→          <motion.div
+  1199→            initial={{ opacity: 0, y: -4 }}
+  1200→            animate={{ opacity: 1, y: 0 }}
+  1201→            className="absolute top-full mt-1.5 right-0 z-50 w-60 rounded-xl border border-orange-100 bg-white p-2.5 shadow-xl"
+  1202→          >
+  1203→            <p className="text-[10px] leading-relaxed text-slate-600">{tip}</p>
+  1204→          </motion.div>
+  1205→        </>
+  1206→      )}
+  1207→    </div>
+  1208→  );
+  1209→}
+  1210→
+  1211→function CoachQuotaBanner({
+  1212→  summary,
+  1213→  planName,
+  1214→  onUpgrade,
+  1215→}: {
+  1216→  summary: QuotaSummary;
+  1217→  planName: Plan | null;
+  1218→  onUpgrade: () => void;
+  1219→}) {
+  1220→  const [openTip, setOpenTip] = useState<string | null>(null);
+  1221→  const canSendImage = canAccess(planName, "chatImageUpload");
+  1222→  const canSendVideo = canAccess(planName, "chatVideoUpload");
+  1223→  const canMealPhoto = canAccess(planName, "mealPhotoAnalysis");
+  1224→  const planLabel = planName ? PLAN_LABELS[planName] : "";
+  1225→
+  1226→  const toggle = (key: string) => setOpenTip((prev) => (prev === key ? null : key));
+  1227→
+  1228→  const chips: ReactNode[] = [];
+  1229→
+  1230→  // ─── چیپ عکس چت ───
+  1231→  if (canSendImage && summary.chatPhoto.total > 0) {
+  1232→    const c = summary.chatPhoto;
+  1233→    chips.push(
+  1234→      <QuotaChip
+  1235→        key="chat_photo"
+  1236→        icon={<ImageIcon className="w-3.5 h-3.5 text-orange-500" />}
+  1237→        label="عکس"
+  1238→        value={`${toPersianDigits(c.used)}/${toPersianDigits(c.total)}`}
+  1239→        dailyValue={
+  1240→          c.dailyTotal > 0
+  1241→            ? `روزانه ${toPersianDigits(c.dailyUsed)}/${toPersianDigits(c.dailyTotal)}`
+  1242→            : undefined
+  1243→        }
+  1244→        pct={c.total > 0 ? (c.used / c.total) * 100 : 0}
+  1245→        tone="orange"
+  1246→        tip={`${toPersianDigits(c.baseTotal)} عکس در دوره + حداکثر ${toPersianDigits(c.dailyTotal)} در روز${
+  1247→          c.bonus > 0 ? ` (+${toPersianDigits(c.bonus)} سهمیهٔ هدیه از مدیر)` : ""
+  1248→        }`}
+  1249→        open={openTip === "chat_photo"}
+  1250→        onToggle={() => toggle("chat_photo")}
+  1251→      />
+  1252→    );
+  1253→  }
+  1254→
+  1255→  // ─── چیپ ویدیو حرکات ───
+  1256→  if (canSendVideo && summary.movementVideo.total > 0) {
+  1257→    const v = summary.movementVideo;
+  1258→    const tip =
+  1259→      summary.workoutExerciseCount > 0
+  1260→        ? `بر اساس پلن ${planLabel} جاری شما تا ${toPersianDigits(v.total)} ویدیو (به تعداد حرکات برنامه‌ات)${
+  1261→            v.bonus > 0 ? ` (+${toPersianDigits(v.bonus)} هدیه)` : ""
+  1262→          }`
+  1263→        : `تا ${toPersianDigits(v.total)} ویدیو در این دوره — وقتی برنامهٔ تمرینی فعالی بسازی، سقف به تعداد حرکات برنامه‌ات تغییر می‌کند`;
+  1264→    chips.push(
+  1265→      <QuotaChip
+  1266→        key="movement_video"
+  1267→        icon={<Video className="w-3.5 h-3.5 text-emerald-600" />}
+  1268→        label="ویدیو حرکات"
+  1269→        value={`${toPersianDigits(v.used)}/${toPersianDigits(v.total)}`}
+  1270→        pct={v.total > 0 ? (v.used / v.total) * 100 : 0}
+  1271→        tone="emerald"
+  1272→        tip={tip}
+  1273→        open={openTip === "movement_video"}
+  1274→        onToggle={() => toggle("movement_video")}
+  1275→      />
+  1276→    );
+  1277→  }
+  1278→
+  1279→  // ─── چیپ تحلیل غذا ───
+  1280→  if (canMealPhoto && summary.mealPhoto.total > 0) {
+  1281→    const m = summary.mealPhoto;
+  1282→    chips.push(
+  1283→      <QuotaChip
+  1284→        key="meal_photo"
+  1285→        icon={<Salad className="w-3.5 h-3.5 text-amber-600" />}
+  1286→        label="تحلیل غذا"
+  1287→        value={`${toPersianDigits(m.used)}/${toPersianDigits(m.total)}`}
+  1288→        pct={m.total > 0 ? (m.used / m.total) * 100 : 0}
+  1289→        tone="amber"
+  1290→        tip={`${toPersianDigits(m.baseTotal)} عکس غذا = روزهای پلنت${
+  1291→          m.bonus > 0 ? ` (+${toPersianDigits(m.bonus)} سهمیهٔ هدیه از مدیر)` : ""
+  1292→        }`}
+  1293→        open={openTip === "meal_photo"}
+  1294→        onToggle={() => toggle("meal_photo")}
+  1295→      />
+  1296→    );
+  1297→  }
+  1298→
+  1299→  const hasLockedFeature = !canSendImage || !canSendVideo || !canMealPhoto;
+  1300→  const lockedChip = (
+  1301→    <button
+  1302→      onClick={onUpgrade}
+  1303→      className="flex items-center gap-1.5 rounded-xl border border-dashed border-orange-200 bg-white/60 px-2.5 py-2 text-[10px] font-bold text-slate-400 hover:bg-orange-50 hover:text-orange-500 transition shrink-0"
+  1304→      title="ارتقای پلن"
+  1305→    >
+  1306→      <Lock className="w-3 h-3" />
+  1307→      با ارتقای پلن فعال می‌شود
+  1308→    </button>
+  1309→  );
+  1310→
+  1311→  if (chips.length === 0) {
+  1312→    // هیچ قابلیتی برای پلن فعلی باز نیست — فقط چیپ قفل
+  1313→    return (
+  1314→      <div className="shrink-0 px-3 pt-2">
+  1315→        <div className="flex justify-center rounded-2xl border border-orange-100/70 bg-white/60 backdrop-blur-md px-2 py-1.5">
+  1316→          {lockedChip}
+  1317→        </div>
+  1318→      </div>
+  1319→    );
+  1320→  }
+  1321→
+  1322→  return (
+  1323→    <div className="shrink-0 px-3 pt-2">
+  1324→      <div className="flex items-center gap-2 rounded-2xl border border-orange-100/80 bg-white/70 backdrop-blur-md px-2 py-1.5 overflow-x-auto custom-scrollbar">
+  1325→        {chips}
+  1326→        {hasLockedFeature && lockedChip}
+  1327→      </div>
+  1328→    </div>
+  1329→  );
+  1330→}
+  1331→
+  1332→/**
+  1333→ * v57 — حباب اختصاصی «پیشنهاد دستیار تغذیه» — بعد از اولین تحلیل عکس غذا در
+  1334→ * چت یک‌بار نمایش داده می‌شود. درخواست مالک: «درسته براش تحلیل بکن ولی بهش
+  1335→ * پیشنهاد بده که از این به بعد از صفحهٔ دستیار تغذیه تحلیل عکس غذا استفاده
+  1336→ * کنه که در تاریخچهٔ غذایی که خورده ثبت بشه.»
+  1337→ * استایل هم‌خانوادهٔMealPlanView (سبز زمردی) تا با برند تغذیه یکدست باشد.
+  1338→ */
+  1339→function FoodAssistantTipBubble() {
+  1340→  return (
+  1341→    <motion.div
+  1342→      initial={{ opacity: 0, y: 10 }}
+  1343→      animate={{ opacity: 1, y: 0 }}
+  1344→      className="flex justify-end"
+  1345→    >
+  1346→      <div className="max-w-[85%] sm:max-w-[75%] flex flex-col items-end">
+  1347→        <div className="flex items-center gap-1.5 mb-1">
+  1348→          <div className="w-6 h-6 rounded-full flex items-center justify-center shadow-sm bg-gradient-to-br from-amber-500 to-orange-600 overflow-hidden">
+  1349→            {/* eslint-disable-next-line @next/next/no-img-element */}
+  1350→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+  1351→          </div>
+  1352→          <span className="text-[10px] text-orange-600 font-medium">فیتاپ</span>
+  1353→        </div>
+  1354→
+  1355→        <div
+  1356→          className="rounded-2xl rounded-br-md overflow-hidden shadow-sm border-2"
+  1357→          style={{ borderColor: "#a7f3d0", background: "#fff" }}
+  1358→        >
+  1359→          <div
+  1360→            className="px-4 py-3 text-white flex items-center gap-2"
+  1361→            style={{ background: "linear-gradient(135deg, #10b981, #059669)" }}
+  1362→          >
+  1363→            <UtensilsCrossed className="w-4 h-4 shrink-0" aria-hidden="true" />
+  1364→            <p className="text-xs font-black">نکتهٔ تحلیل غذا 🍽</p>
+  1365→          </div>
+  1366→          <div className="px-4 py-3">
+  1367→            <p className="text-xs leading-6 text-slate-600">
+  1368→              تحلیل این عکس انجام شد، ولی تحلیل‌های چت در{" "}
+  1369→              <b className="text-slate-800">تاریخچهٔ غذایی</b> ثبت نمی‌شوند.
+  1370→              از این به بعد عکس غذات رو از{" "}
+  1371→              <b className="text-emerald-600">دستیار تغذیه</b> تحلیل کن تا
+  1372→              کالری‌ش خودکار در تاریخچه ثبت بشه و برنامه‌ات دقیق‌تر پیگیری بشه.
+  1373→            </p>
+  1374→            <Button
+  1375→              onClick={() => useAppStore.getState().setMainTab("nutrition")}
+  1376→              className="w-full mt-3 rounded-xl h-9 text-xs font-bold text-white"
+  1377→              style={{ background: "linear-gradient(135deg, #10b981, #059669)" }}
+  1378→            >
+  1379→              <UtensilsCrossed className="w-3.5 h-3.5 ml-1" aria-hidden="true" />
+  1380→              رفتن به دستیار تغذیه
+  1381→            </Button>
+  1382→          </div>
+  1383→        </div>
+  1384→
+  1385→        <div className="text-[10px] text-slate-400 mt-1 text-right">همین حالا</div>
+  1386→      </div>
+  1387→    </motion.div>
+  1388→  );
+  1389→}
+  1390→
+  1391→function CoachBubble({ message }: { message: ChatMessageDto }) {
+  1392→  const isUser = message.role === "user";
+  1393→  const time = formatTime(message.createdAt);
+  1394→  // ─── v73.4 — placeholder pending: پیام assistant با محتوای خالی یعنی تحلیل
+  1395→  // مدیا هنوز در پس‌زمینهٔ سرور در جریان است → حباب اسپینر نشان بده ───
+  1396→  const isPendingAssistant =
+  1397→    !isUser && message.id !== FOOD_TIP_MESSAGE_ID && message.content === "";
+  1398→  // ─── v73.4 — پروتکل APPLY_SWAP: خط انتهایی directive → دکمهٔ اعمال ───
+  1399→  // پیام‌های قدیمی (تاریخچه) هم همین پارس را می‌گیرند.
+  1400→  const swap = isPendingAssistant ? null : isUser ? null : parseApplySwapDirective(message.content);
+  1401→  const bubbleText = swap ? swap.remainder : message.content;
+  1402→
+  1403→  return (
+  1404→    <motion.div
+  1405→      initial={{ opacity: 0, y: 10 }}
+  1406→      animate={{ opacity: 1, y: 0 }}
+  1407→      className={`flex ${isUser ? "justify-start" : "justify-end"}`}
+  1408→    >
+  1409→      <div
+  1410→        className={`max-w-[85%] sm:max-w-[75%] flex flex-col ${
+  1411→          isUser ? "items-start" : "items-end"
+  1412→        }`}
+  1413→      >
+  1414→        {!isUser && (
+  1415→          <div className="flex items-center gap-1.5 mb-1">
+  1416→            <div className="w-6 h-6 rounded-full flex items-center justify-center shadow-sm bg-gradient-to-br from-amber-500 to-orange-600 overflow-hidden">
+  1417→              {/* eslint-disable-next-line @next/next/no-img-element */}
+  1418→              <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+  1419→            </div>
+  1420→            <span className="text-[10px] text-orange-600 font-medium">
+  1421→              فیتاپ
+  1422→            </span>
+  1423→          </div>
+  1424→        )}
+  1425→
+  1426→        {/* نمایش مدیا در بالای متن پیام کاربر */}
+  1427→        {isUser && message.mediaUrl && (
+  1428→          <div className="mb-1.5">
+  1429→            {message.mediaType === "image" ? (
+  1430→              <img
+  1431→                src={message.mediaUrl}
+  1432→                alt="عکس ارسالی"
+  1433→                className="max-w-[220px] max-h-[220px] w-auto h-auto object-cover rounded-2xl border-2 border-orange-200 shadow-sm"
+  1434→              />
+  1435→            ) : message.mediaType === "video" ? (
+  1436→              /* فیکس v45 (درخواست مالک): خودِ ویدیو + دکمهٔ پلی روی آن —
+  1437→                 قبلاً video بدون preload بود که فقط جعبهٔ خالی + دکمهٔ کوچک نشان می‌داد */
+  1438→              <InlineVideoPreview
+  1439→                src={message.mediaUrl}
+  1440→                className="w-fit max-w-[240px]"
+  1441→                videoClassName="max-w-[240px] max-h-[260px] w-auto h-auto object-cover rounded-2xl border-2 border-orange-200 shadow-sm"
+  1442→              />
+  1443→            ) : null}
+  1444→          </div>
+  1445→        )}
+  1446→
+  1447→        {(bubbleText || isUser || isPendingAssistant) && (
+  1448→          <div
+  1449→            className={
+  1450→              isUser
+  1451→                ? "bg-gradient-to-br from-amber-500 to-orange-600 text-white rounded-2xl rounded-bl-md px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap shadow-md"
+  1452→                : "bg-white border border-orange-100 rounded-2xl rounded-br-md px-4 py-2.5 text-sm leading-relaxed text-slate-700 shadow-sm"
+  1453→            }
+  1454→          >
+  1455→            {isUser ? (
+  1456→              message.content
+  1457→            ) : isPendingAssistant ? (
+  1458→              /* v73.4 — اسپینر «در حال تحلیل و پاسخ…» تا تکمیل تحلیل پس‌زمینه */
+  1459→              <div className="flex items-center gap-2 py-0.5">
+  1460→                <Loader2 className="w-4 h-4 animate-spin text-orange-500 shrink-0" />
+  1461→                <span className="text-xs text-slate-500 font-medium">
+  1462→                  در حال تحلیل و پاسخ…
+  1463→                </span>
+  1464→              </div>
+  1465→            ) : (
+  1466→              // ─── رندر markdown برای پیام‌های فیتاپ ───
+  1467→              // جدول‌ها، هدرها، لیست‌ها و... به‌صورت مرتب نمایش داده می‌شوند.
+  1468→              // نکته: در react-markdown v10، override کردن h1/img/a می‌تواند
+  1469→              // parsing جدول‌ها را خراب کند — این‌ها را override نمی‌کنیم.
+  1470→              <div className="prose-chat-fa">
+  1471→                <ReactMarkdown
+  1472→                  remarkPlugins={[remarkGfm]}
+  1473→                  components={{
+  1474→                    // جدول‌ها در یک wrapper اسکرول‌پذیر قرار می‌گیرند
+  1475→                    // استایل واقعی روی CSS .prose-chat-fa table است
+  1476→                    table: ({ node, ...p }) => (
+  1477→                      <div className="fitup-table-wrapper" style={{ margin: "0.5rem 0", overflowX: "auto" }}>
+  1478→                        <table {...p} />
+  1479→                      </div>
+  1480→                    ),
+  1481→                    // بقیه المان‌ها توسط CSS .prose-chat-fa استایل می‌گیرند
+  1482→                    // نیازی به inline style نیست — CSS کامل است
+  1483→                  }}
+  1484→                >
+  1485→                  {bubbleText}
+  1486→                </ReactMarkdown>
+  1487→              </div>
+  1488→            )}
+  1489→          </div>
+  1490→        )}
+  1491→
+  1492→        {/* v73.4 — دکمهٔ اعمال جایگزینی (پروتکل APPLY_SWAP) */}
+  1493→        {swap && <ApplySwapButton swap={swap} />}
+  1494→
+  1495→        {time && (
+  1496→          <div
+  1497→            className={`text-[10px] text-slate-400 mt-1 ${
+  1498→              isUser ? "text-left" : "text-right"
+  1499→            }`}
+  1500→          >
+  1501→            {time}
+  1502→          </div>
+  1503→        )}
+  1504→      </div>
+  1505→    </motion.div>
+  1506→  );
+  1507→}
+  1508→
+  1509→// ═══════════════════════════════════════════════════════════════
+  1510→//  v73.4 — دکمهٔ اعمال جایگزینی (پروتکل APPLY_SWAP — توافق با همکار)
+  1511→//  کلیک → POST /api/coach/apply-swap → توست موفق + refresh برنامه‌ها در store
+  1512→//  → دکمهٔ تیک‌خورده/غیرفعال. توست خطا هم دارد (با امکان تلاش مجدد).
+  1513→// ═══════════════════════════════════════════════════════════════
+  1514→
+  1515→function ApplySwapButton({ swap }: { swap: ParsedApplySwap }) {
+  1516→  const [state, setState] = useState<"idle" | "applying" | "done">("idle");
+  1517→
+  1518→  async function handleApply() {
+  1519→    if (state !== "idle") return;
+  1520→    setState("applying");
+  1521→    try {
+  1522→      const data = await fetchJsonOrThrow<{ applied?: number; message?: string }>(
+  1523→        "/api/coach/apply-swap",
+  1524→        {
+  1525→          method: "POST",
+  1526→          headers: { "Content-Type": "application/json" },
+  1527→          body: JSON.stringify({
+  1528→            type: swap.type,
+  1529→            from: swap.from,
+  1530→            to: swap.to,
+  1531→            day: swap.day,
+  1532→          }),
+  1533→        },
+  1534→        "خطا در اعمال جایگزینی"
+  1535→      );
+  1536→      const applied = typeof data.applied === "number" ? data.applied : 0;
+  1537→      // دکمه در هر حالت ۲xx تیک می‌خورد — تلاش دوباره بی‌معنی است
+  1538→      setState("done");
+  1539→      if (applied > 0) {
+  1540→        toast.success("جایگزینی در برنامهٔ تو اعمال شد ✅");
+  1541→        // refresh برنامه‌ها (fetchJson /api/coach/plan) + به‌روزرسانی store —
+  1542→        // داشبورد/تمرین/تغذیه بلافاصله برنامهٔ جدید را نشان می‌دهند
+  1543→        try {
+  1544→          const { res, data: planData } = await fetchJson<{
+  1545→            workout?: unknown;
+  1546→            meal?: unknown;
+  1547→          }>("/api/coach/plan", { cache: "no-store" });
+  1548→          if (res.ok) {
+  1549→            const st = useAppStore.getState();
+  1550→            if (planData.workout) {
+  1551→              st.setWorkoutPlan(planData.workout as WorkoutPlanContent);
+  1552→            }
+  1553→            if (planData.meal) {
+  1554→              st.setMealPlan(planData.meal as MealPlanContent);
+  1555→            }
+  1556→          }
+  1557→        } catch {
+  1558→          // refresh پلن‌ها حیاتی نیست — خودِ viewها در چرخهٔ بعدی تازه می‌کنند
+  1559→        }
+  1560→      } else {
+  1561→        toast.info(
+  1562→          data.message ||
+  1563→            "این مورد در برنامهٔ فعلیت پیدا نشد — شاید قبلاً جایگزین شده باشد."
+  1564→        );
+  1565→      }
+  1566→    } catch (e) {
+  1567→      setState("idle"); // اجازهٔ تلاش مجدد
+  1568→      toast.error(e instanceof Error ? e.message : "خطا در اعمال جایگزینی");
+  1569→    }
+  1570→  }
+  1571→
+  1572→  if (state === "done") {
+  1573→    return (
+  1574→      <div
+  1575→        className="mt-1.5 inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-bold"
+  1576→        role="status"
+  1577→      >
+  1578→        <Check className="w-3.5 h-3.5" aria-hidden="true" />
+  1579→        اعمال شد
+  1580→      </div>
+  1581→    );
+  1582→  }
+  1583→
+  1584→  return (
+  1585→    <button
+  1586→      onClick={handleApply}
+  1587→      disabled={state === "applying"}
+  1588→      className="mt-1.5 inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-white text-xs font-bold shadow-md transition hover:scale-[1.02] active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed bg-gradient-to-br from-amber-500 to-orange-600"
+  1589→      aria-label="اعمال این جایگزینی در برنامهٔ من"
+  1590→    >
+  1591→      {state === "applying" ? (
+  1592→        <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+  1593→      ) : (
+  1594→        <Check className="w-3.5 h-3.5" aria-hidden="true" />
+  1595→      )}
+  1596→      اعمال این جایگزینی در برنامهٔ من
+  1597→    </button>
+  1598→  );
+  1599→}
+  1600→
+  1601→function CoachTyping() {
+  1602→  return (
+  1603→    <motion.div
+  1604→      initial={{ opacity: 0 }}
+  1605→      animate={{ opacity: 1 }}
+  1606→      className="flex justify-end"
+  1607→    >
+  1608→      <div className="flex flex-col items-end">
+  1609→        <div className="flex items-center gap-1.5 mb-1">
+  1610→          <div className="w-6 h-6 rounded-full flex items-center justify-center shadow-sm bg-gradient-to-br from-amber-500 to-orange-600 overflow-hidden">
+  1611→            {/* eslint-disable-next-line @next/next/no-img-element */}
+  1612→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+  1613→          </div>
+  1614→          <span className="text-[10px] text-orange-600 font-medium">
+  1615→            فیتاپ
+  1616→          </span>
+  1617→        </div>
+  1618→        <div className="flex items-center gap-1.5 px-4 py-3 bg-white border border-orange-100 rounded-2xl rounded-br-md shadow-sm">
+  1619→          <span
+  1620→            className="w-2 h-2 rounded-full bg-orange-400 animate-bounce"
+  1621→            style={{ animationDelay: "0ms" }}
+  1622→          />
+  1623→          <span
+  1624→            className="w-2 h-2 rounded-full bg-orange-400 animate-bounce"
+  1625→            style={{ animationDelay: "150ms" }}
+  1626→          />
+  1627→          <span
+  1628→            className="w-2 h-2 rounded-full bg-orange-400 animate-bounce"
+  1629→            style={{ animationDelay: "300ms" }}
+  1630→          />
+  1631→        </div>
+  1632→      </div>
+  1633→    </motion.div>
+  1634→  );
+  1635→}
+  1636→

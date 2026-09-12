@@ -1,0 +1,931 @@
+     1→"use client";
+     2→
+     3→import { create } from "zustand";
+     4→import { isAppShellMode } from "./app-bridge";
+     5→import type {
+     6→  OnboardingData,
+     7→  WorkoutPlanContent,
+     8→  MealPlanContent,
+     9→  ChatMessageDto,
+    10→  NotificationDto,
+    11→  Plan,
+    12→} from "./types";
+    13→
+    14→export interface LoggedFood {
+    15→  id: string;
+    16→  name: string;
+    17→  meal: "breakfast" | "lunch" | "dinner" | "snack";
+    18→  calories: number;
+    19→  protein: number;
+    20→  carbs: number;
+    21→  fat: number;
+    22→  loggedAt: string;
+    23→  /** اندازه/تعداد وعده — مثلاً "۱.۵ وعده" یا "۲۰۰ گرم" */
+    24→  servingSize?: string;
+    25→  /** منبع ثبت غذا */
+    26→  source?: "manual" | "library" | "ai_photo";
+    27→  /** اگر از بانک غذاها انتخاب شده */
+    28→  foodLibraryId?: string | null;
+    29→  /** اگر از تحلیل عکس غذا آمده، URL عکس */
+    30→  imageUrl?: string | null;
+    31→}
+    32→
+    33→export interface BodyMeasurements {
+    34→  waist?: number; // دور کمر
+    35→  arm?: number; // دور بازو
+    36→  chest?: number; // دور سینه
+    37→  hip?: number; // دور باسن
+    38→  updatedAt?: string;
+    39→}
+    40→
+    41→export interface ActiveSession {
+    42→  dayId: string;
+    43→  startedAt: string;
+    44→  currentExerciseIdx: number;
+    45→  loggedSets: Record<string, { weight: number; reps: number; done: boolean }[]>;
+    46→}
+    47→
+    48→export interface GymTrack {
+    49→  id: string;
+    50→  name: string;
+    51→  url: string; // object URL from File API
+    52→  duration?: number;
+    53→  artist?: string;
+    54→  blob?: Blob; // raw audio blob for IndexedDB persistence
+    55→}
+    56→
+    57→export type AppScreen =
+    58→  | "loading"
+    59→  | "landing"
+    60→  | "referral-landing"
+    61→  | "auth"
+    62→  | "onboarding"
+    63→  | "analysis"
+    64→  | "main"
+    65→  | "admin"
+    66→  | "blocked"
+    67→  | "tool-tdee"
+    68→  | "tool-exercises"
+    69→  | "tool-foods"
+    70→  | "articles"
+    71→  | "article"
+    72→  | "exercise-detail"
+    73→  | "food-detail"
+    74→  | "terms"
+    75→  | "contact"
+    76→  | "about";
+    77→
+    78→export type MainTab =
+    79→  | "dashboard"
+    80→  | "programs"
+    81→  | "workouts"
+    82→  | "nutrition"
+    83→  | "progress"
+    84→  | "chat"
+    85→  | "plans"
+    86→  | "referral"
+    87→  | "support"
+    88→  | "mobileapp";
+    89→
+    90→interface UserDto {
+    91→  id: string;
+    92→  mobile: string;
+    93→  name: string | null;
+    94→  /** عکس پروفایل (webp ریسایزشده) — null = آیکون پیش‌فرض */
+    95→  avatarUrl?: string | null;
+    96→  role: string;
+    97→  onboardingDone: boolean;
+    98→  hasActiveSubscription: boolean;
+    99→  /** اشتراک pending (advanced/ultimate — پیش‌نیازها تکمیل نشده) */
+   100→  hasPendingSubscription?: boolean;
+   101→  subscriptionEnd: string | null;
+   102→  planName: Plan | null;
+   103→  planExpiresAt: string | null;
+   104→  /** v53: شروع دورهٔ پلن فعال — نوار پیشرفت دوره در داشبورد */
+   105→  planStartedAt?: string | null;
+   106→  // آخرین پلن (حتی منقضی) — برای renewal banner و نمایش وضعیت
+   107→  lastPlanName?: Plan | null;
+   108→  lastPlanExpiresAt?: string | null;
+   109→  walletBalance: number;
+   110→  acceptedTermsVersion: number | null;
+   111→  // === AI usage counters (for plan limit display in blood-test/video-analysis views) ===
+   112→  videoAnalysisUsed?: number;
+   113→  bloodTestUsed?: number;
+   114→  // === Prerequisite decision fields ===
+   115→  videoStatus?: string | null; // null | "uploaded" | "skipped"
+   116→  bloodTestStatus?: string | null; // null | "declined" | "pending_blood_test" | "waiting"
+   117→}
+   118→
+   119→// ═══ Task 3-b: وضعیت «روز کامل» مشترک تمرین + تغذیه (مدال روز) ═══
+   120→// سکشن مشترک حالت باشگاه / جلسهٔ هدایت‌شده / کالری‌شمار — تکمیلِ هر مسیر
+   121→// به‌طور خودکار در مسیر دیگر ثبت می‌شود (DayCompletion سمت سرور).
+   122→export interface DailyStatusState {
+   123→  /** کلید روز تهران (YYYY-MM-DD) که این وضعیت به آن تعلق دارد — null = هنوز لود نشده */
+   124→  date: string | null;
+   125→  workoutDone: boolean;
+   126→  nutritionDone: boolean;
+   127→  /** workoutDone && nutritionDone — شرط نمایش مدال طلایی روز */
+   128→  dayComplete: boolean;
+   129→  /** اولین بار که مدال این روز دیده شد (ISO) — null = هنوز دیده نشده */
+   130→  medalSeenAt: string | null;
+   131→  /** آیا حداقل یک‌بار GET /api/daily-status اجرا شده؟ (موفق یا ناموفق) */
+   132→  loaded: boolean;
+   133→}
+   134→
+   135→export const DEFAULT_DAILY_STATUS: DailyStatusState = {
+   136→  date: null,
+   137→  workoutDone: false,
+   138→  nutritionDone: false,
+   139→  dayComplete: false,
+   140→  medalSeenAt: null,
+   141→  loaded: false,
+   142→};
+   143→
+   144→export type DailyStatusPatch = Partial<Omit<DailyStatusState, "loaded">> & { loaded?: boolean };
+   145→
+   146→interface AppState {
+   147→  // Auth
+   148→  screen: AppScreen;
+   149→  user: UserDto | null;
+   150→  setUser: (u: UserDto | null) => void;
+   151→  setScreen: (s: AppScreen) => void;
+   152→
+   153→  // New-terms modal — set to true when /api/auth/me returns
+   154→  // `termsUpdateRequired: true` (user was logged out due to outdated
+   155→  // TermsVersion). The global NewTermsModal renders on top of whatever
+   156→  // screen the user is on; on accept it clears this flag and navigates
+   157→  // to the auth screen for OTP.
+   158→  termsUpdateRequired: boolean;
+   159→  setTermsUpdateRequired: (v: boolean) => void;
+   160→  // Article slug for article detail screen
+   161→  articleSlug: string | null;
+   162→  setArticleSlug: (s: string | null) => void;
+   163→  // Exercise ID for SEO exercise detail screen
+   164→  exerciseId: string | null;
+   165→  setExerciseId: (s: string | null) => void;
+   166→  // Food ID for SEO food detail screen
+   167→  foodId: string | null;
+   168→  setFoodId: (s: string | null) => void;
+   169→
+   170→  // Main tab
+   171→  mainTab: MainTab;
+   172→  setMainTab: (t: MainTab) => void;
+   173→
+   174→  // Chat mode: "coach" (پیش‌فرض — چت مربی هوشمند) vs "nika" (فروش/پشتیبانی).
+   175→  // پیش‌فرض coach است تا تب «چت با فیتاپ» مربی را نشان دهد؛ دکمه «رفتن به چت نیکا"
+   176→  // در smart-coach-chat-view این مقدار را به nika تغییر می‌دهد و ChatView نیکا را رندر می‌کند.
+   177→  chatMode: "nika" | "coach";
+   178→  setChatMode: (m: "nika" | "coach") => void;
+   179→  nikaMessages: ChatMessageDto[];
+   180→  setNikaMessages: (m: ChatMessageDto[]) => void;
+   181→  addNikaMessage: (m: ChatMessageDto) => void;
+   182→
+   183→  // Daily tracking (persisted in-memory across tab switches)
+   184→  waterMl: number; // آب مصرفی امروز به سی‌سی
+   185→  addWater: (ml: number) => void;
+   186→  caloriesConsumed: number;
+   187→  caloriesBurned: number;
+   188→  setCaloriesConsumed: (n: number) => void;
+   189→  setCaloriesBurned: (n: number) => void;
+   190→  loggedFoods: LoggedFood[];
+   191→  addLoggedFood: (f: LoggedFood) => void;
+   192→  removeLoggedFood: (id: string) => void;
+   193→  /** بارگذاری غذاهای ثبت‌شده «امروز» از سرور و جایگزینی state محلی */
+   194→  loadTodayFoodLogs: () => Promise<void>;
+   195→  bodyMeasurements: BodyMeasurements;
+   196→  setBodyMeasurements: (m: BodyMeasurements) => void;
+   197→
+   198→  // ─── Task 3-b: وضعیت «روز کامل» (مدال مشترک تمرین/تغذیه) ───
+   199→  dailyStatus: DailyStatusState;
+   200→  /** GET /api/daily-status — یک‌بار در mount سکشن‌ها؛ خطا بی‌صدا → loaded:true با پیش‌فرض‌ها */
+   201→  loadDailyStatus: () => Promise<void>;
+   202→  /** ادغام پاسخ POST /api/daily-status در state — بدون invalidate شدن بقیهٔ فیلدها */
+   203→  applyDailyStatusUpdate: (patch: DailyStatusPatch) => void;
+   204→
+   205→  // Active workout session
+   206→  activeSession: ActiveSession | null;
+   207→  startSession: (dayId: string) => void;
+   208→  endSession: () => void;
+   209→  logSet: (exerciseId: string, setNumber: number, weight: number, reps: number) => void;
+   210→
+   211→  /**
+   212→   * آخرین وزن شناخته‌شده کاربر (کیلوگرم) — از داده‌های موجود (progress/checkup)
+   213→   * پر می‌شود تا تخمین کالری سوزانده به‌جای وزن هاردکد ۷۵ کیلو از این استفاده کند.
+   214→   * null = هنوز داده‌ای نداریم → fallback 75.
+   215→   */
+   216→  lastKnownWeightKg: number | null;
+   217→  setLastKnownWeightKg: (kg: number | null) => void;
+   218→
+   219→  // Overlay views (rendered on top of main)
+   220→  overlay:
+   221→    | null
+   222→    | "notifications"
+   223→    | "profile"
+   224→    | "subscription"
+   225→    | "nutrition"
+   226→    | "admin"
+   227→    | "workoutDetail"
+   228→    | "exerciseDetail"
+   229→    | "gymMode"
+   230→    | "videoAnalysis"
+   231→    | "bloodTest"
+   232→    | "survey"
+   233→    | "renewal";
+   234→  setOverlay: (o: AppState["overlay"]) => void;
+   235→  exerciseDetailId: string | null;
+   236→  setExerciseDetailId: (id: string | null) => void;
+   237→
+   238→  // Body analysis upload modal — global flag so any view (programs-view,
+   239→  // dashboard-view, body-analysis-banner) can request opening the upload modal
+   240→  // even though the modal itself is rendered inside <BodyAnalysisBanner />.
+   241→  // When set to true, BodyAnalysisBanner will open its modal on next render.
+   242→  bodyAnalysisOpen: boolean;
+   243→  setBodyAnalysisOpen: (v: boolean) => void;
+   244→
+   245→  // Gym Mode music playlist (in-memory)
+   246→  gymPlaylist: GymTrack[];
+   247→  setGymPlaylist: (tracks: GymTrack[]) => void;
+   248→
+   249→  // Data
+   250→  workoutPlan: WorkoutPlanContent | null;
+   251→  setWorkoutPlan: (p: WorkoutPlanContent | null) => void;
+   252→
+   253→  mealPlan: MealPlanContent | null;
+   254→  setMealPlan: (p: MealPlanContent | null) => void;
+   255→
+   256→  chatMessages: ChatMessageDto[];
+   257→  // v73.4 — functional-friendly (هم‌خوان با setNotifications): هم آرایهٔ کامل هم
+   258→  // updater تابعی می‌پذیرد — فیکس باگ کلوژر «پیام یک‌بار ارسال، دوبار نمایش» چت
+   259→  setChatMessages: (
+   260→    m: ChatMessageDto[] | ((prev: ChatMessageDto[]) => ChatMessageDto[])
+   261→  ) => void;
+   262→  addChatMessage: (m: ChatMessageDto) => void;
+   263→
+   264→  notifications: NotificationDto[];
+   265→  setNotifications: (n: NotificationDto[] | ((prev: NotificationDto[]) => NotificationDto[])) => void;
+   266→  unreadCount: number;
+   267→
+   268→  // Plan generation loading
+   269→  generatingPlan: boolean;
+   270→  setGeneratingPlan: (v: boolean) => void;
+   271→
+   272→  // ─── ضد فلیکر رفرش: آیا پلن‌ها حداقل یک‌بار از سرور لود شده‌اند؟ ───
+   273→  // تا false بودن این فلگ، داشبورد به‌جای حالت اشتباه «بی‌پلن» اسکلت نشان می‌دهد.
+   274→  // با اولین پایان loadPlans (موفق یا ناموفق) true می‌شود.
+   275→  plansLoaded: boolean;
+   276→  setPlansLoaded: (v: boolean) => void;
+   277→
+   278→  // Onboarding draft
+   279→  onboardingDraft: Partial<OnboardingData>;
+   280→  setOnboardingDraft: (d: Partial<OnboardingData>) => void;
+   281→
+   282→  // Plan that user selected on landing — persisted across auth+onboarding so we can guide them to buy it after analysis
+   283→  pendingPlanId: string | null;
+   284→  setPendingPlanId: (id: string | null) => void;
+   285→
+   286→  // Reset
+   287→  reset: () => void;
+   288→
+   289→  /**
+   290→   * 🩹 v45: شمارندهٔ session — هر reset (خروج/تعویض کاربر) یکی اضافه می‌شود؛
+   291→   * فراخوانی‌های async که قبل از خروج شروع شده‌اند، بعد از await با مقایسهٔ
+   292→   * epoch جلوی setUser کهنه (کاربر شبح) را می‌گیرند — ریشهٔ باگ
+   293→   * «بعد از خروج دکمهٔ شروع تا رفرش کار نمی‌کند».
+   294→   */
+   295→  sessionEpoch: number;
+   296→}
+   297→
+   298→// ═══ ردیابی نوشته‌های در-پرواز /api/nutrition/log (مهار رقابت‌های خوش‌بینانه) ═══
+   299→//  ۱) GET زمان mount با POST در-پرواز: جایگزینی کل لیست، ورودی تازه‌اضافه‌شده
+   300→//     را پاک می‌کرد (غذا بدون reload ناپدید می‌شد) → تا settle شدن نوشته‌ها
+   301→//     جایگزینی نمی‌کنیم و بعد از آن دوباره fetch می‌کنیم (loadTodayFoodLogs).
+   302→//  ۲) حذفِ آیتمی که POST آن هنوز برنگشته: DELETE سمت سرور skip می‌شد و ردیف
+   303→//     به‌صورت «شبح» در بارگذاری بعدی برمی‌گشت → DELETE را بعد از resolve شدن
+   304→//     POST با id واقعی سرور اجرا می‌کنیم (addLoggedFood).
+   305→const pendingFoodWrites = new Set<Promise<void>>();
+   306→// tempIdهایی (food_*) که قبل از resolve شدن POST حذف شده‌اند (DELETE معلق)
+   307→const deletedFoodTemps = new Set<string>();
+   308→
+   309→export const useAppStore = create<AppState>((set, get) => ({
+   310→  // همیشه "loading" شروع می‌شود تا server و client هماهنگ باشند (جلوگیری از hydration mismatch).
+   311→  // URL parsing در useEffect مربوط به page-client انجام می‌شود (applyUrlToScreen).
+   312→  // این الگو مطابق مستندات Next.js برای hydration-safe state است.
+   313→  screen: "loading",
+   314→  // 🩹 v45: شمارندهٔ session برای باطل‌کردن پاسخ‌های async بعد از خروج
+   315→  sessionEpoch: 0,
+   316→  user: null,
+   317→  setUser: (u) => set({ user: u }),
+   318→
+   319→  setScreen: (s) => set({ screen: s }),
+   320→
+   321→  // New-terms modal flag
+   322→  termsUpdateRequired: false,
+   323→  setTermsUpdateRequired: (v) => set({ termsUpdateRequired: v }),
+   324→  articleSlug: null,
+   325→  setArticleSlug: (s) => set({ articleSlug: s }),
+   326→  exerciseId: null,
+   327→  setExerciseId: (s) => set({ exerciseId: s }),
+   328→  foodId: null,
+   329→  setFoodId: (s) => set({ foodId: s }),
+   330→
+   331→  mainTab: "dashboard",
+   332→  setMainTab: (t) => set({ mainTab: t }),
+   333→
+   334→  chatMode: "coach",
+   335→  setChatMode: (m) => set({ chatMode: m }),
+   336→  nikaMessages: [],
+   337→  setNikaMessages: (m) => set({ nikaMessages: m }),
+   338→  addNikaMessage: (m) => set((s) => ({ nikaMessages: [...s.nikaMessages, m] })),
+   339→
+   340→  // Daily tracking defaults
+   341→  waterMl: 0,
+   342→  addWater: (ml) => set((s) => ({ waterMl: Math.max(0, Math.min(5000, s.waterMl + ml)) })),
+   343→  caloriesConsumed: 0,
+   344→  caloriesBurned: 0,
+   345→  setCaloriesConsumed: (n) => set({ caloriesConsumed: Math.max(0, n) }),
+   346→  setCaloriesBurned: (n) => set({ caloriesBurned: Math.max(0, n) }),
+   347→  loggedFoods: [],
+   348→  addLoggedFood: (f) => {
+   349→    const tempId = f.id;
+   350→    // به‌روزرسانی خوش‌بینانه‌ی محلی (UI فوراً واکنش نشان می‌دهد)
+   351→    set((s) => ({
+   352→      loggedFoods: [...s.loggedFoods, f],
+   353→      caloriesConsumed: s.caloriesConsumed + f.calories,
+   354→    }));
+   355→    // ذخیره در سرور (background, non-blocking) با keepalive برای ادامه در پس‌زمینه
+   356→    const write = (async () => {
+   357→      try {
+   358→        const r = await fetch("/api/nutrition/log", {
+   359→          method: "POST",
+   360→          headers: { "Content-Type": "application/json" },
+   361→          body: JSON.stringify({
+   362→            name: f.name,
+   363→            meal: f.meal,
+   364→            calories: f.calories,
+   365→            protein: f.protein,
+   366→            carbs: f.carbs,
+   367→            fat: f.fat,
+   368→            servingSize: f.servingSize ?? "۱ وعده",
+   369→            source: f.source ?? "manual",
+   370→            foodLibraryId: f.foodLibraryId ?? null,
+   371→            imageUrl: f.imageUrl ?? null,
+   372→          }),
+   373→          keepalive: true,
+   374→        });
+   375→        if (!r.ok) {
+   376→          // ردیفی در سرور ساخته نشده — DELETE معلق (اگر بود) لازم نیست
+   377→          deletedFoodTemps.delete(tempId);
+   378→          return;
+   379→        }
+   380→        const data = await r.json().catch(() => null);
+   381→        // جایگزینی id موقت با id سرور (تا حذف بعدی درست کار کند)
+   382→        if (data?.food?.id && data.food.id !== tempId) {
+   383→          const serverId = data.food.id as string;
+   384→          set((s) => ({
+   385→            loggedFoods: s.loggedFoods.map((x) =>
+   386→              x.id === tempId ? { ...x, id: serverId } : x
+   387→            ),
+   388→          }));
+   389→          // کاربر همین‌حین (قبل از resolve شدن POST) حذف کرده بود → DELETE
+   390→          // معلق را با id واقعی سرور اجرا کن تا ردیف شبح برنگردد
+   391→          if (deletedFoodTemps.has(tempId)) {
+   392→            deletedFoodTemps.delete(tempId);
+   393→            const del = (async () => {
+   394→              try {
+   395→                await fetch(`/api/nutrition/log/${serverId}`, { method: "DELETE", keepalive: true });
+   396→              } catch {}
+   397→            })();
+   398→            pendingFoodWrites.add(del);
+   399→            void del.finally(() => pendingFoodWrites.delete(del));
+   400→          }
+   401→        }
+   402→      } catch {
+   403→        // سکوت — state محلی حفظ می‌شود تا کاربر داده را از دست ندهد
+   404→        // در بارگذاری بعدی صفحه، با سرور reconcile می‌شود
+   405→        deletedFoodTemps.delete(tempId);
+   406→      }
+   407→    })();
+   408→    pendingFoodWrites.add(write);
+   409→    void write.finally(() => pendingFoodWrites.delete(write));
+   410→  },
+   411→  removeLoggedFood: (id) => {
+   412→    set((s) => {
+   413→      const food = s.loggedFoods.find((x) => x.id === id);
+   414→      return {
+   415→        loggedFoods: s.loggedFoods.filter((x) => x.id !== id),
+   416→        caloriesConsumed: Math.max(0, s.caloriesConsumed - (food?.calories ?? 0)),
+   417→      };
+   418→    });
+   419→    // حذف از سرور فقط اگر id موقت نباشد (id موقت با "food_" شروع می‌شود)
+   420→    if (id.startsWith("food_")) {
+   421→      // POST این آیتم هنوز resolve نشده — DELETE فعلاً ممکن نیست؛ علامت می‌زنیم
+   422→      // تا بعد از resolve شدن POST با id واقعی سرور حذف شود (addLoggedFood)
+   423→      deletedFoodTemps.add(id);
+   424→      return;
+   425→    }
+   426→    const del = (async () => {
+   427→      try {
+   428→        await fetch(`/api/nutrition/log/${id}`, { method: "DELETE", keepalive: true });
+   429→      } catch {}
+   430→    })();
+   431→    pendingFoodWrites.add(del);
+   432→    void del.finally(() => pendingFoodWrites.delete(del));
+   433→  },
+   434→  loadTodayFoodLogs: async () => {
+   435→    try {
+   436→      // اگر نوشته‌ای (POST ثبت یا DELETE) هنوز در پرواز است، جایگزینی کل لیست
+   437→      // می‌تواند ورودی خوش‌بینانه را پاک کند یا ردیف حذف‌شده را برگرداند —
+   438→      // این بار جایگزینی نمی‌کنیم؛ بعد از settle شدن نوشته‌ها دوباره fetch می‌کنیم.
+   439→      if (pendingFoodWrites.size > 0) {
+   440→        void Promise.allSettled([...pendingFoodWrites]).then(() => {
+   441→          useAppStore.getState().loadTodayFoodLogs();
+   442→        });
+   443→        return;
+   444→      }
+   445→      const res = await fetch("/api/nutrition/log", { cache: "no-store" });
+   446→      if (!res.ok) return;
+   447→      const data = await res.json();
+   448→      const foods: LoggedFood[] = Array.isArray(data.foods)
+   449→        ? data.foods.map((f: any) => ({
+   450→            id: String(f.id),
+   451→            name: String(f.name),
+   452→            meal: f.meal,
+   453→            calories: Number(f.calories) || 0,
+   454→            protein: Number(f.protein) || 0,
+   455→            carbs: Number(f.carbs) || 0,
+   456→            fat: Number(f.fat) || 0,
+   457→            loggedAt: f.loggedAt || new Date().toISOString(),
+   458→            servingSize: f.servingSize,
+   459→            source: f.source,
+   460→            foodLibraryId: f.foodLibraryId ?? null,
+   461→            imageUrl: f.imageUrl ?? null,
+   462→          }))
+   463→        : [];
+   464→      const total = foods.reduce((sum, f) => sum + f.calories, 0);
+   465→      set({ loggedFoods: foods, caloriesConsumed: total });
+   466→    } catch {
+   467→      // سکوت — خطای شبکه نباید تجربه کاربر را خراب کند
+   468→    }
+   469→  },
+   470→  bodyMeasurements: {},
+   471→  setBodyMeasurements: (m) => set({ bodyMeasurements: { ...m, updatedAt: new Date().toISOString() } }),
+   472→
+   473→  // ─── Task 3-b: وضعیت «روز کامل» (مدال مشترک تمرین/تغذیه) ───
+   474→  dailyStatus: { ...DEFAULT_DAILY_STATUS },
+   475→  loadDailyStatus: async () => {
+   476→    try {
+   477→      const res = await fetch("/api/daily-status", { cache: "no-store" });
+   478→      if (!res.ok) {
+   479→        // حتی در خطا loaded:true تا درخواست‌ها هر رندر تکرار نشوند
+   480→        set({ dailyStatus: { ...get().dailyStatus, loaded: true } });
+   481→        return;
+   482→      }
+   483→      const data = await res.json();
+   484→      set({
+   485→        dailyStatus: {
+   486→          date: typeof data?.date === "string" ? data.date : null,
+   487→          workoutDone: !!data?.workoutDone,
+   488→          nutritionDone: !!data?.nutritionDone,
+   489→          dayComplete: !!data?.dayComplete,
+   490→          medalSeenAt: typeof data?.medalSeenAt === "string" ? data.medalSeenAt : null,
+   491→          loaded: true,
+   492→        },
+   493→      });
+   494→    } catch {
+   495→      // خطای شبکه — سکوت؛ تجربهٔ کاربر خراب نمی‌شود
+   496→      set({ dailyStatus: { ...get().dailyStatus, loaded: true } });
+   497→    }
+   498→  },
+   499→  applyDailyStatusUpdate: (patch) =>
+   500→    set((s) => ({ dailyStatus: { ...s.dailyStatus, ...patch } })),
+   501→
+   502→  // Active workout session
+   503→  activeSession: null,
+   504→  startSession: (dayId) => set({
+   505→    activeSession: {
+   506→      dayId,
+   507→      startedAt: new Date().toISOString(),
+   508→      currentExerciseIdx: 0,
+   509→      loggedSets: {},
+   510→    },
+   511→  }),
+   512→  endSession: () => set({ activeSession: null }),
+   513→  logSet: (exerciseId, setNumber, weight, reps) => set((s) => {
+   514→    if (!s.activeSession) return {};
+   515→    const existing = s.activeSession.loggedSets[exerciseId] || [];
+   516→    const updated = existing.map((entry, i) =>
+   517→      i === setNumber - 1 ? { weight, reps, done: true } : entry
+   518→    );
+   519→    // ensure array length covers setNumber
+   520→    while (updated.length < setNumber) updated.push({ weight: 0, reps: 0, done: false });
+   521→    updated[setNumber - 1] = { weight, reps, done: true };
+   522→    return {
+   523→      activeSession: {
+   524→        ...s.activeSession,
+   525→        loggedSets: { ...s.activeSession.loggedSets, [exerciseId]: updated },
+   526→      },
+   527→    };
+   528→  }),
+   529→
+   530→  // آخرین وزن شناخته‌شده — برای تخمین کالری (جایگزین هاردکد ۷۵kg)
+   531→  lastKnownWeightKg: null,
+   532→  setLastKnownWeightKg: (kg) => set({ lastKnownWeightKg: kg && kg > 20 && kg < 300 ? kg : null }),
+   533→
+   534→  overlay: null,
+   535→  setOverlay: (o) => set({ overlay: o }),
+   536→  exerciseDetailId: null,
+   537→  setExerciseDetailId: (id) => set({ exerciseDetailId: id }),
+   538→
+   539→  // Body analysis upload modal global flag
+   540→  bodyAnalysisOpen: false,
+   541→  setBodyAnalysisOpen: (v) => set({ bodyAnalysisOpen: v }),
+   542→
+   543→  gymPlaylist: [],
+   544→  setGymPlaylist: (tracks) => set({ gymPlaylist: tracks }),
+   545→
+   546→  workoutPlan: null,
+   547→  setWorkoutPlan: (p) => set({ workoutPlan: p }),
+   548→
+   549→  mealPlan: null,
+   550→  setMealPlan: (p) => set({ mealPlan: p }),
+   551→
+   552→  chatMessages: [],
+   553→  // v73.4 — functional-friendly: typeof narrowing اجازهٔ هر دو شکل را می‌دهد
+   554→  setChatMessages: (m) =>
+   555→    set((s) => ({
+   556→      chatMessages: typeof m === "function" ? m(s.chatMessages) : m,
+   557→    })),
+   558→  addChatMessage: (m) => set((s) => ({ chatMessages: [...s.chatMessages, m] })),
+   559→
+   560→  notifications: [],
+   561→  // مقدار اولیه unreadCount — قبلاً در state اولیه نبود (خطای TS2741)
+   562→  unreadCount: 0,
+   563→  setNotifications: (n) =>
+   564→    set((state) => {
+   565→      const arr = typeof n === "function" ? n(state.notifications) : n;
+   566→      return { notifications: arr, unreadCount: arr.filter((x) => !x.read).length };
+   567→    }),
+   568→
+   569→  generatingPlan: false,
+   570→  setGeneratingPlan: (v) => set({ generatingPlan: v }),
+   571→
+   572→  // ضد فلیکر رفرش — فلگ لود شدن پلن‌ها (جزئیات در تعریف interface بالا)
+   573→  plansLoaded: false,
+   574→  setPlansLoaded: (v) => set({ plansLoaded: v }),
+   575→
+   576→  onboardingDraft: {},
+   577→  setOnboardingDraft: (d) =>
+   578→    set((s) => ({ onboardingDraft: { ...s.onboardingDraft, ...d } })),
+   579→
+   580→  pendingPlanId: null,
+   581→  setPendingPlanId: (id) => set({ pendingPlanId: id }),
+   582→
+   583→  reset: () => {
+   584→    // ─── در حالت «برنامه» (اپ نیتیو بازار/اختصاصی یا وب‌اپ iOS) خروج → صفحه OTP ───
+   585→    // درخواست مالک: بعد از خروج از حساب، کاربر به صفحه ورود (OTP) برمی‌گردد،
+   586→    // نه لندینگ — چون کل تجربهٔ اپ حول پنل می‌چرخد و شروع اپ با OTP است.
+   587→    // در مرورگر معمولی رفتار قبلی (لندینگ) حفظ می‌شود.
+   588→    const afterLogoutScreen = isAppShellMode() ? "auth" : "landing";
+   589→    set({
+   590→      // 🩹 v45: باطل‌کردن پاسخ‌های async در-پرواز (setUser/setScreen کهنه)
+   591→      sessionEpoch: (get().sessionEpoch || 0) + 1,
+   592→      screen: afterLogoutScreen,
+   593→      user: null,
+   594→      mainTab: "dashboard",
+   595→      overlay: null,
+   596→      workoutPlan: null,
+   597→      mealPlan: null,
+   598→      chatMessages: [],
+   599→      nikaMessages: [],
+   600→      chatMode: "coach",
+   601→      notifications: [],
+   602→      waterMl: 0,
+   603→      caloriesConsumed: 0,
+   604→      caloriesBurned: 0,
+   605→      loggedFoods: [],
+   606→      activeSession: null,
+   607→      articleSlug: null,
+   608→      exerciseId: null,
+   609→      foodId: null,
+   610→      pendingPlanId: null,
+   611→      termsUpdateRequired: false,
+   612→      bodyAnalysisOpen: false,
+   613→      plansLoaded: false,
+   614→      // Task 3-b: وضعیت روز کامل کاربر جدید نباید از کاربر قبلی بماند
+   615→      dailyStatus: { ...DEFAULT_DAILY_STATUS },
+   616→    });
+   617→    // کش پلن محلی هم پاک شود (خروج = داده پلن دیگر معتبر نیست؛ کاربر بعدی
+   618→    // نباید پلن کاربر قبلی را لحظه‌ای ببیند)
+   619→    clearPlanCache();
+   620→  },
+   621→}));
+   622→
+   623→// ═══════════════════════════════════════════════════════════════
+   624→//  Persist جلسه تمرین فعال در localStorage (FE-H7)
+   625→//  ست‌های ثبت‌شده قبلاً با refresh/endSession از بین می‌رفتند؛
+   626→//  حالا با هر تغییر activeSession (start/logSet/endSession/تغییر حرکت)
+   627→//  در localStorage ذخیره می‌شود و بعد از refresh (تا ۲۴ ساعت) بازیابی می‌گردد.
+   628→// ═══════════════════════════════════════════════════════════════
+   629→const ACTIVE_SESSION_KEY = "fitup_active_session";
+   630→const ACTIVE_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // ۲۴ ساعت
+   631→
+   632→function persistActiveSession(session: ActiveSession | null): void {
+   633→  if (typeof window === "undefined") return;
+   634→  try {
+   635→    if (!session) {
+   636→      window.localStorage.removeItem(ACTIVE_SESSION_KEY);
+   637→    } else {
+   638→      window.localStorage.setItem(
+   639→        ACTIVE_SESSION_KEY,
+   640→        JSON.stringify({ activeSession: session, savedAt: Date.now() })
+   641→      );
+   642→    }
+   643→  } catch {
+   644→    // localStorage پر است یا غیرفعال — بی‌صدا رد شو
+   645→  }
+   646→}
+   647→
+   648→// subscribe همه مسیرهای تغییر activeSession را پوشش می‌دهد
+   649→// (startSession / logSet / endSession / setState مستقیم در active-workout-session)
+   650→// t8c-5: نوشتن با تأخیر trailing ~۵۰۰ms — هر تیک ناوبری/تایپ ست‌ها دیگر
+   651→// localStorage synchronous write نمی‌زند (عامل لگ ناوبری در پلیر).Flush فوری
+   652→// روی pagehide/beforeunload تا بستن تب/اپ وسط تایمر داده گم نکند.
+   653→if (typeof window !== "undefined") {
+   654→  let persistTimer: ReturnType<typeof setTimeout> | null = null;
+   655→
+   656→  const schedulePersistActiveSession = () => {
+   657→    if (persistTimer) clearTimeout(persistTimer);
+   658→    persistTimer = setTimeout(() => {
+   659→      persistTimer = null;
+   660→      persistActiveSession(useAppStore.getState().activeSession);
+   661→    }, 500);
+   662→  };
+   663→
+   664→  const flushActiveSession = () => {
+   665→    if (persistTimer) {
+   666→      clearTimeout(persistTimer);
+   667→      persistTimer = null;
+   668→    }
+   669→    persistActiveSession(useAppStore.getState().activeSession);
+   670→  };
+   671→
+   672→  useAppStore.subscribe((state, prev) => {
+   673→    if (state.activeSession !== prev.activeSession) {
+   674→      schedulePersistActiveSession();
+   675→    }
+   676→  });
+   677→
+   678→  window.addEventListener("pagehide", flushActiveSession);
+   679→  window.addEventListener("beforeunload", flushActiveSession);
+   680→}
+   681→
+   682→/**
+   683→ * بازیابی جلسه تمرین فعال از localStorage — فقط سمت client.
+   684→ * در mount پنل (MainApp) صدا زده می‌شود؛ اگر جلسه‌ای <۲۴ ساعت وجود داشت
+   685→ * و store خالی بود، بازیابی می‌کند تا پیشرفت کاربر با refresh از دست نرود.
+   686→ */
+   687→export function restoreActiveSession(): void {
+   688→  if (typeof window === "undefined") return;
+   689→  try {
+   690→    const raw = window.localStorage.getItem(ACTIVE_SESSION_KEY);
+   691→    if (!raw) return;
+   692→    const parsed = JSON.parse(raw) as {
+   693→      activeSession?: ActiveSession | null;
+   694→      savedAt?: number;
+   695→    };
+   696→    const savedAt = typeof parsed.savedAt === "number" ? parsed.savedAt : 0;
+   697→    const fresh = Date.now() - savedAt < ACTIVE_SESSION_MAX_AGE_MS;
+   698→    if (!parsed.activeSession || !fresh) {
+   699→      window.localStorage.removeItem(ACTIVE_SESSION_KEY);
+   700→      return;
+   701→    }
+   702→    // فقط وقتی store فعلی جلسه‌ای ندارد (که جلسه جدید شروع‌شده را خراب نکند)
+   703→    if (!useAppStore.getState().activeSession) {
+   704→      // ─── اعتبارسنجی جلسه در برابر برنامه فعلی (اگر لود شده باشد) ───
+   705→      // اگر برنامه regenerate شده باشد (روز حذف/حرکات کمتر)، ایندکس یا
+   706→      // روز restore‌شده می‌تواند خارج از محدوده باشد → crash loop رندر.
+   707→      // روز نامعتبر → جلسه پاک؛ ایندکس بزرگ → clamp به آخرین حرکت.
+   708→      // (اگر برنامه هنوز لود نشده، ویو خودش ایندکس را clamp می‌کند)
+   709→      const plan = useAppStore.getState().workoutPlan;
+   710→      let session = parsed.activeSession;
+   711→      if (plan && Array.isArray(plan.days) && plan.days.length > 0) {
+   712→        const day = plan.days.find((d) => d.day === session.dayId);
+   713→        const exCount = day?.exercises?.length ?? 0;
+   714→        if (!day || exCount === 0) {
+   715→          // روز جلسه دیگر در برنامه وجود ندارد — جلسه بی‌اعتبار است
+   716→          window.localStorage.removeItem(ACTIVE_SESSION_KEY);
+   717→          return;
+   718→        }
+   719→        session = {
+   720→          ...session,
+   721→          currentExerciseIdx: Math.min(Math.max(0, session.currentExerciseIdx ?? 0), exCount - 1),
+   722→        };
+   723→      }
+   724→      useAppStore.setState({ activeSession: session });
+   725→    }
+   726→  } catch {
+   727→    // داده خراب — کلید را پاک کن
+   728→    try {
+   729→      window.localStorage.removeItem(ACTIVE_SESSION_KEY);
+   730→    } catch {}
+   731→  }
+   732→}
+   733→
+   734→// ═══════════════════════════════════════════════════════════════
+   735→//  کش پلن در localStorage (ضد فلیکر رفرش)
+   736→//  قبلاً بعد از هر رفرش، workoutPlan/mealPlan تا رسیدن پاسخ
+   737→//  /api/coach/plan خالی می‌ماند و داشبورد لحظه‌ای «بی‌پلن» رندر می‌شد
+   738→//  (فلیکر زشت برای دارندگان پلن — وب و هر دو WebView اندروید).
+   739→//  الگوی همان activeSession: با هر تغییر پلن در store، آخرین وضعیت به‌همراه
+   740→//  userId کاربر ذخیره می‌شود (TTL ۲۴ ساعت)؛ بلافاصله بعد از شناختن کاربر در
+   741→//  MainApp بازیابی می‌گردد تا اولین رندر داشبورد پلن را داشته باشد.
+   742→// ═══════════════════════════════════════════════════════════════
+   743→const PLAN_CACHE_KEY = "fitup_plan_cache_v1";
+   744→const PLAN_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // ۲۴ ساعت
+   745→
+   746→interface PlanCacheEntry {
+   747→  userId: string;
+   748→  workoutPlan: WorkoutPlanContent | null;
+   749→  mealPlan: MealPlanContent | null;
+   750→  savedAt: number;
+   751→}
+   752→
+   753→/**
+   754→ * ذخیره پلن فعلی store برای کاربر جاری.
+   755→ * در loadPlans داشبورد (هر چرخه fetch) و subscribe تغییر پلن صدا زده می‌شود؛
+   756→ * savedAt تازه نوشته می‌شود تا TTL ۲۴ ساعته از سر گرفته شود.
+   757→ */
+   758→export function savePlanCache(): void {
+   759→  if (typeof window === "undefined") return;
+   760→  try {
+   761→    const { user, workoutPlan, mealPlan } = useAppStore.getState();
+   762→    if (!user?.id) return; // کاربر لاگین نیست — چیزی برای ذخیره نیست
+   763→    if (!workoutPlan && !mealPlan) return; // پلنی وجود ندارد (کاربر بی‌پلن کش نمی‌شود)
+   764→    // v48: پلن خراب (بدون days آرایه‌ای) کش نمی‌شود — ضد کرش داشبورد بعد از رفرش
+   765→    if (
+   766→      workoutPlan &&
+   767→      !Array.isArray((workoutPlan as { days?: unknown }).days)
+   768→    ) {
+   769→      return;
+   770→    }
+   771→    // v59: برنامهٔ غذایی ناقص (بدون meals آرایه‌ای) هم کش نمی‌شود
+   772→    if (
+   773→      mealPlan &&
+   774→      !Array.isArray((mealPlan as { meals?: unknown }).meals)
+   775→    ) {
+   776→      return;
+   777→    }
+   778→    const entry: PlanCacheEntry = {
+   779→      userId: user.id,
+   780→      workoutPlan,
+   781→      mealPlan,
+   782→      savedAt: Date.now(),
+   783→    };
+   784→    window.localStorage.setItem(PLAN_CACHE_KEY, JSON.stringify(entry));
+   785→  } catch {
+   786→    // localStorage پر است یا غیرفعال — بی‌صدا رد شو
+   787→  }
+   788→}
+   789→
+   790→/** پاک‌کردن کش پلن — در reset()/خروج از حساب */
+   791→export function clearPlanCache(): void {
+   792→  if (typeof window === "undefined") return;
+   793→  try {
+   794→    window.localStorage.removeItem(PLAN_CACHE_KEY);
+   795→  } catch {}
+   796→}
+   797→
+   798→/**
+   799→ * بازیابی پلن از کش — فقط وقتی userId ذخیره‌شده با کاربر جاری یکی باشد
+   800→ * و TTL ۲۴ ساعته نگذشته باشد. در MainApp بلافاصله بعد از شناختن کاربر
+   801→ * (پاسخ /api/auth/me) صدا زده می‌شود تا اولین رندر داشبورد پلن کش‌شده
+   802→ * را ببیند (بدون فلیکر «بی‌پلن»).
+   803→ */
+   804→export function restorePlanCache(userId: string): void {
+   805→  if (typeof window === "undefined") return;
+   806→  if (!userId) return;
+   807→  try {
+   808→    const raw = window.localStorage.getItem(PLAN_CACHE_KEY);
+   809→    if (!raw) return;
+   810→    const parsed = JSON.parse(raw) as PlanCacheEntry | null;
+   811→    const fresh =
+   812→      !!parsed &&
+   813→      typeof parsed.savedAt === "number" &&
+   814→      Date.now() - parsed.savedAt < PLAN_CACHE_MAX_AGE_MS;
+   815→    if (!parsed || !fresh || parsed.userId !== userId) {
+   816→      // کش مال کاربر دیگری است یا منقضی شده — پاکش کن
+   817→      window.localStorage.removeItem(PLAN_CACHE_KEY);
+   818→      return;
+   819→    }
+   820→    // فقط فیلدهای خالی store پر می‌شوند — داده تازه‌ترِ fetch جاری بازنویسی نشود
+   821→    // v48: اعتبارسنجی شکل داده — پلن کش‌شدهٔ خراب (بدون days آرایه‌ای) هرگز
+   822→    // بازیابی نمی‌شود (ریشهٔ کرش «Cannot read properties of undefined (find)»
+   823→    // در داشبورد وقتی محتوای ناقص از کش می‌آید).
+   824→    const st = useAppStore.getState();
+   825→    // v59 — اعتبارسنجی عمیق‌تر (ممیزی کرش فقط-برخی-دستگاه‌ها):
+   826→    // علاوه بر days، آرایهٔ exercises هر روز و meals/برنامهٔ غذایی هم باید
+   827→    // درست باشند — کشِ نوشته‌شدهٔ نسخهٔ قدیمی اپ با شکل متفاوت هرگز بازیابی
+   828→    // نمی‌شود (ریشهٔ «Cannot read properties of undefined (map/length)» فقط
+   829→    // روی دستگاه‌هایی که کش قدیمی دارند — مالک با کش تازه هرگز نمی‌بیند).
+   830→    const wp = parsed.workoutPlan as { days?: Array<{ exercises?: unknown }> } | null | undefined;
+   831→    const wpValid =
+   832→      !!wp &&
+   833→      Array.isArray(wp.days) &&
+   834→      wp.days.every((d) => d == null || Array.isArray((d as { exercises?: unknown }).exercises));
+   835→    if (!st.workoutPlan && wpValid) {
+   836→      useAppStore.setState({ workoutPlan: parsed.workoutPlan });
+   837→    }
+   838→    const mp = parsed.mealPlan as { meals?: unknown; totalCalories?: unknown } | null | undefined;
+   839→    const mpValid = !!mp && Array.isArray(mp.meals) && typeof mp.totalCalories === "number";
+   840→    if (!st.mealPlan && mpValid) {
+   841→      useAppStore.setState({ mealPlan: parsed.mealPlan });
+   842→    }
+   843→  } catch {
+   844→    // داده خراب — کلید را پاک کن
+   845→    try {
+   846→      window.localStorage.removeItem(PLAN_CACHE_KEY);
+   847→    } catch {}
+   848→  }
+   849→}
+   850→
+   851→// با هر تغییر workoutPlan/mealPlan کش به‌روز می‌شود (الگوی همان activeSession)
+   852→if (typeof window !== "undefined") {
+   853→  useAppStore.subscribe((state, prev) => {
+   854→    if (state.workoutPlan !== prev.workoutPlan || state.mealPlan !== prev.mealPlan) {
+   855→      savePlanCache();
+   856→    }
+   857→  });
+   858→}
+   859→
+   860→// ═══════════════════════════════════════════════════════════════
+   861→//  v48 — به‌روزرسانی زندهٔ اطلاعات کاربر (رفع باگ بحرانی مالک)
+   862→//  «اپ/سایت را باز می‌کنم، صفحهٔ چت می‌آید و می‌نویسد چت با فیتاپ قفل است
+   863→//   با اینکه پلن حرفه‌ای دارم — باید یک بار رفرش کنم تا اطلاعات برگرده.»
+   864→//
+   865→//  ریشه: در اپ‌های نیتیو (WebView زنده) و PWA، اپ ممکن است ساعت‌ها باز بماند؛
+   866→//  اطلاعات کاربر در store فقط هنگام لود کامل صفحه از /api/auth/me خوانده
+   867→//  می‌شود. اگر session قدیمی/ناقص باشد (شبکهٔ ضعیف موقع باز شدن، session
+   868→//  restore اپ، تغییر پلن در دستگاه دیگر و…)، همهٔ گیت‌های پلن (چت/باشگاه/…)
+   869→//  بر اساس دادهٔ کهنه «قفل» نشان می‌دهند تا کاربر دستی رفرش کند.
+   870→//
+   871→//  راه‌حل: refreshUserIfNeeded — هر بار اپ به foreground برمی‌گردد (و در
+   872→//  mount)، اطلاعات کاربر بی‌صدا از سرور تازه می‌شود؛ همهٔ گیت‌ها همان لحظه
+   873→//  زنده می‌شوند. throttle ۶۰ ثانیه‌ای + گارد sessionEpoch (ضد پاسخِ کهنه
+   874→//  بعد از logout — الگوی v45).
+   875→// ═══════════════════════════════════════════════════════════════
+   876→let _lastUserRefreshAt = 0;
+   877→let _refreshInFlight = false;
+   878→
+   879→export async function refreshUserIfNeeded(force = false): Promise<void> {
+   880→  if (typeof window === "undefined") return;
+   881→  if (_refreshInFlight) return;
+   882→  const st = useAppStore.getState();
+   883→  // کاربر لاگین نیست → کاری نیست (auth screen خودش flow ورود را دارد)
+   884→  if (!st.user) {
+   885→    if (!force) return;
+   886→  }
+   887→  const nowMs = Date.now();
+   888→  if (!force && nowMs - _lastUserRefreshAt < 60_000) return; // throttle ۶۰s
+   889→  _lastUserRefreshAt = nowMs;
+   890→  _refreshInFlight = true;
+   891→  const epochAtStart = useAppStore.getState().sessionEpoch;
+   892→  try {
+   893→    const res = await fetch("/api/auth/me", { cache: "no-store" });
+   894→    if (!res.ok) return;
+   895→    if (useAppStore.getState().sessionEpoch !== epochAtStart) return; // وسطش logout شد
+   896→    const data = await res.json();
+   897→    if (useAppStore.getState().sessionEpoch !== epochAtStart) return;
+   898→    // v51 (مسدودسازی): اگر کاربر وسط سشن توسط ادمین مسدود شود، همان لحظه که
+   899→    // اپ به foreground برمی‌گردد صفحهٔ زیبای «مسدود» جای کل پنل را می‌گیرد.
+   900→    if (data?.blocked && !data?.user) {
+   901→      useAppStore.getState().setUser(null);
+   902→      useAppStore.getState().setScreen("blocked");
+   903→      return;
+   904→    }
+   905→    if (data?.user) {
+   906→      const cur = useAppStore.getState().user;
+   907→      // فقط اگر چیزی عوض شده setUser کن — از re-render بی‌مورد سراسری جلوگیری می‌کند
+   908→      const changed =
+   909→        !cur ||
+   910→        cur.planName !== data.user.planName ||
+   911→        cur.subscriptionEnd !== data.user.subscriptionEnd ||
+   912→        cur.hasActiveSubscription !== data.user.hasActiveSubscription ||
+   913→        cur.hasPendingSubscription !== data.user.hasPendingSubscription ||
+   914→        cur.avatarUrl !== data.user.avatarUrl ||
+   915→        cur.name !== data.user.name ||
+   916→        cur.walletBalance !== data.user.walletBalance ||
+   917→        cur.videoAnalysisUsed !== data.user.videoAnalysisUsed ||
+   918→        cur.bloodTestUsed !== data.user.bloodTestUsed ||
+   919→        cur.lastPlanExpiresAt !== data.user.lastPlanExpiresAt;
+   920→      if (changed) useAppStore.getState().setUser(data.user);
+   921→    }
+   922→  } catch {
+   923→    // شبکه در دسترس نیست — دفعهٔ بعد foreground دوباره تلاش می‌شود
+   924→  } finally {
+   925→    _refreshInFlight = false;
+   926→  }
+   927→}
+   928→
+   929→// Persian number formatting helper for components
+   930→export { toPersianDigits } from "./types";
+   931→

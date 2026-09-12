@@ -1,0 +1,970 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState } from "react";
+     4→import { motion, AnimatePresence } from "framer-motion";
+     5→import {
+     6→  Dumbbell, Sparkles, ChevronLeft, ChevronRight, TrendingUp, Target,
+     7→  Activity, Crown, RefreshCw, Flame, Beef, Wheat, Droplet,
+     8→  Scale, Calendar, Ruler, Award, Heart, Bot, CalendarDays,
+     9→} from "lucide-react";
+    10→import { useAppStore } from "@/lib/fitness/store";
+    11→import { Card } from "@/components/ui/card";
+    12→import { Button } from "@/components/ui/button";
+    13→import {
+    14→  toPersianDigits, PLAN_LABELS,
+    15→  formatToman, type Plan,
+    16→} from "@/lib/fitness/types";
+    17→import { usePlans } from "@/lib/fitness/use-plans";
+    18→import { PurchaseModal } from "@/components/fitness/landing/sections/purchase-modal";
+    19→import { toast } from "sonner";
+    20→
+    21→// ─────────────────────────────────────────────────────────────────────────────
+    22→// Types returned by /api/onboarding/analysis
+    23→// ─────────────────────────────────────────────────────────────────────────────
+    24→interface MacroRec {
+    25→  targetCalories: number;
+    26→  protein_g: number;
+    27→  carbs_g: number;
+    28→  fat_g: number;
+    29→  proteinPerKg: number;
+    30→  deficitPercent: number;
+    31→}
+    32→
+    33→interface Trajectory {
+    34→  currentWeight: number;
+    35→  targetWeight: number;
+    36→  weeksToGoal: number;
+    37→  weeklyRate: number;
+    38→  weeklyCalorieAdjustment: number;
+    39→}
+    40→
+    41→interface PlanRec {
+    42→  recommendedPlan: Plan;
+    43→  reason: string;
+    44→}
+    45→
+    46→interface Measurements {
+    47→  chest?: number;
+    48→  arm?: number;
+    49→  waist?: number;
+    50→  hip?: number;
+    51→  thigh?: number;
+    52→  neck?: number;
+    53→}
+    54→
+    55→interface BodyCompositionData {
+    56→  bodyFatPercent: number;
+    57→  leanBodyMass: number;
+    58→  fatMass: number;
+    59→  bodyFatCategory: string;
+    60→  bodyFatColor: string;
+    61→  muscleMassPercent: number | null;
+    62→  muscleMass: number | null;
+    63→}
+    64→
+    65→interface AnalysisResponse {
+    66→  analysis: string;
+    67→  bmi: number;
+    68→  bmr: number;
+    69→  tdee: number;
+    70→  macros?: MacroRec;
+    71→  trajectory?: Trajectory | null;
+    72→  planRecommendation?: PlanRec;
+    73→  measurements?: Measurements;
+    74→  bodyComposition?: BodyCompositionData | null;
+    75→  fromCache?: boolean;
+    76→}
+    77→
+    78→// ─────────────────────────────────────────────────────────────────────────────
+    79→// Macro ring — circular progress for protein/carbs/fat (pure SVG, no deps)
+    80→// ─────────────────────────────────────────────────────────────────────────────
+    81→function MacroRing({
+    82→  label,
+    83→  grams,
+    84→  calories,
+    85→  color,
+    86→  icon,
+    87→}: {
+    88→  label: string;
+    89→  grams: number;
+    90→  calories: number;
+    91→  color: string;
+    92→  icon: React.ReactNode;
+    93→}) {
+    94→  const size = 84;
+    95→  const stroke = 7;
+    96→  const radius = (size - stroke) / 2;
+    97→  const circumference = 2 * Math.PI * radius;
+    98→  // Each macro is shown as a fraction of its calorie contribution vs the
+    99→  // other two. This gives a sense of proportion rather than a fixed max.
+   100→  // We just render a fully-stroked ring with the grams label inside.
+   101→  const fillFraction = 0.78; // visual fill — purely aesthetic
+   102→
+   103→  return (
+   104→    <div className="flex flex-col items-center gap-1.5">
+   105→      <div className="relative" style={{ width: size, height: size }}>
+   106→        <svg width={size} height={size} className="-rotate-90">
+   107→          <circle
+   108→            cx={size / 2}
+   109→            cy={size / 2}
+   110→            r={radius}
+   111→            fill="none"
+   112→            stroke="#f1f5f9"
+   113→            strokeWidth={stroke}
+   114→          />
+   115→          <motion.circle
+   116→            cx={size / 2}
+   117→            cy={size / 2}
+   118→            r={radius}
+   119→            fill="none"
+   120→            stroke={color}
+   121→            strokeWidth={stroke}
+   122→            strokeLinecap="round"
+   123→            strokeDasharray={circumference}
+   124→            initial={{ strokeDashoffset: circumference }}
+   125→            animate={{ strokeDashoffset: circumference * (1 - fillFraction) }}
+   126→            transition={{ duration: 1, ease: "easeOut" }}
+   127→          />
+   128→        </svg>
+   129→        <div className="absolute inset-0 flex flex-col items-center justify-center">
+   130→          <span className="text-slate-400">{icon}</span>
+   131→          <span className="text-base font-black font-stat text-slate-900 leading-none">
+   132→            {toPersianDigits(grams)}
+   133→          </span>
+   134→          <span className="text-[9px] text-slate-400">گرم</span>
+   135→        </div>
+   136→      </div>
+   137→      <p className="text-xs font-bold text-slate-700">{label}</p>
+   138→      <p className="text-[10px] text-slate-400">{toPersianDigits(calories)} کیلوکالری</p>
+   139→    </div>
+   140→  );
+   141→}
+   142→
+   143→// ─────────────────────────────────────────────────────────────────────────────
+   144→// Measurement chip
+   145→// ─────────────────────────────────────────────────────────────────────────────
+   146→function MeasurementChip({ label, value, unit = "سانتی‌متر" }: { label: string; value: number; unit?: string }) {
+   147→  return (
+   148→    <div className="rounded-2xl border-2 border-orange-100 bg-white p-3 text-center">
+   149→      <p className="text-[10px] text-slate-500 mb-1">{label}</p>
+   150→      <p className="text-lg font-black font-stat text-slate-900 leading-none">
+   151→        {toPersianDigits(value)}
+   152→      </p>
+   153→      <p className="text-[9px] text-slate-400 mt-0.5">{unit}</p>
+   154→    </div>
+   155→  );
+   156→}
+   157→
+   158→// ─────────────────────────────────────────────────────────────────────────────
+   159→// صفحه انتظار جذاب و اختصاصی برای تحلیل هوشمند
+   160→// ─────────────────────────────────────────────────────────────────────────────
+   161→function AnalysisLoadingScreen({ userName }: { userName?: string | null }) {
+   162→  const [step, setStep] = useState(0);
+   163→  const steps = [
+   164→    { icon: Scale, text: "تحلیل وزن و ترکیب بدن" },
+   165→    { icon: Target, text: "بررسی هدف و سطح فعالیت" },
+   166→    { icon: Activity, text: "محاسبه کالری و درشت‌مغذی‌ها" },
+   167→    { icon: Dumbbell, text: "طراحی برنامه تمرینی اختصاصی" },
+   168→    { icon: Sparkles, text: "تولید تحلیل هوشمند فیتاپ" },
+   169→  ];
+   170→
+   171→  useEffect(() => {
+   172→    const timer = setInterval(() => {
+   173→      setStep((s) => Math.min(s + 1, steps.length - 1));
+   174→    }, 2000);
+   175→    return () => clearInterval(timer);
+   176→  }, []);
+   177→
+   178→  return (
+   179→    <div className="min-h-screen bg-gradient-to-b from-orange-50 via-white to-amber-50 flex flex-col items-center justify-center px-6">
+   180→      {/* لوگو با انیمیشن */}
+   181→      <motion.div
+   182→        initial={{ scale: 0, opacity: 0 }}
+   183→        animate={{ scale: 1, opacity: 1 }}
+   184→        transition={{ type: "spring", stiffness: 200, damping: 15 }}
+   185→        className="mb-8"
+   186→      >
+   187→        <div
+   188→          className="w-24 h-24 rounded-3xl flex items-center justify-center overflow-hidden shadow-2xl"
+   189→          style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   190→        >
+   191→          <motion.div
+   192→            animate={{ y: [0, -6, 0] }}
+   193→            transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+   194→          >
+   195→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   196→            <img src="/fitup-logo.png" alt="فیتاپ" width={80} height={80} className="object-cover" style={{ width: 80, height: 80 }} />
+   197→          </motion.div>
+   198→        </div>
+   199→      </motion.div>
+   200→
+   201→      {/* نام کاربر + پیام */}
+   202→      <motion.h2
+   203→        initial={{ opacity: 0, y: 10 }}
+   204→        animate={{ opacity: 1, y: 0 }}
+   205→        transition={{ delay: 0.3 }}
+   206→        className="text-xl font-black text-slate-900 mb-2 text-center"
+   207→      >
+   208→        {userName ? `${userName} عزیز` : "ورزشکار گرامی"}
+   209→      </motion.h2>
+   210→      <motion.p
+   211→        initial={{ opacity: 0 }}
+   212→        animate={{ opacity: 1 }}
+   213→        transition={{ delay: 0.5 }}
+   214→        className="text-sm text-slate-500 mb-10 text-center max-w-xs"
+   215→      >
+   216→        فیتاپ هوشمند در حال تحلیل اطلاعات شما و طراحی برنامه اختصاصی شماست
+   217→      </motion.p>
+   218→
+   219→      {/* مراحل تحلیل */}
+   220→      <div className="w-full max-w-sm space-y-3">
+   221→        {steps.map((s, i) => {
+   222→          const Icon = s.icon;
+   223→          const isDone = i < step;
+   224→          const isActive = i === step;
+   225→          return (
+   226→            <motion.div
+   227→              key={i}
+   228→              initial={{ opacity: 0, x: 20 }}
+   229→              animate={{ opacity: 1, x: 0 }}
+   230→              transition={{ delay: 0.6 + i * 0.15 }}
+   231→              className={`flex items-center gap-3 p-3 rounded-2xl transition-all ${
+   232→                isActive
+   233→                  ? "bg-white shadow-lg border-2 border-orange-200"
+   234→                  : isDone
+   235→                  ? "bg-emerald-50 border border-emerald-100"
+   236→                  : "bg-white/50 border border-slate-100"
+   237→              }`}
+   238→            >
+   239→              <div
+   240→                className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-colors ${
+   241→                  isDone
+   242→                    ? "bg-emerald-500"
+   243→                    : isActive
+   244→                    ? "bg-gradient-to-br from-amber-500 to-orange-500"
+   245→                    : "bg-slate-100"
+   246→                }`}
+   247→              >
+   248→                {isDone ? (
+   249→                  <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }}>
+   250→                    <Sparkles className="w-5 h-5 text-white" />
+   251→                  </motion.div>
+   252→                ) : (
+   253→                  <Icon className={`w-5 h-5 ${isActive ? "text-white" : "text-slate-400"}`} />
+   254→                )}
+   255→              </div>
+   256→              <span
+   257→                className={`text-sm font-medium transition-colors ${
+   258→                  isDone ? "text-emerald-700" : isActive ? "text-slate-900" : "text-slate-400"
+   259→                }`}
+   260→              >
+   261→                {s.text}
+   262→              </span>
+   263→              {isActive && (
+   264→                <motion.div
+   265→                  className="mr-auto"
+   266→                  animate={{ rotate: 360 }}
+   267→                  transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+   268→                >
+   269→                  <RefreshCw className="w-4 h-4 text-orange-500" />
+   270→                </motion.div>
+   271→              )}
+   272→            </motion.div>
+   273→          );
+   274→        })}
+   275→      </div>
+   276→
+   277→      {/* نوار پیشرفت */}
+   278→      <motion.div
+   279→        initial={{ opacity: 0 }}
+   280→        animate={{ opacity: 1 }}
+   281→        transition={{ delay: 1 }}
+   282→        className="w-full max-w-xs mt-8"
+   283→      >
+   284→        <div className="h-1.5 bg-orange-100 rounded-full overflow-hidden">
+   285→          <motion.div
+   286→            className="h-full rounded-full"
+   287→            style={{ background: "linear-gradient(90deg, #f59e0b, #f97316)" }}
+   288→            animate={{ width: `${((step + 1) / steps.length) * 100}%` }}
+   289→            transition={{ duration: 0.5 }}
+   290→          />
+   291→        </div>
+   292→        <p className="text-[11px] text-slate-400 text-center mt-2">
+   293→          لطفاً صبر کنید — این پردازش چند ثانیه طول می‌کشد
+   294→        </p>
+   295→      </motion.div>
+   296→    </div>
+   297→  );
+   298→}
+   299→
+   300→// ─────────────────────────────────────────────────────────────────────────────
+   301→// Main screen
+   302→// ─────────────────────────────────────────────────────────────────────────────
+   303→export function AnalysisScreen() {
+   304→  const { user, setScreen, setMainTab, pendingPlanId, setPendingPlanId } = useAppStore();
+   305→  const { plans: SUBSCRIPTION_PLANS } = usePlans();
+   306→  const [data, setData] = useState<AnalysisResponse | null>(null);
+   307→  const [loading, setLoading] = useState(true);
+   308→  const [refreshing, setRefreshing] = useState(false);
+   309→  const [purchasePlanId, setPurchasePlanId] = useState<Plan | null>(null);
+   310→
+   311→  // v15: تاریخ عضویت در فیتاپ — از فیلد memberSince پاسخ API (user.createdAt)
+   312→  const memberSinceText = (() => {
+   313→    const since = (data as any)?.memberSince as string | null | undefined;
+   314→    if (!since) return null;
+   315→    try {
+   316→      return new Date(since).toLocaleDateString("fa-IR", { year: "numeric", month: "long", day: "numeric" });
+   317→    } catch {
+   318→      return null;
+   319→    }
+   320→  })();
+   321→
+   322→  // ═══ v63 — ضد باگ «تحلیل شما پیدا نشد» در مرورگر درون‌برنامه‌ای اینستاگرام ═══
+   323→  // ریشه: تولید تحلیل همگام داخل GET است (چند ثانیه تا چند دقیقه) و WebView
+   324→  // اینستا fetchهای طولانی را قطع می‌کند؛ قبلاً فقط «یک» fetch بی‌retry بود و
+   325→  // هر قطع‌شدن مستقیم به کارت خطا می‌رفت — کاربر باید چند بار دستی «تلاش مجدد»
+   326→  // می‌زد تا یکی از دورهای تولید کامل می‌شد.
+   327→  // حالا: timeout ۲۵ثانیه‌ای هر تلاش + auto-retry با مکث (تا ۱۰ دور ≈ چند
+   328→  // دقیقه صبر) — سمت سرور هم همهٔ درخواست‌های هم‌زمان به «یک» تولید در-جریان
+   329→  // می‌پیوندند (قفل مشترک) پس هر retry هزینهٔ AI اضافه ندارد و به‌محض
+   330→  // آماده‌شدن تحلیل، همان لحظه نمایش داده می‌شود — بدون هیچ لمسی.
+   331→  const ANALYSIS_MAX_ATTEMPTS = 10;
+   332→  const ANALYSIS_ATTEMPT_TIMEOUT_MS = 25_000;
+   333→
+   334→  async function fetchAnalysisOnce(url: string): Promise<{ ok: boolean; permanentFail: boolean; json: any }> {
+   335→    const controller = new AbortController();
+   336→    const timer = setTimeout(() => controller.abort(), ANALYSIS_ATTEMPT_TIMEOUT_MS);
+   337→    try {
+   338→      const res = await fetch(url, { signal: controller.signal });
+   339→      const json = await res.json().catch(() => null);
+   340→      if (res.ok && json?.analysis) return { ok: true, permanentFail: false, json };
+   341→      // خطاهای دائمی — retry بی‌فایده است (پروفایل نبود / سشن نیست)
+   342→      if (res.status === 400 || res.status === 401) {
+   343→        return { ok: false, permanentFail: true, json };
+   344→      }
+   345→      return { ok: false, permanentFail: false, json };
+   346→    } catch {
+   347→      // abort / network — قابل‌retry
+   348→      return { ok: false, permanentFail: false, json: null };
+   349→    } finally {
+   350→      clearTimeout(timer);
+   351→    }
+   352→  }
+   353→
+   354→  async function loadAnalysis(force = false) {
+   355→    if (force) setRefreshing(true);
+   356→    try {
+   357→      const url = force ? "/api/onboarding/analysis?force=1" : "/api/onboarding/analysis";
+   358→      for (let attempt = 1; attempt <= ANALYSIS_MAX_ATTEMPTS; attempt++) {
+   359→        const { ok, permanentFail, json } = await fetchAnalysisOnce(url);
+   360→        if (ok) {
+   361→          setData(json as AnalysisResponse);
+   362→          return;
+   363→        }
+   364→        if (permanentFail) break;
+   365→        // مکث بین تلاش‌ها (backoff ملایم) — در طول retryها صفحهٔ «در حال تحلیل»
+   366→        // جذاب نشان داده می‌شود، نه کارت خطا
+   367→        if (attempt < ANALYSIS_MAX_ATTEMPTS) {
+   368→          await new Promise((r) => setTimeout(r, attempt <= 4 ? 2_500 : 6_000));
+   369→        }
+   370→      }
+   371→      if (force) toast.error("خطا در بازخوانی تحلیل");
+   372→    } finally {
+   373→      setLoading(false);
+   374→      setRefreshing(false);
+   375→    }
+   376→  }
+   377→
+   378→  useEffect(() => {
+   379→    loadAnalysis();
+   380→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   381→  }, []);
+   382→
+   383→  // Resolve the pending plan object (if user came from landing)
+   384→  const pendingPlan = pendingPlanId
+   385→    ? SUBSCRIPTION_PLANS.find((p) => p.id === pendingPlanId) ?? null
+   386→    : null;
+   387→
+   388→  // Resolve recommended plan object
+   389→  const recommendedPlan = data?.planRecommendation
+   390→    ? SUBSCRIPTION_PLANS.find((p) => p.id === data.planRecommendation!.recommendedPlan) ?? null
+   391→    : null;
+   392→
+   393→  const bmi = data?.bmi ?? 0;
+   394→  const bmiCategory = bmi < 18.5 ? "کم‌وزن" : bmi < 25 ? "وزن نرمال" : bmi < 30 ? "اضافه‌وزن" : "چاق";
+   395→  const bmiColor = bmi < 18.5 ? "text-cyan-500" : bmi < 25 ? "text-emerald-500" : bmi < 30 ? "text-amber-500" : "text-red-500";
+   396→
+   397→  function openPurchase(planId: Plan) {
+   398→    setPurchasePlanId(planId);
+   399→  }
+   400→
+   401→  function handlePurchaseClose() {
+   402→    setPurchasePlanId(null);
+   403→    // Clear pendingPlanId once the user has gone through the purchase flow
+   404→    setPendingPlanId(null);
+   405→  }
+   406→
+   407→  if (loading && !data) {
+   408→    return <AnalysisLoadingScreen userName={user?.name} />;
+   409→  }
+   410→
+   411→  // ─── FE-M4: گارد حالت خالی/خطا ───
+   412→  // قبلاً اگر fetch fail می‌شد یا analysis وجود نداشت، data=null ولی رندر
+   413→  // ادامه می‌یافت و BMI=0 به‌عنوان «کم‌وزن» با توصیه‌های غلط نمایش داده می‌شد.
+   414→  if (!data) {
+   415→    return (
+   416→      <div className="min-h-screen bg-white flex flex-col items-center justify-center px-6 text-center">
+   417→        <div
+   418→          className="w-16 h-16 rounded-2xl flex items-center justify-center mb-4"
+   419→          style={{ background: "rgba(245,158,11,0.12)" }}
+   420→        >
+   421→          <Activity className="w-8 h-8 text-orange-500" />
+   422→        </div>
+   423→        <h2 className="text-lg font-black text-slate-900 mb-2">تحلیلی برای نمایش وجود ندارد</h2>
+   424→        <p className="text-sm text-slate-500 mb-6 leading-relaxed max-w-xs">
+   425→          تحلیل شما پیدا نشد یا در دریافت آن خطایی رخ داد. لطفاً دوباره تلاش کنید.
+   426→        </p>
+   427→        <div className="flex gap-2">
+   428→          <Button
+   429→            variant="outline"
+   430→            className="rounded-xl"
+   431→            onClick={() => {
+   432→              setLoading(true);
+   433→              loadAnalysis();
+   434→            }}
+   435→          >
+   436→            <RefreshCw className="w-4 h-4" />
+   437→            تلاش مجدد
+   438→          </Button>
+   439→          <Button
+   440→            className="rounded-xl text-white"
+   441→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   442→            onClick={() => setScreen("landing")}
+   443→          >
+   444→            بازگشت
+   445→          </Button>
+   446→        </div>
+   447→      </div>
+   448→    );
+   449→  }
+   450→
+   451→  return (
+   452→    <div className="min-h-screen bg-white overflow-y-auto">
+   453→      {/* Header */}
+   454→      <div className="sticky top-0 z-10 bg-white/90 backdrop-blur-lg border-b border-orange-100 px-4 py-3 flex items-center justify-between">
+   455→        <button onClick={() => setScreen("landing")} className="p-2 rounded-lg hover:bg-orange-50" aria-label="بازگشت">
+   456→          {/* در RTL جهت بازگشت به راست است */}
+   457→          <ChevronRight className="w-5 h-5 text-slate-600" />
+   458→        </button>
+   459→        <div className="flex items-center gap-2">
+   460→          <div className="w-7 h-7 rounded-lg flex items-center justify-center overflow-hidden" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   461→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   462→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   463→          </div>
+   464→          <span className="font-black text-slate-900">فیتاپ</span>
+   465→        </div>
+   466→        <div className="w-9" />
+   467→      </div>
+   468→
+   469→      <div className="max-w-2xl mx-auto px-4 py-6 space-y-5">
+   470→        {/* Title */}
+   471→        <motion.div
+   472→          initial={{ opacity: 0, y: 20 }}
+   473→          animate={{ opacity: 1, y: 0 }}
+   474→          className="text-center"
+   475→        >
+   476→          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   477→            <Sparkles className="w-8 h-8 text-white" />
+   478→          </div>
+   479→          <h1 className="text-2xl font-black text-slate-900 mb-2">
+   480→            تحلیل اختصاصی شما
+   481→          </h1>
+   482→          <p className="text-sm text-slate-500">
+   483→            {user?.name ? `${user.name} عزیز، ` : ""}فیتاپ هوشمند اطلاعات شما را تحلیل کرد
+   484→          </p>
+   485→          {/* v15: تاریخ عضویت در فیتاپ (درخواست مالک — آنبوردینگ باید کامل باشد) */}
+   486→          {memberSinceText && (
+   487→            <div className="inline-flex items-center gap-1.5 mt-3 px-3 py-1.5 rounded-full bg-orange-50 border border-orange-200 text-[11px] text-orange-700 font-bold">
+   488→              <CalendarDays className="w-3.5 h-3.5" />
+   489→              عضو فیتاپ از {memberSinceText}
+   490→            </div>
+   491→          )}
+   492→        </motion.div>
+   493→
+   494→        {/* تحلیل فیتاپ هوشمند (مربی) — در اول صفحه */}
+   495→        <motion.div
+   496→          initial={{ opacity: 0, y: 20 }}
+   497→          animate={{ opacity: 1, y: 0 }}
+   498→          transition={{ delay: 0.05 }}
+   499→        >
+   500→          <Card className="p-5 border-2 border-orange-200 relative overflow-hidden">
+   501→            {/* Background gradient */}
+   502→            <div className="absolute -top-10 -left-10 w-32 h-32 rounded-full bg-orange-100/40 blur-2xl" />
+   503→            <div className="absolute -bottom-10 -right-10 w-32 h-32 rounded-full bg-amber-100/40 blur-2xl" />
+   504→
+   505→            <div className="relative">
+   506→              <div className="flex items-center gap-2.5 mb-4">
+   507→                <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-md" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   508→                  <Bot className="w-5 h-5 text-white" />
+   509→                </div>
+   510→                <div>
+   511→                  <h3 className="font-bold text-slate-900">تحلیل فیتاپ هوشمند</h3>
+   512→                  <p className="text-[10px] text-slate-500">مربی هوشمند شما</p>
+   513→                </div>
+   514→              </div>
+   515→              {loading ? (
+   516→                <div className="space-y-2">
+   517→                  {[1, 2, 3, 4].map(i => (
+   518→                    <div key={i} className="h-3 bg-orange-100 rounded animate-pulse" style={{ width: `${90 - i * 10}%` }} />
+   519→                  ))}
+   520→                </div>
+   521→              ) : (
+   522→                <div className="p-4 rounded-xl bg-gradient-to-br from-orange-50/50 to-amber-50/30 border border-orange-100/50">
+   523→                  <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">{data?.analysis}</p>
+   524→                </div>
+   525→              )}
+   526→            </div>
+   527→          </Card>
+   528→        </motion.div>
+   529→
+   530→        {/* Biometric cards */}
+   531→        <motion.div
+   532→          initial={{ opacity: 0, y: 20 }}
+   533→          animate={{ opacity: 1, y: 0 }}
+   534→          transition={{ delay: 0.1 }}
+   535→          className="grid grid-cols-3 gap-3"
+   536→        >
+   537→          <Card className="p-4 text-center border-2 border-orange-100">
+   538→            <p className="text-[10px] text-slate-500">شاخص BMI</p>
+   539→            <p className={`text-2xl font-black font-stat ${bmiColor}`}>{toPersianDigits(bmi.toFixed(1))}</p>
+   540→            <p className={`text-[10px] font-bold ${bmiColor}`}>{bmiCategory}</p>
+   541→          </Card>
+   542→          <Card className="p-4 text-center border-2 border-orange-100">
+   543→            <p className="text-[10px] text-slate-500">متابولیسم (BMR)</p>
+   544→            <p className="text-2xl font-black font-stat text-slate-900">{toPersianDigits(data?.bmr ?? 0)}</p>
+   545→            <p className="text-[10px] text-slate-400">کیلوکالری</p>
+   546→          </Card>
+   547→          <Card className="p-4 text-center border-2 border-orange-100">
+   548→            <p className="text-[10px] text-slate-500">کالری روزانه (TDEE)</p>
+   549→            <p className="text-2xl font-black font-stat text-slate-900">{toPersianDigits(data?.tdee ?? 0)}</p>
+   550→            <p className="text-[10px] text-slate-400">کیلوکالری</p>
+   551→          </Card>
+   552→        </motion.div>
+   553→
+   554→        {/* Weight goal trajectory card */}
+   555→        {data?.trajectory && (
+   556→          <motion.div
+   557→            initial={{ opacity: 0, y: 20 }}
+   558→            animate={{ opacity: 1, y: 0 }}
+   559→            transition={{ delay: 0.18 }}
+   560→          >
+   561→            <Card className="p-5 border-2 border-orange-100">
+   562→              <div className="flex items-center gap-2 mb-4">
+   563→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   564→                  <Target className="w-4 h-4 text-white" />
+   565→                </div>
+   566→                <h3 className="font-bold text-slate-900">مسیر رسیدن به وزن هدف</h3>
+   567→              </div>
+   568→
+   569→              <div className="flex items-center justify-between mb-4">
+   570→                <div className="text-center">
+   571→                  <p className="text-[10px] text-slate-500 mb-1">وزن فعلی</p>
+   572→                  <p className="text-xl font-black font-stat text-slate-900">
+   573→                    {toPersianDigits(data.trajectory.currentWeight)}
+   574→                  </p>
+   575→                  <p className="text-[9px] text-slate-400">کیلوگرم</p>
+   576→                </div>
+   577→
+   578→                {/* Progress bar */}
+   579→                <div className="flex-1 mx-3 relative">
+   580→                  <div className="h-2 bg-orange-100 rounded-full overflow-hidden">
+   581→                    <motion.div
+   582→                      initial={{ width: 0 }}
+   583→                      animate={{ width: "100%" }}
+   584→                      transition={{ duration: 1, ease: "easeOut" }}
+   585→                      className="h-full rounded-full"
+   586→                      style={{ background: "linear-gradient(90deg, #f59e0b, #f97316)" }}
+   587→                    />
+   588→                  </div>
+   589→                  <div className="flex items-center justify-center mt-1">
+   590→                    <Scale className="w-3 h-3 text-orange-500" />
+   591→                  </div>
+   592→                </div>
+   593→
+   594→                <div className="text-center">
+   595→                  <p className="text-[10px] text-slate-500 mb-1">وزن هدف</p>
+   596→                  <p className="text-xl font-black font-stat text-orange-600">
+   597→                    {toPersianDigits(data.trajectory.targetWeight)}
+   598→                  </p>
+   599→                  <p className="text-[9px] text-slate-400">کیلوگرم</p>
+   600→                </div>
+   601→              </div>
+   602→
+   603→              <div className="grid grid-cols-3 gap-2">
+   604→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   605→                  <Calendar className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   606→                  <p className="text-[10px] text-slate-500">زمان رسیدن به هدف</p>
+   607→                  <p className="text-sm font-black font-stat text-slate-900">
+   608→                    {toPersianDigits(data.trajectory.weeksToGoal)} هفته
+   609→                  </p>
+   610→                </div>
+   611→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   612→                  <TrendingUp className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   613→                  <p className="text-[10px] text-slate-500">نرخ هفتگی</p>
+   614→                  <p className="text-sm font-black font-stat text-slate-900">
+   615→                    {data.trajectory.weeklyRate > 0 ? "+" : ""}
+   616→                    {toPersianDigits(data.trajectory.weeklyRate.toFixed(2))} kg
+   617→                  </p>
+   618→                </div>
+   619→                <div className="rounded-xl bg-orange-50 p-3 text-center">
+   620→                  <Flame className="w-4 h-4 text-orange-500 mx-auto mb-1" />
+   621→                  <p className="text-[10px] text-slate-500">تنظیم کالری روزانه</p>
+   622→                  <p className="text-sm font-black font-stat text-slate-900">
+   623→                    {data.trajectory.weeklyCalorieAdjustment > 0 ? "+" : ""}
+   624→                    {toPersianDigits(data.trajectory.weeklyCalorieAdjustment)}
+   625→                  </p>
+   626→                </div>
+   627→              </div>
+   628→
+   629→              <p className="mt-3 text-[11px] text-slate-500 text-center leading-relaxed">
+   630→                این مسیر بر اساس نرخ ایمن{" "}
+   631→                {data.trajectory.weeklyRate < 0
+   632→                  ? `کاهش ${toPersianDigits(0.5)} کیلوگرم در هفته`
+   633→                  : `افزایش ${toPersianDigits(0.25)} کیلوگرم در هفته`}{" "}
+   634→                محاسبه شده است. روند تغییر وزن نرمال و پایدار است.
+   635→              </p>
+   636→            </Card>
+   637→          </motion.div>
+   638→        )}
+   639→
+   640→        {/* Body measurements card */}
+   641→        {data?.measurements && Object.keys(data.measurements).length > 0 && (
+   642→          <motion.div
+   643→            initial={{ opacity: 0, y: 20 }}
+   644→            animate={{ opacity: 1, y: 0 }}
+   645→            transition={{ delay: 0.2 }}
+   646→          >
+   647→            <Card className="p-5 border-2 border-orange-100">
+   648→              <div className="flex items-center gap-2 mb-4">
+   649→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   650→                  <Ruler className="w-4 h-4 text-white" />
+   651→                </div>
+   652→                <h3 className="font-bold text-slate-900">اندازه‌های بدن شما</h3>
+   653→              </div>
+   654→              <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+   655→                {data.measurements.chest != null && (
+   656→                  <MeasurementChip label="دور سینه" value={data.measurements.chest} />
+   657→                )}
+   658→                {data.measurements.arm != null && (
+   659→                  <MeasurementChip label="دور بازو" value={data.measurements.arm} />
+   660→                )}
+   661→                {data.measurements.waist != null && (
+   662→                  <MeasurementChip label="دور کمر" value={data.measurements.waist} />
+   663→                )}
+   664→                {data.measurements.hip != null && (
+   665→                  <MeasurementChip label="دور باسن" value={data.measurements.hip} />
+   666→                )}
+   667→                {data.measurements.thigh != null && (
+   668→                  <MeasurementChip label="دور ران" value={data.measurements.thigh} />
+   669→                )}
+   670→                {data.measurements.neck != null && (
+   671→                  <MeasurementChip label="دور گردن" value={data.measurements.neck} />
+   672→                )}
+   673→              </div>
+   674→            </Card>
+   675→          </motion.div>
+   676→        )}
+   677→
+   678→        {/* ─── NEW (BODY-COMPOSITION-PRO): Body Composition card ─── */}
+   679→        {data?.bodyComposition && (
+   680→          <motion.div
+   681→            initial={{ opacity: 0, y: 20 }}
+   682→            animate={{ opacity: 1, y: 0 }}
+   683→            transition={{ delay: 0.22 }}
+   684→          >
+   685→            <Card className="p-5 border-2 border-orange-100">
+   686→              <div className="flex items-center justify-between mb-4">
+   687→                <div className="flex items-center gap-2">
+   688→                  <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   689→                    <Activity className="w-4 h-4 text-white" />
+   690→                  </div>
+   691→                  <h3 className="font-bold text-slate-900">ترکیب بدن شما</h3>
+   692→                </div>
+   693→              </div>
+   694→
+   695→              {/* 3 main stats */}
+   696→              <div className="grid grid-cols-3 gap-2 mb-4">
+   697→                {/* Body Fat % */}
+   698→                <div
+   699→                  className="rounded-2xl p-4 text-center border-2"
+   700→                  style={{
+   701→                    borderColor: data.bodyComposition.bodyFatColor + "60",
+   702→                    background: data.bodyComposition.bodyFatColor + "10",
+   703→                  }}
+   704→                >
+   705→                  <p className="text-[10px] text-slate-500 mb-1">درصد چربی بدن</p>
+   706→                  <p
+   707→                    className="text-3xl font-black font-stat leading-none"
+   708→                    style={{ color: data.bodyComposition.bodyFatColor }}
+   709→                  >
+   710→                    {toPersianDigits(data.bodyComposition.bodyFatPercent.toFixed(1))}
+   711→                    <span className="text-base">٪</span>
+   712→                  </p>
+   713→                  <p
+   714→                    className="text-[10px] font-bold mt-1.5"
+   715→                    style={{ color: data.bodyComposition.bodyFatColor }}
+   716→                  >
+   717→                    {data.bodyComposition.bodyFatCategory}
+   718→                  </p>
+   719→                </div>
+   720→
+   721→                {/* Lean Body Mass */}
+   722→                <div className="rounded-2xl p-4 text-center border-2 border-orange-100 bg-white">
+   723→                  <p className="text-[10px] text-slate-500 mb-1">جرم بدون چربی</p>
+   724→                  <p className="text-3xl font-black font-stat text-slate-900 leading-none">
+   725→                    {toPersianDigits(data.bodyComposition.leanBodyMass)}
+   726→                  </p>
+   727→                  <p className="text-[10px] text-slate-400 mt-1.5">کیلوگرم</p>
+   728→                </div>
+   729→
+   730→                {/* Fat Mass */}
+   731→                <div className="rounded-2xl p-4 text-center border-2 border-orange-100 bg-white">
+   732→                  <p className="text-[10px] text-slate-500 mb-1">جرم چربی</p>
+   733→                  <p className="text-3xl font-black font-stat text-slate-900 leading-none">
+   734→                    {toPersianDigits(data.bodyComposition.fatMass)}
+   735→                  </p>
+   736→                  <p className="text-[10px] text-slate-400 mt-1.5">کیلوگرم</p>
+   737→                </div>
+   738→              </div>
+   739→
+   740→              {/* Muscle mass (estimated) */}
+   741→              {data.bodyComposition.muscleMass != null && (
+   742→                <div className="rounded-xl bg-orange-50/50 border border-orange-100 p-3 mb-3">
+   743→                  <div className="flex items-center justify-between">
+   744→                    <div className="flex items-center gap-2">
+   745→                      <Heart className="w-4 h-4 text-orange-500" />
+   746→                      <span className="text-xs font-bold text-slate-700">درصد عضله تقریبی</span>
+   747→                    </div>
+   748→                    <div className="flex items-baseline gap-1">
+   749→                      <span className="text-lg font-black font-stat text-orange-600">
+   750→                        {toPersianDigits(data.bodyComposition.muscleMassPercent?.toFixed(1) ?? "0")}
+   751→                      </span>
+   752→                      <span className="text-[10px] text-slate-500">٪</span>
+   753→                      <span className="text-[10px] text-slate-400 ml-2">
+   754→                        ({toPersianDigits(data.bodyComposition.muscleMass)} کیلوگرم)
+   755→                      </span>
+   756→                    </div>
+   757→                  </div>
+   758→                </div>
+   759→              )}
+   760→
+   761→              {/* Scientific note */}
+   762→              <div className="rounded-xl bg-slate-50 border border-slate-100 p-3 flex items-start gap-2">
+   763→                <Sparkles className="w-4 h-4 text-orange-500 shrink-0 mt-0.5" />
+   764→                <p className="text-[11px] text-slate-600 leading-relaxed">
+   765→                  محاسبه بر اساس <b>فرمول علمی US Navy</b> (Hodgdon & Beckett, 1984).
+   766→                  این روش با اندازه‌گیری دور کمر، گردن و قد، معتبرترین تخمین بدون‌دستگاه چربی بدن را ارائه می‌دهد.
+   767→                </p>
+   768→              </div>
+   769→            </Card>
+   770→          </motion.div>
+   771→        )}
+   772→
+   773→        {/* 🆕 v56: بنر انگیزشی بالای پلن پیشنهادی (درخواست مالک) — کاربر باید بداند این پکیج چه چیزی به او می‌دهد */}
+   774→        <motion.div
+   775→          initial={{ opacity: 0, y: 12 }}
+   776→          animate={{ opacity: 1, y: 0 }}
+   777→          transition={{ delay: 0.22 }}
+   778→          className="rounded-2xl p-4 text-center relative overflow-hidden"
+   779→          style={{ background: "linear-gradient(135deg, #fffbeb 0%, #ffedd5 100%)", border: "1px solid #fed7aa" }}
+   780→        >
+   781→          <div className="absolute -right-8 -top-8 w-24 h-24 rounded-full bg-orange-200/40 blur-xl" />
+   782→          <div className="absolute -left-8 -bottom-8 w-24 h-24 rounded-full bg-amber-200/40 blur-xl" />
+   783→          <div className="relative flex items-center justify-center gap-1.5 mb-1.5">
+   784→            <Sparkles className="w-4 h-4 text-amber-500" />
+   785→            <Sparkles className="w-4 h-4 text-orange-500" />
+   786→            <Sparkles className="w-4 h-4 text-amber-500" />
+   787→          </div>
+   788→          <p className="relative text-sm sm:text-[15px] font-black leading-relaxed" style={{ color: "#9a3412" }}>
+   789→            فیتاپ برات{" "}
+   790→            <span className="underline decoration-orange-300 decoration-2 underline-offset-4" style={{ color: "#ea580c" }}>
+   791→              برنامه بدنسازی و ورزشی مخصوص به خودتو
+   792→            </span>{" "}
+   793→            میده تا به هدفت برسی
+   794→          </p>
+   795→          <p className="relative text-[11px] text-orange-700/70 mt-1.5">
+   796→            پلنت رو انتخاب کن، بقیه‌ش با ما — مسیر تناسب اندامت از همین‌جا شروع می‌شه 💪
+   797→          </p>
+   798→        </motion.div>
+   799→
+   800→        {/* Plan recommendation card */}
+   801→        {data?.planRecommendation && recommendedPlan && (
+   802→          <motion.div
+   803→            initial={{ opacity: 0, y: 20 }}
+   804→            animate={{ opacity: 1, y: 0 }}
+   805→            transition={{ delay: 0.3 }}
+   806→          >
+   807→            <Card
+   808→              className="p-5 border-2"
+   809→              style={{ borderColor: "#fed7aa", background: "linear-gradient(135deg, #fffbeb 0%, #ffffff 60%)" }}
+   810→            >
+   811→              <div className="flex items-center gap-2 mb-3">
+   812→                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}>
+   813→                  <Award className="w-4 h-4 text-white" />
+   814→                </div>
+   815→                <h3 className="font-bold text-slate-900">پلن پیشنهادی فیتاپ</h3>
+   816→              </div>
+   817→
+   818→              {/* Recommended plan mini-card */}
+   819→              <div
+   820→                className="rounded-2xl p-4 mb-3 text-white relative overflow-hidden"
+   821→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   822→              >
+   823→                <div className="absolute -left-6 -top-6 w-20 h-20 rounded-full bg-white/10" />
+   824→                <div className="relative flex items-start justify-between gap-3">
+   825→                  <div className="flex items-center gap-2">
+   826→                    <div>
+   827→                      <p className="font-black text-lg leading-tight">{recommendedPlan.label}</p>
+   828→                      <p className="text-[11px] opacity-90">{recommendedPlan.tagline}</p>
+   829→                    </div>
+   830→                  </div>
+   831→                  <div className="text-left">
+   832→                    <p className="font-black font-stat text-lg leading-none">
+   833→                      {toPersianDigits(formatToman(recommendedPlan.price))}
+   834→                    </p>
+   835→                    <p className="text-[10px] opacity-80">تومان</p>
+   836→                  </div>
+   837→                </div>
+   838→                <div className="relative flex flex-wrap gap-1.5 mt-3">
+   839→                  {recommendedPlan.features.slice(0, 3).map((f, i) => (
+   840→                    <span key={i} className="text-[10px] px-2 py-0.5 rounded-full bg-white/15 backdrop-blur">
+   841→                      ✓ {f}
+   842→                    </span>
+   843→                  ))}
+   844→                </div>
+   845→              </div>
+   846→
+   847→              <p className="text-xs text-slate-600 leading-relaxed mb-3">
+   848→                {data.planRecommendation.reason}
+   849→              </p>
+   850→
+   851→              <Button
+   852→                onClick={() => openPurchase(recommendedPlan.id)}
+   853→                className="w-full h-11 rounded-xl font-bold text-white"
+   854→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   855→              >
+   856→                <Crown className="w-4 h-4" />
+   857→                خرید پلن {PLAN_LABELS[recommendedPlan.id]}
+   858→              </Button>
+   859→
+   860→              {/* ─── پلن‌های بالاتر — معرفی محو (دیریکتیو مالک v59) ─── */}
+   861→              {/* قیف اصلی خریدِ پلن پیشنهادی است؛ پلن‌های بالاتر فقط «معرفی» می‌شوند
+   862→                  (امکانات قوی‌تر برای وقتی بودجه رسید) — بدون رقابت قیمتِ همزمان.
+   863→                  مقایسهٔ کامل در تب پلن‌ها آزاد است. */}
+   864→              {(() => {
+   865→                const others = SUBSCRIPTION_PLANS.filter((p) => p.id !== recommendedPlan.id);
+   866→                if (others.length === 0) return null;
+   867→                const stronger = others.filter((p) => p.price > recommendedPlan.price);
+   868→                const strongerNames = stronger.map((p) => p.label).join("، ");
+   869→                return (
+   870→                  <div className="mt-3 rounded-xl bg-slate-50 border border-slate-100 p-3 flex items-start gap-2">
+   871→                    <Sparkles className="w-3.5 h-3.5 text-orange-400 shrink-0 mt-0.5" />
+   872→                    <p className="text-[11px] text-slate-500 leading-relaxed flex-1">
+   873→                      {stronger.length > 0 ? (
+   874→                        <>
+   875→                          پلن‌های بالاتر ({strongerNames}) امکانات قوی‌تری دارند — مثل چت بی‌نهایت با مربی هوشمند،
+   876→                          آنالیز عکس غذا و بدن و حالت باشگاه. هر وقت آماده بودی می‌تونی ارتقا بدی.
+   877→                        </>
+   878→                      ) : (
+   879→                        <>پلن‌های دیگر هم برای نیازهای متفاوت موجودند — انتخاب با خود توست.</>
+   880→                      )}{" "}
+   881→                      <button
+   882→                        onClick={() => { setMainTab("plans"); setScreen("main"); }}
+   883→                        className="font-bold underline decoration-orange-300 underline-offset-2 hover:text-orange-600 transition"
+   884→                      >
+   885→                        مقایسه پلن‌ها
+   886→                      </button>
+   887→                    </p>
+   888→                  </div>
+   889→                );
+   890→              })()}
+   891→            </Card>
+   892→          </motion.div>
+   893→        )}
+   894→
+   895→        {/* Action buttons */}
+   896→        <motion.div
+   897→          initial={{ opacity: 0, y: 20 }}
+   898→          animate={{ opacity: 1, y: 0 }}
+   899→          transition={{ delay: 0.35 }}
+   900→          className="space-y-3 pt-2"
+   901→        >
+   902→          <p className="text-center text-sm font-bold text-slate-700">مسیر بعدی شما؟</p>
+   903→
+   904→          {/* Pending plan CTA — primary */}
+   905→          {pendingPlan && (
+   906→            <button
+   907→              onClick={() => openPurchase(pendingPlan.id)}
+   908→              className="w-full p-5 rounded-2xl text-white shadow-xl shadow-orange-500/30 transition hover:scale-[1.02] flex items-center gap-4"
+   909→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   910→            >
+   911→              <div className="w-12 h-12 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
+   912→                <Crown className="w-6 h-6 text-white" />
+   913→              </div>
+   914→              <div className="flex-1 text-right">
+   915→                <p className="font-black text-base">ادامه خرید پلن {pendingPlan.label}</p>
+   916→                <p className="text-xs opacity-90">
+   917→                  پلنی که انتخاب کردید — {toPersianDigits(formatToman(pendingPlan.price))} تومان
+   918→                </p>
+   919→              </div>
+   920→              <ChevronLeft className="w-5 h-5" />
+   921→            </button>
+   922→          )}
+   923→
+   924→          {/* See all plans */}
+   925→          <button
+   926→            onClick={() => { setMainTab("plans"); setScreen("main"); }}
+   927→            className="w-full p-5 rounded-2xl border-2 border-orange-200 bg-white text-slate-700 shadow-sm transition hover:scale-[1.02] hover:border-orange-300 flex items-center gap-4"
+   928→          >
+   929→            <div className="w-12 h-12 rounded-xl bg-orange-50 flex items-center justify-center shrink-0">
+   930→              <Crown className="w-6 h-6 text-orange-500" />
+   931→            </div>
+   932→            <div className="flex-1 text-right">
+   933→              <p className="font-black text-base">مشاهده همه پلن‌ها</p>
+   934→              <p className="text-xs text-slate-500">۴ پلن متناسب با هر هدف و بودجه</p>
+   935→            </div>
+   936→            <ChevronLeft className="w-5 h-5 text-slate-400" />
+   937→          </button>
+   938→
+   939→          {/* Go to dashboard */}
+   940→          <button
+   941→            onClick={() => { setMainTab("dashboard"); setScreen("main"); }}
+   942→            className="w-full p-5 rounded-2xl border-2 border-slate-200 bg-white text-slate-700 shadow-sm transition hover:scale-[1.02] hover:border-slate-300 flex items-center gap-4"
+   943→          >
+   944→            <div className="w-12 h-12 rounded-xl bg-slate-50 flex items-center justify-center shrink-0">
+   945→              <TrendingUp className="w-6 h-6 text-slate-500" />
+   946→            </div>
+   947→            <div className="flex-1 text-right">
+   948→              <p className="font-black text-base">رفتن به داشبورد</p>
+   949→              <p className="text-xs text-slate-500">از ابزارهای رایگان و امکانات پنل استفاده کنید</p>
+   950→            </div>
+   951→            <ChevronLeft className="w-5 h-5 text-slate-400" />
+   952→          </button>
+   953→        </motion.div>
+   954→      </div>
+   955→
+   956→      {/* Purchase modal — user is already logged in at this point so checkout works */}
+   957→      {purchasePlanId && (() => {
+   958→        const plan = SUBSCRIPTION_PLANS.find((p) => p.id === purchasePlanId);
+   959→        return plan ? (
+   960→          <PurchaseModal
+   961→            plan={plan}
+   962→            onClose={handlePurchaseClose}
+   963→            onNeedLogin={() => handlePurchaseClose()}
+   964→          />
+   965→        ) : null;
+   966→      })()}
+   967→    </div>
+   968→  );
+   969→}
+   970→

@@ -1,0 +1,802 @@
+     1→"use client";
+     2→
+     3→import {
+     4→  useCallback,
+     5→  useEffect,
+     6→  useLayoutEffect,
+     7→  useMemo,
+     8→  useRef,
+     9→  useState,
+    10→  type ReactNode,
+    11→} from "react";
+    12→import { motion } from "framer-motion";
+    13→import ReactMarkdown from "react-markdown";
+    14→import remarkGfm from "remark-gfm";
+    15→import {
+    16→  Send,
+    17→  Sparkles,
+    18→  Dumbbell,
+    19→  Salad,
+    20→  RotateCcw,
+    21→  Bot,
+    22→  ImageIcon,
+    23→  Video,
+    24→  Lock,
+    25→  X,
+    26→  Loader2,
+    27→  Mic,
+    28→  Square,
+    29→  Plus,
+    30→  UtensilsCrossed,
+    31→  Check,
+    32→} from "lucide-react";
+    33→import { useAppStore } from "@/lib/fitness/store";
+    34→import { Button } from "@/components/ui/button";
+    35→import { Skeleton } from "@/components/ui/skeleton";
+    36→import { InlineVideoPreview } from "@/components/fitness/inline-video-preview";
+    37→import { UpgradeBanner } from "@/components/fitness/upgrade-banner";
+    38→import {
+    39→  canAccess,
+    40→  toPersianDigits,
+    41→  PLAN_LABELS,
+    42→  type ChatMessageDto,
+    43→  type Plan,
+    44→  type WorkoutPlanContent,
+    45→  type MealPlanContent,
+    46→} from "@/lib/fitness/types";
+    47→import { useVoiceRecorder } from "@/lib/fitness/use-voice-recorder";
+    48→import {
+    49→  ApiError,
+    50→  fetchJson,
+    51→  fetchJsonOrThrow,
+    52→  SERVER_UNREACHABLE_MESSAGE,
+    53→} from "@/lib/fitness/fetch-json";
+    54→import { createVideoThumbnail } from "@/lib/fitness/video-thumbnail";
+    55→import { useQuotaSummary, type QuotaSummary } from "@/lib/fitness/use-quota-summary";
+    56→import { toast } from "sonner";
+    57→
+    58→const QUICK_PROMPTS = [
+    59→  { icon: Dumbbell, text: "یکی از حرکات امروز را سخت‌تر کن" },
+    60→  { icon: Salad, text: "یک میان‌وعده کم‌کالری پیشنهاد بده" },
+    61→  { icon: RotateCcw, text: "جایگزینی برای اسکوات بده" },
+    62→];
+    63→
+    64→/** آستانهٔ ارسال ویدیو: بالاتر از این → مسیر multipart بدون محدودیت حجم (Task 4-a) */
+    65→const VIDEO_MULTIPART_THRESHOLD = 12 * 1024 * 1024;
+    66→/** سقف فنی سمت کلاینت — با سقف مسیر multipart هم‌خوان (۵۰۰ مگابایت) */
+    67→const VIDEO_CLIENT_HARD_CAP = 500 * 1024 * 1024;
+    68→/** Task 4-a — فیکس اسکرول: در رندر اول فقط ۳۰ پیام آخر، قدیمی‌ترها با اسکرول به بالا */
+    69→const INITIAL_VISIBLE_MESSAGES = 30;
+    70→const LOAD_OLDER_STEP = 20;
+    71→
+    72→/** id یکتا برای پیام‌های موقت — پسوند تصادفی برای جلوگیری از تصادم id (FE-L6) */
+    73→function tempId(prefix: string): string {
+    74→  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    75→}
+    76→
+    77→// ═══════════════════════════════════════════════════════════════
+    78→//  v73.4 — پروتکل APPLY_SWAP (توافق‌شده با همکار — دقیقاً همین):
+    79→//  اگر انتهای متن پاسخ AI خط دقیق
+    80→//  [APPLY_SWAP type=exercise|food from="..." to="..." day="..."]
+    81→//  باشد → خط از حباب حذف و به‌جایش دکمهٔ «اعمال این جایگزینی در برنامهٔ من»
+    82→//  نمایش داده می‌شود. پیام‌های قدیمی (تاریخچه) هم همین پارس را می‌گیرند.
+    83→// ═══════════════════════════════════════════════════════════════
+    84→
+    85→interface ParsedApplySwap {
+    86→  type: "exercise" | "food";
+    87→  from: string;
+    88→  to: string;
+    89→  day?: string;
+    90→  /** متن پاسخ بدون خط directive */
+    91→  remainder: string;
+    92→}
+    93→
+    94→function parseApplySwapDirective(content: string): ParsedApplySwap | null {
+    95→  if (!content || content.length > 12000) return null;
+    96→  const idx = content.lastIndexOf("[APPLY_SWAP ");
+    97→  if (idx < 0) return null;
+    98→  const tail = content.slice(idx);
+    99→  const m = tail.match(
+   100→    /^\[APPLY_SWAP type=(exercise|food) from="([^"]*)" to="([^"]*)"(?: day="([^"]*)")?\][ \t\r\n]*$/
+   101→  );
+   102→  if (!m) return null;
+   103→  const from = (m[2] ?? "").trim();
+   104→  const to = (m[3] ?? "").trim();
+   105→  if (!from || !to) return null;
+   106→  return {
+   107→    type: m[1] as "exercise" | "food",
+   108→    from,
+   109→    to,
+   110→    day: (m[4] ?? "").trim() || undefined,
+   111→    remainder: content.slice(0, idx).trimEnd(),
+   112→  };
+   113→}
+   114→
+   115→/** پارامترهای poll پیام‌های pending (تحلیل مدیا در پس‌زمینه — v73.4) */
+   116→const PENDING_POLL_INTERVAL_MS = 4_000;
+   117→const PENDING_POLL_MAX_MS = 5 * 60_000; // حداکثر ۵ دقیقه
+   118→
+   119→/**
+   120→ * v57 — شناسهٔ حباب «پیشنهاد دستیار تغذیه» — بعد از اولین تحلیل عکس غذا در چت،
+   121→ * یک‌بار در هر سشن به‌صورت حباب اختصاصی (با دکمهٔ رفتن به دستیار) نشان داده
+   122→ * می‌شود تا کاربر بداند تحلیلِ تاریخچه‌دار از کجا انجام می‌شود (درخواست مالک).
+   123→ */
+   124→const FOOD_TIP_MESSAGE_ID = "fitup-food-assistant-tip";
+   125→const FOOD_TIP_SESSION_FLAG = "fitup_food_tip_shown_v1";
+   126→
+   127→/** تبدیل File به Data URL برای ارسال به سرور */
+   128→function fileToDataUrl(file: File): Promise<string> {
+   129→  return new Promise((resolve, reject) => {
+   130→    const reader = new FileReader();
+   131→    reader.onload = () => resolve(reader.result as string);
+   132→    reader.onerror = reject;
+   133→    reader.readAsDataURL(file);
+   134→  });
+   135→}
+   136→
+   137→/** قالب‌بندی زمان پیام به فارسی */
+   138→function formatTime(iso: string): string {
+   139→  try {
+   140→    return new Date(iso).toLocaleTimeString("fa-IR", {
+   141→      hour: "2-digit",
+   142→      minute: "2-digit",
+   143→    });
+   144→  } catch {
+   145→    return "";
+   146→  }
+   147→}
+   148→
+   149→/** حجم فایل به‌صورت فارسی و خوانا (برای چیپ پیش‌نمایش ویدیو) */
+   150→function formatFileSizeFa(bytes: number): string {
+   151→  if (!bytes || bytes <= 0) return "۰";
+   152→  const mb = bytes / (1024 * 1024);
+   153→  if (mb >= 1) return `${toPersianDigits(mb >= 10 ? Math.round(mb) : Math.round(mb * 10) / 10)} مگابایت`;
+   154→  return `${toPersianDigits(Math.max(1, Math.round(bytes / 1024)))} کیلوبایت`;
+   155→}
+   156→
+   157→/** آزادسازی امن blob URL — روی مقدار غیر blob بی‌اثر است */
+   158→function revokeObjectUrl(url: string | null | undefined): void {
+   159→  if (url && url.startsWith("blob:")) {
+   160→    try {
+   161→      URL.revokeObjectURL(url);
+   162→    } catch {}
+   163→  }
+   164→}
+   165→
+   166→/**
+   167→ * آپلود ویدیو با XMLHttpRequest — برای دریافت درصد پیشرفت واقعی آپلود
+   168→ * (fetch هنوز upload progress قابل‌اعتماد ندارد). مسیر نسبی — بدون پورت.
+   169→ */
+   170→function uploadVideoWithProgress(
+   171→  file: File,
+   172→  onProgress: (pct: number) => void
+   173→): Promise<{ mediaUrl: string; frames: string[] }> {
+   174→  return new Promise((resolve, reject) => {
+   175→    const xhr = new XMLHttpRequest();
+   176→    xhr.open("POST", "/api/coach/chat/upload");
+   177→    xhr.responseType = "json";
+   178→    xhr.timeout = 10 * 60_000; // آپلود فایل‌های بزرگ — ۱۰ دقیقه
+   179→    xhr.upload.onprogress = (e) => {
+   180→      if (e.lengthComputable && e.total > 0) {
+   181→        onProgress(Math.min(99, Math.round((e.loaded / e.total) * 100)));
+   182→      }
+   183→    };
+   184→    xhr.onload = () => {
+   185→      const data = xhr.response as
+   186→        | { mediaUrl?: string; frames?: string[]; error?: string }
+   187→        | null;
+   188→      if (xhr.status >= 200 && xhr.status < 300 && data?.mediaUrl) {
+   189→        onProgress(100);
+   190→        resolve({
+   191→          mediaUrl: data.mediaUrl,
+   192→          frames: Array.isArray(data.frames) ? data.frames : [],
+   193→        });
+   194→      } else {
+   195→        reject(
+   196→          new Error(
+   197→            (data && data.error) ||
+   198→              "آپلود ویدیو ناموفق بود. دوباره تلاش کن."
+   199→          )
+   200→        );
+   201→      }
+   202→    };
+   203→    xhr.onerror = () => reject(new Error(SERVER_UNREACHABLE_MESSAGE));
+   204→    xhr.ontimeout = () =>
+   205→      reject(new Error("آپلود ویدیو بیش از حد طول کشید. دوباره تلاش کن."));
+   206→    const fd = new FormData();
+   207→    fd.append("file", file);
+   208→    xhr.send(fd);
+   209→  });
+   210→}
+   211→
+   212→export function SmartCoachChatView({ variant = "page" }: { variant?: "page" | "panel" }) {
+   213→  const { user, chatMessages, setChatMessages, addChatMessage, setOverlay } =
+   214→    useAppStore();
+   215→  const [input, setInput] = useState("");
+   216→  const [loading, setLoading] = useState(true);
+   217→  const [sending, setSending] = useState(false);
+   218→  const [error, setError] = useState(false);
+   219→  const scrollRef = useRef<HTMLDivElement>(null);
+   220→
+   221→  // ─── Task 4-a — سهمیه‌ها (بنر شیشه‌ای بالای پیام‌ها) ───
+   222→  const planName = (user?.planName ?? null) as Plan | null;
+   223→  const canChat = canAccess(planName, "aiChatQuestions");
+   224→  const { summary: quotaSummary, refresh: refreshQuota } = useQuotaSummary(
+   225→    !!user && canChat
+   226→  );
+   227→
+   228→  // قابلیت صوتی — ضبط ویس و تبدیل به متن (ASR — دست‌نخورده)
+   229→  const { isRecording, isProcessing, error: voiceError, startRecording, stopRecording } = useVoiceRecorder((text) => {
+   230→    setInput((prev) => (prev ? prev + " " + text : text));
+   231→    lastWasVoiceRef.current = true; // علامت‌گذاری: این پیام از ویس بود
+   232→    toast.success("پیام صوتی تبدیل به متن شد 🎤 — دکمه ارسال را بزنید");
+   233→  });
+   234→
+   235→  // نمایش خطای میکروفون
+   236→  useEffect(() => {
+   237→    if (voiceError) toast.error(voiceError);
+   238→  }, [voiceError]);
+   239→
+   240→  // tracking: آیا آخرین پیام ارسالی از طریق ویس بود؟
+   241→  const lastWasVoiceRef = useRef(false);
+   242→  const inputRef = useRef<HTMLTextAreaElement>(null);
+   243→  const imageInputRef = useRef<HTMLInputElement>(null);
+   244→  const videoInputRef = useRef<HTMLInputElement>(null);
+   245→
+   246→  // پیش‌نمایش مدیای انتخاب‌شده قبل از ارسال
+   247→  const [selectedImage, setSelectedImage] = useState<string | null>(null); // data URL
+   248→  // ─── Task 4-a: ویدیو با blob URL + File + poster کانواسی ───
+   249→  const [selectedVideo, setSelectedVideo] = useState<string | null>(null); // blob URL (پیش‌نمایش فوری)
+   250→  const [selectedVideoFile, setSelectedVideoFile] = useState<File | null>(null);
+   251→  const [selectedVideoPoster, setSelectedVideoPoster] = useState<string | null>(null);
+   252→  const selectedVideoUrlRef = useRef<string | null>(null);
+   253→  const videoSelectionSeqRef = useRef(0); // نسل انتخاب — جلوگیری از overwrite poster قدیمی
+   254→  // درصد پیشرفت آپلود multipart (null = در حال آپلود نیستیم)
+   255→  const [uploadPct, setUploadPct] = useState<number | null>(null);
+   256→
+   257→  // ─── منوی بازشدنی دکمه + (انتخاب عکس/ویدیو) ───
+   258→  const [showUploadMenu, setShowUploadMenu] = useState(false);
+   259→
+   260→  // آزادسازی blob URL هنگام unmount — نشت حافظه نماند
+   261→  useEffect(() => {
+   262→    return () => {
+   263→      revokeObjectUrl(selectedVideoUrlRef.current);
+   264→      selectedVideoUrlRef.current = null;
+   265→    };
+   266→  }, []);
+   267→
+   268→  // ─── Task 4-a — فیکس اسکرول چت ───
+   269→  // قبلاً کل تاریخچه رندر می‌شد و بعد smooth-scroll به پایین — کاربر اول
+   270→  // پیام‌های قدیمی را می‌دید و صفحه «سریع اسکرول» می‌شد. حالا:
+   271→  //   الف) فقط ۳۰ پیام آخر در رندر اول + بارگذاری lazy قدیمی‌ترها (۲۰تایی)
+   272→  //   ب) اسکرول اولیه behavior:"auto" در useLayoutEffect — فقط یک‌بار
+   273→  //   ج) smooth فقط برای پیام‌های جدید بعد از اسکرول اولیه
+   274→  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_MESSAGES);
+   275→  const didInitialScrollRef = useRef(false);
+   276→  const loadingOlderRef = useRef(false);
+   277→  const prevScrollHeightRef = useRef(0);
+   278→  const topSentinelRef = useRef<HTMLDivElement | null>(null);
+   279→
+   280→  const visibleMessages = useMemo(
+   281→    () => chatMessages.slice(Math.max(0, chatMessages.length - visibleCount)),
+   282→    [chatMessages, visibleCount]
+   283→  );
+   284→  const hasOlder = chatMessages.length > visibleCount;
+   285→
+   286→  const loadOlderMessages = useCallback(() => {
+   287→    if (chatMessages.length <= visibleCount) return;
+   288→    loadingOlderRef.current = true;
+   289→    prevScrollHeightRef.current = scrollRef.current?.scrollHeight ?? 0;
+   290→    setVisibleCount((c) => Math.min(c + LOAD_OLDER_STEP, chatMessages.length));
+   291→  }, [chatMessages.length, visibleCount]);
+   292→
+   293→  // حفظ موقعیت اسکرول بعد از prepend پیام‌های قدیمی‌تر (بدون پرش)
+   294→  useLayoutEffect(() => {
+   295→    if (!loadingOlderRef.current) return;
+   296→    loadingOlderRef.current = false;
+   297→    const el = scrollRef.current;
+   298→    if (!el) return;
+   299→    const delta = el.scrollHeight - prevScrollHeightRef.current;
+   300→    if (delta > 0) el.scrollTop += delta;
+   301→  }, [visibleCount]);
+   302→
+   303→  // IntersectionObserver بالای لیست — نزدیک شدن به بالا → بارگذاری قدیمی‌ترها
+   304→  // v59 — گارد مرورگر: بدون IO، صفحه‌بندی نادیده گرفته می‌شود (کرش مرز خطا نشود)
+   305→  useEffect(() => {
+   306→    const el = topSentinelRef.current;
+   307→    const container = scrollRef.current;
+   308→    if (!el || !container || loading || !hasOlder) return;
+   309→    if (typeof IntersectionObserver === "undefined") return;
+   310→    const observer = new IntersectionObserver(
+   311→      (entries) => {
+   312→        for (const entry of entries) {
+   313→          if (entry.isIntersecting) loadOlderMessages();
+   314→        }
+   315→      },
+   316→      { root: container, rootMargin: "160px 0px 0px 0px", threshold: 0 }
+   317→    );
+   318→    observer.observe(el);
+   319→    return () => observer.disconnect();
+   320→  }, [loading, hasOlder, loadOlderMessages]);
+   321→
+   322→  // بارگذاری تاریخچه چت از سرور — تابع جدا تا دکمه «تلاش مجدد» در بنر خطا
+   323→  // هم بتواند همان منطق را اجرا کند (قبلاً فقط داخل useEffect یک‌باره بود)
+   324→  const loadHistory = useCallback(async () => {
+   325→    setLoading(true);
+   326→    try {
+   327→      // fetchJson: پاسخ HTML (خطای گیت‌وی/سرور در حال ری‌استارت) → خطای فارسی
+   328→      const { res, data } = await fetchJson<{ messages?: ChatMessageDto[] }>(
+   329→        "/api/coach/chat",
+   330→        { cache: "no-store" }
+   331→      );
+   332→      if (!res.ok) throw new Error();
+   333→      setChatMessages(data.messages || []);
+   334→      setError(false);
+   335→    } catch {
+   336→      setError(true);
+   337→    } finally {
+   338→      setLoading(false);
+   339→    }
+   340→  }, [setChatMessages]);
+   341→
+   342→  // بارگذاری اولیه تاریخچه چت از سرور (یک‌بار در mount)
+   343→  useEffect(() => {
+   344→    loadHistory();
+   345→  }, [loadHistory]);
+   346→
+   347→  // ─── v73.4 — poll پیام‌های pending (دوفازی مدیا: تحلیل پس‌زمینه) ───
+   348→  // پاسخ POST برای پیام مدیا‌دار فوری برمی‌گردد (placeholder با content خالی) و
+   349→  // تحلیل در پس‌زمینهٔ سرور ادامه دارد. این poll هر ۴ ثانیه messages کامل را
+   350→  // می‌گیرد؛ به‌محض آنکه پیام assistant با همان id محتوا گرفت، آن را نمایش
+   351→  // می‌دهد و poll را تمام می‌کند (سقف ۵ دقیقه). بعد از رفرش صفحه هم کار می‌کند
+   352→  // چون GET خودش placeholderهای pending را برمی‌گرداند.
+   353→  const mountedRef = useRef(true);
+   354→  const pendingPollsRef = useRef<Set<string>>(new Set());
+   355→
+   356→  useEffect(() => {
+   357→    mountedRef.current = true;
+   358→    return () => {
+   359→      mountedRef.current = false;
+   360→    };
+   361→  }, []);
+   362→
+   363→  const startPendingPoll = useCallback(
+   364→    (messageId: string) => {
+   365→      if (!messageId || pendingPollsRef.current.has(messageId)) return;
+   366→      pendingPollsRef.current.add(messageId);
+   367→      void (async () => {
+   368→        const deadline = Date.now() + PENDING_POLL_MAX_MS;
+   369→        try {
+   370→          while (Date.now() < deadline) {
+   371→            await new Promise((r) => setTimeout(r, PENDING_POLL_INTERVAL_MS));
+   372→            if (!mountedRef.current) return;
+   373→            try {
+   374→              const { res, data } = await fetchJson<{ messages?: ChatMessageDto[] }>(
+   375→                "/api/coach/chat",
+   376→                { cache: "no-store" }
+   377→              );
+   378→              if (!res.ok) continue; // خطای موقت سرور — تا ددلاین ادامه بده
+   379→              const target = (data.messages || []).find((m) => m.id === messageId);
+   380→              if (!target) return; // پیام از تاریخچه حذف شده — poll بی‌معنی است
+   381→              if (target.content && target.content.trim().length > 0) {
+   382→                // پاسخ آماده شد → همان حباب placeholder پر می‌شود
+   383→                setChatMessages((prev) => {
+   384→                  if (prev.some((m) => m.id === messageId)) {
+   385→                    return prev.map((m) =>
+   386→                      m.id === messageId
+   387→                        ? { ...m, content: target.content, createdAt: target.createdAt }
+   388→                        : m
+   389→                    );
+   390→                  }
+   391→                  // حباب در لیست محلی نبود (مثلاً بعد از خطای بارگذاری) → اضافه شود
+   392→                  return [
+   393→                    ...prev,
+   394→                    {
+   395→                      id: target.id,
+   396→                      role: target.role,
+   397→                      content: target.content,
+   398→                      mediaUrl: target.mediaUrl ?? null,
+   399→                      mediaType: target.mediaType ?? null,
+   400→                      createdAt: target.createdAt,
+   401→                    },
+   402→                  ];
+   403→                });
+   404→                return;
+   405→              }
+   406→            } catch {
+   407→              // خطای شبکه — تا ددلاین ادامه بده
+   408→            }
+   409→          }
+   410→          // تایم‌اوت ۵ دقیقه — کاربر راهنمایی می‌شود؛ بعد از تکمیل سمت سرور،
+   411→          // رفرش/بازگشت به صفحه پاسخ کامل را نشان می‌دهد
+   412→          if (mountedRef.current) {
+   413→            setChatMessages((prev) =>
+   414→              prev.map((m) =>
+   415→                m.id === messageId && !m.content
+   416→                  ? {
+   417→                      ...m,
+   418→                      content:
+   419→                        "⏳ پاسخ به این پیام بیش از حد انتظار طول کشید. چند لحظه دیگر صفحه را دوباره باز کن یا پیام را دوباره بفرست.",
+   420→                    }
+   421→                  : m
+   422→              )
+   423→            );
+   424→          }
+   425→        } finally {
+   426→          pendingPollsRef.current.delete(messageId);
+   427→        }
+   428→      })();
+   429→    },
+   430→    [setChatMessages]
+   431→  );
+   432→
+   433→  // بعد از رفرش صفحه: placeholderهای pending موجود در تاریخچه دوباره poll می‌شوند
+   434→  useEffect(() => {
+   435→    if (loading) return;
+   436→    for (const m of chatMessages) {
+   437→      if (
+   438→        m.role === "assistant" &&
+   439→        m.content === "" &&
+   440→        m.id !== FOOD_TIP_MESSAGE_ID
+   441→      ) {
+   442→        startPendingPoll(m.id);
+   443→      }
+   444→    }
+   445→  }, [loading, chatMessages, startPendingPoll]);
+   446→
+   447→  // اسکرول اولیه — یک‌بار، بلافاصله بعد از اولین رندر پیام‌ها، بدون انیمیشن (auto)
+   448→  useLayoutEffect(() => {
+   449→    if (loading || chatMessages.length === 0) return;
+   450→    if (didInitialScrollRef.current) return;
+   451→    didInitialScrollRef.current = true;
+   452→    const el = scrollRef.current;
+   453→    if (el) el.scrollTop = el.scrollHeight;
+   454→  }, [loading, chatMessages.length]);
+   455→
+   456→  // اسکرول smooth فقط برای پیام‌های جدید بعد از اسکرول اولیه:
+   457→  //  • وقتی کاربر خودش ارسال می‌کند (sending=true) همیشه دنبال کن
+   458→  //  • وقتی پیام جدید می‌آید، فقط اگر کاربر نزدیک پایین است — مزاحم
+   459→  //    خواندن تاریخچهٔ بالا نشو
+   460→  useEffect(() => {
+   461→    if (!didInitialScrollRef.current) return;
+   462→    const el = scrollRef.current;
+   463→    if (!el) return;
+   464→    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+   465→    if (sending || distanceFromBottom < 300) {
+   466→      el.scrollTo({
+   467→        top: el.scrollHeight,
+   468→        behavior: "smooth",
+   469→      });
+   470→    }
+   471→  }, [chatMessages.length, sending]);
+   472→
+   473→  // Auto-resize textarea تا حداکثر ۱۲۰px
+   474→  useEffect(() => {
+   475→    const el = inputRef.current;
+   476→    if (!el) return;
+   477→    el.style.height = "auto";
+   478→    el.style.height = Math.min(el.scrollHeight, 120) + "px";
+   479→  }, [input]);
+   480→
+   481→  async function handleImageSelect(e: React.ChangeEvent<HTMLInputElement>) {
+   482→    const file = e.target.files?.[0];
+   483→    e.target.value = "";
+   484→    if (!file) return;
+   485→    if (!file.type.startsWith("image/")) {
+   486→      toast.error("فقط فایل تصویری مجاز است.");
+   487→      return;
+   488→    }
+   489→    // Task 4-a: محدودیت حجم کلاینت حذف شد — عکس در سرور خودکار کاهش می‌یابد
+   490→    // (سقف فنی سمت سرور ~۳۰ مگابایت فایل / ۴۰ مگابایت base64 با پیام مهربان)
+   491→    if (file.size > 500 * 1024 * 1024) {
+   492→      toast.error("این فایل خیلی بزرگ است — عکس معقول‌تری انتخاب کن 🙏");
+   493→      return;
+   494→    }
+   495→    try {
+   496→      const dataUrl = await fileToDataUrl(file);
+   497→      setSelectedImage(dataUrl);
+   498→      clearVideoDraft(); // فقط یک مدیا همزمان
+   499→    } catch {
+   500→      toast.error("خطا در پردازش عکس. دوباره تلاش کنید.");
+   501→    }
+   502→  }
+   503→
+   504→  async function handleVideoSelect(e: React.ChangeEvent<HTMLInputElement>) {
+   505→    const file = e.target.files?.[0];
+   506→    e.target.value = "";
+   507→    if (!file) return;
+   508→    if (!file.type.startsWith("video/")) {
+   509→      toast.error("فقط فایل ویدیویی مجاز است.");
+   510→      return;
+   511→    }
+   512→    if (file.size > VIDEO_CLIENT_HARD_CAP) {
+   513→      toast.error("حجم ویدیو بیش از حد فنی مجاز (۵۰۰ مگابایت) است.");
+   514→      return;
+   515→    }
+   516→    try {
+   517→      // ─── Task 4-a: پیش‌نمایش با blob URL (فوری) + poster کانواسی (تضمینی) ───
+   518→      // قبلاً data URL کامل در <video preload="metadata"> تا کلیک فقط سیاه بود.
+   519→      const seq = ++videoSelectionSeqRef.current;
+   520→      revokeObjectUrl(selectedVideoUrlRef.current);
+   521→      const blobUrl = URL.createObjectURL(file);
+   522→      selectedVideoUrlRef.current = blobUrl;
+   523→      setSelectedVideo(blobUrl);
+   524→      setSelectedVideoFile(file);
+   525→      setSelectedVideoPoster(null);
+   526→      setSelectedImage(null); // فقط یک مدیا همزمان
+   527→      const poster = await createVideoThumbnail(blobUrl);
+   528→      if (videoSelectionSeqRef.current === seq && poster) {
+   529→        setSelectedVideoPoster(poster);
+   530→      }
+   531→    } catch {
+   532→      toast.error("خطا در پردازش ویدیو. دوباره تلاش کنید.");
+   533→    }
+   534→  }
+   535→
+   536→  /** پاک‌کردن پیش‌نویس ویدیو + آزادسازی blob URL */
+   537→  function clearVideoDraft() {
+   538→    videoSelectionSeqRef.current += 1;
+   539→    revokeObjectUrl(selectedVideoUrlRef.current);
+   540→    selectedVideoUrlRef.current = null;
+   541→    setSelectedVideoFile(null);
+   542→    setSelectedVideoPoster(null);
+   543→    setSelectedVideo(null);
+   544→  }
+   545→
+   546→  function handleRemoveMedia() {
+   547→    setSelectedImage(null);
+   548→    clearVideoDraft();
+   549→  }
+   550→
+   551→  function handleImageBtn() {
+   552→    if (canAccess(planName, "chatImageUpload")) {
+   553→      imageInputRef.current?.click();
+   554→    } else {
+   555→      toast.info("برای ارسال عکس باید پلن خود را به پیشرفته ارتقا دهید");
+   556→      setOverlay("subscription");
+   557→    }
+   558→  }
+   559→
+   560→  function handleVideoBtn() {
+   561→    if (canAccess(planName, "chatVideoUpload")) {
+   562→      videoInputRef.current?.click();
+   563→    } else {
+   564→      // v60 — «آنالیز فرم حرکات» همین‌جاست: کاربر با ارسال ویدیوی اجرای حرکت،
+   565→      // فرم حرکاتش را بررسی و اصلاح می‌کند (پلن حرفه‌ای).
+   566→      toast.info("آنالیز فرم حرکات اینجاست — ویدیوی اجرای حرکتت رو بفرست تا فرمت رو اصلاح کنیم (نیازمند پلن حرفه‌ای)");
+   567→      setOverlay("subscription");
+   568→    }
+   569→  }
+   570→
+   571→  const canSendImage = canAccess(planName, "chatImageUpload");
+   572→  const canSendVideo = canAccess(planName, "chatVideoUpload");
+   573→
+   574→  async function send(text?: string) {
+   575→    const message = (text ?? input).trim();
+   576→    if ((!message && !selectedImage && !selectedVideoFile) || sending) return;
+   577→    if (!canChat) {
+   578→      toast.info("برای چت با فیتاپ باید پلن خود را ارتقا دهید");
+   579→      setOverlay("subscription");
+   580→      return;
+   581→    }
+   582→    setInput("");
+   583→    setSending(true);
+   584→
+   585→    // ─── مقادیر مدیا قبل از ارسال — برای بازگرداندن در خطا ───
+   586→    const imageData = selectedImage;
+   587→    const videoFile = selectedVideoFile;
+   588→    const videoPreviewUrl = selectedVideo; // blob URL برای پیش‌نمایش پیام موقت
+   589→    const videoPoster = selectedVideoPoster;
+   590→
+   591→    // ساخت پیام موقت با مدیا برای نمایش فوری
+   592→    // (ویدیو با blob URL + poster فوراً فریم اول را نشان می‌دهد — Task 4-a)
+   593→    const tempUserMsg: ChatMessageDto = {
+   594→      id: tempId("temp"),
+   595→      role: "user",
+   596→      content:
+   597→        message ||
+   598→        (selectedImage ? "📷 عکس" : videoFile ? "🎬 ویدیو" : ""),
+   599→      mediaUrl: selectedImage ?? videoPreviewUrl,
+   600→      mediaType: selectedImage ? "image" : videoFile ? "video" : null,
+   601→      createdAt: new Date().toISOString(),
+   602→    };
+   603→    addChatMessage(tempUserMsg);
+   604→
+   605→    setSelectedImage(null);
+   606→    clearVideoDraft();
+   607→
+   608→    try {
+   609→      let videoBase64: string | undefined;
+   610→      let uploadedVideoUrl: string | undefined;
+   611→      let uploadedFrames: string[] | undefined;
+   612→
+   613→      if (videoFile) {
+   614→        if (videoFile.size > VIDEO_MULTIPART_THRESHOLD) {
+   615→          // ─── Task 4-a: ویدیوهای بزرگ → مسیر multipart بدون محدودیت حجم ───
+   616→          // ابتدا آپلود (ذخیره + فشرده‌سازی + استخراج فریم + مصرف سهمیه)،
+   617→          // سپس POST چت با videoUrl/videoFrames.
+   618→          setUploadPct(0);
+   619→          try {
+   620→            const up = await uploadVideoWithProgress(videoFile, (p) =>
+   621→              setUploadPct(p)
+   622→            );
+   623→            uploadedVideoUrl = up.mediaUrl;
+   624→            uploadedFrames = up.frames;
+   625→          } finally {
+   626→            setUploadPct(null);
+   627→          }
+   628→        } else {
+   629→          // مسیر قدیمی base64 (<۱۲MB) — دست‌نخورده
+   630→          videoBase64 = await fileToDataUrl(videoFile);
+   631→        }
+   632→      }
+   633→
+   634→      // fetchJsonOrThrow: پاسخ HTML (۵۰۲ گیت‌وی / تایم‌اوت درخواست‌های بلند ویدیو)
+   635→      // → پیام فارسی «ارتباط با سرور برقرار نشد...» به‌جای «Unexpected token '<'»
+   636→      // v73.4 — clientId: همان tempId پیام موقت → idempotency سمت سرور (فیکس دبل‌سند)
+   637→      const data = await fetchJsonOrThrow<any>(
+   638→        "/api/coach/chat",
+   639→        {
+   640→          method: "POST",
+   641→          headers: { "Content-Type": "application/json" },
+   642→          body: JSON.stringify({
+   643→            message,
+   644→            clientId: tempUserMsg.id,
+   645→            imageBase64: imageData || undefined,
+   646→            videoBase64,
+   647→            videoUrl: uploadedVideoUrl,
+   648→            videoFrames: uploadedFrames,
+   649→            isVoice: lastWasVoiceRef.current, // آیا پیام از طریق ویس بود؟
+   650→          }),
+   651→        },
+   652→        "خطا در ارتباط با سرور"
+   653→      );
+   654→
+   655→      // ─── v57: حباب پیشنهاد «دستیار تغذیه» — درخواست مالک ───
+   656→      // تحلیل غذا در چت انجام می‌شود ولی در تاریخچهٔ غذایی ثبت نمی‌شود؛ کاربر
+   657→      // بعد از اولین تحلیل عکس غذا، یک‌بار در سشن، پیشنهاد اختصاصی می‌گیرد.
+   658→      // v59 — گارد storage: getItem در حالت خصوصی می‌تواند throw کند
+   659→      let foodTipShown = false;
+   660→      try {
+   661→        foodTipShown = !!window.sessionStorage.getItem(FOOD_TIP_SESSION_FLAG);
+   662→      } catch {}
+   663→      const shouldPushFoodTip =
+   664→        !!imageData && !videoFile && typeof window !== "undefined" && !foodTipShown;
+   665→      if (shouldPushFoodTip) {
+   666→        try {
+   667→          window.sessionStorage.setItem(FOOD_TIP_SESSION_FLAG, "1");
+   668→        } catch {}
+   669→      }
+   670→
+   671→      // ─── v73.4 — فیکس باگ کلوژر: به‌جای ساخت آرایه از chatMessages زمان render
+   672→      // (که stale می‌ماند و پیام را دوبار نمایش می‌داد)، آپدیت functional روی
+   673→      // آخرین state انجام می‌شود + حذف هر ردیف تکراری سروری (idempotent replay).
+   674→      setChatMessages((prev) => {
+   675→        const next: ChatMessageDto[] = [];
+   676→        for (const m of prev) {
+   677→          if (m.id === tempUserMsg.id) continue; // پیام موقت → نسخهٔ سروری می‌آید
+   678→          if (data.userMessage && m.id === data.userMessage.id) continue;
+   679→          if (data.aiMessage && m.id === data.aiMessage.id) continue;
+   680→          next.push(m);
+   681→        }
+   682→        if (data.userMessage) next.push(data.userMessage as ChatMessageDto);
+   683→        if (data.aiMessage) next.push(data.aiMessage as ChatMessageDto);
+   684→        if (shouldPushFoodTip) {
+   685→          next.push({
+   686→            id: FOOD_TIP_MESSAGE_ID,
+   687→            role: "assistant",
+   688→            content: "", // محتوا در FoodAssistantTipBubble رندر می‌شود
+   689→            createdAt: new Date().toISOString(),
+   690→          });
+   691→        }
+   692→        return next;
+   693→      });
+   694→
+   695→      // blob پیش‌نمایش دیگر لازم نیست (پیام نهایی URL سروری دارد)
+   696→      if (videoPreviewUrl !== selectedVideoUrlRef.current) {
+   697→        revokeObjectUrl(videoPreviewUrl);
+   698→      }
+   699→
+   700→      // به‌روزرسانی سهمیه‌ها بعد از ارسال موفق عکس/ویدیو (Task 4-a)
+   701→      if (imageData || videoFile) refreshQuota();
+   702→
+   703→      // ─── v56/v73.4 — راهنمایی کاربر به «دستیار تغذیه» بعد از ارسال عکس غذا ───
+   704→      // (تحلیل خودِ عکس حالا در پس‌زمینه انجام می‌شود و نتیجه در حباب pending می‌آید)
+   705→      if (imageData && !videoFile) {
+   706→        toast.info("عکس دریافت شد — تحلیل در جریان است ⏳", {
+   707→          description:
+   708→            "از این به بعد تحلیل عکس غذا را از «دستیار تغذیه» انجام بده تا در تاریخچهٔ غذایی‌ات ثبت شود و برنامه‌ات دقیق‌تر پیگیری بشه 🍽",
+   709→          action: {
+   710→            label: "رفتن به دستیار تغذیه",
+   711→            onClick: () => useAppStore.getState().setMainTab("nutrition"),
+   712→          },
+   713→          duration: 10000,
+   714→        });
+   715→      }
+   716→
+   717→      // ─── v73.4 — دوفازی مدیا: پاسخ فوری با pending=true → poll تا تکمیل تحلیل ───
+   718→      if (data.pending && data.aiMessage?.id) {
+   719→        startPendingPoll(data.aiMessage.id);
+   720→      }
+   721→    } catch (e) {
+   722→      // v73.4 — functional update (فیکس باگ کلوژر)
+   723→      setChatMessages((prev) => prev.filter((m) => m.id !== tempUserMsg.id));
+   724→      // ─── بازیابی متن تایپ‌شده و پیوست‌ها ───
+   725→      // قبلاً پیام کاربر (متن + عکس/ویدیو) با خطای شبکه «برای همیشه» از دست
+   726→      // می‌رفت و کاربر مجبور بود از اول تایپ/انتخاب کند — حالا مقادیر pre-send
+   727→      // به input و پیش‌نمایش مدیا برمی‌گردند (فقط اگر کاربر در این بین چیزی
+   728→      // جدید تایپ/انتخاب نکرده باشد تا کار تازه‌اش دوباره‌کاری نشود).
+   729→      if (message) setInput((prev) => prev || message);
+   730→      if (imageData) setSelectedImage((prev) => prev ?? imageData);
+   731→      if (videoFile) {
+   732→        videoSelectionSeqRef.current += 1;
+   733→        selectedVideoUrlRef.current = videoPreviewUrl; // blob هنوز زنده است — revoke نشده
+   734→        setSelectedVideoFile(videoFile);
+   735→        setSelectedVideo(videoPreviewUrl);
+   736→        setSelectedVideoPoster(videoPoster);
+   737→      }
+   738→      const errMsg =
+   739→        e instanceof Error ? e.message : "خطا در ارتباط با سرور";
+   740→      // پیام سهمیه (۴۲۹) در toast هم نمایش داده می‌شود تا فوری دیده شود
+   741→      if (e instanceof ApiError && e.status === 429) {
+   742→        toast.error(errMsg);
+   743→      }
+   744→      addChatMessage({
+   745→        id: tempId("err"),
+   746→        role: "assistant",
+   747→        content: `⚠️ ${errMsg}`,
+   748→        createdAt: new Date().toISOString(),
+   749→      });
+   750→      // همگام‌سازی سهمیه بعد از خطا (مثلاً ۴۲۹ — شمارنده سرور ممکن است تغییر کرده باشد)
+   751→      refreshQuota();
+   752→    } finally {
+   753→      setSending(false);
+   754→      lastWasVoiceRef.current = false; // reset برای پیام بعدی
+   755→      inputRef.current?.focus();
+   756→    }
+   757→  }
+   758→
+   759→  function handleKeyDown(e: React.KeyboardEvent) {
+   760→    if (e.key === "Enter" && !e.shiftKey) {
+   761→      e.preventDefault();
+   762→      send();
+   763→    }
+   764→  }
+   765→
+   766→  // اگر کاربر به چت دسترسی ندارد (Basic/Standard) → بنر ارتقا
+   767→  // 🩹 v48 (باگ بحرانی مالک): اگر user هنوز null است (لحظهٔ لود/refresh داده)،
+   768→  // هرگز بنر «قفل است» نشان نده — همان UI عادی چت می‌ماند و refreshUserIfNeeded
+   769→  // (main-app — mount/foreground) ظرف کمتر از یک ثانیه دسترسی واقعی را برمی‌گرداند.
+   770→  // قبلاً بنر قفل لحظه‌ای/مsometimes پایدار برای دارندگان پلن حرفه‌ای می‌آمد.
+   771→  if (!loading && user && !canChat) {
+   772→    return (
+   773→      <div className={variant === "panel" ? "px-4 py-4 h-full overflow-y-auto custom-scrollbar" : "px-4 py-4 max-w-md mx-auto"}>
+   774→        <UpgradeBanner
+   775→          featureLabel="فیتاپ"
+   776→          requiredPlan="advanced"
+   777→          description="با ارتقا به پلن پیشرفته، به فیتاپ با دسترسی کامل به داده‌های آنبوردینگ، آزمایش خون و اهداف شما دسترسی پیدا کن. برنامه تمرینی هفتگی، کالری دقیق، مکمل‌ها و پاسخ فنی — همه در ۲۴ ساعت شبانه‌روز."
+   778→          icon={<img src="/fitup-logo.png" alt="فیتاپ" className="w-8 h-8 rounded-lg object-cover" />}
+   779→        />
+   780→        <div className="mt-4 p-3 rounded-2xl bg-orange-50 border border-orange-100 text-center">
+   781→          <p className="text-xs text-slate-600 mb-2">
+   782→            💡 در عوض می‌تونی با «نیکا» چت کنی — راهنمای فروش و پشتیبانی
+   783→          </p>
+   784→          <Button
+   785→            size="sm"
+   786→            variant="outline"
+   787→            className="rounded-xl"
+   788→            onClick={() => useAppStore.getState().setChatMode("nika")}
+   789→          >
+   790→            <Bot className="w-4 h-4 text-orange-500" /> رفتن به چت نیکا
+   791→          </Button>
+   792→        </div>
+   793→      </div>
+   794→    );
+   795→  }
+   796→
+   797→  const containerClass =
+   798→    variant === "panel"
+   799→      ? "flex flex-col h-full w-full bg-white"
+   800→      : "flex flex-col h-[calc(100dvh-4rem)] max-w-2xl lg:max-w-4xl mx-auto bg-white";
+
+[showing lines 1-800 of 1636; use offset=801 with limit to continue reading]

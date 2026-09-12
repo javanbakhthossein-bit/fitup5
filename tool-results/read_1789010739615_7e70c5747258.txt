@@ -1,0 +1,821 @@
+     1→"use client";
+     2→
+     3→import { useState, useEffect } from "react";
+     4→import {
+     5→  X,
+     6→  Tag,
+     7→  Wallet,
+     8→  CreditCard,
+     9→  Check,
+    10→  Loader2,
+    11→  ShieldCheck,
+    12→  Sparkles,
+    13→  AlertCircle,
+    14→  CheckCircle2,
+    15→  XCircle,
+    16→  ExternalLink,
+    17→  Info,
+    18→  Crown,
+    19→  ShieldAlert,
+    20→} from "lucide-react";
+    21→import { Button } from "@/components/ui/button";
+    22→import { Input } from "@/components/ui/input";
+    23→import { Label } from "@/components/ui/label";
+    24→import {
+    25→  Dialog,
+    26→  DialogContent,
+    27→  DialogHeader,
+    28→  DialogTitle,
+    29→} from "@/components/ui/dialog";
+    30→import { useAppStore } from "@/lib/fitness/store";
+    31→import {
+    32→  toPersianDigits,
+    33→  formatToman,
+    34→  type SubscriptionPlan,
+    35→} from "@/lib/fitness/types";
+    36→import { toast } from "sonner";
+    37→
+    38→type Step = "form" | "gateway" | "processing" | "receipt";
+    39→
+    40→const goldGradient = "linear-gradient(135deg, #f59e0b, #f97316)";
+    41→
+    42→export function PurchaseModal({
+    43→  plan,
+    44→  onClose,
+    45→  onNeedLogin,
+    46→  prefillDiscountCode,
+    47→  prefillUserDiscountCode,
+    48→}: {
+    49→  plan: SubscriptionPlan;
+    50→  onClose: () => void;
+    51→  onNeedLogin: () => void;
+    52→  /** Public discount code to prefill (e.g. FITAP20) */
+    53→  prefillDiscountCode?: string;
+    54→  /** Per-user renewal discount code to prefill (auto-applied) */
+    55→  prefillUserDiscountCode?: string;
+    56→}) {
+    57→  const { user, setUser, setOverlay, setScreen, setMainTab } = useAppStore();
+    58→  const [step, setStep] = useState<Step>("form");
+    59→  const [discountCode, setDiscountCode] = useState(prefillDiscountCode ?? "");
+    60→  const [userDiscountCode, setUserDiscountCode] = useState<string>(prefillUserDiscountCode ?? "");
+    61→  const [discountInfo, setDiscountInfo] = useState<{
+    62→    valid: boolean;
+    63→    discountValue: number;
+    64→    finalAmount: number;
+    65→    label: string;
+    66→  } | null>(null);
+    67→  const [validating, setValidating] = useState(false);
+    68→  const [paymentMethod, setPaymentMethod] = useState<"gateway" | "wallet">("gateway");
+    69→  const [paymentData, setPaymentData] = useState<{
+    70→    paymentId: string;
+    71→    authority: string;
+    72→    gatewayUrl: string | null;
+    73→    simulated: boolean;
+    74→    finalAmount: number;
+    75→  } | null>(null);
+    76→  const [receipt, setReceipt] = useState<any>(null);
+    77→  const [loading, setLoading] = useState(false);
+    78→  // ضد دابل‌کلیک دکمه رفتن به درگاه: با اولین کلیک غیرفعال + اسپینر می‌شود
+    79→  // تا لحظه navigation (کلیک دوم می‌توانست پرداخت را به‌هم بریزد)
+    80→  const [redirecting, setRedirecting] = useState(false);
+    81→
+    82→  const isLoggedIn = !!user;
+    83→  const walletBalance = user?.walletBalance ?? 0;
+    84→  const originalAmount = plan.price;
+    85→
+    86→  // === upgrade estimate ===
+    87→  const [upgradeEstimate, setUpgradeEstimate] = useState<{
+    88→    isUpgrade: boolean;
+    89→    upgradeCredit: number;
+    90→    daysLeft: number;
+    91→    currentPlan: string | null;
+    92→    finalAmount: number;
+    93→    originalAmount: number;
+    94→  } | null>(null);
+    95→
+    96→  // وقتی مودال باز می‌شود و کاربر لاگین است، برآورد ارتقا را بگیر
+    97→  useEffect(() => {
+    98→    if (!isLoggedIn) {
+    99→      setUpgradeEstimate(null);
+   100→      return;
+   101→    }
+   102→    let cancelled = false;
+   103→    (async () => {
+   104→      try {
+   105→        const res = await fetch(`/api/payment/upgrade-estimate?planId=${plan.id}`);
+   106→        if (!res.ok) return;
+   107→        const data = await res.json();
+   108→        if (!cancelled && data.isUpgrade) {
+   109→          setUpgradeEstimate(data);
+   110→        } else if (!cancelled) {
+   111→          setUpgradeEstimate(null);
+   112→        }
+   113→      } catch {
+   114→        // ignore
+   115→      }
+   116→    })();
+   117→    return () => { cancelled = true; };
+   118→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   119→  }, [isLoggedIn, plan.id]);
+   120→
+   121→  // If a per-user discount code is prefilled, auto-apply it on mount
+   122→  useEffect(() => {
+   123→    if (prefillUserDiscountCode) {
+   124→      // Auto-apply via the same flow as clicking "اعمال"
+   125→      validateUserDiscount(prefillUserDiscountCode);
+   126→    } else if (prefillDiscountCode) {
+   127→      validateDiscount();
+   128→    }
+   129→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   130→  }, []);
+   131→
+   132→  // اگر مرورگر صفحه را از bfcache برگرداند (Back از درگاه پرداخت)، قفل
+   133→  // redirecting آزاد شود تا کاربر بتواند دوباره روی «رفتن به درگاه» بزند
+   134→  // 🩹 v45: حالا «هر» بازگشت به این صفحه + برگشت به تب (visibilitychange)
+   135→  // قفل را آزاد می‌کند — نه فقط bfcache با persisted=true
+   136→  useEffect(() => {
+   137→    const unlock = () => setRedirecting(false);
+   138→    const onPageShow = (e: PageTransitionEvent) => {
+   139→      unlock();
+   140→    };
+   141→    const onVisible = () => {
+   142→      if (document.visibilityState === "visible") unlock();
+   143→    };
+   144→    window.addEventListener("pageshow", onPageShow);
+   145→    document.addEventListener("visibilitychange", onVisible);
+   146→    return () => {
+   147→      window.removeEventListener("pageshow", onPageShow);
+   148→      document.removeEventListener("visibilitychange", onVisible);
+   149→    };
+   150→  }, []);
+   151→
+   152→  // FIX: فرمول مبلغ نهایی دقیقاً مثل checkout سمت سرور:
+   153→  // finalAmount = max(0, قیمت اصلی − تخفیف − اعتبار ارتقا)
+   154→  // قبلاً تخفیف و اعتبار ارتقا XOR اعمال می‌شدند (هرگز با هم) و «مبلغ قابل
+   155→  // پرداخت» با مبلغ واقعی شارژشده فرق می‌کرد + gating کیف پول عدد غلط می‌دید.
+   156→  const discountValue = discountInfo?.valid ? discountInfo.discountValue : 0;
+   157→  const upgradeCredit = upgradeEstimate?.isUpgrade ? upgradeEstimate.upgradeCredit : 0;
+   158→  const finalAmount = Math.max(0, originalAmount - discountValue - upgradeCredit);
+   159→  const canUseWallet = walletBalance >= finalAmount;
+   160→
+   161→  async function validateUserDiscount(code: string) {
+   162→    if (!code.trim()) {
+   163→      toast.error("کد تخفیف اختصاصی موجود نیست");
+   164→      return;
+   165→    }
+   166→    if (!isLoggedIn) {
+   167→      toast.info("برای استفاده از کد تخفیف ابتدا وارد شوید");
+   168→      onNeedLogin();
+   169→      return;
+   170→    }
+   171→    setValidating(true);
+   172→    try {
+   173→      // Fetch the user's actual per-user discount info to display the correct
+   174→      // percentage. v47: reason-aware — تمدید (renewal) یا هدیهٔ خرید اول.
+   175→      let percent = 15;
+   176→      let kindLabel = "تخفیف تمدید";
+   177→      try {
+   178→        const infoRes = await fetch("/api/user-discount-code");
+   179→        if (infoRes.ok) {
+   180→          const info = await infoRes.json();
+   181→          if (info?.value && info?.value > 0) percent = info.value;
+   182→          if (info?.reason && info.reason !== "renewal_loyalty") kindLabel = "تخفیف اختصاصی";
+   183→        }
+   184→      } catch {
+   185→        /* keep default 15% */
+   186→      }
+   187→      const estDiscount = Math.round((originalAmount * percent) / 100);
+   188→      const estFinal = Math.max(0, originalAmount - estDiscount);
+   189→      setDiscountCode(code);
+   190→      setUserDiscountCode(code);
+   191→      setDiscountInfo({
+   192→        valid: true,
+   193→        discountValue: estDiscount,
+   194→        finalAmount: estFinal,
+   195→        label: `کد اختصاصی ${code} (${toPersianDigits(percent)}٪ ${kindLabel})`,
+   196→      });
+   197→      toast.success(`کد اختصاصی اعمال شد! ${toPersianDigits(percent)}٪ ${kindLabel}`);
+   198→    } finally {
+   199→      setValidating(false);
+   200→    }
+   201→  }
+   202→
+   203→  async function validateDiscount() {
+   204→    if (!discountCode.trim()) {
+   205→      toast.error("کد تخفیف را وارد کنید");
+   206→      return;
+   207→    }
+   208→    if (!isLoggedIn) {
+   209→      toast.info("برای استفاده از کد تخفیف ابتدا وارد شوید");
+   210→      onNeedLogin();
+   211→      return;
+   212→    }
+   213→    setValidating(true);
+   214→    try {
+   215→      const res = await fetch("/api/payment/discount", {
+   216→        method: "POST",
+   217→        headers: { "Content-Type": "application/json" },
+   218→        body: JSON.stringify({ code: discountCode, planId: plan.id }),
+   219→      });
+   220→      const data = await res.json();
+   221→      if (!res.ok || !data.valid) {
+   222→        setDiscountInfo(null);
+   223→        toast.error(data.error || "کد تخفیف نامعتبر است");
+   224→        return;
+   225→      }
+   226→      // FIX: کد اختصاصی تمدید که کاربر دستی تایپ کرده — مثل مسیر prefill، به‌عنوان
+   227→      // userDiscountCode به checkout ارسال می‌شود تا سمت سرور از جدول درست اعمالش کند.
+   228→      setUserDiscountCode(data.isUserCode ? data.code : "");
+   229→      setDiscountCode(data.code);
+   230→      setDiscountInfo({
+   231→        valid: true,
+   232→        discountValue: data.discountValue,
+   233→        finalAmount: data.finalAmount,
+   234→        label: data.discountLabel,
+   235→      });
+   236→      toast.success(`کد اعمال شد! ${data.discountLabel}`);
+   237→    } catch {
+   238→      toast.error("خطا در بررسی کد تخفیف");
+   239→    } finally {
+   240→      setValidating(false);
+   241→    }
+   242→  }
+   243→
+   244→  async function startCheckout() {
+   245→    if (!isLoggedIn) {
+   246→      toast.info("برای خرید ابتدا وارد شوید");
+   247→      onNeedLogin();
+   248→      return;
+   249→    }
+   250→    // ─── چک آنبوردینگ ───
+   251→    // اگر کاربر لاگین کرده ولی آنبوردینگ را تکمیل نکرده، به صفحه آنبوردینگ هدایت کن.
+   252→    // این چک قبل از پرداخت انجام می‌شود تا کاربر مجبور باشد آنبوردینگ را کامل کند.
+   253→    // (!== true شامل حالت undefined/null هم می‌شود — گارد قطعی فرانت)
+   254→    if (user?.onboardingDone !== true) {
+   255→      toast.info("برای خرید پلن، ابتدا اطلاعات آنبوردینگ خود را تکمیل کنید");
+   256→      setScreen("onboarding");
+   257→      setOverlay(null);
+   258→      return;
+   259→    }
+   260→    // ─── T11: اپ کافه‌بازار — پرداخت از طریق درگاه درون‌برنامه‌ای بازار ───
+   261→    // طبق قانون انتشار بازار، فروش اشتراک دیجیتال در اپ بازار فقط از IAB بازار مجاز است.
+   262→    // پل JS (window.fitupBazaarPurchase) در MainActivity اپ اندروید تعریف شده است.
+   263→    const isBazaar = typeof window !== "undefined" && (window as any).isFitUpBazaarApp?.() === true;
+   264→    if (isBazaar) {
+   265→      await startBazaarCheckout();
+   266→      return;
+   267→    }
+   268→
+   269→    setLoading(true);
+   270→    try {
+   271→      const res = await fetch("/api/payment/checkout", {
+   272→        method: "POST",
+   273→        headers: { "Content-Type": "application/json" },
+   274→        body: JSON.stringify({
+   275→          planId: plan.id,
+   276→          paymentMethod,
+   277→          discountCode: discountInfo?.valid && !userDiscountCode ? discountCode : undefined,
+   278→          userDiscountCode: discountInfo?.valid && userDiscountCode ? userDiscountCode : undefined,
+   279→        }),
+   280→      });
+   281→      const data = await res.json();
+   282→      if (!res.ok) {
+   283→        if (data.code === "INSUFFICIENT_WALLET") {
+   284→          toast.error(data.error);
+   285→          setPaymentMethod("gateway");
+   286→          return;
+   287→        }
+   288→        // T12: گارد سرور هم آنبوردینگ را چک می‌کند — هدایت به آنبوردینگ
+   289→        if (data.code === "ONBOARDING_REQUIRED") {
+   290→          toast.info(data.error || "برای خرید پلن، ابتدا آنبوردینگ را تکمیل کنید");
+   291→          setScreen("onboarding");
+   292→          setOverlay(null);
+   293→          return;
+   294→        }
+   295→        throw new Error(data.error);
+   296→      }
+   297→      setPaymentData({
+   298→        paymentId: data.paymentId,
+   299→        authority: data.authority,
+   300→        gatewayUrl: data.gatewayUrl,
+   301→        simulated: data.simulated === true,
+   302→        finalAmount: data.finalAmount,
+   303→      });
+   304→      if (paymentMethod === "wallet") {
+   305→        // FE-C2: مقادیر fresh را مستقیم پاس بده — setPaymentData در همین tick
+   306→        // هنوز در closure فعلی قابل مشاهده نیست و بدون override،
+   307→        // completePayment با paymentData===null بی‌صدا return می‌کرد.
+   308→        await completePayment("OK", data.paymentId, data.authority);
+   309→      } else {
+   310→        setStep("gateway");
+   311→      }
+   312→    } catch (e) {
+   313→      toast.error(e instanceof Error ? e.message : "خطا در ایجاد پرداخت");
+   314→    } finally {
+   315→      setLoading(false);
+   316→    }
+   317→  }
+   318→
+   319→  /**
+   320→   * T11: خرید از طریق پرداخت درون‌برنامه‌ای کافه‌بازار (پولکی).
+   321→   *
+   322→   * اپ اندروید (WebView) پل window.fitupBazaarPurchase(sku, payload, dynamicPriceToken)
+   323→   * را فراهم می‌کند:
+   324→   *  ۱. اگر تخفیف/اعتبار ارتقا هست، ابتدا قیمت پویا در بازار ثبت می‌شود
+   325→   *     (/api/payment/bazaar/dynamic-price) و شناسه‌اش به اپ پاس می‌شود
+   326→   *  ۲. درگاه پرداخت بازار با همان مبلغ دقیق باز می‌شود و کاربر پرداخت می‌کند
+   327→   *  ۳. نتیجه (purchaseToken + orderId) به همین تابع برمی‌گردد
+   328→   *  ۴. برای فعال‌سازی اشتراک به /api/payment/bazaar/purchase ارسال می‌شود
+   329→   *     (سرور خرید را با Developer API بازار راستی‌آزمایی می‌کند)
+   330→   *
+   331→   * SKU محصولات بازار: fitup_{planId} — در پیشخان بازار با همین شناسه تعریف می‌شوند.
+   332→   */
+   333→  async function startBazaarCheckout() {
+   334→    const sku = `fitup_${plan.id}`;
+   335→    setLoading(true);
+   336→    try {
+   337→      // ─── قیمت پویا (تخفیف/اعتبار ارتقا) — اگر هست، مبلغ دقیق در بازار ثبت می‌شود ───
+   338→      let dynamicPriceId: string | null = null;
+   339→      try {
+   340→        const dpRes = await fetch("/api/payment/bazaar/dynamic-price", {
+   341→          method: "POST",
+   342→          headers: { "Content-Type": "application/json" },
+   343→          body: JSON.stringify({
+   344→            planId: plan.id,
+   345→            discountCode: discountInfo?.valid && !userDiscountCode ? discountCode : undefined,
+   346→            userDiscountCode: discountInfo?.valid && userDiscountCode ? userDiscountCode : undefined,
+   347→          }),
+   348→        });
+   349→        const dpData = await dpRes.json().catch(() => ({}));
+   350→        if (dpRes.ok && typeof dpData?.dynamicPriceId === "string" && dpData.dynamicPriceId) {
+   351→          dynamicPriceId = dpData.dynamicPriceId;
+   352→        }
+   353→        // dynamicPriceId=null → قیمت پایه SKU (تخفیفی نبود یا سرویس تنظیم نیست)
+   354→      } catch {
+   355→        // خطا → خرید با قیمت پایه SKU ادامه می‌یابد
+   356→      }
+   357→
+   358→      const purchase = await (window as any).fitupBazaarPurchase(
+   359→        sku,
+   360→        { planId: plan.id, userId: user?.id || null },
+   361→        dynamicPriceId
+   362→      );
+   363→      if (!purchase?.ok) {
+   364→        if (purchase?.canceled) {
+   365→          toast.info(purchase.error || "پرداخت لغو شد");
+   366→        } else {
+   367→          toast.error(purchase?.error || "پرداخت درون‌برنامه‌ای بازار ناموفق بود");
+   368→        }
+   369→        return;
+   370→      }
+   371→      // فعال‌سازی اشتراک در سرور — v55: امضای خرید (originalJson+signature) هم
+   372→      // همراه می‌رود تا اگر API بازار در دسترس نبود، سرور با کلید RSA پنل،
+   373→      // امضای خرید را محلی راستی‌آزمایی کند (رفع خطای «اعتبارنامه API بازار»
+   374→      // بعد از خرید موفق — ایراد بازرسی بازار).
+   375→      const res = await fetch("/api/payment/bazaar/purchase", {
+   376→        method: "POST",
+   377→        headers: { "Content-Type": "application/json" },
+   378→        body: JSON.stringify({
+   379→          planId: plan.id,
+   380→          productId: purchase.productId || sku,
+   381→          purchaseToken: purchase.purchaseToken,
+   382→          orderId: purchase.orderId,
+   383→          dataJson: purchase.dataJson,
+   384→          signature: purchase.signature,
+   385→          // برای ثبت مبلغ واقعی/کد تخفیف در حسابداری (سرور مستقل دوباره محاسبه می‌کند)
+   386→          discountCode: discountInfo?.valid && !userDiscountCode ? discountCode : undefined,
+   387→          userDiscountCode: discountInfo?.valid && userDiscountCode ? userDiscountCode : undefined,
+   388→        }),
+   389→      });
+   390→      const data = await res.json();
+   391→      if (!res.ok) {
+   392→        if (data.code === "ONBOARDING_REQUIRED") {
+   393→          toast.info(data.error);
+   394→          setScreen("onboarding");
+   395→          setOverlay(null);
+   396→          return;
+   397→        }
+   398→        throw new Error(data.error);
+   399→      }
+   400→      // ─── Consume محصول مصرفی بازار ───
+   401→      // محصولات consumable تا وقتی consume نشوند قابل خرید مجدد نیستند (تمدید).
+   402→      // پس از فعال‌سازی موفق روی سرور، به اپ می‌گوییم خرید را consume کند —
+   403→      // اگر فعال‌سازی سرور شکست می‌خورد، خرید unconsume می‌ماند و اپ در
+   404→      // اجرای بعدی با «بازیابی خریدها» (restore) همان توکن را دوباره می‌فرستد.
+   405→      try {
+   406→        (window as any).FitUpNative?.consumePurchase?.(purchase.purchaseToken);
+   407→      } catch {}
+   408→      toast.success(data.message || "اشتراک شما فعال شد 🎉");
+   409→      // رفرش اطلاعات کاربر (باز شدن قابلیت‌های پلن) — الگوی همان completePayment
+   410→      try {
+   411→        const meRes = await fetch("/api/auth/me", { cache: "no-store" });
+   412→        const meData = await meRes.json();
+   413→        if (meData?.user) {
+   414→          setUser(meData.user);
+   415→        }
+   416→      } catch {
+   417→        // رفرش اختیاری است
+   418→      }
+   419→      // نمایش رسید موفق (بدون درگاه — خرید بازار درون‌برنامه‌ای بود)
+   420→      setPaymentData({
+   421→        paymentId: data.paymentId,
+   422→        authority: purchase.purchaseToken,
+   423→        gatewayUrl: null as unknown as string,
+   424→        simulated: false,
+   425→        finalAmount: plan.price,
+   426→      });
+   427→      setReceipt({
+   428→        success: true,
+   429→        refId: purchase.orderId || purchase.purchaseToken.slice(0, 20),
+   430→        message: data.message || "پرداخت درون‌برنامه‌ای کافه‌بازار موفق بود",
+   431→        user: undefined,
+   432→      });
+   433→      setStep("receipt");
+   434→    } catch (e) {
+   435→      toast.error(e instanceof Error ? e.message : "خطا در پرداخت بازار");
+   436→    } finally {
+   437→      setLoading(false);
+   438→    }
+   439→  }
+   440→
+   441→  /**
+   442→   * باز کردن درگاه پرداخت زرین‌پال.
+   443→   *
+   444→   * - حالت واقعی (real Zarinpal): در همان تب فعلی به gatewayUrl هدایت می‌شود.
+   445→   *   زرین‌پال پس از پرداخت به callback_url (?payment_verify=1) redirect می‌کند
+   446→   *   و PaymentVerifyHandler به‌صورت خودکار verify را صدا می‌زند. این کار از
+   447→   *   ایجاد تب اضافی و گیج‌شدن کاربر جلوگیری می‌کند.
+   448→   * - حالت شبیه‌سازی: در یک تب جدید باز می‌شود تا کاربر بتواند بدون ترک صفحه،
+   449→   *   دکمه‌های موفق/ناموفق را امتحان کند.
+   450→   */
+   451→  function openZarinpalGateway() {
+   452→    if (redirecting) return; // گارد دابل‌کلیک — navigation در جریان است
+   453→    if (!paymentData?.gatewayUrl) {
+   454→      toast.error("لینک درگاه پرداخت در دسترس نیست");
+   455→      return;
+   456→    }
+   457→    setRedirecting(true);
+   458→    // واقعی: هدایت در همان تب — زرین‌پال به ?payment_verify=1 برمی‌گرداند
+   459→    toast.info("در حال انتقال به درگاه زرین‌پال... پس از پرداخت، به‌صورت خودکار بازمی‌گردید.");
+   460→    // 🩹 v45 (باگ «هر چقدر روی دکمهٔ درگاه پرداخت میزنم وارد نمیشه»):
+   461→    // قبلاً redirecting یک‌طرفه بود — اگر ناوبری به هر دلیلی انجام نمی‌شد
+   462→    // (شبکه ضعیف، بلاک‌شدن ناوبری در WebView، mixed content)، دکمه برای همیشه
+   463→    // با اسپینر «در حال انتقال…» مرده می‌ماند. حالا بعد از ۱۲ ثانیه قفل
+   464→    // خودکار آزاد می‌شود (بازگشت زودتر با pageshow/visibilitychange پوشش داده شده)
+   465→    window.setTimeout(() => setRedirecting(false), 12_000);
+   466→    window.location.href = paymentData.gatewayUrl;
+   467→  }
+   468→
+   469→  /**
+   470→   * تأیید پرداخت.
+   471→   *
+   472→   * FE-C2: paymentId/authority را می‌توان مستقیم پاس داد (override) — وقتی
+   473→   * completePayment بلافاصله بعد از setPaymentData در همان handler صدا زده
+   474→   * می‌شود، state هنوز در closure رندر قبلی است؛ بدون override بی‌صدا return
+   475→   * می‌شد و در تلاش دوم پرداختِ قبلی (stale) verify می‌شد.
+   476→   */
+   477→  async function completePayment(
+   478→    status: "OK" | "NOK" | "CANCELLED",
+   479→    paymentIdOverride?: string,
+   480→    authorityOverride?: string,
+   481→  ) {
+   482→    const paymentId = paymentIdOverride ?? paymentData?.paymentId;
+   483→    const authority = authorityOverride ?? paymentData?.authority;
+   484→    if (!paymentId) return;
+   485→    setStep("processing");
+   486→    try {
+   487→      const res = await fetch("/api/payment/verify", {
+   488→        method: "POST",
+   489→        headers: { "Content-Type": "application/json" },
+   490→        body: JSON.stringify({
+   491→          paymentId,
+   492→          status,
+   493→          authority,
+   494→        }),
+   495→      });
+   496→      const data = await res.json();
+   497→      // FIX: پاسخ verifying یک message دارد نه error — قبلاً toast خالی می‌داد
+   498→      if (!res.ok) throw new Error(data.error || data.message);
+   499→      setReceipt(data);
+   500→      if (data.success && data.user) {
+   501→        setUser(data.user);
+   502→        toast.success("پلن شما فعال شد! در حال ساخت برنامه... 🎉");
+   503→      }
+   504→      setStep("receipt");
+   505→    } catch (e) {
+   506→      toast.error(e instanceof Error ? e.message : "خطا در تایید پرداخت");
+   507→      setStep("form");
+   508→    }
+   509→  }
+   510→
+   511→  function reset() {
+   512→    setStep("form");
+   513→    setDiscountCode("");
+   514→    setDiscountInfo(null);
+   515→    setPaymentData(null);
+   516→    setReceipt(null);
+   517→  }
+   518→
+   519→  function handleClose() {
+   520→    if (step === "processing") return;
+   521→    reset();
+   522→    onClose();
+   523→  }
+   524→
+   525→  return (
+   526→    <Dialog open onOpenChange={handleClose}>
+   527→      {/* v44 — max-h + اسکرول داخلی: بدون این، در صفحات کوتاه محتوای فرم خرید
+   528→          از ارتفاع viewport بیرون می‌زد و پایین فرم (دکمه پرداخت) دست‌نیافتنی می‌شد */}
+   529→      <DialogContent
+   530→        dir="rtl"
+   531→        showCloseButton={false}
+   532→        className="max-w-md bg-white max-h-[90vh] overflow-y-auto custom-scrollbar"
+   533→      >
+   534→        <DialogHeader>
+   535→          <DialogTitle className="flex items-center justify-between text-slate-900">
+   536→            <span className="flex items-center gap-2">
+   537→              <span
+   538→                className="w-7 h-7 rounded-lg flex items-center justify-center"
+   539→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   540→              >
+   541→                <Crown className="w-4 h-4 text-white" />
+   542→              </span>
+   543→              خرید پلن {plan.label}
+   544→            </span>
+   545→            <button
+   546→              onClick={handleClose}
+   547→              disabled={step === "processing"}
+   548→              className="p-1 rounded-lg hover:bg-slate-100 disabled:opacity-40"
+   549→            >
+   550→              <X className="w-4 h-4 text-slate-500" />
+   551→            </button>
+   552→          </DialogTitle>
+   553→        </DialogHeader>
+   554→
+   555→        <>
+   556→          {step === "form" && (
+   557→            <div key="form" className="animate-fade-in space-y-4">
+   558→              {/* خلاصه پلن */}
+   559→              <div className="p-3 rounded-2xl text-white" style={{ background: "linear-gradient(135deg, #fb923c, #f97316)" }}>
+   560→                <div className="flex items-center justify-between">
+   561→                  <div>
+   562→                    <p className="font-bold text-sm">{plan.label}</p>
+   563→                    <p className="text-[11px] opacity-90">{toPersianDigits(plan.durationDays)} روزه — {toPersianDigits(plan.phases)} فاز</p>
+   564→                  </div>
+   565→                  <p className="text-lg font-black font-stat">{toPersianDigits(formatToman(originalAmount))} <span className="text-xs font-normal">ت</span></p>
+   566→                </div>
+   567→              </div>
+   568→
+   569→              {/* کد تخفیف */}
+   570→              <div>
+   571→                <Label className="mb-2 block text-sm text-slate-700">کد تخفیف (اختیاری)</Label>
+   572→                <div className="flex gap-2">
+   573→                  <div className="relative flex-1">
+   574→                    <Tag className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+   575→                    <Input
+   576→                      value={discountCode}
+   577→                      onChange={(e) => { setDiscountCode(e.target.value.toUpperCase()); setDiscountInfo(null); }}
+   578→                      placeholder="کد تخفیف خود را وارد کنید"
+   579→                      className="pr-9 rounded-xl uppercase text-slate-900"
+   580→                      dir="ltr"
+   581→                    />
+   582→                  </div>
+   583→                  <Button onClick={validateDiscount} disabled={validating || !discountCode.trim() || !isLoggedIn} variant="outline" className="rounded-xl">
+   584→                    {validating ? <Loader2 className="w-4 h-4 animate-spin" /> : "اعمال"}
+   585→                  </Button>
+   586→                </div>
+   587→                {discountInfo?.valid && (
+   588→                  <div className="animate-fade-in-up mt-2 flex items-center gap-2 text-xs text-emerald-600">
+   589→                    <CheckCircle2 className="w-4 h-4" />
+   590→                    {discountInfo.label} — {toPersianDigits(formatToman(discountInfo.discountValue))} تومان تخفیف
+   591→                  </div>
+   592→                )}
+   593→
+   594→              </div>
+   595→
+   596→              {/* روش پرداخت */}
+   597→              <div>
+   598→                <Label className="mb-2 block text-sm text-slate-700">روش پرداخت</Label>
+   599→                <div className="grid grid-cols-2 gap-2">
+   600→                  <button
+   601→                    onClick={() => setPaymentMethod("gateway")}
+   602→                    className={`p-3 rounded-2xl border-2 transition text-right ${paymentMethod === "gateway" ? "border-orange-500 bg-orange-50" : "border-slate-200"}`}
+   603→                  >
+   604→                    <CreditCard className={`w-5 h-5 mb-1.5 ${paymentMethod === "gateway" ? "text-orange-500" : "text-slate-500"}`} />
+   605→                    <p className="text-xs font-bold text-slate-900">پرداخت آنلاین</p>
+   606→                    <p className="text-[10px] text-slate-500">درگاه زرین‌پال</p>
+   607→                  </button>
+   608→                  <button
+   609→                    onClick={() => setPaymentMethod("wallet")}
+   610→                    disabled={!isLoggedIn || !canUseWallet}
+   611→                    className={`p-3 rounded-2xl border-2 transition text-right disabled:opacity-50 ${paymentMethod === "wallet" ? "border-orange-500 bg-orange-50" : "border-slate-200"}`}
+   612→                  >
+   613→                    <Wallet className={`w-5 h-5 mb-1.5 ${paymentMethod === "wallet" ? "text-orange-500" : "text-slate-500"}`} />
+   614→                    <p className="text-xs font-bold text-slate-900">کیف پول فیتاپ</p>
+   615→                    <p className="text-[10px] text-slate-500">{isLoggedIn ? `${toPersianDigits(formatToman(walletBalance))} ت` : "نیاز به ورود"}</p>
+   616→                  </button>
+   617→                </div>
+   618→                {paymentMethod === "wallet" && isLoggedIn && !canUseWallet && (
+   619→                  <div className="mt-2 flex items-center gap-2 text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2">
+   620→                    <AlertCircle className="w-4 h-4 shrink-0" />
+   621→                    موجودی کافی نیست.{" "}
+   622→                    <button
+   623→                      onClick={() => {
+   624→                        setOverlay("profile");
+   625→                        onClose();
+   626→                      }}
+   627→                      className="font-bold underline"
+   628→                    >
+   629→                      افزایش موجودی
+   630→                    </button>
+   631→                  </div>
+   632→                )}
+   633→              </div>
+   634→
+   635→              {/* محاسبه نهایی */}
+   636→              <div className="p-3 rounded-2xl bg-slate-50 space-y-1.5 text-sm text-slate-900">
+   637→                <div className="flex justify-between">
+   638→                  <span className="text-slate-500">قیمت اصلی</span>
+   639→                  <span className="font-stat">{toPersianDigits(formatToman(originalAmount))} تومان</span>
+   640→                </div>
+   641→                {discountInfo?.valid && (
+   642→                  <div className="flex justify-between text-emerald-600">
+   643→                    <span>تخفیف</span>
+   644→                    <span>- {toPersianDigits(formatToman(discountInfo.discountValue))} تومان</span>
+   645→                  </div>
+   646→                )}
+   647→                {upgradeEstimate?.isUpgrade && (
+   648→                  <div className="flex justify-between text-emerald-600">
+   649→                    <span className="flex items-center gap-1">
+   650→                      <Crown className="w-3.5 h-3.5" />
+   651→                      اعتبار ارتقا ({toPersianDigits(upgradeEstimate.daysLeft)} روز باقی‌مانده)
+   652→                    </span>
+   653→                    <span>- {toPersianDigits(formatToman(upgradeEstimate.upgradeCredit))} تومان</span>
+   654→                  </div>
+   655→                )}
+   656→                <div className="flex justify-between font-bold pt-1.5 border-t border-slate-200">
+   657→                  <span>مبلغ قابل پرداخت</span>
+   658→                  <span className="text-orange-600 font-stat">{toPersianDigits(formatToman(finalAmount))} تومان</span>
+   659→                </div>
+   660→                {upgradeEstimate?.isUpgrade && !discountInfo?.valid && (
+   661→                  <p className="text-[11px] text-orange-600 font-medium pt-1">
+   662→                    ✓ با ارتقا به این پلن، ۴۵ روز کامل اشتراک جدید فعال می‌شود.
+   663→                  </p>
+   664→                )}
+   665→              </div>
+   666→
+   667→              <Button
+   668→                onClick={startCheckout}
+   669→                disabled={loading || (paymentMethod === "wallet" && !canUseWallet)}
+   670→                className="w-full h-12 rounded-xl font-bold text-white"
+   671→                style={{ background: goldGradient }}
+   672→              >
+   673→                {loading ? (
+   674→                  <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> در حال ایجاد...</span>
+   675→                ) : !isLoggedIn ? (
+   676→                  "برای خرید وارد شوید"
+   677→                ) : (
+   678→                  <>
+   679→                    {paymentMethod === "wallet" ? <Wallet className="w-4 h-4" /> : <CreditCard className="w-4 h-4" />}
+   680→                    پرداخت {toPersianDigits(formatToman(finalAmount))} تومان
+   681→                  </>
+   682→                )}
+   683→              </Button>
+   684→
+   685→              <div className="flex items-center justify-center gap-1.5 text-[11px] text-slate-500">
+   686→                <ShieldCheck className="w-3.5 h-3.5 text-orange-500" />
+   687→                پرداخت امن — امکان استرداد وجه
+   688→              </div>
+   689→            </div>
+   690→          )}
+   691→
+   692→          {step === "gateway" && paymentData && (
+   693→            <div key="gateway" className="animate-scale-in space-y-4 text-center text-slate-900">
+   694→              <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto shadow-lg" style={{ background: goldGradient }}>
+   695→                <CreditCard className="w-8 h-8 text-white" />
+   696→              </div>
+   697→              <h3 className="font-black text-lg">درگاه پرداخت زرین‌پال</h3>
+   698→              <p className="text-xs text-slate-500">پرداخت امن با درگاه زرین‌پال</p>
+   699→              <div className="space-y-2 text-right p-4 rounded-2xl bg-slate-50 text-sm border border-slate-100">
+   700→                <div className="flex justify-between items-center py-1">
+   701→                  <span className="text-slate-500">مبلغ قابل پرداخت</span>
+   702→                  <span className="font-bold font-stat text-orange-600">{toPersianDigits(formatToman(paymentData.finalAmount))} تومان</span>
+   703→                </div>
+   704→                <div className="border-t border-slate-200 my-1"></div>
+   705→                <div className="flex justify-between items-center py-1">
+   706→                  <span className="text-slate-500">پلن انتخابی</span>
+   707→                  <span className="font-bold">{plan.label}</span>
+   708→                </div>
+   709→                <div className="flex justify-between items-center py-1">
+   710→                  <span className="text-slate-500">مدت اشتراک</span>
+   711→                  <span className="font-bold">{toPersianDigits(plan.durationDays)} روز</span>
+   712→                </div>
+   713→              </div>
+   714→
+   715→              <div className="space-y-3">
+   716→                {/* v49 (درخواست مالک): هشدار VPN — زرین‌پال با IP خارجی باز نمی‌شود؛
+   717→                    کاربر باید قبل از کلیک فیلترشکن را خاموش کند تا «دکمهٔ بی‌اثر» و
+   718→                    تراکنش‌های در انتظار تولید نشود */}
+   719→                <div className="flex items-start gap-2 text-right p-3 rounded-xl bg-red-50 border border-red-200 text-xs font-bold text-red-700">
+   720→                  <ShieldAlert className="w-4 h-4 shrink-0 text-red-500 mt-0.5" />
+   721→                  <span>
+   722→                    قبل از رفتن به درگاه پرداخت، لطفاً فیلترشکن (VPN) خود را خاموش کنید —
+   723→                    درگاه زرین‌پال با IP خارجی باز نمی‌شود.
+   724→                  </span>
+   725→                </div>
+   726→                {/* درگاه واقعی زرین‌پال — رفتن به درگاه در همان تب و انتظار برای callback */}
+   727→                <div className="flex items-start gap-2 text-right p-3 rounded-xl bg-amber-50 border border-orange-100 text-xs text-slate-700">
+   728→                  <Info className="w-4 h-4 shrink-0 text-orange-500 mt-0.5" />
+   729→                  <span>
+   730→                    با کلیک روی دکمه زیر، به درگاه پرداخت زرین‌پال منتقل می‌شوید.
+   731→                    پس از تکمیل پرداخت، به‌صورت خودکار به این سایت بازمی‌گردید و پرداخت شما
+   732→                    تأیید می‌شود — نیازی به هیچ دکمه‌ای نیست.
+   733→                  </span>
+   734→                </div>
+   735→                <Button
+   736→                  onClick={openZarinpalGateway}
+   737→                  disabled={redirecting}
+   738→                  className="w-full rounded-xl h-12 font-bold text-white disabled:opacity-70 disabled:cursor-not-allowed"
+   739→                  style={{ background: goldGradient }}
+   740→                >
+   741→                  {redirecting ? (
+   742→                    <span className="flex items-center gap-2">
+   743→                      <Loader2 className="w-4 h-4 animate-spin" /> در حال انتقال به درگاه…
+   744→                    </span>
+   745→                  ) : (
+   746→                    <>
+   747→                      <ExternalLink className="w-4 h-4" /> رفتن به درگاه پرداخت
+   748→                    </>
+   749→                  )}
+   750→                </Button>
+   751→
+   752→                {/* پیام انتظار با اسپینر — پس از کلیک روی رفتن به درگاه */}
+   753→                <div className="flex items-center justify-center gap-2 text-xs text-slate-500 bg-slate-50 rounded-xl px-3 py-2.5">
+   754→                  <Loader2 className="w-3.5 h-3.5 animate-spin text-orange-500" />
+   755→                  پس از پرداخت در درگاه زرین‌پال، به‌صورت خودکار به این صفحه بازمی‌گردید. صبر کنید...
+   756→                </div>
+   757→
+   758→                {/* FE-M6: قبلاً دو دکمهٔ کاملاً یکسان (انصراف / بازگشت به سایت)
+   759→                    وجود داشت — هر دو handleClose بودند؛ یکی حذف شد. */}
+   760→                <Button onClick={handleClose} variant="ghost" className="w-full rounded-xl text-slate-500">
+   761→                  بازگشت
+   762→                </Button>
+   763→              </div>
+   764→            </div>
+   765→          )}
+   766→
+   767→          {step === "processing" && (
+   768→            <div key="processing" className="animate-fade-in py-10 text-center text-slate-900">
+   769→              <Loader2 className="w-12 h-12 text-orange-500 animate-spin mx-auto mb-4" />
+   770→              <h3 className="font-bold mb-1">در حال تایید پرداخت...</h3>
+   771→              <p className="text-sm text-slate-500">لطفاً صبر کنید</p>
+   772→            </div>
+   773→          )}
+   774→
+   775→          {step === "receipt" && receipt && (
+   776→            <div key="receipt" className="animate-scale-in space-y-4 text-center">
+   777→              {receipt.success ? (
+   778→                <>
+   779→                  <div className="animate-scale-in w-20 h-20 rounded-full bg-emerald-500 flex items-center justify-center mx-auto shadow-xl">
+   780→                    <Check className="w-12 h-12 text-white" strokeWidth={3} />
+   781→                  </div>
+   782→                  <h3 className="text-xl font-black text-emerald-600">پرداخت موفق! 🎉</h3>
+   783→                  <p className="text-sm text-slate-500">پلن {plan.label} فعال شد. درخواست ساخت برنامه ثبت شد — در انتظار تولید توسط مربی هوشمند.</p>
+   784→                  <div className="text-right p-3 rounded-2xl bg-slate-50 space-y-2 text-sm text-slate-900">
+   785→                    <div className="flex justify-between"><span className="text-slate-500">مبلغ</span><span className="font-bold font-stat">{toPersianDigits(formatToman(receipt.amount))} تومان</span></div>
+   786→                    <div className="flex justify-between"><span className="text-slate-500">پلن</span><span>{receipt.plan}</span></div>
+   787→                    <div className="flex justify-between"><span className="text-slate-500">کد پیگیری</span><span dir="ltr" className="font-mono text-xs">{receipt.refId}</span></div>
+   788→                    <div className="flex justify-between"><span className="text-slate-500">وضعیت برنامه</span><span className="text-orange-600 font-bold">در انتظار تولید</span></div>
+   789→                  </div>
+   790→                  <Button onClick={() => {
+   791→                    reset();
+   792→                    onClose();
+   793→                    // ورود به پنل با تب داشبورد
+   794→                    // FE-L10: user را در لحظهٔ کلیک از store بخوان — نه از
+   795→                    // closure رندر قبل از setUser (که در همان tick ست شده)
+   796→                    const currentUser = useAppStore.getState().user;
+   797→                    setMainTab("dashboard");
+   798→                    setScreen(currentUser?.role === "ADMIN" ? "admin" : "main");
+   799→                    try { window.history.replaceState({}, "", "/?screen=panel"); } catch {}
+   800→                  }} className="w-full rounded-xl h-11 font-bold text-white" style={{ background: goldGradient }}>
+   801→                    <Sparkles className="w-4 h-4" /> شروع تمرین! 💪
+   802→                  </Button>
+   803→                </>
+   804→              ) : (
+   805→                <>
+   806→                  <div className="w-20 h-20 rounded-full bg-red-500 flex items-center justify-center mx-auto shadow-xl">
+   807→                    <XCircle className="w-12 h-12 text-white" />
+   808→                  </div>
+   809→                  <h3 className="text-xl font-black text-slate-900">پرداخت ناموفق</h3>
+   810→                  <p className="text-sm text-slate-500">{receipt.message}</p>
+   811→                  <Button onClick={reset} variant="outline" className="w-full rounded-xl h-11">تلاش مجدد</Button>
+   812→                </>
+   813→              )}
+   814→            </div>
+   815→          )}
+   816→        </>
+   817→      </DialogContent>
+   818→    </Dialog>
+   819→  );
+   820→}
+   821→

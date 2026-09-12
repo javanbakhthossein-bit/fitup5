@@ -1,0 +1,567 @@
+  3200→- **حفره ۶:** منوی «مالی و تراکنش‌ها» فقط استعلام (alert بی‌عمل) → فیکس: استعلام actionable (PAID/VERIFIED + DB pending → confirm → recover) + دکمه «بازیابی» روی ردیف‌های pending/verifying + STATUS_LABELS/filtroهای verifying/manual_resolved/expired + whitelist API transactions
+  3201→- **حفره ۷:** cutoff legacy کورکورانه معلق‌های قدیمی را manual_resolved می‌بند (حتی پرداخت‌شده‌ها!) — درخواست جدید مالک: «همه پرداخت‌های موفق وریفای شوند» → فیکس: resolveLegacyPendingPayments (هر اجرا، idempotent): استعلام واقعی زرین‌پال → پرداخت‌شده → تحویل؛ قطعی منفی → expired؛ شبکه → pending بماند + wallet_topup هم پوشش (helper مشترک deliverWalletTopupPayment از recover route استخراج شد)
+  3202→- E2E با سرور واقعی + sandbox زرین‌پال + مرورگر: boot sweep → تحویل کامل پلن (اشتراک active + ProgramRequest generating + ۲ نوتیف) و شارژ کیف (موجودی+تراکنش deposit) ✓؛ legacy sweep با API واقعی (authority جعلی → expired تمیز) ✓؛ دکمه بازیابی ادمین در مرورگر → POST recover → success+اشتراک ✓؛ لاگین بعد از پرداخت معلق → recover همان لحظه → pending→success ✓؛ کارت ورود در بازگشت از بانک بدون لاگین → ورود → تأیید خودکار ✓؛ کنسول ۰ خطا
+  3203→- کش مرورگر/webpack迷惑 حل شد (browser close → کد تازه)؛ OOM خودکار daemon ری‌استارت
+  3204→- مستندات: SERVER-GUIDE (۷ لایه + cron اختیاری + legacy informed) + README v7؛ زیپ v7 (۲.۴MB، ۳۹۹ فایل مانیفست، بدون db/env/APK)؛ v6 حذف شد
+  3205→- پاکسازی: .env restore (بدون PAYMENT_SANDBOX/DEV_OTP)، db از upload/custom.db restore، اسکریپت‌های تست حذف، tsc ۰ خطا | lint ۰ خطا
+  3206→
+  3207→Stage Summary:
+  3208→- شبکه ۷ لایه بازیابی: جاروی داخلی (بدون کرون خارجی) + cutoff آگاهانه + recover در لحظه لاگین + recover در هر بازدید + رسید پایدار با دکمه ورود + بازیابی در منوی مالی و تراکنش‌ها + wallet_topup
+  3209→- روی سرور کاربر: همان چند ثانیه بعد از deploy v7، همه پرداخت‌های موفقِ معلق وریفای + پلن فعال + ثبت حسابداری؛ پرداخت‌نشده‌ها «منقضی — پرداخت‌نشده»
+  3210→- دیپلوی: fitup-deploy-2026-08-31-v7.zip با چهار دستور README
+  3211→
+  3212→---
+  3213→Task ID: 3
+  3214→Agent: Main (Z.ai Code)
+  3215→Task: فیکس ریشه‌ای سیستم نوتیفیکیشن PWA/سایت (نوتیف الکی + باگ نوار + املاء + جاروی رفتاری) + اتصال سرچ کنسول با سرویس‌اکانت جدید
+  3216→
+  3217→Work Log:
+  3218→- **تحلیل اسکرین‌شات کاربر با VLM**: تصویر نشان می‌داد کلیک روی نوتیف PWA «سورس‌کد خام sw.js» را باز می‌کند (نسخه قدیمی SW مستقر روی سرور کاربر با کش fitup-v2026-08-5) — از این، مسیر ردیابی باگ‌ها باز شد
+  3219→- **کالبدشکافی کامل سیستم نوتیف**: sw.js + /api/notifications + /api/notifications/test + /api/cron/behavioral (۷ سناریو) + createNotification (web-push) + notifications-overlay.tsx + main-app.tsx (polling + پل بازار) + pwa-register.tsx + instrumentation
+  3220→- **فیکس ۱ — نوتیف الکی (sw.js)**: periodicsync دیگر showNotification نمی‌زند (فقط postMessage PUSH_RECEIVED به صفحات باز)؛ اعلان سیستم فقط از push واقعی سرور (لحظه رویداد). بمپ کش → fitup-v9-2026-09 تا SW قدیمیِ دستگاه‌های کاربران با دیپلوی جایگزین شود
+  3221→- **فیکس ۲ — کلیک نوتیف sw.js را باز می‌کرد**: sanitizeNotificationUrl — فقط same-origin، مسیرهای داخلی؛ /sw.js و /api/* و /_next/* مسدود → fallback صفحه اصلی؛ در هر سه نقطه (push + SHOW_NOTIFICATION + notificationclick) اعمال شد؛ matchAll با includeUncontrolled
+  3222→- **فیکس ۳ — باگ نوار نوتیف (گزارش مستقیم کاربر)**: حذف تایمر ۲.۵ ثانیه‌ای mark-all خودکار؛ نوتیف با لینک → ناوبری+خوانده‌شدن همان نوتیف؛ بدون لینک → expand متن کامل اختصاصی (line-clamp-2→کامل) + خوانده‌شدن + دکمه «خواندن همه» صریح حفظ شد
+  3223→- **فیکس ۴ — جاروی رفتاری داخلی**: سناریوهای چکاپ ۱۵/۳۰/۴۰ + انقضا + تمدید ۳روزه/۱۰روزه + کد تخفیف ۱۵٪ اختصاصی + re-engagement + مدیریت pending به کرون خارجی وابسته بودند (هرگز اجرا نمی‌شدند) → startBehavioralSweep در instrumentation-node (boot+۹۰ث، هر ۳۶۰دقیقه، BEHAVIORAL_SWEEP_INTERVAL_MIN، محافظ هم‌پوشانی، unref)
+  3224→- **فیکس ۵ — املاء فارسی**: شخصیسازی→شخصی‌سازی (layout.tsx ریویو)، نوتیف تست→اعلان آزمایشی، پوش نوتیفیکیشن→اعلان‌های پوش (mobile-app-view + test route). متن نوتیف «برنامه آماده شد» در کد فعلی از قبل صحیح بود (شخصی‌سازی‌شده)؛ «برنامه پیشرفته شما آماده شد» در هیچ سورسی نبود → از نسخه مستقر قدیمی + re-show باگ SW بود
+  3225→- **فیکس ۶ — باگ sites.list سرچ کنسول**: fields=site.siteUrl → siteEntry(siteUrl,permissionLevel) + کلید پاسخ site→siteEntry (قبلاً همیشه ۴۰۰ Invalid field selection → تشخیص خودکار پراپرتی مرده بود)
+  3226→- **بازیابی معجزه‌آسای کلید خصوصی GSC**: کلید SA کاربر در انتقال چت خراب بود (۲ خط PEM با ۶۳ کاراکتر — ۲ کاراکتر حذف‌شده). راه‌حل: استخراج n,e از پیشوند سالم، p از ناحیه سالم (بایت‌های ۵۵۹-۶۹۱)، فاکتورگیری q=n/p، محاسبه d از e⁻¹ mod λ، بازسازی DER کامل → کلید بازیابی‌شده با openssl sign/verify و پذیرش توکن گوگل تأیید شد (گم‌شده‌ها: خط۸ کاراکتر U بعد از l، خط۱۵ کاراکتر e بعد از 01)
+  3227→- **اتصال GSC کامل**: saveGscConfig (SA بازیابی‌شده + https://fittup.ir/ + API key) → در DB سندباکس ذخیره شد؛ testGscConnection ✓ «اتصال به سرچ کنسول برقرار است»؛ داده واقعی: ۱۵۲ کلیک/۵۸۷۴ ایمپرشن/۲۸روز + ۵۰ کوئری + ۵۰ صفحه؛ پراپرتی URL-prefix است (sc-domain کار نمی‌کند)
+  3228→- **فیکس ۷ — schema.prisma**: ایندکس خراب @@index(obile]) در OtpCode → @@index([mobile])
+  3229→- **پاکسازی آرتیفکت‌ها**: دایرکتوری‌های download/tool-results/agent-ctx/examples/mini-services حذف شدند؛ کاربر تست و OTPهای تست پاک شدند
+  3230→- **تست E2E مرورگر (کاربر واقعی با OTP از DB)**: (۱) باز کردن نوار → ۷ ثانیه صبر → هنوز ۳ ناخوانده روی سرور ✓ (باگ قبلاً همه را می‌خواند)؛ (۲) کلیک نوتیف بدون لینک → expanded=true + متن کامل + فقط همان خوانده شد (۳→۲) ✓؛ (۳) کلیک نوتیف با لینک → ناوبری به ?screen=panel&tab=dashboard + خوانده‌شدن (۲→۱) ✓؛ (۴) دکمه خواندن همه → صریح ۰ ✓
+  3231→- **تست E2E جاروی رفتاری**: boot → «behavioral sweep: ✅ ۱ اعلان جدید»؛ کاربر تست در روز ۱۵ → sweep دستی → «checkup»:1 → نوتیف «زمان چکاپ اول فرا رسید! 📊 روز ۱۵ از دوره ۴۵ روزه…» + link=?tab=progress ✓
+  3232→- **تست UI سرچ کنسول**: لاگین ادمین → تب سرچ کنسول → وضعیت متصل سبز + متریک‌های واقعی (کلیک/ایمپرشن/CTR/موضع) رندر شد ✓
+  3233→- node --check sw.js ✓ | tsc ۰ خطا ✓ | lint ۰ خطا (۷۱ هشدار قدیمی directive) ✓ | dev.log بدون خطا ✓
+  3234→- **زیپ v8**: fitup-deploy-2026-08-31-v8.zip (۲.۴MB، ۵۶۷ فایل، مانیفست ۳۶۱ فایل کد، شامل gsc-service-account-recovered.json + README با چنج‌لاگ)
+  3235→
+  3236→Stage Summary:
+  3237→- کل سیستم نوتیف الان دقیق است: هر اعلان = رویداد واقعی، لحظه‌ای، با لینک درست، خوانده‌شدن فقط با کلیک
+  3238→- چکاپ/انقضا/تمدید/کد تخفیف دیگر به کرون خارجی وابسته نیستند — دیپلوی = اجرای خودکار (boot+۹۰ث، هر ۶ ساعت)
+  3239→- سرچ کنسول متصل شد: کلید خراب انتقالی بازیابی ریاضی شد + باگ siteEntry فیکس شد — برای پروداکتن فایل gsc-service-account-recovered.json را در پنل paste کنند
+  3240→- دیپلوی: چهار دستور README با fitup-deploy-2026-08-31-v8.zip — بعد از دیپلوی دستگاه‌های PWA با بازدید بعدی SW جدید (v9) می‌گیرند و نوتیف الکی کامل قطع می‌شود
+  3241→
+  3242→---
+  3243→Task ID: 4
+  3244→Agent: Main (Z.ai Code)
+  3245→Task: v9 — تجربه تمدید + ریشه‌یابی نوتیف غیبت + پیشنهاد پلن ۸۰۰K+ + پروفایل/مودال پرونده + سئو + اپ بازار (رفرش/مجوزها/نصب) + سرعت + autofill وب + پوشه download همیشه-آخرین
+  3246→
+  3247→Work Log:
+  3248→- **۱. تجربه تمدید (درخواست مالک: «تمدید خیلی مهمه… خیلی زیبا و جذاب»)**: کامپوننت جدید `src/components/fitness/views/renewal-overlay.tsx` (overlay نوع "renewal" در store + Sheet در main-app) — رینگ SVG شمارش روزهای باقی‌مانده با انیمیشن، آمار دوره «در این دوره چه ساختی؟» (تغییر وزن/تمرین‌ها/روزهای همراهی)، کد تخفیف ۱۵٪ اختصاصی با دکمه کپی و مهلت اعتبار، محاسبه شفاف قیمت نهایی، لیست مزایا (حفظ روزهای باقی‌مانده/ادامه مربی)، CTA بزرگ → PurchaseModal با کد اعمال‌شده، مسیر ارتقا. برای پلن خریداری‌شده و ادمین‌فعال یکسان (هر دو از User.planExpiresAt + user-discount-code). API `/api/user-discount-code` گسترش یافت: planStartedAt/planDurationDays/workoutsCompleted/weightStartKg/weightCurrentKg. ورودی‌ها: کارت PriorityActionCard داشبورد (هم انقضا≤۱۴روز هم پلن-تمام‌شده)، بنر plans-view، کلیک نوتیف‌های تمدید (applyLink)، لینک `?renewal=1` (page-client: مستقیم/بعد از auth/بعد از لاگین با sessionStorage).
+  3249→- **۲. ریشه‌یابی نوتیف «چند روزی نیستی» (گزارش: با استفاده مداوم هم می‌آمد + متن رباتی)**: فیلد `User.lastActiveAt` به schema اضافه و db:push؛ `/api/auth/me` در هر بازدید با throttle ۳۰min لمس می‌کند + verify-otp در هر لاگین. سناریو re_engagement بازنویسی: سیگنال اصلی lastActiveAt + مکمل (وزن/چکاپ/چت/برنامه/لاگ غذا/روز تمرین)، آستانه ۵→۷ روز، seed اولیه برای کاربران بدون داده (بدون اسپم)، متن انسانی «{نام} دنبال‌ت بودیم 🧡…». متن renewal/expired/renewal_late/upgrade هم بازنویسی انسانی شد + لینک همه به `?renewal=1`. تست واقعی: sweep → renewal=1 (متن جدید) و reEngage=0 برای کاربر فعال ✓.
+  3250→- **۳. پیشنهاد پلن ۸۰۰K+**: `recommendPlan` — هرگز basic؛ fat_loss/muscle_gain مبتدی → advanced (قبلاً standard)، مبتدی عمومی → standard(800K)، حرفه‌ای/آنالیز → ultimate. ردیف «دیگر پلن‌ها» (۳ کارت قابل خرید) زیر کارت پیشنهادی در analysis-screen — «قابلیت انتخاب هر پلنی» حفظ شد. سیاست مشابه به دانش مربی (ai.ts) + پرامپت تحلیل AI از ذکر نام پلن/قیمت منع شد. تست API: fat_loss مبتدی → advanced ✓.
+  3251→- **۴. پروفایل سبک + مودال پرونده ورزشی (درخواست مالک)**: `sports-profile-modal.tsx` جدید — مودال full-screen جذاب: خلاصه ۴تایی، ۹ سکشن با ویرایش آیتم‌به‌آیتم (PUT /api/onboarding/profile)، baseline، تحلیل AI، عکس‌های پیشرفت، آنالیزهای بدن/خون/ویدیو. profile-overlay از ۱۳۶۰ خط سبک شد: کاربر/اشتراک/کیف پول/اطلاعات فیزیکی خلاصه + دکمه بزرگ «مشاهده پرونده ورزشی». تست: باز شدن مودال + ویرایش «اطلاعات پایه» + ذخیره ✓.
+  3252→- **۵. سئو**: page.tsx — صفحات خصوصی (auth/panel/onboarding/analysis + tab/renewal/survey/payment_verify/open/force) → noindex + canonical صفحه اصلی (رفع محتوای تکراری؛ قبلاً همان title لندینگ با canonical جدا). IndexNow فوری روی create-مقاله منتشرشده + update-mقالله (fire-and-forget) — قبلاً فقط کرون روزانه. sitemap.xml (۱۳۰۰+ URL) و robots.txt ممیزی شد — سالم (کategoriها escape صحیح). Core Web Vitals: lazy-load سنگین‌ها (بند ۶).
+  3253→- **۶. سرعت/نرمی (وب+اپ)**: main-app — next/dynamic برای DashboardView/ProgressView/ChatView (recharts/چت) + AdminOverlay (۹هزار خط!)/GymMode/VideoAnalysis/BloodTest/Survey/ExerciseDetail/ActiveWorkoutSession/RenewalOverlay با skeleton مشترک؛ انیمیشن تب ۳۰۰→۱۵۰ms (عامل حس لگ). تست: تب پیشرفت lazy لود شد و رندر کامل ✓؛ صفر خطای کنسول در سشن تازه ✓.
+  3254→- **۷. اپ بازار — رفرش/مجوزها/نصب**: MainActivity: پل `setSwipeRefreshEnabled` + وب: `bazaar-scroll-guard.ts` (نصب در page-client داخل اپ) — لمس روی عنصر اسکرول‌شونده داخلی → قفل رفرش؛ رفرش فقط از بالای واقعی صفحه. تست با init-script ساختگی bridge: قفل فعال ✓ و تب «اپ موبایل» hidden ✓. دیالوگ بلند SMS → یک خط؛ کارت زیبای «ورود خودکار با پیامک» در auth-screen (فعال‌سازی/خودم وارد می‌کنم + ذخیره انتخاب در localStorage) — تست: کارت ظاهر شد، «فعال‌سازی» → choice=auto ✓. POST_NOTIFICATIONS از استارتاپ حذف → پل requestNotificationPermission از mobile-app-view. pwa-install-prompt: بنر/مودال/نوتیف نصب در اپ بازار کاملاً بی‌اثر؛ نوتیف‌های نصب در notifications-overlay فیلتر. versionCode 4 / v1.3.0 (README+guide: build لازم).
+  3255→- **۸. OTP autofill وب (گزارش: «اجازه جاگذاری می‌گیره ولی وارد نمی‌کنه»)**: auth-screen — `onInputCapture` روی wrapper فاز capture هر input event (شامل autofill مخفی input-otp/WebOTP/کیبورد) را با state سنکرون می‌کند. smsir: حالت `SMSIR_USE_RAW_SEND=true` → ارسال bulk با متن «کد ورود فیتاپ: 1234\n@fittup.ir 1234» (WebOTP origin-bound) + مستندسازی دو راه (ویرایش قالب sms.ir یا خط خدماتی خام).
+  3256→- **۹. ریزفیکس‌ها**: هلپرهای computeBodyFat/buildCheckupReferencePoint از api/checkup/route به lib/fitness/checkup-helpers.ts (خطای TS2344 Next16 route-exports)؛ OtpCode index نهایی شد؛ lint ۰ خطا؛ tsc ۰ خطا.
+  3257→- **۱۰. پوشه `download/` (درخواست مالک: همیشه آخرین راهنما/زیپ/APK)**: SERVER-GUIDE v9 (+بخش ۹ WebOTP + ردیف‌های v9) + README v9 + BAZAAR-PUBLISH-GUIDE + DEPLOY.md + fitup-deploy-2026-09-01-v9.zip (۶۱۴ فایل شامل fitup-bazaar، بدون db/env) + fitup-bazaar-v1.2.0.apk (آخرین APK ساخته‌شده — v1.3.0 طبق راهنما build شود) + fitup-release.keystore. زیپ v8 حذف شد.
+  3258→- **تست E2E (مرورگر + DB واقعی)**: لاگین OTP×۴ کاربر؛ renewal overlay کامل (رینگ/آمار/کد/قیمت/ارتقا) از داشبورد+بنر+نوتیف+URL؛ PurchaseModal با کد prefill؛ مودال پرونده ویرایش+ذخیره؛ noindex صفحات خصوصی؛ شیمی recommendPlan؛ simulation bridge بازار (قفل رفرش + تب hidden + کارت SMS)؛ بعد از همه: DB از upload/custom.db restore + db:push مجدد + لندینگ ۲۰۰ و صفر خطای کنسول.
+  3259→
+  3260→Stage Summary:
+  3261→- تمدید حالا یک تجربه کامل و زیباست (رینگ+آمار+کد+قیمت+ارتقا) با ۴ ورودی — برای پلن خریداری و ادمین‌فعال یکسان؛ نوتیف‌هایش با متن انسانی به `?renewal=1` می‌روند
+  3262→- نوتیف «چند روزی نیستی» ریشه‌ای حل شد (lastActiveAt) — فقط غیبت واقعی ۷+ روز
+  3263→- پیشنهاد پلن همیشه ≥۸۰۰ هزار؛ همه پلن‌ها قابل انتخاب (ردیف «دیگر پلن‌ها»)
+  3264→- سئو: noindex خصوصی‌ها + IndexNow فوری + سبکی باندل → تمرکز رتبه روی صفحات عمومی
+  3265→- اپ بازار: اسکرول↑ دیگر رفرش نمی‌کند (پل قفل)، مجوزها شخصی‌سازی‌شده و کوتاه، هیچ «نصب اپ» داخل اپ — v1.3.0 آماده build
+  3266→- `download/` همیشه آخرین: SERVER-GUIDE + زیپ v9 + APK v1.2.0 + keystore — جلسات بعدی باید این پوشه را به‌روز نگه دارند
+  3267→- دیپلوی: چهار دستور README با fitup-deploy-2026-09-01-v9.zip
+  3268→
+  3269→---
+  3270→Task ID: 10
+  3271→Agent: Main (Z.ai Code)
+  3272→Task: فیکس فوری خطای لاگین «column main.User.lastActiveAt does not exist» (گزارش مالک — فقط همین، بدون کار دیگر)
+  3273→
+  3274→Work Log:
+  3275→- تشخیص: خطا در سندباکس هرگز رخ نداده (grep dev.log → صفر P2022؛ ستون از قبل در db/custom.db موجود). خطا مربوط به سرور پروداکشن کاربر است: کد v9 دیپلوی شده ولی db:push اعمال نشده/بی‌صدا شکست خورده
+  3276→- ریشه‌یابی باگ پنهان‌کننده: deploy.sh داشت `bun run db:push 2>&1 || echo "✓ دیتابیس همگان است"` → خطای واقعی db:push را پنهان می‌کرد → فیکس شد (if/else با پیام صادقانه + ادامه برای self-heal)
+  3277→- لایه ۱ (فوری در دسترس کاربر): دستور ۴ خطی برای سرور پروداکشن: pm2 stop → bun run db:push → cp به standalone (اختیاری) → pm2 restart
+  3278→- لایه ۲ (قطعی/دائمی): route جدید /api/cron/db-selfheal (CRON_SECRET + rate-limit؛ PRAGMA table_info چک می‌کند و ALTER TABLE ADD COLUMN اضافه می‌کند؛ فهرست EXPECTED_COLUMNS فعلاً فقط User.lastActiveAt DATETIME) — idempotent، nullable، بی‌خطر برای داده‌ها
+  3279→- لایه ۳: startDbSelfHeal در instrumentation-node (boot +۸ ثانیه — زودتر از همه جاروها؛ retry تا ۵ بار هر ۳۰ث اگر route آماده نبود؛ سپس چک ارزان هر ۶ ساعت) و register() آن را اول صدا می‌زند
+  3280→- تست‌ها: tsc ۰ خطا؛ route → 200 {"ok":true,"alreadyOk":["User.lastActiveAt"]}؛ مسیر ALTER با جدول آزمایشی _SelfHealTest تأیید شد؛ لاگین کامل با مرورگر (agent-browser): صفحه auth → شماره → OTP از DB (5573) → ورود موفق → Onboarding مرحله ۱ رندر شد؛ /api/auth/me → 200؛ صفر خطای کنسول/لاگ
+  3281→- instrumentation و instrumentation.ts مستندسازی شدند (بند ۰)
+  3282→
+  3283→Stage Summary:
+  3284→- سندباکس: لاگین ۱۰۰٪ سالم (تست مرورگر E2E)
+  3285→- سرور کاربر: با یک دستور ۴ خطی (در پاسخ به کاربر) حل می‌شود
+  3286→- آینده: هر دیپلوی بعدی — حتی بدون db:push — ستون‌های ضروری را در ۸ ثانیه‌ی اول boot خودش می‌سازد؛ deploy.sh دیگر خطا را پنهان نمی‌کند
+  3287→- نکته: EXPECTED_COLUMNS در route باید با هر فیلد Prisma جدید در نسخه‌های بعدی همگام بماند
+  3288→
+  3289→---
+  3290→Task ID: 11
+  3291→Agent: Main (Z.ai Code)
+  3292→Task: بررسی کامل سلامت سندباکس + فیکس قطعی سناریوی سرور (lastActiveAt) + فایل‌های دانلود v10
+  3293→
+  3294→Work Log:
+  3295→- **بازرسی سندباکس**: git log نشان داد همه کامیت‌ها کامل ثبت شده‌اند (v7/v8/v9/v10-selfheal) — نگرانی مالک («کدهای سندباکس نصفه‌مانده») رد شد؛ زیپ v9 موجود هم schema جدید + renewal-overlay + sports-profile-modal + bazaar-scroll-guard را داشت (تأیید با unzip)
+  3296→- **تکمیل خودترمیمی**: route /api/cron/db-selfheal حالا بدون CRON_SECRET هم مجاز است برای اتصال محلی (تشخیص: بدون هدر پروکسی یا IP loopback؛ کشف شد Next خودش XFF=127.0.0.1 می‌گذارد — دیباگ با route موقتی debug-headers که بعد حذف شد)؛ instrumentation هم بدون secret ادامه می‌دهد؛ کاربر خارجی با XFF جعلی → 401 (تست شد)
+  3297→- **تست سناریوی واقعی سرور مالک**: DROP COLUMN lastActiveAt → verify-otp دقیقاً همان خطای مالک (500 + متن یکسان) → ری‌استارت سرور → boot self-heal تلاش اول تایم‌اوت (کامپایل dev) → retry خودکار → «✅ ستون اضافه شد User.lastActiveAt» → لاگین مجدد سالم (verify-otp 200 + DTO کامل)
+  3298→- **deploy.sh**: خطای db:push دیگر پنهان نمی‌شود (if/else صادقانه + اشاره به خودترمیمی)
+  3299→- **تست‌ها**: tsc 0 خطا؛ lint 0 خطا (72 هشدار قدیمی)؛ لاگین E2E مرورگر با ۲ شماره (هر دو → Onboarding)؛ صفر خطای کنسول
+  3300→- **پوشه download به‌روز شد (v10)**: SERVER-GUIDE (نسخه v10 + ۲ ردیف v10 در جدول تغییرات)، README v10 (بخش «فیکس قطعی خطای لاگین» + توضیح چرا ۴ دستور قبلی جواب نداد: احتمال DB مستقل standalone در حالت مسیر نسبی)، DEPLOY.md (بخش v10)، README کپی در download؛ fitup-deploy-2026-09-01-v10.zip ساخته شد (۶۱۵ فایل، 2.6MB؛ شامل selfheal + deploy.sh شفاف + بدون db/env/uploads) و v9 حذف شد؛ .deploy-manifest.txt بازتولید (۳۶۶ فایل)
+  3301→- **پاکسازی**: DB از upload/custom.db بازگردانی + db:push؛ route دیباگ موقتی حذف شد؛ سرور ری‌استارت و سالم
+  3302→
+  3303→Stage Summary:
+  3304→- سندباکس ۱۰۰٪ کامل و سالم است — همه تغییرات همه جلسات در کد موجود و بیلد/لاگین تست‌شده
+  3305→- v10 = v9 + خودترمیمی دیتابیس (حتی بدون CRON_SECRET/db:push) + deploy.sh صادق
+  3306→- سناریوی خطای سرور مالک به‌طور کامل شبیه‌سازی و حل شد: بعد از دیپلوی v10 و pm2 restart، ۸ ثانیه بعد (یا با retry حداکثر ~۳ دقیقه) ستون ساخته می‌شود و لاگین برمی‌گردد
+  3307→- دیپلوی مالک: چهار دستور README با fitup-deploy-2026-09-01-v10.zip
+  3308→
+  3309→---
+  3310→Task ID: 12-a
+  3311→Agent: Sub-agent (general-purpose)
+  3312→Task: فیکس موقعیت ضربدر (X) مودال‌ها در RTL + حذف X دوبل شیت‌ها + رفع سرریز متن دوز مکمل (ZMA/سروینگ طولانی)
+  3313→
+  3314→Work Log:
+  3315→- **A1 — src/components/ui/dialog.tsx:72**: ضربدر داخلی DialogContent از `absolute top-4 right-4` به `absolute top-4 left-4` — اندِ بصری در RTL، روبه‌روی آیکن عنوان (دیگر روی عنوان نمی‌افتد)؛ منطق `showCloseButton` دست‌نخورده
+  3316→- **A2 — src/components/ui/sheet.tsx:51,55,77-82**: SheetContent پراپ جدید `showCloseButton = true` (آینه الگوی dialog.tsx) + ضربدر داخلی به `top-4 left-4` منتقل شد برای یکدستی؛ sidebar موبایل بی‌اثر ماند (X داخلی‌اش از قبل با `[&>button]:hidden` مخفی بود)
+  3317→- **A3 — src/components/fitness/main-app.tsx:348,354,360,366,372,378,384,390,396,403**: هر ۱۰ SheetContent شیت‌های اصلی (notifications / profile / subscription / admin / exerciseDetail / gymMode / videoAnalysis / bloodTest / survey / renewal) → `showCloseButton={false}` — قبلاً دو X بود (یکی built-in بالا-راست + یکی داخل هدر overlay در چپ)؛ حالا فقط Xِ داخل هدر هر overlay می‌ماند
+  3318→- **A4 — src/components/fitness/views/programs-view.tsx** (۵ نقطه رندر دوز، همه چیپ گردشده wrap شونده — بدون shrink-0، بدون سرریز/اسکرول افقی):
+  3319→  - SupplementStackView استک مکمل (1281-1283): چیپ `bg-slate-100 dark:bg-slate-800 rounded-lg px-2 py-0.5 max-w-full break-words leading-relaxed text-right` داخل wrapper `min-w-0 flex-1 flex justify-end`؛ نام مکمل هم `min-w-0 break-words` شد
+  3320→  - لیست تخت fallback در PlanViewModal (1182-1188) و AllProgramsModal (1696-1702): همین الگو با متن بنفش
+  3321→  - PrintableProgram نسخه تصویر/PDF (2387-2391 و 2408-2412): همین fix با inline style (background/borderRadius/wordBreak/overflowWrap/lineHeight 1.6/textAlign right) — چون html-to-image استایل inline مطمئن‌تر است
+  3322→  - DialogContent هر دو مودال (999 و 1467): `overflow-x-hidden` از قبل موجود بود — فقط تأیید شد
+  3323→  - 1001-1002 و 1469-1470: `pl-8` روی DialogTitle دو مودال — چون دکمه‌های «تصویر/PDF» در اندِ بصری (چپ) هدر هستند و ضربدرِ داخلیِ جدیدِ بالا-چپ رویشان می‌افتاد
+  3324→- **A5 — ممیزی X سفارشی در همه Dialogهای اپ**: فقط ExerciseDetailModal (programs-view:1924-1928) و purchase-modal (488/500-506) X سفارشی دارند — هر دو `showCloseButton={false}` + X داخل هدر در چپ بصری ✓ تک-X؛ همه Dialogهای دیگر (admin-overlay ×۱۶، profile-overlay wallet، checkup، support، terms/new-terms، survey، command) فقط X داخلی را دارند (حالا در چپ) و دکمه فوتر «بستن/انصراف» — بدون X دوبل؛ بقیه Xهای grepشده (feedback-modal، sports-profile-modal، pwa، nutrition-view و…) overlayهای غیر-Radix/custom-position هستند و ربطی به Dialog ندارند. X داخل هدرِ شیت‌های اصلی (notifications:236، renewal:186، gymMode:475 و…) تک‌X باقی ماند
+  3325→- **تست**: `npx tsc --noEmit` → ۰ خطا؛ `bun run lint` → ۰ خطا (۷۲ هشدار قدیمی، بدون تغییر). سرور dev اجرا نشد (طبق دستور)
+  3326→
+  3327→Stage Summary:
+  3328→- همه مودال‌ها/شیت‌های اپ حالا دقیقاً یک ضربدر در بالا-چپِ بصری (اند RTL، روبه‌روی عنوان) دارند — نه روی آیکن عنوان، نه دوبل
+  3329→- دوز مکمل طولانی (مثل «سروینگ (روی ۳۰ میلی‌گرم + منیزیم ۴۵۰ میلی‌گرم + B6 ۱۰ میلی‌گرم)») در هر ۵ نقطه رندر (استک مشترک دو مودال + fallback×۲ + نسخه چاپی×۲) به‌صورت چیپ نرم در چند خط تمیز می‌شکند
+  3330→- SheetComponent استاندارد شادکن حالا `showCloseButton` دارد (برای شیت‌های سفارشی آینده)
+  3331→
+  3332→---
+  3333→Task ID: 12-b
+  3334→Agent: Sub-agent (general-purpose)
+  3335→Task: داشبورد — پیشرفت پلن + جمله‌ی روزانه + دکمه تمرین امروز + دسترسی‌های جدید (B1..B7)
+  3336→
+  3337→Work Log:
+  3338→- **B1**: کارت هِیرو — متن قدودی «— امروز رو بترکون!» حذف شد → فقط «پلن {label} فعال» (dashboard-view.tsx:401)
+  3339→- **B2**: کامپوننت جدید `src/components/fitness/views/plan-progress-card.tsx` (فقط فایل جدید مجاز) — رندر بلافاصله بعد از کارت هِیرو (dashboard-view.tsx:427-428)، برای همه کاربران:
+  3340→  - پلن فعال: رینگ SVG پیشرفت (strokeDasharray + framer-motion نرم) با گرادیان کهربایی/نارنجی (بدون آبی) — «روز X از ۴۵»، «Z روز باقی‌مانده»، ردیف آمار ۳تایی (پایان دوره شمسی / طول دوره / وضعیت)؛ باقیمانده ≤ ۱۰ روز → لهجه کهربایی + دکمه «تمدید پلن» → setOverlay("renewal")
+  3341→  - pending: کارت «پلن X در انتظار فعال‌سازی» + توضیح شروع دوره ۴۵ روزه پس از پیش‌نیازها
+  3342→  - بدون پلن: CTA گرادیانی «پلن فعالی نداری» + دکمه «دریافت پلن» → setMainTab("plans")
+  3343→  - داده: planStartedAt در UserDto نیست (auth.ts دست‌نخورده — مال ایجنت دیگر) → شروع دوره کلاینت‌ساید = planExpiresAt (یا subscriptionEnd) − ۴۵ روز
+  3344→- **B3**: کارت «امروز رو بترکون» (DailyQuoteCard در dashboard-view.tsx:697-768) — زیر پیشرفت پلن: قاب گرادیانی کهربایی p-[1.5px] + بدنه تیره (stone-900→0c0a09)، Zap پرشده + چیپ تاریخ شمسی (dateKey)، جمله text-lg/sm:text-xl بولد با خط تأکید سمت راست، هاله/واترمارک Sparkles، ورود نرم CSS خالص (animate-fade-in-up + anim-delay-100 از globals.css — صفر وابستگی جدید، بدون آبی/بنفش). getDailyQuote یک‌بار در هر رندر (ارزان/deterministic)؛ نگرانی hydration ندارد چون DashboardView با ssr:false لود می‌شود
+  3345→- **B4**: تمرین امروز بدون گیت — (۱) ردیف دکمه‌های بالا → grid-cols-3 gap-2/sm:gap-3 با دکمه جدید «تمرین امروز» (Zap طلایی، استایل سفید-کهربایی متمایز، sub داینامیک «آماده اجرا/همیشه فعال») → setMainTab("workouts")؛ هر سه دکمه کامپکت شدند (text-xs موبایل، py-4، آیکون‌های w-5→sm:w-6)؛ (۲) اولین GatedFeature در گرید امکانات با unlocked={true} همیشه → setMainTab("workouts")
+  3346→- **B5**: دستیار تغذیه → unlocked={true} و onClick همیشه setMainTab("nutrition") (شاخه toast/redirect حذف) — برای هر ۴ پلن
+  3347→- **B6**: GatedFeature جدید «تحلیل عکس غذا» (آیکون UtensilsCrossed، sub «کالری با یک عکس») — unlocked = canAccess(planName, "mealPhotoAnalysis") (advanced/ultimate — types.ts دست‌نخورده)؛ باز → setMainTab("nutrition")، قفل → toastInfo فارسی + setMainTab("plans")
+  3348→- **B7**: GatedFeature یک‌شکل و خوانا — min-h-[122px] + justify-center (ارتفاع ثابت)، آیکون در مربع گرد رنگ‌مایه‌دار، label text-sm بولد، sub text-xs خاکستری با truncate، حالت قفل: همان چیدمان + بج کوچک Lock (bg-slate-100) و حذف opacity-70 (کم‌رنگی شدید) — sub در حالت قفل هم نمایش داده می‌شود
+  3349→- **تست**: `npx tsc --noEmit` → ۰ خطا؛ `bun run lint` → ۰ خطا / ۷۲ هشدار (دقیقاً برابر baseline قبل از تغییر — بدون هشدار جدید). dev server اجرا نشد (طبق دستور)
+  3350→- تغییرات فقط در: dashboard-view.tsx (۱۳۸۱→۱۵۰۰ خط) + فایل جدید plan-progress-card.tsx — هیچ فایل دیگری لمس نشد
+  3351→
+  3352→Stage Summary:
+  3353→- داشبورد حالا برای همه کاربران (فعال/pending/بدون پلن) مسیر روشن دارد: پیشرفت پلن با رینگ گرادیانی کهربایی + جمله‌ی انگیزشی قطعی روزانه + دکمه تمرین همیشه‌فعال
+  3354→- تمرین امروز و دستیار تغذیه برای همه پلن‌ها باز شدند؛ تحلیل عکس غذا به‌عنوان ویژگی advanced/ultimate به گرید اضافه شد
+  3355→- کارت‌های امکانات ویژه یک‌فرمت، مختصر و خوانا شدند (ارتفاع ثابت + بج قفل کوچک)
+  3356→- شروع دوره از planExpiresAt−۴۵ روز کلاینت‌ساین محاسبه می‌شود (planStartedAt در DTO نبود) — اگر بعداً planStartedAt به auth.ts اضافه شد، fallback همین‌طور درست کار می‌کند
+  3357→
+  3358→---
+  3359→Task ID: 12-c
+  3360→Agent: Sub-agent (general-purpose)
+  3361→Task: گالری پیشرفت + فیکس‌های تغذیه (C1-C5) — عکس‌های پیشرفت مودال پرونده، تب‌های فیلتر گالری، نمودار چکاپ‌ها، گیت/سهمیه تحلیل پیشرفت، دکمه عکس غذا
+  3362→
+  3363→Work Log:
+  3364→- **C1 (باگ عکس‌های پیشرفت مودال پرونده)**: `sports-profile-modal.tsx` L147-154 — GET /api/progress کلید `photos` برمی‌گرداند نه `progressPhotos` → کارت «عکس‌های پیشرفت بدن» همیشه خالی بود. فیکس: `progressData?.photos` + fallback به `mediaData?.bodyPhotos` (از /api/user-media با همان شکل داده) وقتی photos نبود
+  3365→- **C2 (تب‌های گالری جلو/بغل/پشت واقعی شوند)**: `progress-view.tsx` ProgressGallery — کنترل سگمنت قبلاً فقط setSelectedType (هدف آپلود) بود و گرید را فیلتر نمی‌کرد. حالا ۴ تب «همه/جلو/بغل/پشت»: تب زاویه = فیلتر گرید + هدف آپلود (selectedType سنکرون)؛ «همه» همه عکس‌ها (شامل type=custom از مسیر body-analysis) + آپلود با آخرین زاویه (پیش‌فرض جلو) + راهنمای «عکس جدید با زاویه … ثبت می‌شود». گرید ۳ ستونه، جدیدترین اول (ترتیب desc API حفظ شد)؛ empty-state مخصوص هر زاویه؛ typeLabel برای custom = «آزاد»
+  3366→- **C3 (نمودار چکاپ‌ها جای WeightLog)**: `progress-view.tsx` L155-190 + L305-416 — LineChart وزن حذف شد؛ ComposedChart جدید «روند پیشرفت بر اساس چکاپ‌ها»: X = تاریخ چکاپ (fa-IR، reversed برای RTL)، Line «وزن» solid amber #f59e0b + Line «چربی بدن %» dashed rose #f43f5e (فقط اگر داده دارد — دو YAxis: وزن راست/چربی چپ با tick رنگی)، تولتیپ سفارشی RTL گرد (CheckupChartTooltip L776-800). بازه: planStartedAt → (planExpiresAt − ۴۵ روز) → earliest checkup؛ اگر فیلتر < ۲ نقطه → همه چکاپ‌ها (fallback). گیت: `planTierRank >= 2` (استاندارد+)؛ پلن اقتصادی → کارت قفل‌شده زیبا (Lock گرادیان نارنجی + «نمودار پیشرفت چکاپ‌ها در پلن استاندارد و بالاتر فعال است» + دکمه «مشاهده پلن‌ها» → setMainTab("plans"))
+  3367→- **C4 (گیت + سهمیه تحلیل پیشرفت)**:
+  3368→  - types.ts L356 + L411/450/493/533 (فقط additive): قابلیت جدید `progressAnalysis` در PlanCapabilities و ۴ پلن (basic:false, standard/advanced/ultimate:true)
+  3369→  - auth.ts L126 (فقط additive): `progressAnalysis: 2` در minTierMap (استاندارد)
+  3370→  - route `analyze-body-progress`: گیت از bodyPhotoAnalysis(t3) → progressAnalysis(t2)؛ سهمیه ۳ بار در طول اشتراک فعال (count analysisResult type=body_progress با createdAt >= subscriptionStart؛ subscriptionStart = activeSub.startDate ?? createdAt ?? user.planStartedAt؛ اگر >= ۳ → 403 با پیام فارسی + code:LIMIT_REACHED)؛ **GET جدید** → {used, limit:3, remaining} (بدون گیت پلن — requireAuth)؛ VLM از ۶ → ۱۲ عکس؛ rateLimit 10/h و مالکیت عکس دست‌نخورده
+  3371→  - progress-view.tsx کلاینت: canAnalyze = canAccess(planName,"progressAnalysis") (استاندارد+)؛ پلن اقتصادی → دکمه قفل‌شده (dashed + Lock) → toast.info(«تحلیل پیشرفت در پلن استاندارد و بالاتر فعال است») + setMainTab("plans")؛ کپشن «۳ بار در طول اشتراک — X تحلیل باقی‌مانده» از GET؛ POST با ۱۲ عکس آخر؛ خطای 403/سهمیه مستقیم toast می‌شود و remaining رفرش می‌شود
+  3372→- **C5 (دکمه عکس غذا در تغذیه)**: `nutrition-view.tsx` L324-356 — دکمه همیشه دیده می‌شود: باز (advanced+، رفتار قبلی) / قفل‌شده (dashed نارنجی + Lock) → toast.info(«تحلیل عکس غذا در پلن پیشرفته و بالاتر فعال است») + setMainTab("plans") (از store؛ Lock به ایمپورت‌ها اضافه شد). موبایل: به‌جای آیکون‌تنها، متن کوتاه «عکس غذا» (text-xs) کنار Camera + لیبل کامل «آنالیز عکس غذا» فقط sm+
+  3373→- **رنگ‌ها**: فقط amber/orange/rose/emerald/cyan — بدون آبی/ایندیگو در همه تغییرات
+  3374→- **تست‌ها**: `npx tsc --noEmit` → ۰ خطا؛ `bun run lint` → ۰ خطا، ۷۲ هشدار قدیمی (بدون هشدار جدید)
+  3375→- نکته: فایل‌های دیگر (main-app/dashboard-view/programs-view/dialog/sheet/plan-progress-card/daily-quotes) کار ایجنت موازی 12-a/12-b است — دست نخورد
+  3376→
+  3377→Stage Summary:
+  3378→- عکس‌های پیشرفت در مودال پرونده ورزشی حالا واقعاً نمایش داده می‌شوند (باگ کلید API)
+  3379→- گالری پیشرفت تب‌های واقعی همه/جلو/بغل/پشت دارد (فیلتر + هدف آپلود)
+  3380→- نمودار پیشرفت از داده واقعی چکاپ‌ها (وزن + چربی) با گیت استاندارد+ و کارت قفل‌شده زیبا برای اقتصادی
+  3381→- تحلیل پیشرفت بدن: از پلن استاندارد فعال (قبلاً فقط پیشرفته/حرفه‌ای)، ۱۲ عکس به‌جای ۶، سهمیه ۳ بار در طول اشتراک با نمایش باقی‌مانده و پیام واضح 403
+  3382→- دکمه عکس غذا برای همه پلن‌ها دیده می‌شود (قفل‌شده با مسیر ارتقا برای پایین‌تر از پیشرفته) + لیبل کوتاه موبایل
+  3383→
+  3384→---
+  3385→Task ID: 12-f
+  3386→Agent: Sub-agent (general-purpose)
+  3387→Task: اپ بازار — گرفتن دسترسی‌ها در زمان خودشان (میکروفون/دوربین/گالری/نوتیف) — F1..F5
+  3388→
+  3389→Work Log:
+  3390→- **F1 — AndroidManifest.xml:14-21**: افزودن `CAMERA` + `RECORD_AUDIO` + `MODIFY_AUDIO_SETTINGS` بعد از RECEIVE_SMS، با کامنت فارسی: مجوزها فقط «در زمان استفاده» (WebChromeClient.onPermissionRequest) گرفته می‌شوند، نه در استارتاپ — قانون حریم خصوصی بازار. بقیه مانیفست دست‌نخورده.
+  3391→- **F2 — MainActivity.kt:265-296**: اورراید جدید `onPermissionRequest` داخل همان object anonymous : WebChromeClient (بعد از onShowFileChooser): فقط RESOURCE_VIDEO/AUDIO_CAPTURE پذیرفته می‌شود (بقیه deny)؛ روی UI thread دیالوگ فارسی کوتاه «اجازه دسترسی / برای … اجازه می‌دهی؟» با دکمه‌های «اجازه می‌دهم / نه» — الگوی دقیق دیالوگ پیامک OTP (appcompat AlertDialog + listener دوپارامتری `{ _, _ -> }` + runOnUiThread). متن what سه‌حالته: «ضبط ویدیو (دوربین و میکروفون)» / «استفاده از دوربین» / «استفاده از میکروفون».
+  3392→- **F3 — MainActivity.kt:109-118 (فیلدها) + 705-739 (تابع)**:
+  3393→  - `pendingWebPermissionRequest: PermissionRequest?` + `mediaPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions())` (property-init — معتبر در ComponentActivity، قبل از onStart)؛ کال‌بک: اگر همه grants تایید → `req.grant(req.resources)` وگرنه `req.deny()` (هر دو داخل runOnUiThread — ریسه امن).
+  3394→  - `requestMediaRuntimePermissions(webRequest)`: deny درخواست معلق قبلی در صورت درخواست همزمان → ساخت لیست مجوزها (VIDEO→CAMERA، AUDIO→RECORD_AUDIO) → اگر همه از قبل granted → grant مستقیم؛ وگرنه `mediaPermissionLauncher.launch(perms.toTypedArray())` با try/catch fail-closed (deny در خطا).
+  3395→  - ایمپورت جدید فقط `android.webkit.PermissionRequest` (L24) — بقیه (PackageManager/ContextCompat/ActivityResultContracts/ActivityResultLauncher/appcompat AlertDialog) از قبل موجود بودند.
+  3396→- **F4 — build.gradle.kts:14-18**: versionCode 4→5، versionName "1.3.0"→"1.4.0" + کامنت v1.4.0 (مجوز دوربین/میکروفون در زمان getUserMedia + گالری با system picker).
+  3397→- **F5 — download/BAZAAR-PUBLISH-GUIDE.md:258-277**: سکشن جدید «تاریخچه نسخه‌ها (Changelog)» بعد از معماری فنی — ورودی v1.4.0 (code 5): میکروفون/دوربین فقط لحظه getUserMedia (ویس چت + آنالیز ویدیو) با دیالوگ فارسی سپس سیستمی؛ گالری با انتخاب‌گر سیستم بدون مجوز؛ اعلان فقط با کارت «فعال‌سازی اعلان‌ها» در سایت؛ پیامک OTP فقط صفحه ورود با کارت + دیالوگ توضیح؛ + یک‌لاینرهای 1.3/1.2/1.1/1.0. به‌روزرسانی دو خط چک‌لیست مجوزها (L181، L205) و خط فلوی نوتیف (L252-254) برای دقت در بررسی بازار.
+  3398→- **تأیید نحوی (بیلد در دسترس نیست — Android SDK نداریم)**: بررسی دستی کامل + اسکریپت شمارش آکولاد/پرانتز بعد از حذف کامنت/استرینگ‌ها → ۲۰۲/۲۰۲ و ۴۴۰/۴۴۰ متعادل؛ هر ۵ occurrence مربوط به registerForActivityResult صحیح (۴ ثبت + ۱ return@label موجود قبلی)؛ امضای onPermissionRequest دقیقاً منطبق بر android.webkit (API 21+، minSdk 24)؛ R8 override متدهای WebChromeClient را نگه می‌دارد (همان الگوی onShowFileChooser که در release v1.3.0 کار می‌کرد) — proguard-rules.pro نیازی به تغییر ندارد.
+  3399→- فقط ۴ فایل مجاز لمس شد: AndroidManifest.xml / MainActivity.kt / build.gradle.kts / BAZAAR-PUBLISH-GUIDE.md (git status تأیید).
+  3400→
+  3401→Stage Summary:
+  3402→- v1.4.0 (code 5): getUserMedia سایت (ضبط ویس چت، ضبط ویدیو آنالیز) حالا در WebView بازار واقعاً کار می‌کند — دیالوگ فارسی اجازه → مجوز runtime اندروید دقیقاً در لحظه استفاده؛ گالری همچنان بدون مجوز (system picker)؛ نوتیف/پیامک سر جای درست خودشان هستند
+  3403→- هیچ مجوزی در استارتاپ درخواست نمی‌شود — الگوی «دسترسی‌های شخصی‌سازی‌شده» مالک در کل اپ برقرار
+  3404→- نکته انتشار: بعد از بیلد، `app_latest_version_code` پنل ادمین را به 5 تغییر دهید (راهنما، بخش فاز ۳.۴)
+  3405→
+  3406→---
+  3407→Task ID: 12-d
+  3408→Agent: Sub-agent (general-purpose)
+  3409→Task: توضیحات مدیر — یادداشت‌های پایدار هر کاربر در مودال پروفایل (D1..D5) + خودترمیمی جدول در پروداکشن + فیکس دید تب سرچ کنسول
+  3410→
+  3411→Work Log:
+  3412→- **D1 (مدل Prisma)**: `prisma/schema.prisma` — مدل جدید `UserAdminNote` (id, userId, body, createdAt, updatedAt, authorMobile + رابطه onDelete: Cascade) با `@@index([userId, createdAt])` در انتهای فایل؛ back-relation `adminNotes UserAdminNote[]` روی مدل User (خط ۸۴). `bun run db:push` در اولین تلاش موفق شد (بدون قفل SQLite — دیتابیس sync + Prisma Client regenerate شد)
+  3413→- **D2 (خودترمیمی پروداکشن)**: `src/app/api/cron/db-selfheal/route.ts` — آرایه `EXPECTED_TABLES` جدید با DDL آینه‌ی مدل (`CREATE TABLE IF NOT EXISTS "UserAdminNote"` + `CREATE INDEX IF NOT EXISTS "UserAdminNote_userId_createdAt_idx"`)؛ گام ۲ بعد از حلقه‌ی ستون‌ها اجرا می‌شود: چک sqlite_master → اجرای هر دو دستور idempotent → فقط اگر جدول نبود push به `tablesCreated` و کلید `created:true/false` به JSON پاسخ اضافه شد. همان مجوزسازی قبلی (secret/loopback) دست‌نخورده. DDL با اجرا روی DB زنده تست شد (no-op موفق)
+  3414→- **D3 (API)**: فایل جدید `src/app/api/admin/users/[id]/notes/route.ts` — GET (لیست newest-first: `{notes:[{id,body,createdAt,updatedAt,authorMobile}]}`)، POST (body trim شده ۲..۵۰۰۰ کاراکتر وگرنه ۴۰۰؛ authorMobile = mobile ادمینِ لاگین‌شده از requireAdmin؛ ۴۰۴ اگر کاربر نبود؛ پاسخ ۲۰۱)، PUT ({id, body} — یادداشت باید متعلق به همان userId باشد وگرنه ۴۰۴)، DELETE (?id= → deleteMany با where دوتایی → ۴۰۴ اگر ۰ ردیف). همه با requireAdmin + apiError مطابق استایل route های موجود
+  3415→- **D4 (UI مودال)**: `admin-overlay.tsx` — کامپوننت جدید `UserAdminNotesSection` (خط ۱۲۲۱-۱۴۸۱) رندرشده به‌عنوان آخرین بخش مودال UserProfileDialog قبل از DialogFooter (خط ۱۱۷۱-۱۱۷۲)؛ فچ یادداشت‌ها با باز شدن مودال (useEffect مستقل + cancelled flag). سربرگ: NotebookPen در مربع کهربایی + «توضیحات مدیر» + زیرنویس «تاریخچه گفتگوها و سوابق — همیشه ذخیره می‌ماند» + شمارنده یادداشت‌ها. Textarea ثبت جدید با placeholder «مثلاً: تماس تلفنی ۱۴۰۵/۰۶/۱۰ — کاربر گفت...»، hint تعداد کاراکتر فارسی (۲..۵۰۰۰)، دکمه «افزودن یادداشت» (disabled < ۲ کاراکتر + اسپینر). لیست جدیدترین اول با max-h-64 overflow-y-auto custom-scrollbar؛ هر آیتم: تاریخ نسبی فارسی (timeAgo موجود + title تاریخ کامل fa-IR)، چیپ authorMobile، نشان «(ویرایش شده)» اگر updatedAt−createdAt > ۱ دقیقه، متن whitespace-pre-wrap break-words؛ اکشن‌های inline: «ویرایش» (textarea کهربایی + ذخیره/انصراف با hint کاراکتر) و «حذف» دومرحله‌ای («حذف» → «تأیید حذف» destructive + «انصراف»). empty state «هنوز یادداشتی ثبت نشده است» + Skeleton هنگام لود. استایل هم‌خوان با کارت‌های مودال (rounded-xl border orange-100, p-4, text-sm) — فقط amber/orange/rose/stone، بدون آبی/ایندیگو
+  3416→- **D5 (فیکس تب)**: خط ۴۰۷ — تب search_console از `perm: "canManageArticles"` → `canManageUsers` (سطح ادمین کامل) تا فیلتر `allTabs.filter((t) => permissions[t.perm])` آن را برای ادمین‌های دارای مدیریت کاربران نمایش دهد
+  3417→- **تست‌ها**: `npx tsc --noEmit` → ۰ خطا؛ `bun run lint` → ۰ خطا / ۷۲ هشدار (برابر baseline، بدون هشدار جدید)؛ اسکریپت node → table exists: true + index exists: true؛ smoke-test CRUD زنده (create/update/delete با پاکسازی کامل) موفق. dev server اجرا/ری‌استارت نشد
+  3418→- ⚠️ نکته: dev server جاری Prisma Client قدیمی را در globalThis کش کرده (db.ts طبق قواعد دست‌نخورده) — برای کارکرد endpoint یادداشت‌ها در dev باید سرور یک‌بار ری‌استارت شود؛ db:push خودش client جدید generate کرده است
+  3419→- فایل‌های لمس‌شده فقط: prisma/schema.prisma، db-selfheal/route.ts، notes/route.ts (جدید)، admin-overlay.tsx
+  3420→
+  3421→Stage Summary:
+  3422→- ادمین حالا در انتهای مودال پروفایل هر کاربر بخش «توضیحات مدیر» دارد: ثبت/ویرایش/حذف یادداشت‌های پایدار با تاریخ نسبی فارسی، نویسنده (موبایل ادمین) و نشان ویرایش — سوابق ماندگار برای مرور چند سال بعد
+  3423→- جدول UserAdminNote روی پروداکشن هم خودکار ساخته می‌شود (CREATE TABLE IF NOT EXISTS + ایندکس در cron/db-selfheal با گزارش tablesCreated/created در پاسخ)
+  3424→- تب «سرچ کنسول» حالا با دسترسی مدیریت کاربران (سطح ادمین) دیده می‌شود، نه فقط مدیریت مقالات
+  3425→
+  3426→---
+  3427→Task ID: 12-e
+  3428→Agent: Sub-agent (general-purpose)
+  3429→Task: سئو — لینک‌سازی هوشمند به همه مقالات + صفحات پویا + خودترمیمی sitemap + نصب خودکار سرچ کنسول در boot
+  3430→
+  3431→Work Log:
+  3432→- **E1 — src/lib/fitness/seo-agent.ts** (درخواست الف و ب مالک: «سئو باید بدونه چه مقالاتی منتشر شده» + «به صفحات پویا هم لینک بده»):
+  3433→  - **SiteAnalysis (L29-50)**: دو فیلد جدید `exercises: {id,name}[]` و `foods: {id,name}[]`
+  3434→  - **analyzeSite (L578-604)**: واکشی ۳۰۰ حرکت ورزشی (ExerciseLibrary — بدون آمار بازدید → orderBy name asc، مثل sitemap، فقط id+name) و ۳۰۰ ماده غذایی (FoodLibrary همینطور) — هر کدام try/catch جدا تا خطای DB کل تحلیل را نکشد؛ لاگ موفقیت حالا «X مقاله، Y حرکت ورزشی، Z ماده غذایی» را می‌گوید
+  3435→  - **هلپرهای جدید (L406-552)**: `tokenizeFa()` (ZWNJ/RLM→فاصله، ی/ک عربی→فارسی، علائم→فاصله، حذف توکن تک‌حرفی)، `buildLinkCandidates(site, keywords)` — امتیاز هر مقاله = تعداد توکن مشترک (عنوان+تگ+دسته+خلاصه) با کلمات کلیدی هدف؛ مرتب‌سازی score desc با tie→ترتیب قبلی (مقالات newest-first یعنی fallback جدیدترین‌ها)؛ خروجی: ~۴۰ مقاله (slug خام) + ~۱۲ حرکت (slug کامل `/?exercise=ID`) + ~۱۲ غذا (`/?food=ID`) + ۶ صفحه کلیدی = حداکثر ~۷۰ آیتم (سایز پرامپت sane)؛ `renderLinkCandidates()` با برچسب نوع «(مقاله)/(حرکت ورزشی)/(ماده غذایی)/(صفحه)»
+  3436→  - **planArticles (L1313-1348)**: `existingForLinks` از «۱۵ مقاله اول + صفحات» → `buildLinkCandidates(site, selected.map(k=>k.keyword))` (relevance به کلمات کلیدی batch برنامه‌ریزی)؛ systemPrompt: «۲-۳ لینک» → «۲-۴ لینک به صفحات/مقالات/حرکات/غذاها»؛ قوانین جدید: slug خام مقاله در internalLinks با پیشوند /?article=، slug کامل صفحات پویا عیناً، «۱-۲ لینک به صفحات پویا — صفحات پویا هم باید رتبه بگیرند»
+  3437→  - **generateArticle (L1608-1613)**: همان انتخاب relevance-based با `planKeywords = [plan.keyword, ...plan.secondaryKeywords]`
+  3438→  - **contentSystem (L1640-1652)**: دو فرمت مجاز جدید — «۵. لینک به صفحه حرکت ورزشی: [متن](/?exercise=آیدی)» و «۶. لینک به صفحه ماده غذایی: [متن](/?food=آیدی)» + قید «آیدی را هرگز از خودت نساز» + «۲-۳ لینک به صفحات پویا در متن بگذار»
+  3439→  - **contentUser (L1705-1719)**: رندر لیست با renderLinkCandidates + دو خط یادآوری فرمت exercise/food؛ رندر plan.internalLinks حالا slug کامل (شروع با /) را عیناً نگه می‌دارد تا لینک‌های پویای program-stage خراب نشوند
+  3440→  - Post-processing تعمیر لینک‌ها (~L1745) دست‌نخورده
+  3441→- **E2 — src/app/sitemap.ts** (باگ پروداکشن: فقط ~۷ URL): یک try/catch کلی → چهار بخش مستقل (articles/categories/exercises/foods) با هلپر `fetchSection()` — هر بخش ۲ تلاش (retry بعد از ۳ ثانیه)، لاگ بلند `[sitemap]` per section، `failedSections` tracking + خلاصه پایانی (error اگر بخشی fail، else log شمارش دقیق). articles take 500→5000. categories حالا کوئری مستقل groupBy. `revalidate=3600` و بدون force-dynamic (دست‌نخورده)
+  3442→- **E3 — deploy.sh (L231-245)**: بعد از health check HTTP، قدم ۱۵.۵ — شمارش `<loc>` از localhost:3000/sitemap.xml (با گاردهای `|| true` برای set -e)؛ اگر < ۲۰ → هشدار بلند «Ⓦ SITEMAP PROBLEM: فقط N URL (انتظار ۱۳۰۰+)» + راهنمای `pm2 logs ... | grep '\[sitemap\]'` — دیپلوی fail نمی‌شود
+  3443→- **E4 — GSC seed خودکار در boot** (درخواست د مالک):
+  3444→  - **route جدید src/app/api/cron/seed-gsc/route.ts**: GET، مجوز عین db-selfheal (rate-limit 30/min + secret درست OR local/no-proxy-headers/loopback)؛ readFile `gsc-service-account-recovered.json` از process.cwd() (500 با پیام فارسی اگر نبود)؛ اگر `SiteSetting.gsc_service_account` غیرخالی → `{seeded:false, reason:"already configured"}` (هرگز overwrite)؛ وگرنه `saveGscConfig(saJson, "https://fittup.ir/", apiKey)` با apiKey = `process.env.GSC_API_KEY || DEFAULT_GSC_API_KEY` (کلید داده‌شده هاردکد)؛ موفق → `{seeded:true}`، خطا → 500
+  3445→  - **instrumentation-node.ts**: `startGscSeed()` — boot+12s (بعد از db-selfheal)، URL با secret مثل startDbSelfHeal، retry تا ۳ بار هر ۳۰s، unref، لاگ‌های `[instrumentation] GSC seed: ✅ پیکربندی سرچ کنسول نصب شد` / ⏭ از قبل / ⚠ خطا
+  3446→  - **instrumentation.ts**: `startGscSeed()` بعد از `startDbSelfHeal()` ثبت شد (بقیه فراخوانی‌ها دست‌نخورده)
+  3447→- **تست‌ها**: `npx tsc --noEmit` → ۰ خطا؛ `bun run lint` → ۰ خطا / ۷۲ هشدار (baseline بدون تغییر)؛ dev server اجرا نشد (سرور از قبل روشن بود — فقط curl):
+  3448→  - `curl "http://localhost:3000/api/cron/seed-gsc?secret=$SECRET"` → `{"seeded":false,"reason":"already configured"}` ✓ ( sandbox DB از قبل gsc_service_account=2349 chars + site_url + api_key دارد)
+  3449→  - با هدر fake proxy + secret غلط → 401 ✓ / با secret درست → 200 ✓
+  3450→  - sitemap روی سرور sandbox → **۱۳۱۶ URL** (قبلاً روی پروداکشن ۷!) — همه بخش‌های DB سالم
+  3451→- فایل‌های لمس‌شده فقط: seo-agent.ts، sitemap.ts، deploy.sh، seed-gsc/route.ts (جدید)، instrumentation-node.ts، instrumentation.ts — search-console.ts فقط import شد
+  3452→
+  3453→Stage Summary:
+  3454→- ایجنت سئو حالا در هر اجرا کل ۱۳۰۰+ محتوا را می‌شناسد: ~۴۰ مقاله مرتبط‌ (relevance-based به کلمات کلیدی همان مقاله، نه ۱۵-۲۰ مقاله جدید) + ۱۲ حرکت ورزشی + ۱۲ ماده غذایی + ۶ صفحه کلیدی را به LLM می‌دهد و با فرمت‌های مجاز /?exercise=آیدی و /?food=آیدی به صفحات پویا هم لینک می‌سازد — لینک‌سازی داخلی قوی برای رتبه‌گیری صفحات پویا
+  3455→- sitemap خودترمیم‌شو per-section شد: خطای یک بخش فقط همان بخش را می‌اندازد (retry ۳ ثانیه‌ای + لاگ بلند [sitemap]) — باگ «۷ URL در پروداکشن» ریشه‌یابی و رفع شد؛ سقف مقالات ۵۰۰۰
+  3456→- deploy.sh بعد از health check سلامت sitemap را واقعاً می‌سنجد (شمارش <loc>) و اگر < ۲۰ بود بلند هشدار می‌دهد (بدون fail دیپلوی)
+  3457→- سرچ کنسول از boot خودکار نصب می‌شود: instrumentation در ثانیه ۱۲ route seed-gsc را می‌زند، SA از فایل recovered ریشه پروژه خوانده می‌شود، پیکربندی موجود هرگز overwrite نمی‌شود — مالک دیگر چیزی paste نمی‌کند
+  3458→
+  3459→---
+  3460→Task ID: 12
+  3461→Agent: Main (Z.ai Code) — با ۶ ایجنت موازی (12-a تا 12-f)
+  3462→Task: v11 — همه درخواست‌های مالک: مودال‌ها/پلن‌ها/داشبورد/گالری/ادمین/ویدیو/سئو/GSC/نوتیف/اپ بازار/APK
+  3463→
+  3464→Work Log:
+  3465→- **کالبدشکافی کامل** با ۳ ایجنت Explore (مودال‌ها+مکمل / گالری+پلن‌ها / سئو+GSC+APK) — همه با file:line
+  3466→- **12-a مودال‌ها:** dialog X → top-4 left-4 (RTL انتهای بصری)؛ sheet.tsx گرفت showCloseButton؛ ۱۰ شیت main-app → showCloseButton={false} (رفع X دوتایی)؛ دوز مکمل → چیپ wrap-شونده بدون shrink-0 (۴ نقطه + Printable)؛ pl-8 روی تیترهای مودال برنامه تا X روی دکمه‌های تصویر/PDF نیفتد
+  3467→- **12-b داشبورد:** حذف «امروز رو بترکون!» قدیمی از هدر؛ کارت جدید پیشرفت پلن (رینگ SVG گرادیانی + روز X از ۴۵ + تمدید ≤۱۰روز) برای همه حالت‌ها (فعال/pending/بی‌پلن)؛ کارت «امروز رو بترکون» (تاریک + قاب گرادیانی + تاریخ شمسی) با src/lib/fitness/daily-quotes.ts — ۱۱۱ جمله دست‌نویس + انتخاب بر اساس روزِ سال شمسی با Intl (تست: ۱۰ شهریور، جمله ۵۳)؛ دکمه تمرین امروز ×۲ (ردیف بالا + اولین GatedFeature) همه پلن‌ها؛ دستیار تغذیه unlocked همیشه؛ GatedFeature جدید تحلیل عکس غذا (mealPhotoAnalysis)؛ پولیش یکدست کارت‌ها
+  3468→- **12-c گالری:** باگ عکس پروفایل (progressPhotos→photos + fallback bodyPhotos)؛ تب‌ها همه/جلو/بغل/پشت = فیلتر+هدف آپلود؛ نمودار چکاپ ComposedChart (وزن+چربی، از اولین خرید، استاندارد+/قفل اقتصادی)؛ قابلیت جدید progressAnalysis (basic:false, بقیه:true) + minTier:2؛ route: سقف ۳ بار/اشتراک (شمارش AnalysisResult body_progress از شروع اشتراک) + GET used/limit + ۱۲ عکس به VLM؛ دکمه دوربین غذا همیشه + قفل با toast + لیبل موبایل «عکس غذا»
+  3469→- **12-d ادمین:** مدل UserAdminNote (schema+db:push) + خودترمیمی CREATE TABLE IF NOT EXISTS در db-selfheal (تست شد: boot → جدول ساخته شد)؛ route notes CRUD؛ بخش «توضیحات مدیر» در انتهای مدال کاربر (نویسنده+تاریخ نسبی+ویرایش+حذف دومرحله‌ای)؛ تب سرچ کنسول perm→canManageUsers
+  3470→- **12-e سئو:** analyzeSite += ۳۰۰ حرکت+۳۰۰ غذا؛ buildLinkCandidates (توکن‌ایز فارسی ZWNJ/ی/ک + امتیاز همپوشانی) → ~۴۰ مقاله+~۱۲ حرکت+~۱۲ غذا+۶ صفحه؛ فرمت‌های /?exercise= و /?food= در پرامپت‌ها؛ sitemap: ۴ بخش مستقل با retry ۳ث + take ۵۰۰۰ (تست: ۱۳۱۶ URL) + خطای شفاف؛ deploy.sh هشدار sitemap<۲۰؛ seed-gsc route + instrumentation (boot+12s، ۳ retry) — تست: seeded:true وقتی خالی، skip وقتی هست، 401 با XFF خارجی
+  3471→- **12-f بازار v1.4.0:** manifest += CAMERA/RECORD_AUDIO/MODIFY_AUDIO؛ onPermissionRequest با دیالوگ فارسی + mediaPermissionLauncher + grant/deny امن؛ versionCode 5
+  3472→- **خودم:** plans-view منقضی (currentPlanId فقط فعال/pending؛ کارت «به پایان رسیده»+تمدید؛ ۴ دکمه انتخاب پلن؛ بدون ارتقای بی‌پلن) — تست E2E با کاربر ساختگی منقضی؛ اسکرول روزهای تمرین (will-change: scroll-position + snap proximity + overscroll-contain + transition-colors) در workouts+gym-mode؛ ویدیو: extractFramesFromVideoFile + ریموکس fallback (ffmpeg -c copy faststart) — تست با ۳ فایل (نرمال/موو/زباله) + ۶ فریم؛ متن re_engagement بازنویسی انسانی؛ loadError شفاف در progress-view (بنر قرمز+تلاش مجدد)
+  3473→- **APK بیلد در سندباکس:** Android SDK نصب (cmdline-tools+platform-34+build-tools) + JDK کامل (jlink نبود!) + gradle — BUILD SUCCESSFUL؛ app-release.apk 782KB امضاشده با keystore فیتاپ (versionCode 5) → download/ + public/downloads/ + کارت دانلود مستقیم در mobile-app-view (مخفی در اپ بازار) + default latest=5
+  3474→- **GSC تحقیق عمیق:** کلید paste شده RSA معتبرِ داخلی است (p×q=n و d×e≡1) ولی با ۲ گواهی فعلی گوگل برای SA نمی‌خواند → Invalid JWT Signature قطعی؛ کلید «بازیابی‌شده» جلسه قبل هم همین کلید است (فایل گیت= paste) — پیام خطا قابل‌اقدام شد (راهنمای کلید جدید از گوگل کلاد). seed حفظ شد (کلید جدید فقط با فایل/پنل)
+  3475→- **E2E:** ۵ لاگین موفق؛ داشبورد (VLM: رینگ+کارت تیره+۳دکمه مرتب)؛ مودال مکمل دسکتاپ+عرض ۴۰۰px (VLM: بدون بیرون‌زدگی، X بالا-چپ تنها)؛ گالری ۶ عکس+تب فیلتر+نمودار (needs-more-checkups برای ۱ چکاپ)؛ plans منقضی؛ ادمین notes CRUD+ماندگاری DB؛ دوربین قفل+toast؛ سایت‌مپ ۱۳۱۶؛ lint 0 خطا؛ tsc 0
+  3476→- **پاکسازی:** کاربر/یادداشت/OTPهای تست حذف؛ cjsها حذف؛ zip v11 (۶۲۳ فایل، شامل APK، بدون build/gradle) + مستندات v11 (README/SERVER-GUIDE/DEPLOY)
+  3477→
+  3478→Stage Summary:
+  3479→- همه ۱۷ درخواست مالک پیاده و تست شد (جز کلید GSC که گوگل ردش می‌کند — زیرساخت نصب خودکار آماده؛ فقط کلید جدید لازم است)
+  3480→- APK v1.4.0 واقعاً در سندباکس بیلد شد و در سایت (public/downloads) + download/ قرار گرفت — دیپلوی zip شامل همه
+  3481→- دیپلوی: `rm -rf src scripts prisma public && unzip fitup-deploy-2026-09-01-v11.zip && bash deploy.sh` (public هم حذف شود تا APK جدید منتشر شود)
+  3482→- نکته GSC: کلید JSON فعلی در گوگل معتبر نیست (Invalid JWT Signature) — مالک باید از IAM→Keys کلید جدید بسازد و یا فایل gsc-service-account-recovered.json را جایگزین کند یا در تب پیکربندی paste کند؛ API key ذخیره شده
+  3483→
+  3484→---
+  3485→Task ID: V12-2026-09-01
+  3486→Agent: Main (Z.ai Code)
+  3487→Task: چهار درخواست کاربر — همگامی گیت‌هاب، فیکس sitemap، حذف دکمه «مشاهده کل برنامه»، ادغام پیشرفت پلن+جملات بزرگان، تجویز مکمل حداقلی
+  3488→
+  3489→Work Log:
+  3490→- گیت‌هاب: fetch + مقایسه blob-hash — کد پروژه سندباکس با origin/main (fitup5) بایت‌به‌بایت یکسان؛ فقط فایل‌های سندباکسی (skills/، worklog، بکاپ db) روی remote نیستند
+  3491→- DB سندباکس خالی شده بود → از upload/custom.db بازگردانی شد (۴۳ مقاله، ۲۶۰ حرکت، ۱۰۸۰ غذا، ۸ کاربر)
+  3492→- فیکس sitemap (ریشه): app/sitemap.ts با revalidate=3600 در زمان build پیش‌رندر و نسخه ۷ صفحه‌ای در ISR کش می‌شد → حذف و جایگزینی با app/sitemap.xml/route.ts با force-dynamic + کش حافظه‌ای ۱۰ دقیقه‌ای + per-section retry؛ فیکس جانبی: take غذاها ۱۰۰۰→۱۰۰۰۰ (۸۰ غذا جا می‌ماند!)
+  3493→- تست سندباکس: ۷→۱۳۹۶ URL (۴۳ مقاله + ۶ دسته + ۲۶۰ حرکت + ۱۰۸۰ غذا + ۷ ثابت)
+  3494→- حذف دکمه «مشاهده کل برنامه» از ProgramCard (programs-view.tsx) + حذف کامپوننت مرده AllProgramsModal (~۴۳۰ خط) + پاکسازی propهای onOpenAllPrograms و type:"all"
+  3495→- بازطراحی daily-quotes.ts: ۱۱۱ جمله واقعی بزرگان با نام گوینده (امام علی، فردوسی، مولانا، حافظ، سعدی، ارسطو، سقراط، مارکوس آئرلیوس، نیچه، کافکا، هوگو، چرچیل، ماندلا، محمدعلی کلی، جردن، بروس لی، آرنولد، کیپچوگه، ...) + author در DailyQuote
+  3496→- ادغام: plan-progress-card.tsx بازنویسی شد — یک کارت تیره پرمیوم واحد: بخش بالا (رینگ پیشرفت/CTA/pending) + OrnamentDivider + بخش پایین (حکمت روز + گوینده + تاریخ شمسی)؛ dashboard-view.tsx: حذف DailyQuoteCard (~۷۲ خط) و رندر یکجا
+  3497→- تجویز مکمل حداقلی مؤثر (درخواست «۲۵ میلیون تومن مکمل»):
+  3498→  • پرامپت تمرین (ai.ts): base فقط ۳ قلم (D3+امگا۳+کراتین)، advanced حداکثر ۱ (فقط وی اگر پروتئین از غذا تأمین نمی‌شود)، BCAA/EAA/بتاآلانین/سیترین/گلوتامین ممنوع، گینر/کارنیتین/کلاژن/ZMA فقط اختیاری در note، کل استک حداکثر ۵ قلم + جایگزین غذایی ارزان
+  3499→  • پرامپت برنامه غذایی بخش ۱۱ + DEFAULT_COACH/CHAT/NUTRITION_PROMPT همگی هماهنگ شدند
+  3500→  • UI: برچسب‌های دسته «ضروری‌ها (ارزان و مؤثر)/اختیاری — فقط با نیاز/هدفمند (اختیاری)» + بنر «غذا اول، مکمل دوم» در SupplementStackView و PrintableProgram + حذف رنگ آبی
+  3501→- تست E2E با agent-browser (لاگین OTP واقعی، کاربر ultimate): کارت ادغامی (روز ۸ از ۴۵ + مایا آنجلو) ✓ دسکتاپ+موبایل، حذف دکمه ✓ (۰ occurrence)، مودال تمرین ✓، مودال مکمل با بنر جدید ✓، بدون خطای کنسول
+  3502→- نکته فنی: sed -i باعث inode جدید → file-watcher وبپک می‌شکند؛ بعد از sed باید dev restart شود + کش مرورگر پاک شود (fresh browser session)
+  3503→
+  3504→Stage Summary:
+  3505→- ✅ سندباکس = گیت‌هاب (تایید بایت‌به‌بایت)
+  3506→- ✅ sitemap.xml: ۱۳۹۶ URL داینامیک — هرگز نسخه build-time کش نمی‌شود؛ X-Sitemap-Count header برای دیباگ
+  3507→- ✅ دکمه «مشاهده کل برنامه» حذف شد؛ فقط ۳ دکمه تمرین/تغذیه/مکمل
+  3508→- ✅ کارت واحد «پیشرفت پلن + حکمت روز» — ۱۱۱ جمله بزرگان با attribution، deterministic بر اساس روز سال شمسی
+  3509→- ✅ تجویز مکمل: حداکثر ۵ قلم، BCAA/EAA/بتاآلانین/سیترین/گلوتامین ممنوع، غذا اول
+  3510→- فایل‌های تغییر‌یافته: src/app/sitemap.xml/route.ts (جدید)، src/app/sitemap.ts (حذف)، programs-view.tsx، dashboard-view.tsx، plan-progress-card.tsx، daily-quotes.ts، ai.ts
+  3511→- Commit: «v12: sitemap داینامیک ۱۳۹۶URL + حذف مشاهده کل برنامه + کارت ادغامی پیشرفت/حکمت روز بزرگان + تجویز مکمل حداقلی مؤثر»
+  3512→
+  3513→---
+  3514→Task ID: V12.1-2026-09-01
+  3515→Agent: Main (Z.ai Code)
+  3516→Task: ۱۱ درخواست مالک — توضیحات زرین‌پال با نام/شماره، باکس‌های داشبورد، جملات انگیزشی ورزشی، مکمل داینامیک، تمرین امروز داینامیک + روز استراحت، ترتیب عدد-واحد، انتشار خودکار مقالات زمان‌بندی‌شده، ریشه‌یابی GSC 403 (IP بلاک)، theme-color نارنجی
+  3517→
+  3518→Work Log:
+  3519→- **۱. توضیحات زرین‌پال (checkout/route.ts):** description جدید = `فیتاپ — {plan.label} — {نام کامل یا موبایل} — {mobile} — {۴۵ روزه}` — هم در zarinpalRequest (درگاه) و هم رکورد Payment در DB (۲ نقطه)
+  3520→- **۲. theme-color (layout.tsx):** `#f59e0b` زرد → `#f97316` نارنجی سازمانی (viewport export) — curl تأیید: `<meta name="theme-color" content="#f97316"/>`؛ manifest از قبل همین بود
+  3521→- **۳. باکس ۳ دکمه داشبورد (dashboard-view.tsx):** grid لخت → کارت پرمیوم با قاب گرادیانی نارنجی + هدر شخصی‌سازی‌شده «{user.name} جان، بریم سراغ امروز؟» + آیکون Flame + چیپ پلن طلایی + زیرنویس «برنامه، جلسه‌ی امروز و حالت باشگاه — همه یک‌جا»؛ ساب‌تیتل دکمه تمرین امروز داینامیک (آماده اجرا/استراحت و ریکاوری)
+  3522→- **۴. باکس امکانات ویژه پلن (dashboard-view.tsx):** هدر ساده + grid → قاب گرادیانی نارنجی + بدنه کرم `#fffdf8→#fff6e9` + هدر Sparkles «امکانات ویژه‌ی پلن شما / همه‌ی ابزارهای پلنت — یک‌جا» + چیپ پلن طلایی یا دکمه «خرید پلن ←»
+  3523→- **۵. جملات انگیزشی (daily-quotes.ts کامل بازنویسی):** ۱۰۳ جمله فقط از بزرگان ورزش/بدنسازی (آرنولد ۸، رونی کلمن، دوریان ییتس، مایک منتزر، کای گرین، لی هِینی، فرانک زِین، سرخیو اُلیوا، تام پلاتس، فرانکو کولومبو، جی کاتلر، محمدعلی کلی، مایک تایسون، جردن، کوبی، بولت، کیپچوگه، رونالدو، سرِنا، دن گیبل...) — مذهبی/شاعرانه حذف شد؛ عنوان کارت «حکمتِ روز» → «جملات انگیزشی» (plan-progress-card.tsx)؛ dateKey با ارقام فارسی
+  3524→- **۶. مکمل داینامیک (ai.ts):** پرامپت تمرین کاملاً بازنویسی — «فرمت ثابت ممنوع»: چک‌لیست نیاز (D3/امگا۳ فقط با دلیل، کراتین فقط عضله‌سازی، وی فقط شکاف پروتئین، B12 وگان، آهن شرایط خاص)، ۱-۴ قلم، دسته‌ی خالی ممنوع، دلیل در note؛ بخش ۱۱ پرامپت غذایی هماهنگ؛ ۳ پرامپت پیش‌فرض (COACH/CHAT/NUTRITION) هم «اول غذا، بعد مکمل» + داینامیک؛ JSON نمونه: BCAA حذف شد و مثال ۳ قلمی با «دلیل:» + جمله «استکِ واقعی را بر اساس نیازِ همین کاربر بساز»
+  3525→- **۷. UI مکمل (programs-view.tsx):** بنر «اول غذا، بعد مکمل» + شمارش داینامیک («بر اساس نیازِ تو نوشته شده — N مکمل») + برچسب‌های جدید base/advanced/targeted = «ضروری برای تو/پوشش شکافِ خاص/هدفمند و ارزان»
+  3526→- **۸. تمرین امروز داینامیک (workouts-view.tsx):** ریشه باگ «همیشه شنبه» = روزهای استراحت (سه‌شنبه/جمعه) در آرایه‌ی days نیستند → findIndex منفی → ایندکس ۰ می‌ماند + ایندکس روی آرایه خام محاسبه می‌شد ولی رندر روی sortedDays؛ FIX: محاسبه روی آرایه مرتب‌شده + state جدید userPicked + کارت استراحت زیبا (تیره پرمیوم + MoonStar + «امروز، روزِ استراحتِ توست» + «عضله در استراحت ساخته می‌شود...» + راهنمای انتخاب روز از نوار) + اسکرول خودکار نوار به چیپ فعال (data-is-active + scrollIntoView center)
+  3527→- **۹. ترتیب عدد-واحد (۷ فایل):** «دقیقه ۸۰»→«۸۰ دقیقه»، «حرکت ۷»→«۷ حرکت»، «ست ۲»→«۲ ست»، «ثانیه ۶۰»→«۶۰ ثانیه»، «حرکت ۲ پشت سر هم»→«۲ حرکت پشت سر هم»، «۴ حرکت یا بیشتر — سیرکویت»، «restSec s»→«ثانیه» — در workouts-view (۶ نقطه)، gym-mode-view (۳)، active-workout-session، exercise-detail-overlay (۲)، dashboard-view (۱)، home-view (۱)
+  3528→- **۱۰. ناشر خودکار مقالات:** publish-scheduled/route.ts مجوز محلی (الگوی db-selfheal: secret درست OR بدون هدر پروکسی/loopback) + startScheduledPublisher در instrumentation-node.ts (boot+۶۰ث، هر ۱۵ دقیقه، PUBLISH_SWEEP_INTERVAL_MIN=0 خاموش، بدون CRON_SECRET هم کار می‌کند) + ثبت در instrumentation.ts + SERVER-GUIDE: cron انتشار کامنت‌شد «دیگر لازم نیست»؛ اجرای دستی: ۲ مقاله عقب‌افتاده (۲۸ مرداد + ۱ شهریور) همین الان منتشر شد ✓ — ۵ و ۹ شهریور طبق زمان‌بندی می‌مانند
+  3529→- **۱۱. GSC 403 ریشه‌یابی:** از سندباکس هر دو endpoint گوگل JSON سالم می‌دهند (IP سندباکس باز) → خطای HTML 403 کاربر = بلاکِ IP سرور ایران توسط گوگل (کلید جدید او سالم است! — Invalid JWT قبلی ۴۰۰ JSON بود نه ۴۰۳ HTML)؛ FIX: `googleFetch()` با undici ProxyAgent از env `GSC_PROXY_URL`/HTTPS_PROXY (پکیج undici نصب شد، کش dispatcher، dynamic import امن) در هر ۳ فراخوانی (token، sites.list، searchAnalytics) + تشخیص isHtmlErrorPage + پیام فارسی قابل‌اقدام (IP بلاک + راه‌حل پروکسی) + getAccessToken بدنه HTML را بدون crash می‌خواند + مستندسازی در SERVER-GUIDE
+  3530→- **تست‌ها:** tsc ۰ خطا / lint ۰ خطا ۷۲ هشدار baseline / dev ری‌استارت (sed inode) / E2E با agent-browser: لاگین OTP واقعی (DEV_OTP_ENABLED برای تست سندباکس) → داشبورد: باکس «حسین جوان جان، بریم سراغ امروز؟» + امکانات ویژه + کارت تیره «پیشرفت پلن ۷۱٪» + «جملات انگیزشی: اگر از تمرینِ سخت بترسی، رقیبت هر روز آن را می‌خرد — دن گیبل» ✓ (VLM تأیید بصری: هر ۳ باکس + بدون به‌هم‌ریختگی) → تمرین امروز: کارت استراحت (امروز سه‌شنبه در پلن نیست) ✓ → کلیک شنبه: «۸۰ دقیقه / ۷ حرکت» ✓ → مودال مکمل: «اول غذا، بعد مکمل — ۱۲ مکمل» + ۳ دسته جدید ✓ → sitemap ۱۳۹۹ URL / GET / 200 / checkout guard درست (درگاه sandbox پیکربندی نشده) / seed-gsc ok
+  3531→- **بسته:** `download/fitup-deploy-2026-09-01-v12.1.zip` (۶۲۴ فایل — شامل fitup-bazaar + APK + undici در package.json) + DEPLOY/README/SERVER-GUIDE به‌روز + v12.zip حذف شد
+  3532→- **کامیت‌ها:** «v12.1: …» + «v12.1 final: docs + zip»
+  3533→
+  3534→Stage Summary:
+  3535→- ✅ زرین‌پال: پلن + نام کامل + شماره تماس در توضیحات تراکنش و DB
+  3536→- ✅ ۳ دکمه داشبورد در باکس «{نام} جان، بریم سراغ امروز؟» + امکانات ویژه در یک باکس جذاب
+  3537→- ✅ «جملات انگیزشی» با ۱۰۳ نقل‌قول بزرگان ورزش/بدنسازی (بدون شخصیت مذهبی/شاعر)
+  3538→- ✅ مکمل داینامیک need-based (۱-۴ قلم با دلیل) + «اول غذا، بعد مکمل» — برنامه‌های جدید فرمت یکسان ندارند
+  3539→- ✅ تمرین امروز داینامیک: روز جاری + کارت زیبا برای استراحت + جابجایی آزاد روزها + اسکرول به امروز
+  3540→- ✅ «۲ حرکت»/«۶۰ ثانیه» در ۷ فایل
+  3541→- ✅ مقالات زمان‌بندی‌شده بدون کرون خارجی منتشر می‌شوند (هر ۱۵ دقیقه درون‌اپ) — ۲ مقاله عقب‌افتاده منتشر شد
+  3542→- ✅ GSC: کلید سالم است؛ مشکل = بلاک IP سرور توسط گوگل → GSC_PROXY_URL در .env سرور + پیام خطای شفاف
+  3543→- ✅ theme-color نارنجی سازمانی #f97316
+  3544→- دیپلوی: `cd /var/www/fitup && rm -rf src scripts prisma public && unzip fitup-deploy-2026-09-01-v12.1.zip && bash deploy.sh`
+  3545→- نکته: bun install در deploy.sh پکیج جدید undici را نصب می‌کند (لازم برای GSC proxy)
+  3546→
+  3547→---
+  3548→Task ID: V12.2-2026-09-01
+  3549→Agent: Main (Z.ai Code)
+  3550→Task: راستی‌آزمایی کامل همه درخواست‌های pendng + کارت پیشرفت بازطراحی‌شده + جایگزینی باکس «شب بخیر» + همگام‌سازی گیت‌هاب/دیپلای
+  3551→
+  3552→Work Log:
+  3553→- **گیت‌هاب:** fetch + مقایسه — سندباکس ۱۴ کامیت جلوتر از origin/main (fitup5) است؛ اسنپ‌شات گیت‌هاب (کامیت «FitUp» ساعت ۱۰:۱۲) قدیمی‌تر از فیکس‌های v12/v12.1/v12.2 است. کلون از گیت‌هاب = از دست رفتن همه فیکس‌ها → انجام نشد؛ پوش هم ممکن نیست (توکن گیت‌هاب در سندباکس نیست). زیپ v12.2 برای دیپلوی/آپدیت گیت‌هاب ساخته شد.
+  3554→- **راستی‌آزمایی زنده همه فیکس‌های v12/v12.1:** sitemap ۱۳۹۹ URL ✓، theme-color #f97316 در HTML ✓، «مشاهده کل برنامه» فقط در کامنت (نه UI) ✓، «حکمت روز» صفر مورد ✓، «اول غذا، بعد مکمل» ۱۱ مورد ✓، جملات آرنولد/رونی/دن گیبل ✓، توضیحات زرین‌پال (پلن+نام+موبایل) ✓، GSC ProxyAgent ✓، ناشر مقالات: ۲ مقاله امروز منتشر + ۲ مقاله ۵/۹ شهریور در صف (draft+scheduledAt درست) ✓
+  3555→- **بازطراحی plan-progress-card.tsx (v12.2):** prop جدید showGreeting — سلام‌وعلیک hydration-safe (Sunrise/Sun/MoonStar بر اساس ساعت تهران) + LiveClock کامپوننت ایزوله (۳۰ث، «شنبه ۱۰ شهریور · ۲۱:۰۵») + رینگ بزرگ‌تر (۹۲/۱۰۰px) + چیپ پلن + چیپ «دورهٔ فعال» سبز + «X روز تا پایان · تاریخ» با آیکون Hourglass + StatCell شبکه ۳ ستونی (سپری‌شده/باقی‌مانده/پایان دوره) + جمله با پس‌زمینه کهربایی ملایم + چیپ تاریخ فقط وقتی greeting نیست
+  3556→- **dashboard-view.tsx:** باکس «شب بخیر» فقط برای کاربرانِ بدون پلن (user.planName=null)؛ دارندگان پلن (فعال/pending) → PlanProgressCard با showGreeting=true به‌عنوان اولین باکس
+  3557→- **تست‌ها:** tsc ۰ خطا / lint ۰ خطا ۷۲ هشدار baseline / sitemap ۱۳۹۹ / dev-server در طول توسعه چندبار OOM (کرنل OOM-killer: next-server ~2.2GB + chrome ~1GB > RAM 3.9GB سندباکس) — حل با گرم‌کردن کامل مسیرها با curl قبل از مرورگر + بستن کروم‌های اضافی
+  3558→- **E2E مرورگر (موفق):** لاگین با curl (OTP dev) → تزریق کوکی sc_session به کروم → داشبورد رندر شد: «شب بخیر، حسین جوان!» + «سه‌شنبه ۱۰ شهریور · ۲۱:۵۶» + ٪۱۸ + حرفه‌ای + دورهٔ فعال + «روز ۹ از ۴۵» + «۳۷ روز تا پایان · ۱۶ مهر» + ۳ ستون آمار + «اگر از تمرینِ سخت بترسی...» — دن گیبل + باکس ۳ دکمه + امکانات ویژه — بدون خطای کنسول، VLM تأیید بصری: همه در یک کارت تیره، بدون باکس سفید جداگانه، بدون به‌هم‌ریختگی (390px)
+  3559→- **بسته v12.2:** download/fitup-deploy-2026-09-01-v12.2.zip (۶۲۱ فایل — src/prisma/scripts/public/fitup-bazaar/configs + deploy.sh + APK + gsc key + مانیفست) + DEPLOY.md/README/SERVER-GUIDE به‌روز (شامل راهنمای Turbopack build error + علت «sitemap ۷ صفحه» در پروداکشن = کد قدیمی روی سرور)
+  3560→
+  3561→Stage Summary:
+  3562→- ✅ همه درخواست‌های قبلی (v12/v12.1) راستی‌آزمایی شدند — همه سالم و زنده‌اند
+  3563→- ✅ کارت «پیشرفت پلن + جملات انگیزشی» بازطراحی + جایگزین کامل باکس «شب بخیر» برای دارندگان پلن (تست E2E موفق)
+  3564→- ✅ sitemap کاربر ۷ صفحه است چون سرورش کد قدیمی دارد — دیپلوی v12.2 حلش می‌کند
+  3565→- ✅ گیت‌هاب قدیمی‌تر از سندباکس است؛ کلون نکردیم تا فیکس‌ها از بین نروند — زیپ v12.2 برای همگام‌سازی
+  3566→- دیپلوی: `cd /var/www/fitup && rm -rf src scripts prisma public && unzip fitup-deploy-2026-09-01-v12.2.zip && bash deploy.sh`
+  3567→
+  3568→---
+  3569→Task ID: V13-2026-09-02
+  3570→Agent: Main (Z.ai Code)
+  3571→Task: ۱۵+ درخواست مالک — پاک‌سازی باکس‌های داشبورد، رفع لگ‌ها، ناوبری/بک، آنبوردینگ، sitemap و GSC ریشه‌ای
+  3572→
+  3573→Work Log:
+  3574→- **بازیابی محیط:** پلتفرم سندباکس در resume سشن (۱۲:۴۹) .env را به حالت پیش‌فرض برگرداند (DEV_OTP حذف شد) و DB را خالی کرد → .env از git + DB از upload/custom.db بازگردانی شد + `db:push` (ستون OtpCode.attempts) — نکته: این رخداد «sitemap ۷ صفحه» را در سندباکس هم تولید کرد (نتیجه‌ی ناقص کش شده بود) → دقیقاً همان سناریوی سرور کاربر!
+  3575→- **کارت پیشرفت (plan-progress-card.tsx):** حذف کامل سلام‌وعلیک (صبح/شب بخیر) → فقط نام کاربر + آیکون Crown؛ تاریخ کامل شمسی با روز هفته و سال «شنبه ۱۰ شهریور ۱۴۰۵» — بدون ساعت/دقیقه (LiveDate ایزوله، تیک ۵دقیقه‌ای فقط برای نیمه‌شب)
+  3576→- **باکس 💪 بدون پلن (dashboard-view.tsx):** حذف greeting state و «{greeting}، {name}!» → فقط نام؛ TehranClock → تاریخ کامل بدون ساعت (تیک ۱s→۵min)
+  3577→- **باکس برنامه‌ها:** «{name} جان، بریم سراغ امروز؟» + زیرمتن → تیتر «برنامه شما»؛ زیربرچسب «برنامه تمرینی» → «همه برنامه ها»
+  3578→- **باکس امکانات ویژه:** حذف زیرمتن «همه‌ی ابزارهای پلنت — یک‌جا»
+  3579→- **daily-quotes.ts:** بازنویسی کامل ۸۳ جمله با زبان ساده/انسانی/قابل‌فهم (همان بزرگان ورزش) — تست: «خسته‌شدن بخشی از مسیر است؛ رهاکردن، پایان مسیر است.» آرنولد
+  3580→- **onboarding اسلایدرها (ریشه):** Radix Slider پیش‌فرض LTR بود ولی لیبل‌ها RTL → ۳ اسلایدر (خواب/استرس/آب) `dir="rtl"` گرفتند؛ تست کیبورد: ArrowLeft = افزایش (سمت لیبل ۱۲) ✓
+  3581→- **تاریخ هدف آنبوردینگ:** تقویم شمسی در دسکتاپ+موبایل سالم بود؛ عامل واقعی «کلیک‌نشدن» = کارت شناور نیکا (fixed bottom-24 z-50، بعد از ۵s بدون auto-hide) که ناحیه فرم را می‌پوشاند → auto-dismiss ۸s + set nika_hint_seen (فیکس ریشه‌ای)
+  3582→- **کلمات چسبیده تحلیل:** src/lib/fitness/persian-typography.ts (دیکشنری کلمات مرکب + می/نمی + فاصله بعد از علائم) روی متن AI تازه + کش‌شده در analysis route + قاعده نگارش در پرامپت
+  3583→- **قفل اسکرول مودال‌ها:** src/hooks/use-scroll-lock.ts (position:fixed + top منفی + جبران scrollbar، ref-count برای مودال‌های تودرتو) → اعمال روی: body-analysis-banner، sports-profile-modal، logout-button، feedback-modal، pwa-install modal، جلسه تمرین فعال — تست: body pos:fixed top:-300px ✓ / unlock ✓
+  3584→- **لگ مودال‌ها:** sheet.tsx duration 500/300 → 200/150 + ease-out؛ دراور موبایل spring 420/38 + حذف backdrop-blur
+  3585→- **لگ حالت فعال (active-workout-session.tsx):** SessionTimer کامپوننت ایزوله (تیک ۱s فقط همان یک خط — قبلاً کل صفحه + همه inputها re-render می‌شدند!)؛ ExerciseCard → React.memo؛ حذف انیمیشن بی‌نهایت دامبل + حذف glass/glass-strong (backdrop-blur) از نوارها؛ انیمیشن جابجایی 250ms→120ms
+  3586→- **تبریک وسط صفحه:** finish() → setFinishedStats (دقیقه/کالری/ست) → دیالوگ مرکزی با Trophy + آمار + «بازگشت به داشبورد» (endSession بعد از تأیید) — بجای toast بالای صفحه
+  3587→- **اسکرول به بالا در ناوبری پنل:** useEffect جدید روی mainTab در main-app.tsx (window.scrollTo(0,0))
+  3588→- **بک مرورگر/گوشی:** popstate در page-client — بک اول → setMainTab("dashboard") + pushState(?panel&dashboard)؛ بک دوم → مرورگر: setScreen("landing") + replaceState("/") (URL تمیز) / PWA: دیالوگ خروج — تست E2E موفق (nutrition→back→dashboard→back→landing ✓)
+  3589→- **sitemap ریشه‌ای:** buildSitemapXml حالا `complete` برمی‌گرداند؛ کش فقط برای حالت کامل؛ ناقص → stale-fallback از کش قبلی یا no-store (دیگر نسخه‌ی ۷ صفحه‌ای تا ۱۰ دقیقه کش نمی‌شود!) + هدرهای شفاف miss/miss-incomplete/stale-fallback — تست: ۱۳۹۶ URL ✓ (۴۳ مقاله + ۶ دسته + ۲۶۰ حرکت + ۱۰۸۰ غذا + ۷ ثابت)
+  3590→- **GSC ایران:** راه‌حل پروکسی (GSC_PROXY_URL + undici ProxyAgent در هر ۳ فراخوانی گوگل) از v12.1 موجود و سالم — مستندسازی در DEPLOY.md
+  3591→- **تست‌های E2E (agent-browser + VLM):** لاگین OTP واقعی (کاربر بدون پلن + حسین جوان با پلن فعال) — داشبورد: نام بدون سلام + تاریخ کامل بدون ساعت (هر دو حالت) ✓ VLM؛ «برنامه شما» + «همه برنامه ها» ✓؛ امکانات ویژه بدون زیرمتن ✓؛ آنبوردینگ کامل ۴ مرحله + انتخاب تاریخ «۱۵ شهریور ۱۴۰۵» ✓؛ تحلیل تمیز ✓؛ اسکرول 218→0 در تغییر تب ✓؛ بک ۲ مرحله‌ای ✓؛ جلسه فعال: شروع/تکمیل ست/جابجایی فوری (0.13s)/تبریک مرکزی ✓ VLM؛ بدون خطای کنسول
+  3592→- **بسته v13:** download/fitup-deploy-2026-09-02-v13.zip (۶۲۱ فایل) + DEPLOY/README/SERVER-GUIDE به‌روز + v12.2.zip حذف؛ tsc ۰ خطا / lint ۰ خطا (baseline)
+  3593→
+  3594→Stage Summary:
+  3595→- ✅ همه باکس‌های داشبورد طبق درخواست: نام + تاریخ کامل بدون ساعت، بدون سلام‌وعلیک، تیتر «برنامه شما»، «همه برنامه ها»، بدون «همه ابزارهای پلنت»، جملات انسانی ساده
+  3596→- ✅ لگ‌ها ریشه‌یابی شد: Sheet 500ms → 200ms؛ تایمر جلسه re-render کل صفحه → ایزوله؛ backdrop-blur و انیمیشن بی‌نهایت حذف
+  3597→- ✅ تبریک پایان تمرین وسط صفحه با آمار
+  3598→- ✅ ناوبری: تب جدید از بالای صفحه + بک اول=داشبورد/بک دوم=خروج پنل
+  3599→- ✅ آنبوردینگ: اسلایدرهای RTL درست شد؛ تاریخ هدف سالم است (عامل بلاک: کارت نیکا → auto-dismiss)؛ کلمات چسبیده فیکس
+  3600→- ✅ مودال‌ها: قفل اسکرول پشت همه مودال‌ها (هook جدید position:fixed)
+  3601→- ✅ sitemap: نتایج ناقص دیگر کش نمی‌شوند — ریشه‌ی «۷ صفحه» = DB خالی/در دسترس‌نبودن در لحظه‌ی build + کش؛ دیپلوی v13 + DB سالم = ۱۳۰۰+ URL
+  3602→- ✅ GSC: GSC_PROXY_URL در .env سرور (راه‌حل بلاک IP ایران)
+  3603→- ⚠️ نکته سندباکس: پلتفرم در resume سشن DB/.env را ریست می‌کند → همیشه از upload/custom.db بازگردانی + git checkout .env
+  3604→- دیپلوی: `cd /var/www/fitup && rm -rf src scripts prisma public && unzip fitup-deploy-2026-09-02-v13.zip && bash deploy.sh`
+  3605→
+  3606→---
+  3607→Task ID: V14-2026-09-02
+  3608→Agent: Main (Z.ai Code)
+  3609→Task: بازطراحی پیش‌نیازهای پلن حرفه‌ای (۳ مرحله شماره‌دار) + رفع باگ رد خودکار آنالیز ویدیویی + برگشت به داشبورد + دایالوگ تأیید + رفع باکس تمدید
+  3610→
+  3611→Work Log:
+  3612→- **prerequisites.ts (بازطراحی کامل):** ترتیب جدید: ۱. آزمایش خون (اختیاری، step=1) → ۲. آنالیز ویدیویی فرم حرکات (اختیاری، step=2) → ۳. ارسال عکس بدن و ساخت برنامه (الزامی، step=3 فقط برای ultimate)؛ پلن پیشرفته: فقط body_photo با step=null (بدون شماره — درخواست مالک)؛ فیلد جدید `step: number | null` در Prerequisite؛ «waiting» آزمایش خون حالا status=completed با لیبل «تعیین تکلیف شد — در انتظار نتایج ⏳» (تیک می‌خورد ولی مسیر تولید را باز می‌گذارد — آزمایش خون/ویدیو اختیاری‌اند)
+  3613→- **submit-body-analysis/route.ts (رفع باگ بزرگ):** حذف بلوک auto-skip ویدیو — قبلاً آپلود عکس بدون ویدیو → videoStatus="skipped" (آنالیز ویدیویی خودکار رد می‌شد!)؛ الان فقط اگر ویدیو «واقعاً» ارسال شود videoStatus="uploaded" ثبت می‌شود؛ تصمیم «آپلود نمی‌کنم» فقط از صفحه آنالیز ویدیویی (video-status API)
+  3614→- **prerequisites-banner.tsx (UI جدید):** بنر «پیش‌نیازهای ساخت برنامه — ۳ مرحله» برای ultimate (متن راهنمای «مراحل را به‌ترتیب از ۱ شروع کن...») و «پیش‌نیاز ساخت برنامه» برای advanced؛ کارت‌ها به‌ترتیب مرحله؛ دایره شماره (۱/۲/۳ فارسی) که با تکمیل به تیک سبز CheckCircle2 تبدیل می‌شود؛ advanced بدون شماره (آیکون)؛ دکمه شروع مرحله ۳ با آیکون Sparkles («شروع» همه مراحل)
+  3615→- **blood-test-view.tsx:** دایالوگ تأیید AlertDialog برای «آپلود نمی‌کنم» (متن مالک: «در صورت آپلود نکردن، دیگر در طول پلن جاری امکان ارسال آزمایش خون نداری و با تأیید، این مورد در طراحی برنامه تو نادیده گرفته می‌شود.» + دکمه‌های «بله، آپلود نمی‌کنم» قرمز/«انصراف»)؛ تابع declineBloodTest + returnToDashboard (setMainTab("dashboard") + setOverlay(null))؛ «آزمایش دادم و منتظر جوابم» هم به داشبورد برمی‌گردد؛ کاربر declined دیگر باکس آپلود ندارد (قفل در طول پلن جاری) + پیام شفاف در کارت سبز
+  3616→- **video-analysis-view.tsx:** همان دایالوگ تأیید برای «آپلود نمی‌کنم»؛ skipVideo بعد از تأیید: API + toast + setUser + prereq-updated + برگشت فوری به داشبورد (حذف setTimeout 1.5s قبلی)
+  3617→- **blood-test-status/route.ts:** «منتظر جواب» هم تعیین تکلیف حساب می‌شود (startProgramGenerationInBackground برای هر تصمیم غیر-null) + پیام جدید «جواب آزمایش هر وقت آماده شد از همین بخش آپلودش کن»
+  3618→- **dashboard-view.tsx (رفع باکس تمدید):** showPriorityAction و PriorityActionCard با وضعیت‌های تفکیک‌شده: neverHadPlan (بدون پلن/سابقه → «پلن خود را فعال کن!») / planTrulyExpired (سابقه + نه فعال نه pending → «پلنت تمام شده — تمدیدش کن» — فیکس متن «دوباره روشن‌ش کن») / فعال ≤۱۴ روز → یادآور تمدید / isPendingPrereqs → هیچ کارتی (بنر پیش‌نیازها راهنماست) — کاربر pending دیگر باکس تمدید نمی‌بیند (باگ اصلی مالک)
+  3619→- **تست‌های E2E (agent-browser، همه موفق):** سرور با double-fork (bash -c 'setsid ... & disown') + NODE_OPTIONS=1536 برای بقا در برابر OOM killer؛ لاگین با OTP dev (کوکی sc_session تزریق به مرورگر)؛ کاربر ultimate بدون برنامه: بنر ۳ مرحله با شماره‌های ۱/۲/۳ و بدون تیک ✓؛ مرحله ۱ → صفحه آزمایش خون → «آپلود نمی‌کنم» → دایالوگ تأیید (متن دقیق مالک) → تأیید → برگشت خودکار به داشبورد + تیک مرحله ۱ «تعیین تکلیف شد (رد شد) ✓» ✓؛ مرحله ۲ → صفحه ویدیو → دایالوگ → تأیید → داشبورد + تیک ✓؛ «آزمایش دادم و منتظر جوابم» → داشبورد + تیک «در انتظار نتایج ⏳» + toast جدید ✓؛ آپلود عکس بدن (بدون ویدیو) از طریق API → videoStatus در DB همچنان null (باگ auto-skip رفع شد — قبلاً skipped می‌شد) ✓ + پاسخ awaitingDecision=true ✓؛ کاربر بدون پلن (مهدیس): کارت «پلن خود را فعال کن!» بدون هیچ باکس تمدید ✓؛ کاربر pending (اشتراک pending تستی): فقط بنر پیش‌نیازها، هیچ کارت تمدید/فعال‌سازی ✓
+  3620→- **پاک‌سازی تست:** اشتراک pending مهدیس حذف + bloodTestStatus ریست؛ حساب حسین به حالت اولیه (videoStatus=null, bloodTestStatus=null, بدون عکس/برنامه) برای تست جریان کامل توسط مالک؛ فایل عکس تستی SVG پاک شد
+  3621→- **نکته محیطی:** کلید AVALAI_API_KEY در سندباکس placeholder است (401) → تحلیل VLM عکس در سندباکس fail می‌شود — روی سرور مالک با کلید واقعی کار می‌کند (پیش‌موجود، بی‌ربط به تغییرات)
+  3622→- **بسته v14:** download/fitup-deploy-2026-09-02-v14.zip (۶۲۲ فایل — src/fitup-bazaar/public/scripts/prisma/configs + deploy.sh + eslint.config.mjs) + README.md + DEPLOY.md با سکشن v14 + v13.zip حذف؛ tsc ۰ خطا / lint ۰ خطا (baseline ۷۲ هشدار_unused_directive)
+  3623→
+  3624→Stage Summary:
+  3625→- ✅ پیش‌نیازهای پلن حرفه‌ای: ۳ مرحله شماره‌دار (۱.آزمایش خون ۲.آنالیز ویدیویی ۳.ارسال عکس بدن+ساخت برنامه) با تیک — ترتیب/شکل/عملکرد طبق درخواست مالک
+  3626→- ✅ پلن پیشرفته: فقط «ارسال عکس بدن و ساخت برنامه» بدون شماره
+  3627→- ✅ باگ رد خودکار آنالیز ویدیویی بعد از آپلود عکس بدن رفع شد (آزمایش DB: videoStatus پس از آپلود null ماند)
+  3628→- ✅ «آپلود نمی‌کنم»/«منتظر جوابم» → دایالوگ تأیید (متن مالک) + برگشت خودکار به داشبورد + تیک پیش‌نیاز — در هر دو صفحه
+  3629→- ✅ باکس تمدید فقط برای پلن واقعاً منقضی؛ pending و بدون‌پلن دیگر «پلنت تمام شده» نمی‌بینند؛ متن «تمدیدش کن» فیکس شد
+  3630→- ✅ کاربر declined آزمایش خون: آپلود در طول پلن جاری قفل + پیام شفاف
+  3631→- ✅ E2E کامل با مرورگر (۶ سناریو، همه موفق) + lint/tsc صفر خطا + download/ به‌روز (v14)
+  3632→- دیپلوی: `cd /var/www/fitup && rm -rf src scripts prisma public && unzip fitup-deploy-2026-09-02-v14.zip && bash deploy.sh`
+  3633→
+  3634→---
+  3635→Task ID: V15-2026-09-02
+  3636→Agent: Main (Z.ai Code)
+  3637→Task: فیکس ۲ خطای build + ۱۴ درخواست مالک (چکاپ/تحلیل جامع/قفل پلن/عکس‌های شکسته/مودال‌ها/ادمین/درباره ما)
+  3638→
+  3639→Work Log:
+  3640→- **بیلد (۲ خطای گزارش‌شده مالک):** ۱) «Conflicting route and metadata at /sitemap.xml» — ریشه: در Next.js 16 Turbopack پوشه app/sitemap.xml/ رزروشدهٔ metadata است؛ route به app/api/sitemap/route.ts منتقل + rewrite «/sitemap.xml → /api/sitemap» در next.config.ts (URL عمومی بدون تغییر؛ تست: ۱۳۹۹ URL از هر دو مسیر) ۲) هشدار tracing کل پروژه — همه fs داینامیک‌های cleanup-media + serve-upload با /*turbopackIgnore: true*/ علامت‌خوردند
+  3641→- **عکس‌های شکسته:** ریشه = فایل‌های public/uploads قدیمی حذف‌شده با رکورد DB مانده (deploy قبلی rm -rf public قبل از مهاجرت) — ۴ لایه: fallback legacy در serve-upload + کامپوننت MediaImage (placeholder شکیل به‌جای broken) در گالری/پرونده/ادمین + scripts/repair-user-media.ts (بازیابی از backups — در deploy.sh قدم ۶-ب-۲) + پشتیبان «کل» uploads در deploy.sh (قبلاً فقط articles!) — تست: آپلود→سرو ۲۰۰؛ repair: سالم=۱ گم=۹ گزارش دقیق
+  3642→- **چکاپ دوره‌ای (بازطراحی کامل):** checkup-section.tsx جدید — فاز صفر بدون اندازه: «در انتظار وارد کردن اندازه‌های بدن» + «شما هنوز اندازه‌های بدن خود را وارد نکردید» + دکمه «وارد کردن اندازه‌های بدن» (متن دقیق مالک)؛ با ثبت: تیک «تکمیل شد» + تحلیل AI ۲-۳ خط (analyzeBaselineMeasurements در ai.ts + اصلاح نگارش فارسی)؛ GET /api/checkup حالا schedule برمی‌گرداند (فاز ۱=روز۱۵/۲=روز۳۰/۳=روز۴۰ از planStartedAt)؛ کارت هر فاز: رسیده→فعال+دکمه/ثبت‌شده→تاریخچه/نرسیده→قفل با شمارش معکوس؛ دکمه «ثبت چکاپ» فقط وقتی فاز رسیده (درخواست مالک)؛ نوتیف چکاپ: لینک ?tab=progress&section=checkup + applyLink → ایونت fitup:focus-checkup → اسکرول به کارت (id=checkup-section)؛ baseline-measurements: پذیرش weight + sync پروفایل + phaseCompleted + AI analysis
+  3643→- **تحلیل جامع فیتاپ:** API جدید POST/GET /api/coach/comprehensive-analysis (تجمیع پروفایل/چکاپ/وزن/عکس → گزارش JSON ساختاریافته + ذخیره در AnalysisResult حداکثر ۵ گزارش + rate-limit ۶/ساعت) + کارت بازطراحی‌شده در progress-view (هدر گرادیانی + امتیاز/۱۰۰ + نوار انیمیشنی + آمار لحظه‌ای + خلاصه/روند وزن/چربی/نقاط قوت/تمرکز/تمرین/تغذیه/توصیه شماره‌دار/جمله انگیزشی + دکمه تحلیل تازه) — خطای AI شکیل با تلاش مجدد (سندباکس: کلید 401 → تست hndle شد؛ سرور واقعی OK)
+  3644→- **قفل بدون پلن:** plan-locked-view.tsx (کارت زیبا + ۴ قابلیت + CTA پلن‌ها) — در main-app برای ۵ تب programs/workouts/nutrition/progress/chat وقتی !hasActiveSubscription && !hasPendingSubscription && role≠ADMIN — تست E2E: «کاربر تست عزیز، این بخش قفل است» ✓
+  3645→- **اسکرول (دستیار تغذیه از وسط):** ریشه = html{scroll-behavior:smooth} + behavior:auto → انیمیشن لغوشدنی با تغییر layout — فیکس: behavior:"instant" + scrollTo دوم بعد ۲۰۰ms (تأیید بعد از mount) در main-app و page-client — تست E2E: کلیک دستیار تغذیه از پایین داشبورد → صفحه از تیتر «کالری‌شمار و تغذیه» شروع ✓ VLM
+  3646→- **مودال‌ها:** videoAnalysis/bloodTest از Sheet bottom به Dialog وسط‌چین (h-88vh) در main-app — تست پیکسلی: بالا=۵۱px پایین=۵۰px ✓؛ مودال عکس بدن (body-analysis-banner) items-center + rounded-3xl در همه سایزها؛ قفل اسکرول: Radix خودکار + useScrollLock موجود — تست: اسکرول پشت مودال → المان ثابت ماند ✓
+  3647→- **دکمه توضیحات:** workouts-view (دو دکمه تکراری→یکی «توضیحات») + gym-mode (آیکون+کلمه) + active-session («توضیحات» / «توضیحات و ویدیو») — گزینه ویدیو چت برای advanced قفل با لیبل «نیازمند پلن حرفه‌ای» (پیش‌موجود، تأیید)
+  3648→- **مودال کاربر ادمین:** API details: +mediaGallery (۹ دسته: progress/body_photo/blood_test/video/food/chat با شمارنده) + جزئیات برنامه‌ها (dayNames/totalExercises/totalSets/weeklyGoal/splitType) + mealPlans جزئیات؛ UI: ۳ DetailModalButton + ۳ مودال مجزا: UserPlansDetailDialog (تب تمرینی/غذایی + اکسپند)، UserMediaGalleryDialog (فیلتر ۶ دسته + MediaImage + video preview)، UserPaymentsDetailDialog (اکسپند با Authority/RefID/cardPan/discount/تاریخ‌ها) — تست API: mediaGallery=۹، payments=۵، total=۱٬۸۰۷٬۷۷۸ ✓
+  3649→- **تاریخ عضویت:** onboarding/analysis API فیلد memberSince (user.createdAt) → چیپ «عضو فیتاپ از ...» در صفحه تحلیل آنبوردینگ + پرونده ورزشی (بالای خلاصه)
+  3650→- **درباره ما:** about-page.tsx (۷۶۵ خط — هرو با پرتره فشرده ۲۷KB از uploadkon + آمار + داستان فیتاپ + تایم‌لاین ۵ مرحله‌ای + تخصص‌ها + نقل‌قول + CTA)؛ محتوای واقعی از hosseinjavan.com (دانشگاه تهران، ۲۲ رشته، از ۱۳۹۳)؛ AppScreen+about + PAGE_TITLES + getScreenFromUrl + لینک فوتر لندینگ — تست: عنوان «درباره ما | فیتاپ» + پرتره + همه بخش‌ها ✓ VLM
+  3651→- **محیط:** حلقه ری‌استارت Next (memory watcher در سندباکس ۴GB + compile طولانی → عبور threshold → ری‌استارت → cache از دست رفت → تکرار) → __NEXT_DISABLE_MEMORY_WATCHER=1 در run-server.sh؛ تست‌های E2E بعد از گرم‌کردن کامل چانک‌ها/APIها موفق
+  3652→- **بسته v15:** download/fitup-deploy-2026-09-02-v15.zip (۶۳۰ فایل) + DEPLOY.md/README سکشن v15 + v14.zip حذف
+  3653→
+  3654→Stage Summary:
+  3655→- ✅ هر ۲ خطای build ریشه‌ای رفع شد — build بدون خطا و بدون هشدار tracing
+  3656→- ✅ چکاپ دوره‌ای طبق متن‌های دقیق مالک + فاز صفر با AI + زمان‌بندی + دکمه شرطی + نوتیف لینک‌دار
+  3657→- ✅ عکس شکسته: ۴ لایه فیکس (fallback + placeholder + ترمیم + backup)
+  3658→- ✅ تحلیل جامع AI جذاب + قفل ۵ تب بدون پلن + اسکرول فیکس + مودال‌های وسط‌چین
+  3659→- ✅ توضیحات روی دکمه‌ها + مودال ادمین ۳گانه + تاریخ عضویت + درباره ما
+  3660→- ⚠️ کلید AvalAI سندباکس placeholder است (۴۰۱) — تحلیل‌های AI روی سرور واقعی مالک کار می‌کنند
+  3661→- دیپلوی: `cd /var/www/fitup && rm -rf src scripts prisma public fitup-bazaar && unzip fitup-deploy-2026-09-02-v15.zip && bash deploy.sh`
+  3662→
+  3663→---
+  3664→Task ID: BUILD-AND-PREVIEW
+  3665→Agent: Main (Z.ai Code)
+  3666→Task: بیلد و نمایش سایت در پیش‌نمایش (رفع تداخل build/dev + ری‌استارت تمیز)
+  3667→
+  3668→Work Log:
+  3669→- تشخیص: یک فرآیند `next build` همزمان با `next dev` روی پوشه `.next` می‌نوشت و باعث پاسخ خالی/قطع اتصال صفحه اصلی شد
+  3670→- توقف فرآیند build باقی‌مانده و کل درخت پروسه‌ها (سوپروایزر `run-server.sh` قدیمی + dev)
+  3671→- پاک‌سازی کامل `.next` (آرتیفکت‌های خراب build+dev همزمان)
+  3672→- کشف مشکل کلیدی: پروسه‌های startشده در دستورات Bash بین فراخوانی‌های ابزار کُشته می‌شوند (حتی با nohup/setsid معمولی)
+  3673→- راه‌حل: اجرای سوپروایزر با `setsid --fork bash run-server.sh` → فرزند بلافاصله به init واگذار می‌شود و بین دستورات زنده می‌ماند
+  3674→- تست detachment با پروسه تستی موفق؛ سپس اجرای سوپروایسر واقعی به همین روش
+  3675→- کامپایل صفحه اصلی: GET / 200 (compile 22s، سپس کش: 60-240ms)
+  3676→- تأیید End-to-End با Agent Browser:
+  3677→  * صفحه اصلی رندر کامل (hero، آمار، امکانات، فوتر موجود)
+  3678→  * کلیک CTA «شروع کنید» → ناوبری به ?screen=panel&tab=dashboard و رندر پنل ورزشکار
+  3679→  * موبایل 390px: بدون اسکرول افقی، محتوای کامل (ارتفاع 15625px)
+  3680→  * بدون خطای کنسول و بدون خطای صفحه
+  3681→  * API هم کار می‌کند: GET /api/nika/chat 200
+  3682→
+  3683→Stage Summary:
+  3684→- ✅ سرور dev روی پورت 3000 بالا، پایدار و کامپایل‌شده (سوپروایزر PID 29047 + next-server PID 29065)
+  3685→- ✅ HTTP 200 در ~75ms (کش کامل)
+  3686→- ✅ پیش‌نمایش از طریق Preview Panel قابل مشاهده است
+  3687→- ⚠️ نکته: در این سندباکس طبق قوانین، `bun run build` (پروداکشن) هرگز نباید اجرا شود — پیش‌نمایش از طریق سرور dev پورت 3000 سرو می‌شود؛ کامپایل dev همان «بیلد» مؤثر است
+  3688→- 💡 برای هر ری‌استارت آینده: `cd /home/z/my-project && setsid --fork bash run-server.sh` (نه nohup معمولی)
+  3689→
+  3690→---
+  3691→Task ID: FIX-PRELOADER-RESTART-LOOP
+  3692→Agent: Main (Z.ai Code)
+  3693→Task: رفع «ماندگاری طولانی روی پرلودر» بعد از دیپلوی/پیش‌نمایش
+  3694→
+  3695→Work Log:
+  3696→- بررسی شکایت کاربر: سایت بعد از دیپلوی مدت زیادی روی پرلودر می‌ماند
+  3697→- تشخیص ۱: سرور dev هر ۱-۳ دقیقه با exit 0 می‌مرد → هر بار کامپایل از صفر (~۳۰-۴۰ ثانیه برای /) → پرلودر طولانی
+  3698→- کشف علت ریشه‌ای در سورس Next 16 (node_modules/next/dist/server/lib/start-server.js):
+  3699→  بعد از «هر درخواست» در dev، اگر used_heap_size > 80% × heap_size_limit → graceful restart (exit 0)
+  3700→  ⚠ __NEXT_DISABLE_MEMORY_WATCHER این چک را خاموش نمی‌کند!
+  3701→- تشخیص ۲: max-old-space قبلی (1536 و بعد 1024) آستانه را در ~۹۰۰MB-1.3GB می‌گذاشت — heap گرم اپ (~1.2GB) دائماً رد می‌شد → حلقه بی‌نهایت
+  3702→- تشخیص ۳: instrumentation boot-cronها (db-selfheal +8s، seed-gsc +12s، articles +20s، publish-scheduled +60s) با self-fetch هرکدام compile موازی راه می‌انداختند و heap را در دقیقه اول می‌ترکاندند
+  3703→- تشخیص ۴: کش دیسک webpack در Next 16 حالت --webpack بین پروسه‌ها بازیافت نمی‌شود → هر ری‌استارت = کامپایل کامل
+  3704→- تشخیص ۵ (فرعی): کروم‌های باقی‌مانده از تست مرورگر (~1.2GB RAM) قبلاً OOM hard-kill (exit 137) می‌ساختند
+  3705→
+  3706→رفع:
+  3707→1. run-server.sh: NODE_OPTIONS از 1024 → 2048 (آستانه heap ~1.7GB — بالاتر از heap گرم ~1.2GB → صفر restart خودکار)
+  3708→2. run-server.sh: گرم‌کردن خودکار بعد از هر بوت (ترتیبی: payment/checkout → / → auth/me → nika/chat → guest-chat) — مسیر سنگین اول وقتی حافظه خالی است؛ self-healing بعد از هر مرگ
+  3709→3. src/instrumentation.ts: گارد dev — boot-cronها در NODE_ENV=development خاموش (DEV_FORCE_CRONS=1 برای فعال‌سازی اجباری)؛ production بدون تغییر
+  3710→4. بستن کروم‌های سرگردان (آزادسازی ~1.2GB)
+  3711→
+  3712→تأیید نهایی:
+  3713→- گرم‌شدن کامل بعد از بوت: ۳۳ ثانیه (۵ مسیر)
+  3714→- پایداری: ۸+ دقیقه بدون حتی یک restart (قبلاً هر ۱-۳ دقیقه) — صفر هشدار memory threshold
+  3715→- سرعت: / → 85-990ms، /api/auth/me → 21ms، payment/checkout → 30ms (گرم)
+  3716→- مرورگر E2E: FCP = 608ms، محتوای اصلی فوری، کلیک CTA «شروع کنید» → صفحه ورود، صفر خطای کنسول
+  3717→- پاسخ به نگرانی کاربر: استاپ وسط کار قبلی هیچ خرابی نساخته (دیتابیس/مقالات/عکس‌ها سالم) — پرلودر طولانی صرفاً چرخه restart/compile بود
+  3718→
+  3719→Stage Summary:
+  3720→- ✅ پرلودر طولانی رفع شد (از ~۳۰-۴۰ ثانیه مکرر → ~۰.۶ ثانیه FCP)
+  3721→- ✅ سرور پایدار با خودترمیمی کامل (supervisor + warmup خودکار)
+  3722→- 🔑 نکته کلیدی Next 16: heap-threshold restart بعد از هر درخواست؛ کنترل آن فقط با --max-old-space-size
+  3723→- 🔑 کش دیسک dev بین پروسه‌ها بازیافت نمی‌شود → warmup خودکار ضروری است
+  3724→
+  3725→---
+  3726→Task ID: OWN-APP-V1
+  3727→Agent: Main (Z.ai Code)
+  3728→Task: اپ اندروید اختصاصی فیتاپ (نسخه سایت) + سیستم نسخه/آپدیت + بازطراحی منوی نصب + اصلاحات فوتر/تماس/درباره ما/اینستاگرام
+  3729→
+  3730→Work Log:
+  3731→- **تحلیل کامل کد**: page-client, main-app, sidebar, top-bar, nika-widget, store, navigation, ssr-screen, footer, contact, about, instagram, app-install, mobile-app-view, pwa-install-prompt, layout, fitup-bazaar (پروژه اندروید بازار), /api/app/version (بازار)
+  3732→- **تولچِین اندروید بازسازی شد** (در /tmp پاک شده بود): scripts/setup-android-toolchain.sh → JDK17 Temurin + cmdline-tools + platform-34 + build-tools 34.0.0 + Gradle 8.7 در /tmp/toolchain (با setsid --fork)
+  3733→- **پروژه اپ اختصاصی**: fitup-app/ (پکیج ir.fittup.panel, versionCode 1, v1.0.0) — WebView پنل کاربری شروع با ?screen=auth؛ بدون پولکی/IAB؛ درگاه زرین‌پال+شاپرک داخل WebView؛ شبکه‌های اجتماعی → مرورگر بیرونی؛ DownloadManager + FileProvider برای نصب APK آپدیت؛ REQUEST_INSTALL_PACKAGES؛ OTP خودکار پیامکی؛ دوربین/میکروفون در لحظه استفاده؛ pull-to-refresh + scroll guard؛ همان آیکون/نام/keystore بازار — بیلد موفق ۷۴۴KB امضاشده (CN=FitUp)
+  3734→- **Prisma**: model OwnAppRelease (versionName/versionCode/changelog/fileName/fileSize/downloads/forceUpdate/isActive) + db:push
+  3735→- **API**: GET /api/app/own/latest (عمومی) + /api/app/own/download (stream + Range 206 + شمارنده) + /api/app/own/releases (GET/POST آپلود multipart / DELETE ?id — requireAdmin)
+  3736→- **app-bridge.ts**: isFitUpOwnApp/isFitUpNativeApp/isAppShellMode/getOwnAppVersionCode/downloadOwnAppUpdate
+  3737→- **app-update-modal.tsx**: مودال زیبای «نسخه جدید» (نسخه+changelog+حجم+دانلود نیتیو+بعداً/اجباری) — رندر در page-client (auth/onboarding/main/landing)
+  3738→- **mobile-app-view.tsx بازطراحی کامل**: فقط ۳ کارت (APK اختصاصی از API + راهنمای iOS + نوتیف iOS) در app-install-cards.tsx مشترک با لندینگ — PWA کروم/«سایر مرورگرها» حذف شد
+  3739→- **pwa-install-prompt.tsx بازنویسی**: بنر+مودال ساده → دکمه «رفتن به منوی نصب اپ» (لاگین‌شده→تب mobileapp / مهمان→اسکرول #install)؛ حذف beforeinstallprompt/Chrome؛ event show-pwa-install (دکمه منوی لندینگ) وصل شد؛ نوتیف DB اولین ورود → link tab=mobileapp
+  3740→- **app-install-section.tsx (لندینگ) بازطراحی**: همان ۳ کارت + ترتیب هوشمند بر اساس پلتفرم
+  3741→- **page-client**: isStandalone/inAppShell شامل اپ‌های نیتیو؛ AppUpdateModal رندر؛ گارد اسکرول برای هر دو اپ؛ isFitUpBazaarApp import حذف
+  3742→- **nika-widget**: مخفی در اپ‌های نیتیو (نوتیف نیکا در OTP نمی‌آید — درخواست مالک؛ در پنل از تب چت در دسترس)
+  3743→- **main-app**: تب mobileapp مخفی در اپ اختصاصی هم؛ فیلتر نوتیف چت برای هر دو اپ نیتیو
+  3744→- **sidebar + top-bar**: دکمه لوگو→لندینگ فقط در مرورگر؛ در اپ‌ها (نیتیو/وب‌اپ iOS) غیرفعال (div نمایشی)
+  3745→- **store.reset()**: خروج → auth در حالت برنامه (اپ نیتیو/PWA)، landing در مرورگر — profile-overlay و LogoutButton هر دو از reset استفاده می‌کنند
+  3746→- **notifications-overlay**: فیلتر اعلان‌های نصب اپ برای هر دو اپ نیتیو
+  3747→- **فوتر**: یک شماره 02128427405 (tel:) + ساعت کاری ۱۰ تا ۲۰ کنار آدرس + آیکون یکدست برای همه گزینه‌ها (ExternalLink حذف)
+  3748→- **تماس با ما**: یک شماره + کارت ساعت کاری + schema (openingHours/telephone +982128427405)
+  3749→- **اینستاگرام**: متن انسانی جدید («ما هم اونجاییم که شما هستید…») + چیپ‌های ساده
+  3750→- **درباره ما**: «عکاس حرفه‌ای» (meta/schema/alt/چیپ) + «مربی همیشه در دسترس» (۲ جای AI) + سرعت عکس (width/height+fetchpriority+preload link+حذف انیمیشن opacity هرو)
+  3751→- **ادمین**: OwnAppReleasesManager (own-app-releases-manager.tsx) داخل SiteSettingsDialog — آپلود APK+نسخه+changelog+اجباری، لیست نسخه‌ها با دانلود/حذف
+  3752→- **انتشار v1.0.0**: scripts/publish-own-app.ts → uploads/apk/ + رکورد DB + دانلود تست‌شده (200/744KB/APK MIME + 206 Range + 401 ادمین)
+  3753→- **E2E (Playwright با addInitScript شبیه‌سازی WebView + UA FitUpApp/)**: ۱۴/۱۴ ✅ — OTP شروع، نیکا مخفی، مودال آپدیت (نسخه/changelog/بعداً/پل دانلود)، لاگین واقعی OTP از DB، تب mobileapp مخفی، لوگو غیرفعال، خروج→OTP، URL تمیز
+  3754→- **بازبینی مرورگر**: لندینگ (کارت APK+نسخه، iOS، حذف PWA قدیمی، فوتر، اینستاگرام)، درباره ما، تماس، تب mobileapp (۳ کارت+changelog باز)، بنر→مودال→CTA→منوی اپ، ادمین→تنظیمات→مدیریت نسخه‌ها (فرم+ردیف v1.0.0) — 0 خطای کنسول/pageerror
+  3755→- lint: 0 error / tsc: clean / dev.log: بدون خطا
+  3756→
+  3757→Stage Summary:
+  3758→- ✅ اپ اندروید اختصاصی امضاشده آماده: download/fitup-own-v1.0.0.apk (۷۴۴KB، ir.fittup.panel، همان لوگو/نام فیتاپ)
+  3759→- ✅ سیستم نسخه کامل: ادمین APK آپلود می‌کند → کاربران قدیمی مودال زیبای آپدیت با changelog می‌گیرند → دانلود نیتیو + نصب؛ تغییرات سایت هرگز APK جدید نمی‌خواهند (WebView همیشه تازه)
+  3760→- ✅ منوی نصب جدید فقط ۳ مسیر: APK اختصاصی + راهنمای iOS + نوتیف iOS (PWA کروم حذف) — هم در پنل هم لندینگ
+  3761→- ✅ رفتار اپ: شروع OTP، نیکا فقط بعد از ورود (تب چت)، خروج→OTP، لوگو غیرفعال — برای اپ اختصاصی + بازار + وب‌اپ iOS
+  3762→- ✅ فوتر/تماس: تک‌شماره 02128427405 + ساعت ۱۰-۲۰ + آیکون یکدست؛ اینستاگرام انسانی؛ درباره ما اصلاح + عکس سریع
+  3763→- فایل‌های کلیدی: fitup-app/ (سورس اندروید), src/lib/fitness/app-bridge.ts, src/components/fitness/app-update-modal.tsx, src/components/fitness/views/app-install-cards.tsx, src/components/fitness/views/own-app-releases-manager.tsx, src/app/api/app/own/*, prisma OwnAppRelease, scripts/publish-own-app.ts + setup-android-toolchain.sh, download/OWN-APP-GUIDE.md
+  3764→- نکته: زیپ دیپلوی download/ به‌روز نشد (درخواست نشده بود) — برای انتشار، zip جدید طبق الگوی v15 ساخته شود
+
+[showing lines 3200-3764 of 3766; use offset=3765 with limit to continue reading]

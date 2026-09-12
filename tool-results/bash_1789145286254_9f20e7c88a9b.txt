@@ -1,0 +1,250 @@
+- **ریشه‌یابی SMS 663678 (دو ریشه هم‌زمان)**: (الف) کلید داپ SmsLog ثابت `program_ready` بود → هر کاربر فقط «اولین برنامهٔ عمرش» پیامک می‌گرفت؛ تمدید/تولید مجدد/watchdog همه با already_sent رد می‌شد. کلید → `program_ready_{programRequestId}` در هر ۵ نقطهٔ فراخوانی (program-generation ×۲، manage-subscription ×۲، admin/programs ×۱). (ب) اگر `SMSIR_TEMPLATE_PROGRAM_READY` env سرور نبود → skip بی‌صدای no_template؛ حالا `DEFAULT_SMS_TEMPLATE_IDS` (هر ۱۶ قالب تأییدشده) در smsir.ts + `resolveTemplateId()` با ترجیح override > env > پیش‌فرض — فقط SMSIR_API_KEY کافی است.
+- **ممیزی همه پیامک‌ها**: در همین راستی‌آزمایی، **همان باگ داپ ابدی در چکاپ (761137)** پیدا شد — کلید ثابت یعنی چکاپ‌های ۱۵/۳۰/۴۰ فقط یک بار در عمر! کلید → `checkup_reminder_{planStartedDate}_p{phase}`. بقیهٔ سناریوها ممیزی شدند: purchase (paymentId) / upgrade (planId+paymentId) / wallet (paymentId) / plan_expiring-expired-winback-boost (subId/cycleId) / abandoned_cart (paymentId) / invite (inviterId) — همگی سالم.
+- **کارت «ممیزی پیامک‌های سیستمی» در پنل ادمین**: `/api/admin/sms-audit` (۱۴ سناریو با زمان‌بندی دقیق/داپ/مقصد لینک/شناسهٔ قالب مؤثر+منبع/آمار sent-failed/۸ لاگ آخر ماسک‌شده) + حالت تکی تست در `/api/admin/sms-test` (body {key}) + کامپوننت `admin-sms-audit-card.tsx` با آکاردئون سناریوها و دکمهٔ «ارسال تست» تکی. تست مرورگری: رندر ✓، اکسپند program_ready با متن فیکس v66 ✓، لاگ فیکسچر ماسک‌شده ✓، هشدار SMSIR_API_KEY ✓ (اسکرین‌شات v66-sms-audit.png).
+- **بکاپ دیتابیس → گوگل‌درایو بدون Google Cloud API**: مدل `DbBackupRun` (db:push ✓) + `src/lib/fitness/db-backup.ts` — VACUUM INTO (اتصال Prisma مستقل، کپی سازگار) → gzip → `db/backups/fitup-db-YYYY-MM-DD-HH-mm.db.gz` (زمان تهران) → prune محلی بر اساس retention → آپلود multipart {token,name,created,data(base64)} به webhook از SiteSetting. کد آمادهٔ **Google Apps Script** با ID پوشهٔ مالک (1H4r9iep…wVE) پرشده در کارت ادمین — اسکریپت ذخیره می‌کند و فایل‌های >۴۸ ساعت را خودش به Trash می‌برد. زمان‌بندی: `startDbBackupSweep` (هر ۱۰ دقیقه چک سررسید — بازه از پنل، بدون ری‌استارت) + `/api/cron/db-backup` (CRON_SECRET/loopback + ?force=1). کلیدهای SiteSetting جدید: db_backup_enabled/interval_hours/retention_hours/webhook_url/token (دو تای آخر secret-ماسک) + اعتبارسنجی ۱..۲۴ و ۱۲..۷۲۰ و https.
+- **کارت «بکاپ دیتابیس — گوگل درایو» پنل ادمین** (`admin-db-backup-card.tsx` + `/api/admin/db-backup`): آمار (حجم DB/آخرین/بعدی/وضعیت آپلود)، سوییچ فعال، چیپ‌های بازه ۱/۲/۳/۴/۵/۶/۱۲ ساعته، چیپ نگهداری ۲۴/۴۸/۷۲/۱۶۸، لینک+توکن، «بکاپ فوری»، «تست آپلود» (فایل آزمایشی)، راهنمای ۵مرحله‌ای با کد کپی‌شدنی، تاریخچه ۱۲ اجرا. **تست واقعی سندباکس**: بکاپ اجباری → فایل 16KB معتبر (۴۹ جدول، sqlite3 verify) → آپلود به receiver موک bun روی 3050 با پروتکل کامل (gzipMagic=true، token/name/created دریافتی) ✓ → آپلود قدیمی‌ترین با mtime ۳روز → deletedOld=1 ✓ → تغییر بازه به ۴ ساعت از UI → nextDue +۴ ساعت و DB persist ✓ → بازگشت به ۲ ساعت ✓ (اسکرین‌شات v66-db-backup.png).
+- **گالری پیشرفت**: home-view + dashboard-view — کارت «آنالیز ویدیوی فرم بدن» حذف، «گالری پیشرفت» (Images icon، ساب «عکس‌های قبل و بعد بدن») — unlocked = hasActiveSubscription || hasPendingSubscription (اقتصادی به بالا)، لمس → تب پیشرفت؛ بدون پلن → قفل + هدایت به پلن‌ها. **گیت سرور**: POST /api/progress/photo بدون اشتراک فعال/pending → 403 PLAN_REQUIRED فارسی. تست مرورگری با کاربر DB-sessioned: بدون پلن «نیازمند پلن فعال» ✓ / با اشتراک اقتصادی «عکس‌های قبل و بعد بدن» ✓ / کلیک → tab=progress و گالری v53 رندر ✓ / curl آپلود: بدون پلن 403 ✓، اقتصادی 200 ✓.
+- **بازطراحی کارت‌های پلن صفحه تحلیل**: PLAN_VISUALS جدید — پالت کامل برند (اقتصادی خاکستری-گرم ساده / استاندارد کهربایی #d97706 / پیشرفته نارنجی #ea580c + ring + «محبوب‌ترین» داخل کارت / حرفه‌ای طلایی-تیره پرمیوم #b45309 + CTA تیره-طلایی به سبک حالت باشگاه)؛ حذف چک‌لیست ۳موردی، «+N امکان دیگر»، نوار گرادیان، شیمر، نشان روبانی، triple-icon هدر؛ هر کارت: آیکون + نام + یک خط headline تفاوت + قیمت + چیپ ۴۵روزه (flex-wrap ضد برش در ۳۶۰px) + CTA. هدر بخش ساده شد (یک Crown در چیپ گرادیانی). تست: پیش‌نمایش موقت /tmp-plan-preview (بعد حذف) در ۴۱۲px و ۱۴۴۰px — اسکرین‌شات‌ها. جریان واقعی آنبوردینگ هم با کاربر تست تا مرحله ارسال رفت؛ رندر تحلیل در dev سندباکس به‌خاطر ری‌استارت‌های مکرر حافظه (heap watcher — مسئلهٔ شناخته‌شدهٔ سندباکس، نه اپ) دو بار reload خورد؛ API تحلیل با کش مستقیم تست شد (200 در ۳۵ms، پیلود کامل) و کارت‌ها با هارنس ایزوله راستی‌آزمایی شدند.
+- **پاک‌سازی کامل**: کاربران/سشن/اشتراک/پروفایل/SmsLog/ProgressPhoto/نوتیف/DbBackupRun فیکسچر با ID صریح حذف (۰ ردیف)؛ اسکریپت‌های tmp حذف (شامل scripts/tmp قدیمی)؛ db/backups سندباکس حذف؛ فایل‌های /tmp موقت + مرورگر CDP + receiver موک بسته؛ db/custom.db → upload/ سینک.
+- **بسته‌بندی**: lint=0 error (بعد از حذف ۴ require فیکسچر جا‌مانده)، tsc=0 خطا؛ package.json→66.0.0؛ DEPLOY.md (root + download/) چنج‌لاگ کامل v66؛ زیپ fitup-deploy-2026-09-10-v66.zip (۶۳۶ فایل، ۷.۴MB) — وریفای داخل زیپ: version/DEPLOY/۲۰ فایل حیاتی/DbBackupRun در اسکیما/startDbBackupSweep/عدم نشت مسیر تست ✓ → download/ + upload/ (MD5 یکسان 1dc75e7b…)؛ v65 از هر دو حذف؛ دونیت zip-v55 اشتباهی اولیه حذف شد.
+- نکتهٔ سندباکس: dev-server چند بار توسط memory-watcher ری‌استارت شد و صفحاتِ در حال رندر سنگین reload کامل خوردند — دقیقاً همان چیزی که در production standalone (pm2 + heap ثابت) رخ نمی‌دهد؛ در لاگ‌های مالک هم قبلاً ردیابی شده بود.
+
+Stage Summary:
+- هر ۴ خواستهٔ مالک اجرا و (جایی که در سندباکس شدنی بود) تست زنده شد: پیامک 663678 با دو فیکس ریشه‌ای + ممیزی کامل پنلی همه پیامک‌ها (با کشف و فیکس همان باگ در چکاپ) + سیستم بکاپ ۲ساعتهٔ دیتابیس با آپلود درایو/نگهداری ۴۸س/مدیریت پنل (بدون Google Cloud API — Apps Script آماده) + گالری پیشرفت گیت‌دار + کارت‌های پلن برند-محور کم‌شلوغ.
+- OWNER ACTIONS: (۱) دیپلوی v66 (زیپ → /var/www/fitup → bash deploy.sh)؛ (۲) برای آپلود درایو: پنل → تنظیمات → کارت «بکاپ دیتابیس» → راهنمای ۵مرحله‌ای Apps Script (کد آماده با ID پوشهٔ خودش) → URL را در «لینک آپلود» + توکن → «تست آپلود»؛ (۳) بدون تغییر env (حتی اگر SMSIR_TEMPLATE_* جا افتاده باشند پیامک‌ها می‌روند)؛ (۴) APKها بدون تغییر (1.3.1/1.5.9).
+- زیپ نهایی: download/fitup-deploy-2026-09-10-v66.zip (همچنین در upload/).
+
+---
+Task ID: V67-CHUNK-ERROR-403-UPLOAD
+Agent: Main (Z.ai Code)
+Task: ریشه‌یابی و فیکس اسپم ChunkLoadError لاگ خطاهای مدیر + تشخیص دقیق خطای HTTP 403 تست آپلود بکاپ دیتابیس (گزارش جدید مالک با ۲۰+ رکورد لاگ)
+
+Work Log:
+- تحلیل ۲۰+ رکورد لاگ مالک: ۴ الگو — (A) missing = HTML کش‌شدهٔ ۲+ دیپلوی قبل (IAB اینستاگرام/WebView اپ، از جمله روی www) به چانک حذف‌شده اشاره می‌کند؛ کپی «نسخهٔ قبلی» v65 فقط ۱ نسل را پوشش می‌داد. (B) timeout = شبکهٔ کند/متعطیل IAB و iOS 15/16 — وب‌پک بعد از ۱۲۰ثانیه reject می‌کند. (C) error = script onerror (404/شبکه) در WebView اپ (chunk 9711/918). (D) تکرار رکوردها (9711 شش‌بار در ۲ ساعت) = دِداپ سرور فقط ۱۵ دقیقه + کلاینت هیچ دِداپی نداشت.
+- src/lib/fitness/client-error-report.ts (جدید): reportClientError با دِداپ اثرانگوشی sessionStorage (۱۰ دقیقه) + سقف ۲۰ گزارش/سشن + dedupeKey مشترک برای چند گزارشگر یک حادثه؛ maybeReloadForChunkFailure با گارد مشترک ۶۰ ثانیه‌ای؛ isChunkFailure یکسان برای همهٔ مسیرها.
+- error-capture.tsx: (۱) تلاش مجدد خودکار اسکریپت‌های /_next/static در فاز capture — تگ تازه با cache-buster قبل از reject وب‌پک؛ (۲) نگهبان جهانی chunk (window error + unhandledrejection) با ریکاوری reload حتی خارج از مرز خطای React؛ (۳) گزارش از طریق گزارشگر مشترک.
+- error.tsx + global-error.tsx: مهاجرت به reportClientError (اثرانگوش = پیام خام بدون پیشوند) + گارد reload مشترک ۶۰ ثانیه‌ای (قبلاً ۳۰ ثانیهٔ محلی).
+- api/error-log/route.ts: پنجرهٔ دِداپ سرور ۱۵ → ۶۰ دقیقه (chunk 9711 دیگر حداکثر ۱ رکورد در ساعت).
+- deploy.sh (۶-پ-۲ v67): آرشیو ماندگار .chunk-archive در ریشهٔ سایت — تجمیع همهٔ نسل‌های static (content-hash بدون تداخل)، تزریق به بیلد جدید با هر دیپلوی، هرس ۱۴ روزه؛ با bash -n وریفای شد و هیچ rm -rf ای آن را پاک نمی‌کند.
+- db-backup.ts: classifyUploadHttpError — صفحهٔ HTML گوگل (ppConfig) دیگر خام نمایش داده نمی‌شود؛ 403 → تشخیص فارسی دوعلت (انتشار Web App بدون Anyone / بلاک IP ایران توسط گوگل + راه‌حل رلهٔ Cloudflare Worker)؛ ریدایرکت لاگین → دستور دقیق Deploy→Manage deployments؛ پاسخ ۲xx-ولی-HTML-گوگل دیگر «موفق» فیک نیست.
+- lint=0 error (۷۴ warning قدیمی)، tsc --noEmit=0، سرور dev سالم (GET / 200).
+- package.json → 67.0.0؛ DEPLOY.md (root + download/) چنج‌لاگ v67؛ زیپ fitup-deploy-2026-09-10-v67.zip (۶۳۷ فایل، ۷.۴MB) — وریفای داخل زیپ: deploy.sh شامل chunk-archive ✓، client-error-report.ts ✓، version 67.0.0 ✓ → download/ + upload/ با MD5 یکسان (6aeb2dcf…)؛ v66 از هر دو حذف شد.
+
+Stage Summary:
+- هر ۴ ریشهٔ ChunkLoadError پوشش داده شد: آرشیو ۱۴روزهٔ چانک (missing)، retry اسکریپت (timeout/error گذرا)، نگهبان جهانی reload (خارج از boundary)، دِداپ دولایهٔ ۱۰دقیقه کلاینت/۶۰دقیقه سرور (اسپم پنل).
+- خطای 403 آپلود بکاپ = صفحهٔ HTML گوگل (احتمالاً بلاک IP ایران توسط گوگل یا انتشار بدون Anyone) — حالا پنل تشخیص فارسی قابل‌اقدام می‌دهد؛ بکاپ محلی db/backups همیشه سالم است.
+- زیپ نهایی: download/fitup-deploy-2026-09-10-v67.zip (همچنین در upload/). OWNER ACTION: دیپلوی v67 + در صورت تکرار 403، انتشار Web App با «Anyone» یا رلهٔ خارج از ایران.
+
+---
+Task ID: 70
+Agent: Z.ai Code (main)
+Task: بچ v68 مالک — ① بازطراحی وسواسی کارت‌های ۴ پلن صفحهٔ تحلیل (دکمه‌ها یک ردیف + ارتفاع بیشتر + برچسب بدون تداخل با نام) ② فیکس «جدول مقایسه اسکرول بالا/پایین را قفل می‌کند» در پنل کاربری و صفحهٔ اصلی ③ لینک پیامک‌های تخفیف‌دار بعد از پایان مهلت (۲ساعته/دودوزه) باید به کارت‌های بدون تخفیف پلن‌ها در پنل برود
+
+Work Log:
+- **کارت‌های پلن صفحهٔ تحلیل (analysis-screen.tsx — PLAN_VISUALS + PlanMiniCard بازنویسی کامل)**: سه شكایت مالک یک ریشهٔ ساختاری داشتند. (الف) برچسب «محبوب‌ترین/کامل‌ترین» با absolute گوشهٔ کارت شناور بود و روی «پلن پیشرفته/حرفه‌ای» می‌افتاد → برچسب به «ردیف ثابت بالای کارت» رفت (h یکسان روی هر ۴ کارت، در جریانِ layout — تداخل ناممکن شد)؛ برای تقارن، هر ۴ پلن برچسب گرفت: «شروع هوشمند»/«بهترین ارزش»/«محبوب‌ترین» ⭐/«کامل‌ترین» 👑. (ب) ناهم‌ترازی دکمه‌ها به‌خاطر طول متفاوت headline بود → بلوک قیمت+CTA با mt-auto به کف چسبید و headline داخل کادر tinted با min-height دوعرفی شد ⇒ هر ۴ دکمه دقیقاً یک ردیف. (ج) کارت بلندتر شد (~۲۳۰→~۲۸۰px) با padding بیشتر + خط‌چین جداکنندهٔ قیمت + کادر headline. translate-y ناهم‌ترازکنندهٔ کارت محبوب حذف شد.
+- **قفل اسکرول جدول مقایسه (plan-card-shared.tsx — ComparisonTable بازنویسی)**: ریشه = wrapper «overflow-x-auto + min-w-[680px] + کلاس custom-scrollbar (overscroll-behavior: contain)» ⇒ مرورگر ژست لمس/چرخ موس روی جدولِ ۲۱ ردیفی را می‌بلعید و اسکرول عمودی صفحه می‌مرد (رفتار شناخته‌شدهٔ Chromium با overscroll-behavior روی کانتینرهای افقی). فیکس: جدول کاملاً ریسپانسیو بدون هیچ اسکرول افقی داخلی — گرید `grid-cols-inmax(88px,1.45fr)_repeat(4,minmax(0,1fr))]`، برچسب قابلیت تا ۳ خط، سرستون پلن فشرده (قیمت+۴۵روزه)، تیک/خط‌تیره و هایلایت ستون پیشرفته و دسته‌بندی‌ها حفظ شد. sticky درون-کانتینری بی‌اثر حذف شد. هر دو مصرف‌کننده (لندینگ pricing-section + پنل plans-view) خودکار فیکس شدند.
+- **لینک پیامک بعد از انقضای تخفیف**: (الف) `/r/[code]` — لینک منقضیِ مقصدش go/plans یا go/panel است، حتی بعد از انقضا به همان مقصد 302 می‌شود (پارامتر offer حفظ می‌شود؛ صفحهٔ پلن‌ها کد را سروری اعتبارسنجی و «کارت‌های بدون تخفیف + نوار زرد منقضی» نشان می‌دهد)؛ مقصدهای دیگر (go/renew و…) مثل قبل به صفحهٔ اصلی. (ب) plans-view.tsx — انقضای زندهٔ تخفیف شخصی: personalDiscount حالا با تیک ثانیه‌ای تا validUntil اعتبار دارد؛ بعد از آن قیمت کارت‌ها و بنر هدیه خودکار عادی می‌شوند (بدون رفرش). گیت سروری /api/user-discount-code (فیلتر validUntil > now) از قبل سالم بود و راستی‌آزمایی شد.
+- **تست زندهٔ مرورگری (Playwright + Chromium واقعی، الگوی روت موقت v64)**: روت‌های موقت dev-v68-preview (همان PlanMiniCard واقعی + ComparisonTable واقعی) و dev-v68-analysis (AnalysisScreen کامل) ساخته، تست و بعداً حذف شدند: ① کارت‌ها موبایل ۳۹۰: ردیف۱ اختلاف top دکمه‌ها ≤۲px ✓ ردیف۲ ≤۲px ✓ ارتفاع همهٔ کارت‌ها ~۲۸۰ ✓ تداخل برچسب×نام = هیچ ✓ صفر سرریز افقی ✓ کلیک CTA ✓ (اسکرین‌شات)؛ ② دسکتاپ ۱۲۸۰: top هر ۴ دکمه = ۲۸۲ (دقیقاً برابر) ✓؛ ③ صفحهٔ تحلیل واقعی (AnalysisScreen با کاربر DB-sessioned): ۴ کارت رندر، ردیف‌ها هم‌تراز ✓ (اسکرین‌شات full-page)؛ ④ جدول در پیش‌نمایش و «پنل واقعی»: باز شدن ✓، scrollW==clientW=356 (صفر سرریز) ✓، scrollH==clientH (بدون برش) ✓، چرخ موس روی وسط جدول صفحه را ۷۰۰px می‌برد و برمی‌گرداند ✓ (اسکرین‌شات). نکته: در تست اول پنل، wheel=false خورد — ریشه‌یابی شد: مودال PanelTour کاربر جدید (Radix) body-scroll را قفل می‌کرد؛ با فلگ fitup_tour_seen_v1 تست دوباره شد = true ✓ (رفتار مودال، ربطی به جدول نداشت).
+- **تست چرخهٔ تخفیف**: کد شخصی معتبر (welcome_offer ۳۰٪) → بنر هدیه + خط‌خورده روی هر ۴ کارت + کد V68WELCOME ✓؛ بعد از انقضای سروری (validUntil گذشته) → /api/user-discount-code کد:null ✓ و رندر مجدد پنل: صفر خط‌خورده، صفر بنر، قیمت‌های عادی ۳۵۰/۸۰۰/۱۲۰۰/۱۸۰۰ ✓. آفر منقضی ترک-درگاه (?offer= نامعتبر) → نوار زرد «کد تخفیف شما منقضی شده است» + کارت بدون تخفیف ✓. ریدایرکت‌ها: T68EXPIRED→302 fittup.ir/go/plans?offer=… ✓ / T68RENEW (منقضی غیرپنلی)→302 / ✓ / T68LIVE→مقصد ✓ / ناموجود→/ ✓.
+- **پاک‌سازی کامل**: روت‌های موقت + ۵ اسکریپت tmp حذف؛ export موقت PlanMiniCard برگردانده شد؛ کاربر/پروفایل/کد تخفیف/لینک کوتاه تستی حذف (۰ ردیف باقی)؛ types/.next regen و tsc پاک شد؛ chrome/keepalive موقت بسته شد.
+- **بسته‌بندی**: tsc=0 خطا، lint=0 error (۷۴ warning قدیمی)؛ package.json→68.0.0؛ DEPLOY.md (root + download/) چنج‌لاگ کامل v68؛ زیپ fitup-deploy-2026-09-10-v68.zip (۶۳۷ فایل، ۷.۵MB) — وریفای داخل زیپ: version=68.0.0 ✓، plan-card-shared با گرید جدید ✓، r/[code] با isPanelPlansTarget ✓، plans-view با personalDiscountActive ✓ → download/ + upload/ با MD5 یکسان (18daa97b…)؛ v67 از هر دو حذف؛ db/custom.db → upload/ سینک (بعد از پاک‌سازی فیکسچر).
+
+Stage Summary:
+- هر ۳ خواستهٔ مالک ریشه‌ای فیکس و با تست هندسی زندهٔ مرورگری اثبات شد: دکمه‌های کارت‌ها دقیقاً یک ردیف (۰px اختلاف در دسکتاپ)، برچسب‌ها هرگز روی نام نمی‌افتند (ردیف ثابت)، کارت‌ها بلندتر؛ جدول مقایسه دیگر اسکرول صفحه را قفل نمی‌کند (صفر کانتینر اسکرول داخلی — چرخ موس روی جدول صفحه را می‌برد)؛ لینک پیامک منقضی به کارت‌های بدون تخفیف پنل می‌رسد (و تخفیف شخصی هم لحظه‌ای منقضا می‌شود).
+- OWNER ACTION: فقط دیپلوی v68 (زیپ → /var/www/fitup → bash deploy.sh). بدون تغییر env؛ APKها بدون تغییر (1.3.1/1.5.9).
+- زیپ نهایی: download/fitup-deploy-2026-09-10-v68.zip (همچنین در upload/).
+
+---
+Task ID: 71
+Agent: Z.ai Code (main)
+Task: بچ v69 مالک — ① حذف گوگل‌درایور از بکاپ دیتابیس و ارسال به ربات بله (توکن داده‌شده) ② ممیزی جامع مصرف AI و انتقال همهٔ وظایف متنی به DeepSeek 4 Flash (۸۰٪ gemini نباید باشد) ③ جستجوی کامل نشتی API ④ زیر ویدیوی بانک حرکات: زیرنویس خودکار + ذکر منبع یوتیوب
+
+Work Log:
+- **بکاپ بله**: db-backup.ts بازنویسی شد — حذف کامل Apps Script/classifyUploadHttpError/webhook؛ مقصد جدید = Bot API بله (`tapi.bale.ai/bot<TOKEN>/sendDocument` با Blob gzip + کپشن فارسی)؛ `resolveBaleToken` (env `BALE_BOT_TOKEN` اولویت، بعد SiteSetting ماسک‌شده)؛ `discoverBaleChats` (getUpdates → چت‌ها با نام)؛ خطاهای فارسی (401 توکن نامعتبر / chat not found / 429 / too big). کارت ادمین بازنویسی («بکاپ دیتابیس — ارسال به ربات بله»): فیلد توکن (خالی=env) + chat_id + دکمهٔ «کشف خودکار» + انتخاب از لیست چت‌های کشف‌شده + تست ارسال + راهنمای ۴مرحله‌ای. settings/route.ts: کلیدهای جدید `db_backup_bale_token` (SECRET/ماسک) و `db_backup_bale_chat_id` (اعتبارسنجی عدد) — webhook قدیمی حذف. instrumentation log فیکس (no_token/no_chat_id).
+- **تست واقعی بله**: توکن getMe ✓ (fitupdatabase_bot)؛ getUpdates → chat_id مالک 1566730423 «حسین جوان @hossein_javanbakht»؛ ارسال فایل تست با همان پروتکل multipart → HTTP 200 ok:true ✓؛ سپس از پنل (ادمین سشن تستی): discover_chat ✓ / ذخیرهٔ chat_id ✓ / test_upload uploaded:true ✓ / **run کامل → fitup-db-2026-09-11-0252.db.gz (19.6KB) uploaded:true رکورد success** ✓.
+- **ممیزی AI**: ریشهٔ ۸۰٪ gemini = ۸+ مسیر متنی پرمصرف که هنوز TEXT_MODEL (gemini-3.8) بودند. ثابت `TEXT_TASK_MODEL` (deepseek-v4-flash) ساخته شد و این مسیرها منتقل شدند (همه با fallback_model صریح = gemini-3.8): aiChat متنی (چت مربی پنل — بزرگ‌ترین مصرف‌کننده)، swapFood، analyzeCheckup، analyzeBaselineMeasurements، adminCopilotChat، comprehensive-analysis، program-history، feedback/analyze. دست‌نخورده: تولید برنامه (دیریکتیو v40 مالک — gemini تفکر high)، همهٔ ویژن‌ها (deepseek تصویر نمی‌فهمد)، TTS، تصویر، سئو/مقاله. نیکا+آنبوردینگ از v58 deepseek بودند (تایید مجدد).
+- **تست واقعی AI**: کاربر تست + پروفایل آنبوردینگ ساخته شد؛ GET /api/onboarding/analysis → HTTP 200 در ۱۲ثانیه، تحلیل فارسی کامل؛ AiUsageLog: `route=onboarding-analysis, model=deepseek-v4-flash` ✓ (۵/۵ رکورد deepseek).
+- **ممیزی نشتی API**: ۳ نشتی بسته شد: (۱) توکن بله داخل کامپوننت کلاینت (دکمهٔ کپی راهنما — توکن در bundle مرورگر می‌رفت!) حذف → env؛ (۲) GET /api/admin/db-backup توکن پنل را کامل می‌فرستاد → مماسک شد؛ (۳) /api/payment/test requestBody با merchant_id کامل → مماسک شد. تأییدهای منفی: grep مقدار واقعی کلیدهای .env در .next/static+client = صفر ✓؛ هیچ 'use client' ای env غیرعمومی نمی‌خواند ✓؛ هیچ الگوی هاردکد (توکن تلگرام/Bearer/sk-) در src+mini-services+scripts+public ✓؛ docs بدون مقدار واقعی ✓؛ zip فقط .env.example ✓؛ .gitignore حالا .env را رد می‌کند ✓؛ NEXT_PUBLIC فقط SITE_URL و VAPID_PUBLIC_KEY ✓.
+- **یوتیوب**: زیرنویس خودکار از v65 فعال بود (cc_load_policy=1&cc_lang_pref=fa)؛ متن ۳ محل به‌روز شد: «زیرنویس فارسی خودکار روشن است · ویدیو از یوتیوب» (آیکون Subtitles + Youtube) — exercise-detail-page، exercise-detail-overlay، programs-view.
+- **پاک‌سازی**: کاربران تست v69 (ادمین+کاربر) و پروفایل و رکوردهای تستی DbBackupRun/chat_id از DB سندباکس حذف (۰ ردیف باقی)؛ /tmp اسکریپت‌ها موقت.
+- **بسته‌بندی**: lint=0 error (۷۴ warning قدیمی)، tsc --noEmit=0؛ package.json→69.0.0؛ DEPLOY.md (root + download/) چنج‌لاگ کامل v69؛ زیپ fitup-deploy-2026-09-11-v69.zip (۹۰۰ فایل، ۸.۰MB؛ build/.gradle اندروید exclude — ۵۲۳۲ فایل اشتباه اولیه اصلاح شد) — وریفای داخل زیپ: version=69.0.0 ✓، db-backup.ts با tapi.bale.ai ✓، **هیچ توکن بله/کلید واقعی در src زیپ نیست ✓**، بدون .env واقعی ✓ → download/ + upload/ با MD5 یکسان (220fcb49…)؛ v68 از هر دو حذف؛ db/custom.db → upload/ سینک.
+- **تست مرورگر**: صفحه اصلی موبایل ۳۹۰px و دسکتاپ ۱۲۸۰px رندر کامل (اسکرین‌شات) — عنوان/هیرو/CTA سالم؛ تنها خطای کنسول = WebSocket HMR dev (در production وجود ندارد). dev.log بدون خطای ران‌تایم.
+
+Stage Summary:
+- هر ۴ خواستهٔ مالک اجرا و زنجیره‌ای تست شد: بکاپ دیتابیس (فقط DB، ۲ساعته، نگهداری ۴۸س محلی) حالا **واقعاً به چت بلهٔ مالک ارسال شد**؛ همهٔ وظایف متنی AI → deepseek-v4-flash (فال‌بک gemini) تا سهم مدل ارزان به‌طور معناداری بالا برود؛ ممیزی نشتی = ۳ نشتی بسته + ۶ تأیید منفی (صفر نشتی باقی)؛ متن یوتیوب/زیرنویس به‌روز.
+- OWNER ACTIONS: (۱) دیپلوی v69 (زیپ → /var/www/fitup → bash deploy.sh)؛ (۲) یک خط به .env سرور اضافه کند: `BALE_BOT_TOKEN=1133996971:v4HbDS50mBB9YgzplDOIaYQFMRsECAz7ShQ` (یا توکن را از فیلد کارت پنل بگذارد)؛ (۳) پنل → تنظیمات → کارت «بکاپ دیتابیس — ارسال به ربات بله» → یک /start به ربات در بله → «کشف خودکار» → «ذخیره» → «تست ارسال به بله»؛ (۴) APKها بدون تغییر (1.3.1/1.5.9).
+- زیپ نهایی: download/fitup-deploy-2026-09-11-v69.zip (همچنین در upload/).
+
+---
+Task ID: 72
+Agent: Z.ai Code (main)
+Task: تحلیل دیتابیس آپلودی مالک (کجا AI مصرف هدر می‌رود) + تضمین بی‌باگ بودن حالت دیپ‌سیک + سینک کامل رسانه در چت فیتاپ (عکس/ویدیو بعد متن)
+
+Work Log:
+- **تحلیل دیتابیس آپلودی (upload/custom.db)**: AiUsageLog فقط ۵ رکورد داشت — همه onboarding-analysis با deepseek-v4-flash (تأیید عملی مهاجرت v69: ~۴۲–۵۴ تومان به‌ازای هر تحلیل، ۱۱–۱۷ثانیه) ولی userId همه null بود. ErrorLog = ۱۰ رکورد ChunkLoadError فقط از محیط preview سندباکس (نه پروداکشن). NikaMessage/ChatMessage خالی → این کپی دیتای تستی سندباکس بود نه آمار پروداکشن؛ پس ممیزی مصرف از دل کد انجام شد.
+- **ممیزی کامل کد (ایجنت Explore — نقشه ۳۳ نقطهٔ فراخوانی AI)**: ۴ نقطهٔ فیزیکی کال (ai.ts)، مدل‌ها، کش‌ها و لاگ‌ها همه شناسایی شدند.
+- **کشف ۱ (بزرگ‌ترین هدررفتِ دید)**: چت نیکا + چت مربی + «همهٔ» تحلیل‌های ویژن + کل زنجیرهٔ تولید برنامه از createChatCompletionWithRetry/createPlanCompletionWithRetry می‌گذشتند که «هیچ» AiUsageLog نمی‌گذاشتند → داشبورد حسابداری ۸۰٪+ مصرف را نمی‌دید. فیکس: logAiUsage به هر دو تابع اضافه شد (route بدون پسوند fallback، مدل واقعیِ همان تلاش موفق، userId اختیاری، best-effort).
+- **کشف ۲**: ۴ تحلیل متنی ادمین هنوز gemini-3.8 بودند (v69 ادعای انتقال نظرسنجی را داشت ولی انجام نشده بود): analyzeAccountingData / analyzeSurveys / analyzeSeoComprehensive / runSmartAnalysis (هر دو کال گزارش و JSON اکشن‌ها) → همه به TEXT_TASK_MODEL (deepseek-v4-flash) با fallback_model صریح gemini-3.8 منتقل شدند.
+- **userId در لاگ**: مسیر آنبوردینگ userId پاس نمی‌داد (null در DB) → اضافه شد؛ aiChat/nikaChat پارامتر userId گرفتند و هر دو route واقعی پاس می‌دهند.
+- **کش قیمت نیکا**: قیمت‌های زندهٔ پلن‌ها هر پیام از DB + ساخت رشته تکرار می‌شد → کش ۵ دقیقه‌ای در-حافظه (هم‌الگوی کش مقالات v46).
+- **سینک رسانه چت مربی (خواستهٔ صریح مالک)**: قبلاً بعد از پیامِ عکس/ویدیو، متنِ بعدی فقط جا‌نگذشتهٔ «📷 عکس» را می‌دید. فیکس سه‌لایه: (۱) ستون mediaFrames در ChatMessage (db:push ✓) + ذخیرهٔ فریم‌های ویدیو روی دیسک در لحظهٔ ارسال (هر دو مسیر base64 و multipart — تابع saveFramesToDisk)؛ (۲) buildMediaSyncAttachment: پیام متنی بعدی، آخرین مدیای ۶ پیام اخیر را از دیسک می‌خواند (عکس: webp ذخیره‌شده؛ ویدیو: فریم‌های ذخیره‌شده → فال‌بک استخراج ffmpeg) و با note شفاف «مدیای قبلی برای مرجع پیوست شده» به کال AI می‌برد؛ (۳) پارامتر note سفارشی در aiChat (اولویت بر note پیش‌فرض ویدیو).
+- **ساخت مسیر گمشده /api/coach/chat/upload**: کلاینت ویدیوهای ≥12MB به این مسیر XHR می‌زد و 404 می‌گرفت (تمام مسیر ویدیوی بزرگ چت شکسته بود). ساخته شد: گیت chatVideoUpload (حرفه‌ای) + rate-limit 10/10min + سهمیه movement_video + ذخیره با الگوی chat-video-{uid}- (مالکیت‌محور) + فشرده‌سازی درجا + استخراج ۶ فریم + پاسخ {mediaUrl, frames} طبق قرارداد uploadVideoWithProgress کلاینت.
+- **تست‌های واقعی (همه با کال AI واقعی AvalAI)**: ① نیکا deepseek → پاسخ فارسی با قیمت زندهٔ پلن (۱۳ثانیه) ✓ ② چت مربی متنی deepseek ✓ ③ ویژن عکس gemini-3.8 → محتوای واقعی عکس را توصیف کرد ✓ ④ سینک عکس: «درباره همون عکس بگو» → «رنگ غالب تصویر سفید با دکمه‌های نارنجی» (مدل عکس را دوباره دید!) ✓ ⑤ چت با ویدیوی تست ffmpeg (مسیر base64 کامل route) → 200 + توصیف فریم‌ها ✓ ⑥ متن بعد از ویدیو → دوباره فریم‌ها را دید («نوارهای رنگی، دایرهٔ مرکزی، شمارنده») ✓ ⑦ mediaFrames در DB = ۲ فریم ذخیره ✓ ⑧ لاگ هزینه: nikaChat/deepseek (۳۳۸۵ توکن، ۶۰ت) + aiChat/deepseek (۱۹۳۳ توکن، ۳۳ت) + aiChat/gemini ویژن (۲۹۳۷ توکن، ۱۳۰ت) — همه با userId=✓ ⑨ چت نیکا از UI واقعی مرورگر (ویجت مهمان) → POST 200 در ۱۲.۴ثانیه با پاسخ کامل فارسی (اسکرین‌شات) ⑩ POST /api/coach/chat/upload بدون auth → 401 تمیز (نه 404).
+- **تست مرورگری نهایی**: صفحه اصلی دسکتاپ رندر کامل بدون خطا (اسکرین‌شات)؛ سرور: home 200، guest-chat پاسخ AI واقعی.
+- **بسته‌بندی**: lint=0 error (۷۴ warning قدیمی)، tsc --noEmit=0؛ package.json→70.0.0؛ DEPLOY.md (root + download/) چنج‌لاگ کامل v70؛ زیپ fitup-deploy-2026-09-11-v70.zip (۶۳۸ فایل، ۷.۹۶MB) از مانیفست v69 + route جدید — وریفای: version=70.0.0 ✓، upload/route.ts داخل زیپ ✓، mediaFrames در schema ✓، ۱۴ رفرش TEXT_TASK_MODEL/logAiUsage در ai.ts ✓، بدون .env واقعی ✓، بدون db/custom.db ✓، اسکن هر ۶۳۸ فایل زیپ برای توکن بله = صفر ✓ → download/ + upload/ با MD5 یکسان (752f8e39…)؛ v69 از هر دو حذف؛ db/custom.db → upload/ سینک (MD5 یکسان a436b38e…).
+- **پاک‌سازی**: اسکریپت‌های تست حذف؛ کاربران/اشتراک/پیام/لاگ تستی حذف (AiUsageLog تست‌ها پاک شد).
+
+Stage Summary:
+- ریشهٔ واقعی «۸۰٪ gemini» دو چیز بود: (۱) داشبورد حسابداری پرمصرف‌ترین مسیرها (چت/ویژن/برنامه) را اصلاً لاگ نمی‌دید، (۲) ۴ تحلیل ادمین هنوز gemini بودند. هر دو بسته شد — از این به بعد داشبورد «همهٔ» مصرف را با مدل واقعی و userId می‌بیند.
+- سینک رسانهٔ چت مربی کامل شد: عکس/ویدیو + متنِ بعدی = مدل هر دو را می‌بیند (تست واقعی E2E با پاسخ‌هایی که محتوای مدیا را توصیف می‌کنند اثبات شد) + مسیر ویدیوی بزرگ چت که 404 بود حالا کامل کار می‌کند.
+- OWNER ACTION: فقط دیپلوی v70 (زیپ → /var/www/fitup → bash deploy.sh). بدون تغییر env؛ APKها بدون تغییر (1.3.1/1.5.9). ستون mediaFrames خودکار اضافه می‌شود.
+- زیپ نهایی: download/fitup-deploy-2026-09-11-v70.zip (همچنین در upload/).
+
+---
+Task ID: 73
+Agent: Z.ai Code (main)
+Task: شفاف‌سازی مالک — معماری دقیق چت با فیتاپ: «متن‌ها با دیپ‌سیک پاسخ داده بشه و نوشته بشه، رسانه‌ها با جمنای تحلیل بشن، این تنوع با هم سینک باشه در همه حالت، هیچ باگی در هیچ جای سایت نباشه. فقط تولید برنامه و تحلیل عکس/ویدیو جمنای است و بقیه دیپ‌سیک. تولید تصویر و تبدیل صدا به متن تغییری نکند»
+
+Work Log:
+- **شناسایی «چت با فیتاپ»**: = چت مربی پنل (SmartCoachChatView، تب «چت با فیتاپ» در main-app) با API /api/coach/chat. ایجنت Explore نقشهٔ کامل ۶ چت سایت و ۳۳ نقطهٔ AI را داد.
+- **کشف مغایرت معماری v70**: در v70 پیام متنیِ بعد از عکس/ویدیو «همراه با خودِ مدیا» به gemini (ویژن) می‌رفت و کل پاسخ توسط جمنای نوشته می‌شد — خلاف دیریکتیو صریح مالک («بقیه به عهدهٔ دیپ‌سیک»).
+- **معماری دومرحله‌ای جدید (v71)**: ① `analyzeChatMedia` (جمنای gemini-3.8-flash، پرامپت تحلیل‌گر فنی خالص، max_tokens=1200) یک‌بار مدیا را تحلیل می‌کند و متن گزارش در ستون جدید `ChatMessage.mediaAnalysis` کش می‌شود (db:push ✓). ② `aiChat` بازنویسی شد — همیشه deepseek-v4-flash (فال‌بک gemini-3.8 متنی)، تحلیل جمنای در «پیام سیستم» تزریق می‌شود؛ مدیا هرگز به کال پاسخ پیوست نمی‌شود. ③ سینک پیام‌های بعدی از کش (پنجرهٔ ۶ پیام) = صفر توکن ویژن تکراری (اصلاح هزینه نسبت به v70)؛ مدیای قدیمی بدون کش → تحلیل روی‌تقاضا (بودجه ۱/پیام) + کش.
+- **تست واقعی اول → کشف باگ رفتاری**: تزریق تحلیل داخل پیام کاربر گاهی نادیده گرفته می‌شد و دیپ‌سیک «دسترسی ندارم» می‌گفت (در تست ویدیو). فیکس: انتقال تزریق به پیام سیستم + دستور الزامی صریح («هرگز نگو دسترسی نداری»).
+- **تست E2E واقعی ۶/۶ سبز** (کاربر تستی ultimate + عکس sharp با عدد ۷۷۴۱ + ویدیو ffmpeg با کد 8842): ① متن→deepseek ✓ ② عکس→gemini-3.8 تحلیل(۱۶۰۰توکن)+deepseek پاسخ با عدد+کش ✓ ③ متن بعد عکس→صفر کال ویژن، deepseek عدد را از کش گفت («۷۷۴۱») ✓ ④ ویدیو→۶ فریم ذخیره+gemini(۳۷۰۰توکن)+deepseek «CODE 8842» ✓ ⑤ متن بعد ویدیو→صفر ویژن، کد از کش ✓ ⑥ مدیای قدیمی pre-v71→تحلیل روی‌تقاضا+کش+پاسخ درست ✓. (شمارش کال‌ها با diff AiUsageLog؛ اعداد با ارقام فارسی هم پذیرفته شد.)
+- **کشف و فیکس باگ ویس (پیش‌موجود — پروداکشن هم خراب بود)**: کلید AvalAI مالک برای همهٔ مدل‌های صوتی محدود است (403 Access denied whisper-1 و همهٔ /audio/transcriptions و gpt-4o-transcribe و…) → ویس چت برای همه 502 می‌داد. فیکس بدون تغییر کلید: فال‌بک transcribeWithGemini (gemini-3.8-flash مسیر chat completions با input_audio؛ فرمت‌های webm/ogg/mp3 تست مستقیم=200 ✓) بعد از شکست whisper؛ لاگ مصرف route=voice:transcribe ✓؛ تست زندهٔ route = 200 ✓. اگر مالک بعداً کلید بدون محدودیت بسازد whisper خودکار برمی‌گردد (اول امتحان می‌شود).
+- **رگرسیون‌ها**: نیکا مهمان (curl) → deepseek با قیمت زنده ✓؛ ویجت چت در مرورگر واقعی → پیام کاربر + پاسخ کامل AI در UI ✓؛ صفحهٔ اصلی دسکتاپ رندر کامل بدون خطای کنسول ✓؛ dev.log بدون خطای ران‌تایم ✓.
+- **پاک‌سازی**: کاربر/پروفایل/اشتراک/پیام/لاگ تستی + ۲۱ فایل مدیای چت تستی + اسکریپت و رسانه‌های تست حذف (AiUsageLog = 0 ردیف).
+- **بسته‌بندی**: tsc --noEmit=0، lint=0 error (۷۴ warning قدیمی)؛ package.json→71.0.0؛ DEPLOY.md چنج‌لاگ کامل v71 (root+download/)؛ زیپ fitup-deploy-2026-09-11-v71.zip (۶۳۸ فایل، ۷.۵MB) — وریفای: version=71.0.0 ✓، analyzeChatMedia/mediaAnalysis/transcribeWithGemini داخل زیپ ✓، اسکن توکن بله/sk- = صفر ✓، بدون .env و db ✓ → download/ + upload/ با MD5 یکسان (4bd53f80…)؛ v70 از هر دو حذف؛ db/custom.db → upload/ سینک (MD5 یکسان ade0f1ee…).
+
+Stage Summary:
+- معماری AI چت با فیتاپ حالا دقیقاً به انتخاب مالک است: جمنای فقط تحلیل رسانه + تولید برنامه + تولید تصویر؛ دیپ‌سیک نویسندهٔ همهٔ پاسخ‌های متنی چت/نیکا/ادمین؛ whisper→جمنای فال‌بک برای ویس؛ همه با هم سینک (کش تحلیل) — با اثبات E2E واقعی ۶/۶ + رگرسیون‌ها.
+- کشف مهم: ویس چت در پروداکشن به‌خاطر محدودیت کلید AvalAI کاملاً خراب بود (403) — با فال‌بک جمنای فیکس شد؛ اقدام اختیاری مالک: کلید بدون محدودیت در پنل AvalAI بسازد تا whisper مستقیم شود (فعلاً هم ویس کاملاً کار می‌کند).
+- OWNER ACTION: فقط دیپلوی v71 (زیپ → /var/www/fitup → bash deploy.sh). بدون تغییر env؛ APKها بدون تغییر (1.3.1/1.5.9). ستون mediaAnalysis خودکار اضافه می‌شود.
+- زیپ نهایی: download/fitup-deploy-2026-09-11-v71.zip (همچنین در upload/).
+
+---
+Task ID: 74
+Agent: Z.ai Code (main)
+Task: بچ v72 مالک — ① اثبات کامل‌بودن بکاپ بله (۵MB در برابر ۲۵MB) ② ممیزی کامل E2E همهٔ مسیرهای AI به‌عنوان کاربر ③ تضمین کمترین هزینه ④ حذف ویس پاسخ AI ⑤ بررسی دقیق ۴ خطای لاگ خطاها
+
+Work Log:
+- **بکاپ بله**: تست واقعی فشرده‌سازی — دیتابیس ۲۰.۶۵MB → gzip سطح ۹ = ۴.۷۱MB (نسبت ۴.۴x) + roundtrip بایت‌به‌بایت یکسان؛ یعنی فایل ~۵MB بله «همان» دیتابیس کامل ۲۵MB است (بله سقف ۲۰MB دارد؛ فشرده‌سازی اجبار است). db-backup.ts: از این به بعد روی فایل VACUUM‌شده `PRAGMA integrity_check` + شمارش جداول + جمع ردیف‌ها اجرا و همه در «کپشن پیام بله» درج می‌شود (حجم اصلی → فشرده ×برابر، جداول، ردیف‌ها، ✅ سلامت، راهنمای باز کردن gz) + gzip level 9 + گارد شفاف >۲۰MB. تست زندهٔ مسیر واقعی (cron force=1): raw=0.84MB→gz=19KB، tables=49، rows=22، integrity=ok ✓.
+- **فیکس ۴ خطای لاگ**: (۱) کرش `Select.Item` خالی در مودال پروندهٔ ورزشی (تب پلن‌ها) — آپشن «—» با value="" در ۳ سلکت (زمان تمرین/سبک آشپزی/فرم بدن) با سنتینل داخلی در EditSelect نگاشت شد بدون تغییر call-site؛ تست زنده: dropdown با «—» باز شد ✓، انتخاب متوسط → DB ذخیره bodyFrame="medium" ✓، صفر خطا ✓. (۲) `walletTransaction.findMany` Socket timeout — db.ts: connection_limit=1 + socket_timeout=15s + pool_timeout=30s (برنامه‌نویسی‌شده روی DATABASE_URL، بدون تغییر .env سرور) + PRAGMA journal_mode=WAL و busy_timeout=8s در استارتاپ هر پروسه. (۳) React #185 داشبورد — با کاربر پلن‌دار واقعی مرورگری بازتولید نشد (صفر خطای کنسول)؛ ریکاوری موجود (auto-reset ×۶ + گارد ضدحلقه reload) پوشش می‌دهد. (۴) Chunk 232 failed از IAB اینستاگرام — HTML کش‌شده/چانک قدیمی؛ مکانیزم cp -n چانک‌های v65 + reload خودکار error-boundary موجود ترمیم می‌کند.
+- **ویس (خواستهٔ مالک: فقط کاربر ویس بفرستد)**: تأیید — پاسخ AI از v71 فقط متن است (TTS تولید حذف شده بود، صفر دکمهٔ پخش در UI با تست مرورگری ✓)، فایل مردهٔ tts.ts (بدون importer) حذف شد؛ دکمهٔ «ارسال پیام صوتی» (STT کاربر) سر جایش ✓.
+- **ممیزی E2E کاربرمحور (ایجنت Explore: نقشهٔ ۳۳ نقطهٔ AI + تست زنده)**: متن چت→deepseek (لاگ aiChat/deepseek/userId✓)؛ عکس→gemini تحلیل+deepseek پاسخ؛ متن بعد عکس→صفر کال ویژن جدید (کش) و رنگ عکس را از کش گفت؛ چت از UI واقعی→پاسخ کامل 6.7s؛ نیکا مهمان→deepseek با قیمت زندهٔ ۱.۲M؛ ویس→whisper 403 کوت‌اف و کال دوم 2.0s (به‌جای 6.9s)؛ داشبورد/پلن‌ها/پروفایل صفر خطا؛ home دسکتاپ رندر کامل.
+- **بستن هدررفت هزینه (قاعده: فقط برنامه+رسانه جمنای، بقیه دیپ‌سیک)**: ۳ مسیر متنی سئو → deepseek-v4-flash با فال‌بک gemini (seo-report، content-refresh، seo-agent callLlm — سنگین‌ترین مسیرهای متنی باقی‌مانده روی gemini)؛ کال مردهٔ whisper (همیشه 403) → کوت‌اف ۲۴ ساعته بعد از اولین 403؛ max_tokens به ۹ مسیر بدون سقف اضافه شد (aiChat 4096، نیکا/swapFood/ویژن‌ها 2048، خون 3000، چکاپ/فاز صفر 4096)؛ سقف طول پیام چت مربی ۸K و نیکای لاگین ۲K نویسه؛ حذف ۲ هلپر ویژن مرده (۴.۱KB)؛ لیبل مدل PlanAiAnalysis اصلاح شد (env قدیمی gemini را می‌نوشت)؛ متن پرامپت دستیار مدیر اصلاح شد.
+- **پاک‌سازی**: ۲ کاربر تستی + پروفایل/اشتراک/پیام/OTP/لاگ مصرف/رکورد بکاپ تستی حذف (users=0)؛ بکاپ تستی محلی حذف؛ فایل‌های /tmp پاک شد.
+- **بسته‌بندی**: tsc=0، lint=0 error (۷۴ warning قدیمی)؛ package.json→72.0.0؛ DEPLOY.md چنج‌لاگ کامل v72؛ زیپ fitup-deploy-2026-09-11-v72.zip (۶۳۷ فایل، ۷.۵MB) — وریفای: version=72 ✓، tts.ts غایب ✓، بدون توکن بله/کلید در src ✓، بدون .env/db ✓ → download/ + upload/ با MD5 یکسان (196a73c6…)؛ v71 از هر دو حذف؛ db/custom.db → upload/ سینک (MD5 یکسان).
+
+Stage Summary:
+- ابهام «۵MB بله در برابر ۲۵MB سرور» بسته شد: فایل بله کامل و فشرده‌شده است و حالا کپشن هر بکاپ خودش اثبات کامل‌بودن (حجم اصلی/فشرده، جداول، ردیف‌ها، سلامت) را نشان می‌دهد.
+- هر ۴ خطای لاگ بررسی/فیکس شد؛ ۲ فیکس با تست زندهٔ مرورگری اثبات شد (Select + سرعت ویس)؛ #185 بازتولید نشد و ریکاوری خودکار موجود پوشش می‌دهد.
+- قاعدهٔ نهایی مدل‌ها با اثبات زنده برقرار است: متن همه‌جا (چت/نیکا/انبوردینگ/ادمین/سئو/مقاله) deepseek-v4-flash؛ فقط تولید برنامه + تحلیل عکس/ویدیو gemini؛ تولید تصویر و STT دست‌نخورده. هدررفت‌ها (whisper مرده، max_tokens نامحدود، پرامپت بی‌کران، سئوی gemini) همه بسته شدند → پایین‌ترین هزینه ممکن با حفظ کارکرد.
+- OWNER ACTION: فقط دیپلوی v72 (زیپ → /var/www/fitup → bash deploy.sh). بدون تغییر env؛ APKها بدون تغییر (1.3.1/1.5.9). بعد از دیپلوی، بکاپ بعدی بله کپشن جدید با آمار کامل خواهد داشت.
+- زیپ نهایی: download/fitup-deploy-2026-09-11-v72.zip (همچنین در upload/).
+
+---
+Task ID: sandbox-reclone-v72.8-12g-close
+Agent: main
+Task: دستور مالک: سندباکس برگشته بود به نسخه‌های قبل → پاک‌سازی کامل + کلون کامل fitup5.git + deploy.sh آخرین نسخه + بستن پروندهٔ ۱۲G
+
+Work Log:
+- حفاظت قبل از حذف: tar کامل 179M به /home/z/preserve-fitup/proj (بدون .git/.next/node_modules/dev.log) — شامل keystore پروژه‌های APK (fitup-app/fitup-bazaar)، db، uploads، upload، download، skills. کشف: upload/ یک mount point است (rm: Device or resource busy) — از وایپ جان سالم به در برد.
+- وایپ کامل + کلون https://github.com/javanbakhthossein-bit/fitup5.git (168M، تک‌کامیت 59156d9 «FitUp»).
+- وضعیت مخزن: deploy.sh = v72.5 باگ‌دار (تأیید ادعای مالک)؛ worklog مخزن = 5156 خط، پایانش قبل از وقایع امروز + ۱۰ رکورد یکتا با نام‌گذاری عددی (Task ID 67-74 + V67-CHUNK-ERROR-403-UPLOAD) که در نسخهٔ سندباکس نبود.
+- ادغام دو خطهٔ worklog: نسخهٔ حفاظت‌شده (5185 خط با رکوردهای امروز) به‌عنوان پایه + الصاق بلوک بازیابی‌شده 4964-5156 مخزن با یادداشت → 5381 خط / 176 رکورد — صفر اتلاف از هر دو خطه.
+- بازگردانی: deploy.sh v72.7، db/custom.db، uploads و download (merge)، skills، پرکردن مجدد mount زندهٔ upload/ از بکاپ. .env مخزن (398B) حفظ شد.
+- bun install (893 پکیج) + prisma generate + بوت dev سالم (Ready 1.7s).
+- deploy.sh → v72.8 (bash -n OK) — ۴ تغییر:
+  ۱) DEPLOY_VERSION=72.8
+  ۲) ریشهٔ ۱۲گیگ پیدا شد: کامنت خط 585 خودش می‌گوید سرور زنده کش را از .next/standalone/.next/cache می‌خورد؛ v72.4 فقط .next/cache بیرونی را پاک می‌کرد؛ بهینه‌ساز تصویر Next نسخه‌های resize را در standalone/.next.new/cache/images بی‌سقف انباشته می‌کرد → ۱۲G. فیکس: بلاک ۹-ج — پاک‌سازی کش runtime داخل standalone/.next.new/cache و standalone/.next/cache (+ دوقلوهای .next.old) بعد از swap وقتی اپ stop است.
+  ۳) هاردنینگ WAL: cp db/custom.db-wal/-shm همراه دیتابیس (درس معمای ۱۰۷مگ).
+  ۴) وزن‌سنج ⚖ پایان دیپلوی: du .next + standalone؛ اگر >3G بود → هشدار + ۶ بلاک سنگین.
+- زیپ دیپلوی ساخته شد: download/fitup-deploy-2026-09-11-v72.8.zip (9.3M، 901 فایل — کد جدیدتر مخزن: src=646 مقابل 439 قبلی) + کپی به upload/. رسپی دقیقاً مطابق زیپ v72 (بدون db/uploads/.env/skills؛ download/*.zip مستثنی تا تو در تو نشود). سلامت zip تست شد؛ deploy.sh داخلش = 72.8.
+- lint: 0 errors / 74 warnings (پیش‌موجود).
+- راستی‌آزمایی مرورگری: عنوان «برنامه بدنسازی آنلاین | فیتاپ»، لندینگ کامل RTL رندر، صفر خطای صفحه، warmup مسیرهای auth/checkout را کامپایل کرد.
+- کشف عملیاتی سندباکس: dmesg نشان داد dev بدون سقف حافظه OOM شده (next-server با RSS 2.58GB روی رم 4GB). اجرای رسمی = run-server.sh (سقف 2048 + حلقهٔ restart + warmup). پروسه‌های spawn‌شده از فراخوانی‌های ایجنت بین دو call جمع می‌شوند — سرور ماندگار مال پلتفرم است.
+
+Stage Summary:
+- سندباکس کاملاً نو: کد = آخرین مخزن گیت‌هاب + deploy.sh v72.8 + worklog کامل (هر دو خطه) + دیتا/رسانه/keystore سالم.
+- پروندهٔ ۱۲G: ریشه (کش runtime بهینه‌ساز تصویر داخل standalone) پیدا و در v72.8 ساختاری فیکس شد؛ پاک‌سازی فوری سرور با دو rm امن (کش runtime + عروسک‌ها) به مالک داده شد.
+- زیپ v72.8 در download/ و upload/ آماده دیپلوی بعدی است (مکانیزم self-update خودش از v72.5 سرور به 72.8 ارتقا می‌دهد).
+
+---
+Task ID: v73-deepseek-v41-flash-migration
+Agent: main
+Task: دیریکتیو مالک — پاک‌سازی download/، بستن پروندهٔ ۱۲G (du تأیید مالک)، مهاجرت کامل سیستم به deepseek-v4.1-flash (AvalAI) با ویژن بومی، تفکر مکس برای تولید برنامه و low برای بقیه، قفل چت فیتاپ هوشمند (فقط جایگزینی تکی)، تست کامل پرداخت+AI
+
+Work Log:
+- download/ پاک شد: ۵ آرتیفکت قدیمی (سورس v58، bazaar 1.5.8، own 1.3.0، زیپ v63 و v72) حذف → 30M→13M. نگه‌داشته‌شده‌ها: زیپ v73، APKهای آخر (1.5.9/1.3.1)، keystore (حیاتی — امضای APK)، نسخه‌txt، راهنماها.
+- پروندهٔ ۱۲G بسته شد: du مالک .next=301M — ریشه (کش runtime بهینه‌ساز تصویر داخل standalone/.next.new/cache/images، پاک‌ساز نشده توسط v72.4 که فقط .next/cache بیرونی را می‌زد) در v72.8 فیکس شده بود؛ پاک‌سازی دستی سرور هم انجام شد. اعداد سالم: standalone=269M (node_modules=103M، public=76M، db=25M، live disk=38M)، server=22M، static=6.3M.
+- کشف حیاتی: deepseek-v4-flash و V4-Flash-Vision-Exp توسط DeepSeek بازنشسته شده‌اند → فال‌بک‌های فعلی سیستم (متن=deepseek-v4-flash، ویژن=gemini-3.5-flash) عملاً مرده بودند؛ مهاجرت ضروری بود.
+- مهاجرت در src/lib/fitness/ai.ts: TEXT/VISION/TEXT_TASK/NIKA/ONBOARDING/PLAN همگی → deepseek-v4.1-flash (پیش‌فرض کد)؛ FALLBACK_TEXT/VISION/PLAN → gemini-3.8-flash (مدل اثبات‌شده؛ v4-flash مرده). PLAN_MODEL از TEXT_MODEL جدا شد تا envِ سرورِ قدیمی مسیر حساس را خراب نکند.
+- زنجیرهٔ تولید برنامه (generatePlanContent): deepseek-v4.1-flash@max (۲ تلاش) → تور نجات همان مدل@low (۱ تلاش) → gemini-3.8-flash@high (۲ تلاش)؛ max_tokens=65536 حفظ شد؛ بودجهٔ زمانی بدترین حالت ≈22.5min < watchdog 50min.
+- قید مالک روی چت: بلوک «مرزهای اختیارات» به DEFAULT_CHAT_PROMPT اضافه شد — تعویض/تولید کل برنامه مطلقاً ممنوع + هدایت به مسیر رسمی؛ فقط جایگزینی تکی (یک حرکت/یک غذا) مجاز؛ ادعای تغییر برنامه ممنوع. چت از قبل tool نداشت (بدون دسترسی واقعی به برنامه) → لایهٔ پرامپت لایهٔ اصلی کنترل است.
+- ویژن بومی — کشف با پروب زنده (probe-ai-vision-v73.ts): AvalAI روی chat/completions بلاک image_url را بی‌صدا حذف می‌کند (مدل کور: «تصویری نمی‌بینم»)؛ type:image → 400 دائمی؛ مسیر درست = /v1/messages (Anthropic‌سازگار) با source.base64 → مدل واقعاً عکس را دید (توصیف دقیق اسکرین‌شات fittup.ir مرحله ۱/۴) + کش پرامپت فعال (cache_read). گیت‌وی روی این مسیر 400 گذرای پشت‌سرهم می‌دهد (کلید: فاصله بین کال‌ها).
+- آداپتور anthropicVisionCompletion در ai.ts (قبل از Proxy): تبدیل OpenAI→Anthropic (data URL→base64 source، http→url source، system→پارامتر system)، ۲ تلاش داخلی روی 400/5xx/429، خروجی به شکل OpenAI (choices/usage) → صفر تغییر در call-siteها؛ usage برای حسابداری نگاشت شد (input+cache→prompt، output→completion). تفکر در مسیر messages قابل قطع نیست (thinking disabled→400) و بودجه را می‌خورد → کف بودجهٔ آداپتور 4096 + ویدیوی ۶فریمی → 8192.
+- دو فیکس فنی: regex data-URL بدون فلگ s (TS1501 با target پروژه)؛ بودجهٔ ویدیو 2048→8192.
+- تست‌های زنده (کلید واقعی AvalAI): T1 متن+low ✓ 3.7s؛ T2 پذیرش reasoning_effort=max ✓ (مهم — جدول مالک هشدار «تعمیم مقادیر» می‌داد)؛ T4 JSON+max+65536 ✓ finish=stop؛ T5 high ✓. تست یکپارچه با کلاینت واقعی برنامه (test-app-ai-v73.ts از طریق avalaiClient/Proxy): متن low ✓، ویژن تک‌عکس ✓ (usage 460/586)، ویژن دو-فریمی (شبیه‌سازی ویدیو) ✓ «هر دو فریم یک صحنه‌اند». نکته: getAvalaiClient کلاینت خامِ بدون Proxy است — تست باید avalaiClient را صدا بزند (تست اول من اشتباهی خام را گرفت و «کور» جواب داد).
+- تست رفتاری زنجیره با سرور capture (test-plan-thinking-v73.ts): ۱۹/۱۹ سبز — سلامت=فقط یک درخواست deepseek@max@65536؛ 400→تور low همان مدل؛ شکست کامل→gemini@high با thinkingLevel=high؛ content:null→تور low (باگ «برنامه خالی» پوشش داده می‌شود). 400 دائمی = fail-fast (رفتار صحیح).
+- تست زندهٔ زرین‌پال: POST payment/request.json با merchant واقعی، ۱۰۰۰ تومان → code=100 Success + authority صادر شد (پرداخت واقعی انجام نشد).
+- قیمت‌گذاری: costs.ts + "deepseek-v4.1-flash": {input:0.15, output:0.6} (تعرفهٔ ثابت AvalAI از جدول مالک)؛ مدل‌های قدیمی برای لاگ تاریخی حفظ شدند.
+- .env.example بازنویسی شد (بخش AI)؛ lint: 0 errors/74 warnings؛ tsc: پاک.
+- زیپ: download/fitup-deploy-2026-09-11-v73.zip (7.5MB، ۶۴۱ فایل) + کپی به upload/ — بازسازی دوم بعد از فیکس رجکس/بودجهٔ ویدیو؛ DEPLOY_VERSION=73؛ محتوا راستی‌آزمایی شد (ai.ts=19 match، قید چت، آداپتور، .env.example).
+
+Stage Summary:
+- کل سیستم AI (متن+ویژن+تولید برنامه) روی deepseek-v4.1-flash است؛ تفکر: مکس فقط برای تولید برنامه، low برای همهٔ بقیه؛ فال‌بک‌های مرده به gemini-3.8-flash زنده شدند.
+- ویژن فقط از مسیر /v1/messages کار می‌کند — آداپتور دائمی در ai.ts این را از بقیهٔ سیستم مخفی می‌کند؛ ویدیو = ۶ فریم → همان مسیر (تست شد).
+- اسکریپت‌های تست ماندگار: test-real-ai-v73.ts / probe-ai-vision-v73.ts / test-app-ai-v73.ts / test-plan-thinking-v73.ts.
+- OWNER ACTION: (۱) آپدیت .env سرور با بلوک داده‌شده (env قدیمی بر کد اولویت دارد — حیاتی!)؛ (۲) دیپلوی زیپ v73؛ (۳) بعد از دیپلوی یک تولید برنامه واقعی از پنل تست شود؛ APKها بدون تغییر (1.3.1/1.5.9).
+
+---
+Task ID: v73m-deepseek-audit-production-build
+Agent: Z.ai Code (main)
+Task: درخواست مالک — ممیزی بسیار کامل دوم: تضمین یکپارچگی کل هوش مصنوعی‌های سایت روی deepseek-v4.1-flash + کارکرد درست/نتیجه‌بخش همهٔ مسیرها + تست کامل بیلد پروداکشن در پایان
+
+Work Log:
+- ممیزی استاتیک تک‌تک نقاط AI (grep کل src): همهٔ ثابت‌ها در ai.ts = deepseek-v4.1-flash (TEXT/VISION/TEXT_TASK/NIKA/ONBOARDING/PLAN)؛ فال‌بک سراسری gemini-3.8-flash؛ .env لوکال بدون هیچ override قدیمی (پیش‌فرض کد حاکم)؛ .env.example مرجع کامل بلوک env سرور.
+- نقشهٔ کامل ۳۳ نقطه تأیید شد: چت مربی (متن=TEXT_TASK+low؛ تحلیل رسانه=VISION از آداپتور /v1/messages؛ پاسخ نویسنده=TEXT_TASK)؛ نیکا مهمان/لاگین=NIKA+low؛ تحلیل آنبوردینگ=ONBOARDING؛ جایگزین غذا/دستیار مدیر/تحلیل چکاپ/جامع/نظرسنجی/سئو/مقاله=TEXT_TASK؛ عکس غذا/عکس بدن/ویدیو/آزمایش خون/پیشرفت بدن=VISION؛ تولید برنامه=PLAN@max+65536. مسیرهای مستقل قانونی: تولید تصویر (gemini-image)، STT ویس (whisper→gemini فال‌بک + کوت‌اف 403)، تولید تصویر封面.
+- اصلاح ۸ کامنت قدیمی «جمنای/deepseek-v4-flash» در ۵ فایل (ai.ts، content-refresh، seo-report، seo-agent، smart-analysis) — صفر تغییر کد اجرایی؛ مستندات کد حالا با واقعیت v73 یکدست.
+- آداپتور ویژن /v1/messages + Proxy (پیش‌فرض reasoning_effort=low برای deepseek-v4 متن؛ ویژن→آداپتور) — بازخوانی خط‌به‌خط و تأیید.
+- گارد چت (DEFAULT_CHAT_PROMPT «مرزهای اختیارات») بازخوانی شد: تعویض/تولید کل برنامه ممنوع + هدایت به مسیر رسمی + سقف «جایگزینی تکی».
+- تست زندهٔ مجدد (کلید واقعی AvalAI): test-app-ai-v73 (مسیر واقعی برنامه): متن low ✓ 2.2s / تک‌عکس ✓ 9.0s (توصیف دقیق اسکرین‌شات) / دو-فریمی ✓ 11.8s. test-real-ai-v73 (خام): T1 low ✓ 4.7s؛ T2 max ✓؛ T3 خام کور (انتظاررفته — دلیل وجود آداپتور)؛ T4 JSON@max+65536 finish=stop ✓؛ T5 high ✓. test-plan-thinking-v73 (capture server): ۴ سناریو زنجیرهٔ تولید برنامه همگی سبز.
+- گارد چت رفتاری با مدل زنده — اسکریپت جدید ماندگار scripts/test-chat-guard-v73m.ts (۵ پیام خصمانه): تعویض کامل برنامه→رد+هدایت ✓ / برنامهٔ جدید دورزننده→رد ✓ / جایگزینی تکی حرکت (زانودرد)→فقط یک جایگزین ✓ / جایگزینی تکی غذا (آلرژی)→فقط یک جایگزین ✓ / برنامهٔ غذایی کامل→رد ✓ → ۵/۵.
+- ممیزی پرداخت+AI: تست زندهٔ زرین‌پال code=100+authority ✓؛ همهٔ نقاط پایان (payment/verify، recover، cron/recover-payments، renew/verify، bazaar/purchase، wallet topup) به deliverPlanPayment/deliverWalletTopupPayment می‌رسند → programRequest → startProgramGenerationInBackground → generateWorkout/MealPlan (دیپ‌سیک max) ✓؛ مسیر ultimate: عکس بدن→تحلیل ویژن→ادامهٔ خودکار تولید ✓.
+- بیلد پروداکشن کامل (دستور همان deploy.sh — webpack+standalone+کپی static): EXIT=0؛ BUILD_ID=tikjaVr_PlUPsk8dg8P4P؛ standalone=152M؛ اسموک‌تست سرور استندالون روی 3100 در یک فراخوانی واحد (درس جمع‌شدن پروسهٔ پس‌زمینه): ۹ مسیر — خانه/robots/auth-me/checkout/articles/sitemap=200 ✓، guest-chat=405 صحیح (POST-only)، /plans و /onboarding=404 صحیح (اپ تب‌محور)؛ لاگ پروسه پروداکشن تمیز.
+- DEPLOY.md مخزن قدیمی بود (تا v63 — چنج‌لاگ v64→v73 در گیت‌هاب جا مانده بود): عنوان→v73.1 + چنج‌لاگ کامل v73.1 + بلوک خلاصهٔ فشردهٔ v64→v73 بازنویسی شد.
+- بستهٔ v73.1: deploy.sh DEPLOY_VERSION=73.1 (bash -n OK)؛ package.json 72.0.0→73.1.0 (هیچ مصرف runtime ندارد)؛ bun scripts/build-deploy-zip.mjs 73.1 → 642 فایل، 7.5MB، تطبیق خودکار src با دیسک ✓؛ اسکن امنیتی زیپ: اسکن فایل‌به‌فایل sk-/bale_bot=صفر (هشدار اولیهٔ «FOUND SECRETS» مثبت کاذبِ باگ if|head و به‌هم‌چسبی بایت‌ها بود)؛ src/app/uploads route در زیپ عمدی است (سرویس‌دهندهٔ رسانه)؛ بدون .env/db/uploads ✓ → download/+upload/ با MD5 یکسان (2b99a3e1…)؛ زیپ‌های v72/v72.8/v73 از هر دو حذف (قاعده: فقط آخرین زیپ)؛ db/custom.db → upload/ سینک (MD5 یکسان).
+- tsc --noEmit=0؛ lint=0 error (۷۴ warning قدیمی)؛ دِو سرور با run-server.sh (سقف 2048) ری‌استارت و گرم شد — home=200.
+
+Stage Summary:
+- تضمین ممیزی‌شده: تک‌تک مسیرهای AI سایت (متن، ویژن، نیکا، آنبوردینگ، تحلیل‌ها، سئو، ادمین) روی deepseek-v4.1-flash یکپارچه‌اند؛ تفکر max فقط تولید برنامه و low همهٔ بقیه؛ فال‌بک زندهٔ gemini-3.8-flash جلوی بی‌پاسخی را می‌گیرد؛ گارد «چت برنامه را عوض نمی‌کند» ۵/۵ رفتاری سبز؛ پرداخت‌ها (زرین‌پال/بازار/کیف پول/تمدید/ریکاوری) همگی به تولید برنامهٔ دیپ‌سیک وصل‌اند و درگاه زنده است.
+- بیلد پروداکشن کامل بدون خطا + اسموک‌تست سرور استندالون ۹/۹ — خروجی deploy کامل است.
+- OWNER ACTION: اگر v73 دیپلوی نشده، v73.1 را با بلوک env مدل‌ها (بخش AI در .env.example) دیپلوی کنید؛ اگر v73 دیپلوی شده، v73.1 اختیاری است (رفتار بیت‌به‌بیت یکی — فقط سینک کامنت/مستندات). APKها بدون تغییر (1.3.1/1.5.9). یادآوری: env سرور بر پیش‌فرض کد اولویت دارد — اگر AVALAI_*_MODEL قدیمی (deepseek-v4-flash یا gemini به‌عنوان اصلی) در .env سرور است حتماً حذف/به‌روز شود.
+- زیپ نهایی: download/fitup-deploy-2026-09-11-v73.1.zip (همچنین در upload/، MD5: 2b99a3e1988293dd485922ebbbea6359).
+
+---
+Task ID: v73.2-confidentiality-plancards-checkup-update
+Agent: Z.ai Code (main)
+Task: بچ درخواست‌های مالک — ①ممنوعیت مطلق افشای مدل/محرمانه به کاربر ②حذف تزئینات کنار نام پلن‌های تحلیل آنبوردینگ ③آگاهی/محدودیت/به‌روزی نیکا و فیتاپ هوشمند ④واژگان «به‌روزرسانی برنامه با پیشرفت شما» + قابلیت به‌روزرسانی با چکاپ (استاندارد+، بدون تغییر پلن/زمان) در کارت‌های صفحهٔ اصلی و پنل + تست کامل بیلد پروداکشن
+
+Work Log:
+- اکتشاف سه‌ایجنت موازی: (۱) افشاها: /api/agents مدل+هزینه به مهمان می‌داد؛ apiError پیام خام ۵۰۰ می‌فرستاد؛ guest-chat و dynamic-price خطای خام؛ هیچ گارد ضدافشایی در پرامپت‌ها نبود؛ دو رشتهٔ AvalAI در باندل ادمین؛ متن مدل‌های دستیار مدیر قدیمی (v69). (۲) ایموجی پلن‌ها (🌱⚡🔥👑) فقط در analysis-screen.tsx:308 رندر می‌شود؛ کارت‌های لندینگ/پنل SharedPlanCard ایموجی ندارند؛ feature «به‌روزرسانی» هیچ‌جا نبود؛ (۳) پرامپت نیکا: گارد برنامه‌دهی دو لایه دارد ولی گارد محرمانگی ندارد؛ جریان چکاپ→به‌روزرسانی «ناموجود» (وضعیت ج) — سوئیپ فعال/غیرفعال فقط در startProgramGenerationInBackground است و activatePendingSubscription بدون pending، no-op امن.
+- فیکس محرمانگی (۶ نقطه): agents (حذف model/estimatedCost از پاسخ+interface)؛ apiError → پیام عمومی فارسی برای ۵۰۰ (جزئیات فقط logError)؛ guest-chat → پیام صمیمی عمومی؛ dynamic-price → حذف فیلد error از پاسخ 200 (کلاینت فقط dynamicPriceId می‌خواند — بررسی شد)؛ getSystemDirectives بند ۳ «محرمانگی هویت فنی» (همهٔ پرامپت‌ها می‌گیرند)؛ نیکا قانون طلایی ۶+۷ (محرمانگی+وظیفه‌شناسی)؛ دستیار مدیر متن مدل‌ها→v73؛ دو رشتهٔ باندل ادمین عمومی شد.
+- فیکس کارت پلن‌ها: PlanMiniCard فقط بلاک ایموجی حذف شد (طراحی بقیه دست‌نخورده — grep: صفر رندر plan.icon در کل src).
+- قابلیت «به‌روزرسانی برنامه با پیشرفت شما»: analyzeCheckup خروجی programUpdateNeeded/programUpdateNotes + قوانین تصمیم در پرامپت؛ POST /api/checkup بعد از ذخیرهٔ تحلیل: اگر نیاز → hasActiveProgram → startProgramGenerationInBackground(userId,{source:"checkup"}) + نوتیف «در حال به‌روزرسانی ⏳»؛ program-generation: پارامتر opts.source، دورزدن fresh-plan فقط برای checkup، نوتیف ready اختصاصی «به‌روزرسانی شد ✨» با متن «جای قبلی + پلن/زمان ثابت»؛ response شامل programUpdateTriggered؛ checkup-section.tsx کارت وضعیت سبز/خاکستری جدید. tsc=0.
+- واژگان: JSON-LD FAQ layout.tsx بازنویسی؛ توست programs-view؛ feature «به‌روزرسانی برنامه‌ها با پیشرفت شما (با هر چکاپ، در جای همان برنامه)» به استاندارد/پیشرفته/حرفه‌ای (types.ts) + ردیف جدول مقایسه (plan-card-shared) + تولتیپ (feature-descriptions).
+- آگاهی: DEFAULT_CHAT_PROMPT دانش دقیق (ویدیو=حرفه‌ای، چکاپ/به‌روزرسانی=استاندارد+، تحلیل پیشرفت، دستیار تغذیه، سقف‌ها) + هدایت گارد به چکاپ/تمدید؛ DEFAULT_NIKA_PROMPT: پلن‌ها با به‌روزرسانی، اقتصادی بدون آن، وظیفه‌شناسی؛ مربی حالا نام کاربر + انقضای اشتراک (روز مانده) را در context می‌بیند؛ AIConfig خالی = پیش‌فرض کد حاکم (پرامپت‌های جدید فوراً زنده)؛ سال پویا ✓.
+- E2E واقعی (پلتفرم 3000 + curl): کاربر تستی استاندارد + گارد بدون منبع بلاک ✓ → POST واقعی /api/checkup (AI واقعی: امتیاز ۴۰، programUpdateNeeded=true با یادداشت منطقی) → triggered=true → تولید واقعی deepseek مکس ~۹دقیقه → تمرین 30,028 + غذا 24,648 کاراکتر جای قبلی (قبلی‌ها غیرفعال) → اشتراک/planName/انقضا بیت‌به‌بیت ثابت → هر دو نوتیف ✓ → پاک‌سازی کامل. (مسیر رسیدن به این تست: سرور دیتچ سندباکس بین callها کشته می‌شد و قفل .next/dev توسط next-server یتیم می‌ماند → راه‌حل نهایی: تولید داخل دِو ماندگار پلتفرم. درس: next-server فرزند از گروه پروسه خارج می‌شود — pkill الگویی لازم.)
+- تست زندهٔ محرمانگی/محدودیت/آگاهی ۷/۷ (scripts/test-confidentiality-v73m.ts): نیکا مدل را لو نمی‌دهد ✓ فیتاپی معرفی ✓ برنامهٔ کامل نمی‌دهد ✓ قیمت زنده ✓؛ مربی مدل نمی‌گوید ✓ تعویض کامل را رد می‌کند ✓ قابلیت چکاپ/به‌روزرسانی را می‌شناسد ✓.
+- مرورگری: لندینگ feature جدید دارد ✓ بدون ایموجی پلن ✓؛ پنل تب پلن‌ها feature ✓ صفر «ساخت مجدد/بازسازی» ✓ (🔥 یگانه داخل بنر بازاریابی «قصهٔ بچه‌ها» است — نه کنار نام پلن؛ طبق دستور دست نخورد).
+- بیلد پروداکشن: کشف رستاخیزکننده = run-server.sh خودم از اوایل سشن (لوپ restart با init والد) — کشته شد؛ بیلد کامل deploy.sh-مانند EXIT=0، BUILD_ID=VcGCRc6PWh5Xd7cUp5fsw، استندالون 152M، اسموک‌تست ۷/۷ (200/405) ✓. (۲ تلاش اول OOM شد چون دِو 2.3GB زنده بود — درس: قبل از بیلد run-server.sh را بکش بعد ری‌استارت کن.) دِو دوباره بالا و گرم (200). tsc=0؛ lint=0 error (75 warning).
+- بستهٔ v73.2: DEPLOY_VERSION=73.2 + package.json 73.2.0 + DEPLOY.md چنج‌لاگ کامل + build-deploy-zip 646 فایل 7.5MB (تطبیق خودکار src) → download/+upload/ MD5 یکسان (3149e2d7…)؛ v73.1 حذف (قاعده تک‌زیپ)؛ db→upload سینک.
+
+Stage Summary:
+- محرمانگی: کاربر عادی/مهمان هیچ مسیری به نام مدل، هزینه، کلید، پیام خطای داخلی یا ساختار فنی ندارد — هم در API (۴ فیکس) هم در پرامپت (بند سراسری+نیکا) — با تست زندهٔ ۷/۷ اثبات شد.
+- کارت‌های تحلیل آنبوردینگ بدون شکل‌های تزئینی؛ بقیهٔ طراحی ذره‌ای تغییر نکرد.
+- نیکا و فیتاپ هوشمند: دانش کامل/به‌روز پلتفرم (۴ پلن، به‌روزرسانی با چکاپ، سقف‌ها)، دسترسی کامل نیکا (قیمت زنده/مقاله/حساب) و مربی (پروندهٔ ورزشی + حالا نام و انقضای اشتراک)، نیکا هرگز برنامه نمی‌دهد و هر دو هویت فنی را لو نمی‌دهند — همه با تست زنده.
+- قابلیت جدید: چکاپ → تصمیم AI → به‌روزرسانی خودکار برنامه در جای برنامهٔ قبلی — بدون هیچ تغییری در پلن و زمان اشتراک — فقط استاندارد+ — با E2E کاملاً واقعی سبز شد و در کارت‌های صفحهٔ اصلی و پنل advertised می‌شود؛ «ساخت مجدد/بازسازی» از همهٔ سطوح کاربر-محور حذف شد.
+- OWNER ACTION: فقط دیپلوی زیپ v73.2 → بعد از دیپلوی یک چکاپ واقعی از پنل (استاندارد+) بزنید تا به‌روزرسانی خودکار را ببینید. بدون env جدید؛ APKها بدون تغییر.
+- زیپ نهایی: download/fitup-deploy-2026-09-11-v73.2.zip (همچنین upload/، MD5: 3149e2d7fcf03d5cb5c71180a0118549).

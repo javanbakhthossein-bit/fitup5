@@ -1,0 +1,1109 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState, useCallback, useRef } from "react";
+     4→import { motion } from "framer-motion";
+     5→import {
+     6→  X,
+     7→  Crown,
+     8→  Shield,
+     9→  LogOut,
+    10→  ChevronLeft,
+    11→  CreditCard,
+    12→  Settings,
+    13→  Activity,
+    14→  Wallet,
+    15→  Loader2,
+    16→  TrendingUp,
+    17→  TrendingDown,
+    18→  Dumbbell,
+    19→  Camera,
+    20→  Trash2,
+    21→  // v53: سکشن «آزمایش‌های خون من»
+    22→  TestTube,
+    23→} from "lucide-react";
+    24→import { useAppStore } from "@/lib/fitness/store";
+    25→import { Button } from "@/components/ui/button";
+    26→import { Card } from "@/components/ui/card";
+    27→import { Skeleton } from "@/components/ui/skeleton";
+    28→import {
+    29→  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+    30→} from "@/components/ui/dialog";
+    31→import { Input } from "@/components/ui/input";
+    32→import { Label } from "@/components/ui/label";
+    33→import {
+    34→  toPersianDigits, formatToman,
+    35→  PLAN_LABELS,
+    36→} from "@/lib/fitness/types";
+    37→import { SportsProfileModal } from "@/components/fitness/views/sports-profile-modal";
+    38→import { LogoutConfirmModal } from "@/components/fitness/logout-button"; // ۳۲-B: تأیید خروج یکدست با دکمه خروج اصلی
+    39→// v53: لایت‌باکس مشترک — بزرگ‌نمایی عکس آزمایش خون
+    40→import { MediaLightbox } from "@/components/fitness/media-lightbox";
+    41→import { toast } from "sonner";
+    42→
+    43→// ─── t10: فلگ در-پرواز سطح ماژول — ضد آپلود دوباره ───
+    44→// state کامپوننت با unmount از دست می‌رود؛ اگر کاربر overlay پروفایل را وسط
+    45→// آپلود ببندد و دوباره باز کند، این فلگ هنوز در-پرواز بودن را نشان می‌دهد.
+    46→let avatarUploadInFlight = false;
+    47→
+    48→// ─── DTO شامل تمام فیلدهای آنبوردینگ ───
+    49→interface OnboardingProfileDto {
+    50→  // Basic
+    51→  gender: string;
+    52→  genderLabel: string;
+    53→  age: number;
+    54→  height: number;
+    55→  weight: number;
+    56→  targetWeight: number | null;
+    57→  goal: string;
+    58→  goalLabel: string;
+    59→  activityLevel: string;
+    60→  activityLabel: string;
+    61→  workoutDays: number;
+    62→  workoutDaysList: string[];
+    63→  workoutPlace: string;
+    64→  workoutPlaceLabel: string;
+    65→  workoutTime: string | null;
+    66→  workoutTimeLabel: string | null;
+    67→  // Equipment
+    68→  equipment: string[];
+    69→  // Diet
+    70→  dietType: string;
+    71→  dietLabel: string;
+    72→  preferredCuisine: string | null;
+    73→  preferredCuisineLabel: string | null;
+    74→  dislikedFoods: string | null;
+    75→  allergies: string;
+    76→  // Health
+    77→  injuries: string;
+    78→  diseases: string;
+    79→  drugAllergies: string | null;
+    80→  currentMedications: string | null;
+    81→  medicalConditions: string[];
+    82→  medicalConditionsLabel: string | null;
+    83→  // Recovery
+    84→  sleepHours: number | null;
+    85→  stressLevel: number | null;
+    86→  waterHabit: number | null;
+    87→  waterGoalMl: number | null;
+    88→  bodyFrame: string | null;
+    89→  bodyFrameLabel: string | null;
+    90→  // Training experience
+    91→  trainingExperience: string | null;
+    92→  trainingExperienceLabel: string | null;
+    93→  previousTrainingType: string | null;
+    94→  maxLifts: string | null;
+    95→  // Target date
+    96→  targetDate: string | null;
+    97→  // Supplements
+    98→  currentSupplements: string | null;
+    99→  // Body composition measurements
+   100→  neckMeasurement: number | null;
+   101→  shoulderMeasurement: number | null;
+   102→  calfMeasurement: number | null;
+   103→}
+   104→
+   105→interface BaselineDto {
+   106→  weight: number;
+   107→  chestMeasurement: number | null;
+   108→  armMeasurement: number | null;
+   109→  waistMeasurement: number | null;
+   110→  hipMeasurement: number | null;
+   111→  thighMeasurement: number | null;
+   112→  createdAt: string;
+   113→}
+   114→
+   115→interface WalletTxnDto {
+   116→  id: string;
+   117→  type: string;
+   118→  amount: number;
+   119→  balance: number;
+   120→  description: string;
+   121→  createdAt: string;
+   122→}
+   123→
+   124→// شناسه‌های سکشن‌های قابل ویرایش
+   125→export function ProfileOverlay() {
+   126→  const { user, setUser, setOverlay, reset } = useAppStore();
+   127→  const [profile, setProfile] = useState<any>(null);
+   128→  const [onboarding, setOnboarding] = useState<{
+   129→    analysis?: string;
+   130→    bmi?: number;
+   131→    bmr?: number;
+   132→    tdee?: number;
+   133→    profile?: OnboardingProfileDto;
+   134→    baseline?: BaselineDto | null;
+   135→  } | null>(null);
+   136→  const [loading, setLoading] = useState(true);
+   137→  const [walletOpen, setWalletOpen] = useState(false);
+   138→  const [chargeAmount, setChargeAmount] = useState("");
+   139→  const [charging, setCharging] = useState(false);
+   140→  // 🩹 v49 (هم‌تراز با فیکس v45 مودال خرید): هر بازگشت به صفحه (Back از درگاه،
+   141→  // برگشت به تب) قفل شارژ را آزاد می‌کند تا مودال با اسپینر قفل نشود
+   142→  useEffect(() => {
+   143→    const unlock = () => setCharging(false);
+   144→    const onPageShow = () => unlock();
+   145→    const onVisible = () => {
+   146→      if (document.visibilityState === "visible") unlock();
+   147→    };
+   148→    window.addEventListener("pageshow", onPageShow);
+   149→    document.addEventListener("visibilitychange", onVisible);
+   150→    return () => {
+   151→      window.removeEventListener("pageshow", onPageShow);
+   152→      document.removeEventListener("visibilitychange", onVisible);
+   153→    };
+   154→  }, []);
+   155→  const [walletTxns, setWalletTxns] = useState<WalletTxnDto[]>([]);
+   156→  // FIX: کل واقعی تراکنش‌ها از API (txns فقط ۵۰ مورد آخر است)
+   157→  const [walletTxnsTotal, setWalletTxnsTotal] = useState(0);
+   158→  const [walletTxnsLoading, setWalletTxnsLoading] = useState(true);
+   159→  const [loggingOut, setLoggingOut] = useState(false);
+   160→  // ۳۲-B: مودال تأیید خروج — خروج بدون تأیید نباید انجام شود
+   161→  const [confirmOpen, setConfirmOpen] = useState(false);
+   162→  // ─── مودال «پرونده ورزشی» — کل پرونده در یک تجربه مجزا (درخواست مالک) ───
+   163→  const [sportsProfileOpen, setSportsProfileOpen] = useState(false);
+   164→  // ─── عکس پروفایل (آواتار) ───
+   165→  const [avatarUploading, setAvatarUploading] = useState(false);
+   166→  const [avatarRemoving, setAvatarRemoving] = useState(false);
+   167→  const [avatarBroken, setAvatarBroken] = useState(false); // فایل ۴۰۴ شد → fallback به مربع حرفی
+   168→  const avatarInputRef = useRef<HTMLInputElement>(null);
+   169→  const showAvatar = !!user?.avatarUrl && !avatarBroken;
+   170→
+   171→  // ─── v53: سکشن «آزمایش‌های خون من» ───
+   172→  // از /api/user-media (گروه bloodTests) — آیتم: { id, mediaUrl, result, createdAt }
+   173→  const [bloodTests, setBloodTests] = useState<
+   174→    { id: string; mediaUrl: string | null; result: any; createdAt: string }[]
+   175→  >([]);
+   176→  const [bloodLoading, setBloodLoading] = useState(true);
+   177→  // لایت‌باکس برای آزمایش‌های دارای عکس — ایندکس روی bloodLightboxItems
+   178→  const [bloodLightboxIndex, setBloodLightboxIndex] = useState<number | null>(null);
+   179→  // مودال نتیجهٔ متنی — برای آزمایش‌های بدون عکس (AnalysisResult متن دارد)
+   180→  const [bloodDetail, setBloodDetail] = useState<any | null>(null);
+   181→  const [bloodDetailDate, setBloodDetailDate] = useState<string | null>(null);
+   182→
+   183→  // اگر آواتار عوض/حذف شد، وضعیت broken ریست شود
+   184→  useEffect(() => {
+   185→    setAvatarBroken(false);
+   186→  }, [user?.avatarUrl]);
+   187→
+   188→  /**
+   189→   * آپلود عکس پروفایل — t10: بهینه + پس‌زمینه‌ای.
+   190→   * ۱) کوچک‌سازی کلاینت‌ساید (client-image.ts → webp ~۶۴۰px؛ خطا = فایل اصلی)
+   191→   * ۲) آپدیت خوش‌بینانه از طریق store با objectURL — TopBar/Sidebar/پروفایل
+   192→   *    بلافاصله عکس جدید را نشان می‌دهند (بدون spinner مسدودکننده)
+   193→   * ۳) POST بدون انتظارِ UI — نتیجه: setUser با URL سرور + آزادسازی objectURL
+   194→   * خطا: برگشت خودکار به آواتار قبلی + toast خطا
+   195→   */
+   196→  function handleAvatarChange(e: React.ChangeEvent<HTMLInputElement>) {
+   197→    const file = e.target.files?.[0];
+   198→    e.target.value = ""; // ریست input تا انتخاب دوباره‌ی همان فایل هم کار کند
+   199→    if (!file || !user) return;
+   200→    if (!file.type.startsWith("image/")) {
+   201→      toast.error("فقط فایل تصویری مجاز است.");
+   202→      return;
+   203→    }
+   204→    if (file.size > 8 * 1024 * 1024) {
+   205→      toast.error("حجم عکس بیش از ۸ مگابایت است.");
+   206→      return;
+   207→    }
+   208→    if (avatarUploadInFlight) return; // ضد دوبار-ارسال
+   209→    avatarUploadInFlight = true;
+   210→    setAvatarUploading(true); // فقط نشانگر ظریف روی بج دوربین (مسدودکننده نیست)
+   211→
+   212→    const previousAvatarUrl = user.avatarUrl ?? null;
+   213→
+   214→    // عمداً await نمی‌کنیم — UI بلاک نشود؛ حتی اگر overlay unmount شود
+   215→    // ادامه پیدا می‌کند (همه‌ی به‌روزرسانی‌ها از useAppStore.getState()).
+   216→    void (async () => {
+   217→      let objectUrl: string | null = null;
+   218→      try {
+   219→        const { downscaleImage } = await import("@/lib/fitness/client-image");
+   220→        const resized = await downscaleImage(file);
+   221→
+   222→        // آپدیت خوش‌بینانه — همه‌ی مصرف‌کننده‌های store فوری عوض می‌شوند
+   223→        objectUrl = URL.createObjectURL(resized);
+   224→        const st0 = useAppStore.getState();
+   225→        if (st0.user) st0.setUser({ ...st0.user, avatarUrl: objectUrl });
+   226→        toast("در حال بروزرسانی عکس پروفایل…");
+   227→
+   228→        const fd = new FormData();
+   229→        fd.append("image", resized);
+   230→        const res = await fetch("/api/user/avatar", { method: "POST", body: fd });
+   231→        const data = await res.json().catch(() => ({}));
+   232→        if (!res.ok || !data.ok || !data.avatarUrl) {
+   233→          throw new Error(data.error || "آپلود عکس پروفایل ناموفق بود.");
+   234→        }
+   235→        const serverUrl = data.avatarUrl as string;
+   236→        // URL نهایی سرور — merge با آخرین state کاربر (نه closure کهنه)
+   237→        const st = useAppStore.getState();
+   238→        if (st.user) st.setUser({ ...st.user, avatarUrl: serverUrl });
+   239→        toast.success("عکس پروفایل به‌روزرسانی شد.");
+   240→      } catch (err) {
+   241→        // برگشت به آواتار قبلی
+   242→        const st = useAppStore.getState();
+   243→        if (st.user) st.setUser({ ...st.user, avatarUrl: previousAvatarUrl });
+   244→        toast.error(err instanceof Error ? err.message : "خطا در آپلود عکس پروفایل");
+   245→      } finally {
+   246→        if (objectUrl) {
+   247→          // با تأخیر آزاد می‌شود تا <img> فرصت لود objectURL را داشته باشد
+   248→          const url = objectUrl;
+   249→          setTimeout(() => URL.revokeObjectURL(url), 1500);
+   250→        }
+   251→        avatarUploadInFlight = false;
+   252→        setAvatarUploading(false);
+   253→      }
+   254→    })();
+   255→  }
+   256→
+   257→  /** حذف عکس پروفایل — DELETE /api/user/avatar */
+   258→  async function handleAvatarRemove() {
+   259→    if (!user || avatarRemoving || avatarUploading) return;
+   260→    setAvatarRemoving(true);
+   261→    try {
+   262→      const res = await fetch("/api/user/avatar", { method: "DELETE" });
+   263→      const data = await res.json().catch(() => ({}));
+   264→      if (!res.ok || !data.ok) {
+   265→        throw new Error(data.error || "حذف عکس پروفایل ناموفق بود.");
+   266→      }
+   267→      setUser({ ...user, avatarUrl: null });
+   268→      toast.success("عکس پروفایل حذف شد.");
+   269→    } catch (err) {
+   270→      toast.error(err instanceof Error ? err.message : "خطا در حذف عکس پروفایل");
+   271→    } finally {
+   272→      setAvatarRemoving(false);
+   273→    }
+   274→  }
+   275→
+   276→  // ─── v48 — رفع لگ باز شدن مودال پروفایل در اپ‌ها (شکایت مالک) ───
+   277→  // ۱) contentReady: محتوای سنگین (کیف‌پول/متRICS/پرونده) دو فریم بعد از mount
+   278→  //    رندر می‌شود تا انیمیشن باز شدن Sheet با درخت سبک اجرا شود (روان در WebView ضعیف).
+   279→  // ۲) واکشی کیف‌پول فاز دوم (۳۵۰ms بعد) — سه فچ موازی فریم اول را قفل نمی‌کنند.
+   280→  const [contentReady, setContentReady] = useState(false);
+   281→  useEffect(() => {
+   282→    let raf2 = 0;
+   283→    const raf1 = requestAnimationFrame(() => {
+   284→      raf2 = requestAnimationFrame(() => setContentReady(true));
+   285→    });
+   286→    return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
+   287→  }, []);
+   288→
+   289→  const loadData = useCallback(async () => {
+   290→    const [progressRes, onboardingRes] = await Promise.all([
+   291→      fetch("/api/progress"),
+   292→      fetch("/api/onboarding/analysis"),
+   293→    ]);
+   294→    const progressData = await progressRes.json();
+   295→    let onboardingData: any = null;
+   296→    try { onboardingData = await onboardingRes.json(); } catch {}
+   297→    setProfile({
+   298→      startWeight: progressData.startWeight,
+   299→      targetWeight: progressData.targetWeight,
+   300→      bmi: onboardingData?.bmi,
+   301→      bmr: onboardingData?.bmr,
+   302→      tdee: onboardingData?.tdee,
+   303→      gender: (onboardingData?.profile?.genderLabel || "").includes("آقا") ? "male" : (onboardingData?.profile?.genderLabel || "").includes("خانم") ? "female" : null,
+   304→    });
+   305→    if (onboardingData) setOnboarding(onboardingData);
+   306→  }, []);
+   307→
+   308→  // فاز دوم — تراکنش‌های کیف‌پول (پایین صفحه؛ عجله‌ای ندارد)
+   309→  const loadWallet = useCallback(async () => {
+   310→    const walletRes = await fetch("/api/wallet");
+   311→    let walletData: any = null;
+   312→    try { walletData = await walletRes.json(); } catch {}
+   313→    if (Array.isArray(walletData?.transactions)) {
+   314→      setWalletTxns(walletData.transactions as WalletTxnDto[]);
+   315→      setWalletTxnsTotal(
+   316→        typeof walletData?.total === "number" ? walletData.total : walletData.transactions.length
+   317→      );
+   318→    }
+   319→  }, []);
+   320→
+   321→  // ─── v53: فاز دوم — آزمایش‌های خون کاربر (سبک؛ خطا = سکوت و ردیف خالی) ───
+   322→  const loadBloodTests = useCallback(async () => {
+   323→    try {
+   324→      const res = await fetch("/api/user-media", { cache: "no-store" });
+   325→      if (!res.ok) return;
+   326→      const data = await res.json();
+   327→      if (Array.isArray(data?.bloodTests)) {
+   328→        setBloodTests(data.bloodTests);
+   329→      }
+   330→    } catch {
+   331→      // سکوت — سکشن خون نباید بقیهٔ پروفایل را خراب کند
+   332→    } finally {
+   333→      setBloodLoading(false);
+   334→    }
+   335→  }, []);
+   336→
+   337→  useEffect(() => {
+   338→    let mounted = true;
+   339→    (async () => {
+   340→      try {
+   341→        await loadData();
+   342→      } catch {
+   343→      } finally {
+   344→        if (mounted) setLoading(false);
+   345→      }
+   346→    })();
+   347→    const walletTimer = setTimeout(() => {
+   348→      loadWallet()
+   349→        .catch(() => {})
+   350→        .finally(() => { if (mounted) setWalletTxnsLoading(false); });
+   351→    }, 350);
+   352→    // v53: آزمایش‌های خون — کمی بعدتر از کیف‌پول (هر دو سبک‌اند، فریم اول را نمی‌گیرند)
+   353→    const bloodTimer = setTimeout(() => {
+   354→      if (mounted) void loadBloodTests();
+   355→    }, 500);
+   356→    return () => {
+   357→      mounted = false;
+   358→      clearTimeout(walletTimer);
+   359→      clearTimeout(bloodTimer);
+   360→    };
+   361→  }, [loadData, loadWallet, loadBloodTests]);
+   362→
+   363→  async function handleLogout() {
+   364→    if (loggingOut) return;
+   365→    setLoggingOut(true);
+   366→    // 🩹 v45: خروج از نسخهٔ مشترک lib/fitness/logout.ts — پاک‌کردن کش SW +
+   367→    // storage + reload با cache-buster (پاک‌سازی کامل = بدون state شبح)
+   368→    try {
+   369→      const { performLogout: sharedLogout } = await import("@/lib/fitness/logout");
+   370→      const ok = await sharedLogout({ confirm: false });
+   371→      if (!ok) {
+   372→        setLoggingOut(false);
+   373→        return;
+   374→      }
+   375→    } catch {
+   376→      // حتی اگر lib شکست خورد، مسیر قدیمی امن را برو
+   377→      try { await fetch("/api/auth/logout", { method: "POST" }); } catch {}
+   378→      try { window.sessionStorage.removeItem("fitap_last_screen"); } catch {}
+   379→      reset();
+   380→      setOverlay(null);
+   381→      window.location.href = "/?_logout=" + Date.now();
+   382→    }
+   383→  }
+   384→
+   385→  const subEndDate = user?.subscriptionEnd ? new Date(user.subscriptionEnd) : null;
+   386→  const daysLeft = subEndDate ? Math.ceil((subEndDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)) : 0;
+   387→
+   388→  return (
+   389→    <div className="flex flex-col h-full">
+   390→      {/* Header */}
+   391→      <div className="flex items-center justify-between p-4 border-b">
+   392→        <h2 className="font-bold">پروفایل</h2>
+   393→        <Button variant="ghost" size="icon" onClick={() => setOverlay(null)} className="rounded-full">
+   394→          <X className="w-5 h-5" />
+   395→        </Button>
+   396→      </div>
+   397→
+   398→      <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4">
+   399→        {/* User card */}
+   400→        <Card className="p-5 relative overflow-hidden">
+   401→          <div className="absolute -left-8 -top-8 w-32 h-32 rounded-full bg-primary/10" />
+   402→          <div className="relative flex items-center gap-4">
+   403→            {/* ─── آواتار: عکس کاربر (اگر آپلود کرده) یا مربع گرادیانی حرف اول ─── */}
+   404→            <div className="relative shrink-0 w-16 h-16">
+   405→              {showAvatar ? (
+   406→                <img
+   407→                  src={user?.avatarUrl ?? ""}
+   408→                  alt={`عکس پروفایل ${user?.name || "کاربر"}`}
+   409→                  className="w-16 h-16 rounded-full object-cover shadow-lg ring-2 ring-white/80 dark:ring-slate-800"
+   410→                  onError={() => setAvatarBroken(true)}
+   411→                />
+   412→              ) : (
+   413→                <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary to-emerald-600 flex items-center justify-center text-white text-2xl font-black shadow-lg">
+   414→                  {user?.name?.[0] || "ک"}
+   415→                </div>
+   416→              )}
+   417→              {/* نشان دوربین — باز کردن file input؛ هدف لمس ≥۴۴px با ::before نامرئی */}
+   418→              <button
+   419→                type="button"
+   420→                onClick={() => avatarInputRef.current?.click()}
+   421→                disabled={avatarUploading || avatarRemoving}
+   422→                aria-label={user?.avatarUrl ? "تغییر عکس پروفایل" : "افزودن عکس پروفایل"}
+   423→                className="absolute -bottom-1.5 -left-1.5 w-8 h-8 rounded-full bg-primary text-white flex items-center justify-center shadow-md border-2 border-white dark:border-slate-900 hover:bg-primary/90 active:scale-95 transition disabled:opacity-70 before:absolute before:-inset-2 before:rounded-full before:content-['']"
+   424→              >
+   425→                {avatarUploading ? (
+   426→                  <Loader2 className="w-4 h-4 animate-spin" />
+   427→                ) : (
+   428→                  <Camera className="w-4 h-4" />
+   429→                )}
+   430→              </button>
+   431→            </div>
+   432→            <div className="flex-1">
+   433→              <h3 className="font-black text-lg">{user?.name || "ورزشکار"}</h3>
+   434→              <p className="text-sm text-muted-foreground" dir="ltr">{user?.mobile}</p>
+   435→              <div className="flex items-center gap-1.5 flex-wrap mt-1">
+   436→                {user?.role === "ADMIN" && (
+   437→                  <span className="inline-flex items-center gap-1 text-[11px] bg-primary/10 text-primary px-2 py-0.5 rounded-full">
+   438→                    <Shield className="w-3 h-3" /> مدیر سیستم
+   439→                  </span>
+   440→                )}
+   441→                {user?.planName && (
+   442→                  <span className="inline-flex items-center gap-1 text-[11px] bg-amber-500/15 text-amber-600 dark:text-amber-400 px-2 py-0.5 rounded-full">
+   443→                    <Crown className="w-3 h-3" /> پلن {PLAN_LABELS[user.planName as keyof typeof PLAN_LABELS] ?? user.planName}
+   444→                  </span>
+   445→                )}
+   446→                {/* حذف عکس پروفایل — فقط وقتی عکس وجود دارد؛ هدف لمس با ::before ≥۴۴px */}
+   447→                {user?.avatarUrl && (
+   448→                  <button
+   449→                    type="button"
+   450→                    onClick={handleAvatarRemove}
+   451→                    disabled={avatarUploading || avatarRemoving}
+   452→                    className="inline-flex items-center gap-1 text-[11px] bg-rose-500/10 text-rose-600 dark:text-rose-400 px-2.5 py-0.5 rounded-full hover:bg-rose-500/20 active:scale-95 transition disabled:opacity-60 relative before:absolute before:-inset-1.5 before:content-['']"
+   453→                  >
+   454→                    {avatarRemoving ? (
+   455→                      <Loader2 className="w-3 h-3 animate-spin" />
+   456→                    ) : (
+   457→                      <Trash2 className="w-3 h-3" />
+   458→                    )}
+   459→                    حذف عکس
+   460→                  </button>
+   461→                )}
+   462→              </div>
+   463→            </div>
+   464→          </div>
+   465→        </Card>
+   466→
+   467→        {/* Subscription status */}
+   468→        <Card className="p-4">
+   469→          <div className="flex items-center justify-between mb-3">
+   470→            <div className="flex items-center gap-2">
+   471→              <Crown className="w-5 h-5 text-amber-500" />
+   472→              <h3 className="font-bold text-sm">وضعیت اشتراک</h3>
+   473→            </div>
+   474→          </div>
+   475→          {user?.hasActiveSubscription ? (
+   476→            <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+   477→              <div className="flex items-center justify-between">
+   478→                <div>
+   479→                  <p className="font-bold text-sm text-emerald-600 dark:text-emerald-400">اشتراک فعال ✓</p>
+   480→                  <p className="text-xs text-muted-foreground mt-0.5">
+   481→                    {toPersianDigits(daysLeft)} روز باقی‌مانده
+   482→                  </p>
+   483→                </div>
+   484→                <div className="text-left">
+   485→                  <p className="text-[11px] text-muted-foreground">تاریخ پایان</p>
+   486→                  <p className="text-xs font-medium">{subEndDate?.toLocaleDateString("fa-IR")}</p>
+   487→                </div>
+   488→              </div>
+   489→            </div>
+   490→          ) : (
+   491→            <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
+   492→              <p className="text-sm font-medium text-amber-600 dark:text-amber-400 mb-2">اشتراک فعال نیست</p>
+   493→              <Button
+   494→                size="sm"
+   495→                className="w-full rounded-xl"
+   496→                onClick={() => setOverlay("subscription")}
+   497→              >
+   498→                <Crown className="w-4 h-4" />
+   499→                خرید پلن
+   500→              </Button>
+   501→            </div>
+   502→          )}
+   503→        </Card>
+   504→
+   505→        {/* Wallet — v48: دو فریم بعد از پینت رندر می‌شود (نرمی باز شدن مودال) */}
+   506→        {!contentReady ? (
+   507→          <Skeleton className="h-40 rounded-2xl" />
+   508→        ) : (
+   509→        <Card className="p-4">
+   510→          <div className="flex items-center justify-between mb-3">
+   511→            <div className="flex items-center gap-2">
+   512→              <Wallet className="w-5 h-5 text-cyan-500" />
+   513→              <h3 className="font-bold text-sm">کیف پول</h3>
+   514→            </div>
+   515→          </div>
+   516→          <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/20">
+   517→            <div className="flex items-center justify-between mb-2">
+   518→              <div>
+   519→                <p className="text-[11px] text-muted-foreground">موجودی فعلی</p>
+   520→                <p className="font-black text-lg text-cyan-600 dark:text-cyan-400">
+   521→                  {toPersianDigits((user?.walletBalance ?? 0).toLocaleString("en-US"))} <span className="text-xs font-normal">تومان</span>
+   522→                </p>
+   523→              </div>
+   524→              <Wallet className="w-8 h-8 text-cyan-500/40" />
+   525→            </div>
+   526→            <Button
+   527→              size="sm"
+   528→              variant="outline"
+   529→              className="w-full rounded-xl"
+   530→              onClick={() => setWalletOpen(true)}
+   531→            >
+   532→              شارژ کیف پول
+   533→            </Button>
+   534→          </div>
+   535→
+   536→          <div className="mt-3">
+   537→            <div className="flex items-center justify-between mb-2">
+   538→              <h4 className="text-xs font-bold text-muted-foreground">تراکنش‌های اخیر</h4>
+   539→              {walletTxnsTotal > 5 && (
+   540→                <span className="text-[10px] text-muted-foreground/70">
+   541→                  {toPersianDigits(walletTxnsTotal)} تراکنش
+   542→                </span>
+   543→              )}
+   544→            </div>
+   545→            {walletTxnsLoading ? (
+   546→              <Skeleton className="h-20 rounded-xl" />
+   547→            ) : walletTxns.length === 0 ? (
+   548→              <div className="text-center py-4 text-xs text-muted-foreground rounded-xl bg-muted/30 border border-dashed">
+   549→                هنوز تراکنشی ثبت نشده است
+   550→              </div>
+   551→            ) : (
+   552→              <div className="space-y-1.5 max-h-64 overflow-y-auto custom-scrollbar pl-1">
+   553→                {walletTxns.slice(0, 20).map((t) => {
+   554→                  const isIncome = t.amount >= 0;
+   555→                  return (
+   556→                    <div
+   557→                      key={t.id}
+   558→                      className="flex items-center gap-2 p-2.5 rounded-lg bg-muted/40 border border-border/50"
+   559→                    >
+   560→                      <div
+   561→                        className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+   562→                          isIncome
+   563→                            ? "bg-emerald-100 text-emerald-600"
+   564→                            : "bg-rose-100 text-rose-600"
+   565→                        }`}
+   566→                      >
+   567→                        {isIncome ? (
+   568→                          <TrendingUp className="w-4 h-4" />
+   569→                        ) : (
+   570→                          <TrendingDown className="w-4 h-4" />
+   571→                        )}
+   572→                      </div>
+   573→                      <div className="flex-1 min-w-0">
+   574→                        <p className="text-xs font-medium text-foreground truncate">
+   575→                          {t.description || txnTypeLabel(t.type)}
+   576→                        </p>
+   577→                        <p className="text-[10px] text-muted-foreground">
+   578→                          {formatJalaliDateTime(t.createdAt)}
+   579→                        </p>
+   580→                      </div>
+   581→                      <div
+   582→                        className={`text-xs font-bold font-stat shrink-0 ${
+   583→                          isIncome ? "text-emerald-600" : "text-rose-600"
+   584→                        }`}
+   585→                      >
+   586→                        {isIncome ? "+" : ""}
+   587→                        {toPersianDigits(Math.abs(t.amount).toLocaleString("en-US"))}
+   588→                        <span className="text-[9px] font-normal mr-0.5 opacity-70">ت</span>
+   589→                      </div>
+   590→                    </div>
+   591→                  );
+   592→                })}
+   593→              </div>
+   594→            )}
+   595→          </div>
+   596→        </Card>
+   597→        )}
+   598→        {loading ? (
+   599→          <Skeleton className="h-32 rounded-2xl" />
+   600→        ) : (
+   601→          profile && (
+   602→            <Card className="p-4">
+   603→              <div className="flex items-center gap-2 mb-3">
+   604→                <Activity className="w-5 h-5 text-primary" />
+   605→                <h3 className="font-bold text-sm">اطلاعات فیزیکی</h3>
+   606→              </div>
+   607→              <div className="grid grid-cols-2 gap-2 text-sm">
+   608→                <InfoRow label="وزن شروع" value={profile.startWeight ? `${toPersianDigits(profile.startWeight)} kg` : "—"} />
+   609→                <InfoRow label="وزن هدف" value={profile.targetWeight ? `${toPersianDigits(profile.targetWeight)} kg` : "—"} />
+   610→                {profile.bmi && <InfoRow label="شاخص BMI" value={toPersianDigits(profile.bmi)} />}
+   611→                {profile.bmr && <InfoRow label="متابولیسم (BMR)" value={`${toPersianDigits(profile.bmr)} کالری`} />}
+   612→                {profile.tdee && <InfoRow label="کالری روزانه (TDEE)" value={`${toPersianDigits(profile.tdee)} کالری`} />}
+   613→              </div>
+   614→            </Card>
+   615→          )
+   616→        )}
+   617→
+   618→        {/* ─── v53: سکشن «آزمایش‌های خون من» — بعد از اطلاعات فیزیکی ───
+   619→            لیست آزمایش‌های خون آپلود/تحلیل‌شده کاربر از /api/user-media.
+   620→            آیتم دارای عکس → لایت‌باکس؛ بدون عکس → مودال نتیجهٔ متنی.
+   621→            خالی → ردیف باریک + دکمهٔ آپلود (باز کردن blood-test-view). */}
+   622→        {bloodLoading ? (
+   623→          <Skeleton className="h-24 rounded-2xl" />
+   624→        ) : (
+   625→          <Card className="p-4">
+   626→            <div className="flex items-center justify-between mb-3">
+   627→              <div className="flex items-center gap-2">
+   628→                <TestTube className="w-5 h-5 text-rose-500" />
+   629→                <h3 className="font-bold text-sm">آزمایش‌های خون من</h3>
+   630→                {bloodTests.length > 0 && (
+   631→                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-100 text-rose-600 font-bold">
+   632→                    {toPersianDigits(bloodTests.length)} تحلیل
+   633→                  </span>
+   634→                )}
+   635→              </div>
+   636→              <button
+   637→                onClick={() => setOverlay("bloodTest")}
+   638→                className="text-[11px] font-bold text-rose-600 hover:text-rose-700 flex items-center gap-0.5 active:scale-95 transition"
+   639→              >
+   640→                آپلود آزمایش خون <ChevronLeft className="w-3.5 h-3.5" />
+   641→              </button>
+   642→            </div>
+   643→
+   644→            {bloodTests.length === 0 ? (
+   645→              <div className="py-3 px-3 rounded-xl bg-muted/30 border border-dashed text-center">
+   646→                <p className="text-xs text-muted-foreground">هنوز آزمایشی آپلود نکرده‌ای</p>
+   647→                <Button
+   648→                  size="sm"
+   649→                  variant="outline"
+   650→                  className="mt-2 rounded-xl text-xs border-rose-200 text-rose-600 hover:bg-rose-50"
+   651→                  onClick={() => setOverlay("bloodTest")}
+   652→                >
+   653→                  <TestTube className="w-3.5 h-3.5" /> آپلود آزمایش خون
+   654→                </Button>
+   655→              </div>
+   656→            ) : (
+   657→              <div className="space-y-1.5 max-h-56 overflow-y-auto custom-scrollbar pl-1">
+   658→                {bloodTests.map((bt) => (
+   659→                  <button
+   660→                    key={bt.id}
+   661→                    type="button"
+   662→                    onClick={() => {
+   663→                      if (bt.mediaUrl) {
+   664→                        // دارای عکس → لایت‌باکس (ایندکس روی لیست فیلترشدهٔ دارای عکس)
+   665→                        const idx = bloodTests
+   666→                          .map((x, i) => (x.mediaUrl ? i : -1))
+   667→                          .filter((i) => i >= 0)
+   668→                          .indexOf(bloodTests.indexOf(bt));
+   669→                        if (idx >= 0) setBloodLightboxIndex(idx);
+   670→                        else {
+   671→                          // فایل عکس در دسترس نیست — نتیجهٔ متنی
+   672→                          setBloodDetail(bt.result);
+   673→                          setBloodDetailDate(bt.createdAt);
+   674→                        }
+   675→                      } else {
+   676→                        // بدون عکس → نتیجهٔ متنی در مودال ساده
+   677→                        setBloodDetail(bt.result);
+   678→                        setBloodDetailDate(bt.createdAt);
+   679→                      }
+   680→                    }}
+   681→                    className="w-full flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/40 border border-border/50 hover:bg-muted/70 transition text-right active:scale-[0.99]"
+   682→                  >
+   683→                    <div className="w-8 h-8 rounded-lg bg-rose-100 flex items-center justify-center shrink-0">
+   684→                      <TestTube className="w-4 h-4 text-rose-500" />
+   685→                    </div>
+   686→                    <div className="flex-1 min-w-0">
+   687→                      <p className="text-xs font-bold text-foreground truncate">
+   688→                        {bloodTestSummary(bt.result)}
+   689→                      </p>
+   690→                      <p className="text-[10px] text-muted-foreground">
+   691→                        {formatJalaliDateTime(bt.createdAt)}
+   692→                      </p>
+   693→                    </div>
+   694→                    <ChevronLeft className="w-4 h-4 text-muted-foreground shrink-0" />
+   695→                  </button>
+   696→                ))}
+   697→              </div>
+   698→            )}
+   699→          </Card>
+   700→        )}
+   701→
+   702→        {/* ─── دکمه «مشاهده پرونده ورزشی» (درخواست مالک) ───
+   703→            پروفایل فقط اطلاعات پایه را نشان می‌دهد؛ کل پرونده ورزشی/پزشکی
+   704→            (۹ سکشن + baseline + تحلیل AI + عکس‌ها و آنالیزها) در مودال
+   705→            اختصاصی SportsProfileModal با قابلیت ویرایش نمایش داده می‌شود. */}
+   706→        {loading ? (
+   707→          <Skeleton className="h-24 rounded-2xl" />
+   708→        ) : (
+   709→          <motion.button
+   710→            initial={{ opacity: 0, y: 8 }}
+   711→            animate={{ opacity: 1, y: 0 }}
+   712→            onClick={() => setSportsProfileOpen(true)}
+   713→            className="w-full p-5 rounded-2xl border-2 border-orange-200 bg-gradient-to-l from-orange-50 to-amber-50/60 text-right shadow-sm transition hover:shadow-md hover:border-orange-300 active:scale-[0.99] flex items-center gap-4"
+   714→            aria-label="مشاهده پرونده ورزشی"
+   715→          >
+   716→            <div
+   717→              className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 shadow-md"
+   718→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   719→            >
+   720→              <Dumbbell className="w-6 h-6 text-white" />
+   721→            </div>
+   722→            <div className="flex-1 min-w-0">
+   723→              <p className="font-black text-base text-slate-800">مشاهده پرونده ورزشی</p>
+   724→              <p className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+   725→                هدف، برنامه تمرین، تغذیه، سلامت، ریکاوری و همه‌ی جزئیات — قابل ویرایش
+   726→              </p>
+   727→            </div>
+   728→            <ChevronLeft className="w-5 h-5 text-orange-400 shrink-0" />
+   729→          </motion.button>
+   730→        )}
+   731→
+   732→        {/* Settings list */}
+   733→        <div className="space-y-1">
+   734→          <SettingsRow
+   735→            icon={CreditCard}
+   736→            label="مدیریت اشتراک"
+   737→            onClick={() => setOverlay("subscription")}
+   738→            chevron
+   739→          />
+   740→          {user?.role === "ADMIN" && (
+   741→            <SettingsRow
+   742→              icon={Settings}
+   743→              label="پنل مدیریت"
+   744→              onClick={() => setOverlay("admin")}
+   745→              chevron
+   746→              highlight
+   747→            />
+   748→          )}
+   749→        </div>
+   750→
+   751→        {/* Logout — ۳۲-B: کلیک اول فقط مودال تأیید باز می‌کند؛ خروج واقعی
+   752→            بعد از «بله، خارج می‌شوم» در LogoutConfirmModal اجرا می‌شود */}
+   753→        <Button
+   754→          variant="outline"
+   755→          onClick={() => setConfirmOpen(true)}
+   756→          disabled={loggingOut}
+   757→          className="w-full rounded-xl text-destructive hover:text-destructive hover:bg-destructive/5"
+   758→        >
+   759→          {loggingOut ? (
+   760→            <>
+   761→              <Loader2 className="w-4 h-4 animate-spin" />
+   762→              در حال خروج...
+   763→            </>
+   764→          ) : (
+   765→            <>
+   766→              <LogOut className="w-4 h-4" />
+   767→              خروج از حساب
+   768→            </>
+   769→          )}
+   770→        </Button>
+   771→
+   772→        <p className="text-center text-[11px] text-muted-foreground pt-2">
+   773→          فیتاپ — نسخه ۱.۰.۰
+   774→        </p>
+   775→      </div>
+   776→
+   777→      {/* ورودی مخفی فایل عکس پروفایل — با نشان دوربین باز می‌شود */}
+   778→      <input
+   779→        ref={avatarInputRef}
+   780→        type="file"
+   781→        accept="image/*"
+   782→        className="hidden"
+   783→        onChange={handleAvatarChange}
+   784→        aria-hidden="true"
+   785→        tabIndex={-1}
+   786→      />
+   787→
+   788→      {/* ─── مودال «پرونده ورزشی» — تمام جزئیات + ویرایش (درخواست مالک) ─── */}
+   789→      <SportsProfileModal
+   790→        open={sportsProfileOpen}
+   791→        onClose={() => setSportsProfileOpen(false)}
+   792→      />
+   793→
+   794→      {/* ─── ۳۲-B: مودال تأیید خروج (همان طراحی دکمه خروج اصلی) ─── */}
+   795→      <LogoutConfirmModal
+   796→        open={confirmOpen}
+   797→        onOpenChange={setConfirmOpen}
+   798→        onConfirm={handleLogout}
+   799→      />
+   800→
+   801→      {/* ─── v53: لایت‌باکس آزمایش‌های خون (فقط آیتم‌های دارای عکس) ─── */}
+   802→      {bloodLightboxIndex !== null &&
+   803→        bloodTests.filter((bt) => bt.mediaUrl)[bloodLightboxIndex] && (
+   804→          <MediaLightbox
+   805→            items={bloodTests
+   806→              .filter((bt) => bt.mediaUrl)
+   807→              .map((bt) => ({
+   808→                type: "image" as const,
+   809→                url: bt.mediaUrl as string,
+   810→                title: `آزمایش خون — ${formatJalaliDateTime(bt.createdAt)}`,
+   811→              }))}
+   812→            index={bloodLightboxIndex}
+   813→            onClose={() => setBloodLightboxIndex(null)}
+   814→            onIndexChange={setBloodLightboxIndex}
+   815→          />
+   816→        )}
+   817→
+   818→      {/* ─── v53: مودال سادهٔ نتیجهٔ متنی آزمایش خون (آیتم‌های بدون عکس) ─── */}
+   819→      <Dialog open={!!bloodDetail} onOpenChange={(o) => { if (!o) { setBloodDetail(null); setBloodDetailDate(null); } }}>
+   820→        <DialogContent dir="rtl" className="max-w-md max-h-[85vh] overflow-y-auto custom-scrollbar">
+   821→          <DialogHeader>
+   822→            <DialogTitle className="flex items-center gap-2 text-base">
+   823→              <TestTube className="w-5 h-5 text-rose-500" />
+   824→              نتیجهٔ تحلیل آزمایش خون
+   825→            </DialogTitle>
+   826→          </DialogHeader>
+   827→          {bloodDetailDate && (
+   828→            <p className="text-[11px] text-muted-foreground">{formatJalaliDateTime(bloodDetailDate)}</p>
+   829→          )}
+   830→          {bloodDetail && typeof bloodDetail === "object" ? (
+   831→            <div className="space-y-3">
+   832→              {typeof bloodDetail.score === "number" && (
+   833→                <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-100 text-center">
+   834→                  <p className="text-[11px] text-muted-foreground mb-0.5">امتیاز کلی</p>
+   835→                  <p className="text-2xl font-black text-rose-600">{toPersianDigits(bloodDetail.score)}</p>
+   836→                </div>
+   837→              )}
+   838→              {typeof bloodDetail.overall === "string" && bloodDetail.overall && (
+   839→                <p className="text-xs text-foreground leading-relaxed">{bloodDetail.overall}</p>
+   840→              )}
+   841→              {Array.isArray(bloodDetail.markers) && bloodDetail.markers.length > 0 && (
+   842→                <div>
+   843→                  <h4 className="text-xs font-bold text-muted-foreground mb-1.5">
+   844→                    نشانگرها ({toPersianDigits(bloodDetail.markers.length)})
+   845→                  </h4>
+   846→                  <div className="space-y-1 max-h-56 overflow-y-auto custom-scrollbar pl-1">
+   847→                    {bloodDetail.markers.map((m: any, i: number) => (
+   848→                      <div key={i} className="flex items-center gap-2 p-2 rounded-lg bg-muted/40 border border-border/50">
+   849→                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0 ${BLOOD_STATUS_CLASSES[m?.status] || BLOOD_STATUS_CLASSES.unknown}`}>
+   850→                          {BLOOD_STATUS_LABELS[m?.status] || BLOOD_STATUS_LABELS.unknown}
+   851→                        </span>
+   852→                        <span className="text-[11px] font-bold text-foreground truncate flex-1">{m?.name || "نشانگر"}</span>
+   853→                        {m?.value && (
+   854→                          <span className="text-[11px] text-muted-foreground font-stat shrink-0">
+   855→                            {m.value}{m?.unit ? ` ${m.unit}` : ""}
+   856→                          </span>
+   857→                        )}
+   858→                      </div>
+   859→                    ))}
+   860→                  </div>
+   861→                </div>
+   862→              )}
+   863→              {Array.isArray(bloodDetail.recommendations) && bloodDetail.recommendations.length > 0 && (
+   864→                <div>
+   865→                  <h4 className="text-xs font-bold text-muted-foreground mb-1">توصیه‌ها</h4>
+   866→                  <ul className="space-y-1">
+   867→                    {bloodDetail.recommendations.slice(0, 5).map((rec: string, i: number) => (
+   868→                      <li key={i} className="text-[11px] text-foreground/80 leading-relaxed flex items-start gap-1.5">
+   869→                        <span className="w-1.5 h-1.5 rounded-full bg-rose-400 mt-1.5 shrink-0" /> {rec}
+   870→                      </li>
+   871→                    ))}
+   872→                  </ul>
+   873→                </div>
+   874→              )}
+   875→            </div>
+   876→          ) : (
+   877→            <p className="text-xs text-muted-foreground">نتیجهٔ متنی برای این آزمایش ذخیره نشده است.</p>
+   878→          )}
+   879→          <DialogFooter>
+   880→            <Button variant="outline" className="rounded-xl" onClick={() => { setBloodDetail(null); setBloodDetailDate(null); }}>
+   881→              بستن
+   882→            </Button>
+   883→          </DialogFooter>
+   884→        </DialogContent>
+   885→      </Dialog>
+   886→
+   887→      {/* Wallet Charge Modal — FE-C4: شارژ واقعی از طریق درگاه زرین‌پال.
+   888→          قرارداد جدید POST /api/wallet: {ok, paymentId, authority, gatewayUrl}
+   889→          کاربر به gatewayUrl هدایت می‌شود و پس از پرداخت به ?payment_verify=1
+   890→          برمی‌گردد تا PaymentVerifyHandler نتیجه را تأیید کند. */}
+   891→      <Dialog open={walletOpen} onOpenChange={(open) => { if (!charging) setWalletOpen(open); }}>
+   892→        <DialogContent dir="rtl" className="max-w-sm">
+   893→          <DialogHeader><DialogTitle>شارژ کیف پول</DialogTitle></DialogHeader>
+   894→          <div className="space-y-3">
+   895→            <div className="p-2 rounded-lg bg-orange-50 text-xs text-center">موجودی فعلی: <b className="font-stat">{toPersianDigits(formatToman(user?.walletBalance || 0))} ت</b></div>
+   896→            <div>
+   897→              <Label className="mb-1 block">مبلغ (تومان)</Label>
+   898→              {/* v20: جداکنندهٔ هزارگان زنده — بعد از هر ۳ رقم کاما؛ ارقام فارسی */}
+   899→              <Input
+   900→                type="text"
+   901→                inputMode="numeric"
+   902→                dir="ltr"
+   903→                value={formatChargeInput(chargeAmount)}
+   904→                onChange={(e) => setChargeAmount(sanitizeChargeInput(e.target.value))}
+   905→                placeholder={`مثلاً ${toPersianDigits(formatToman(500000))}`}
+   906→                className="rounded-xl text-center font-stat text-lg font-bold tracking-wide"
+   907→              />
+   908→              {chargeAmount && Number(chargeAmount) > 0 && (
+   909→                <p className="text-[11px] text-center text-slate-500 mt-1">
+   910→                  {toPersianDigits(formatToman(Number(chargeAmount)))} تومان
+   911→                </p>
+   912→              )}
+   913→            </div>
+   914→            <div className="flex gap-2 flex-wrap">
+   915→              {[100000, 500000, 1000000].map(v => (
+   916→                <button key={v} onClick={() => setChargeAmount(String(v))} className="text-xs px-3 py-1.5 rounded-lg bg-orange-50 hover:bg-orange-100 text-orange-600 font-stat transition">
+   917→                  {toPersianDigits(formatToman(v))}
+   918→                </button>
+   919→              ))}
+   920→            </div>
+   921→            <div>
+   922→            <p className="text-[11px] text-slate-500 text-center leading-relaxed">
+   923→              پس از تأیید، به درگاه پرداخت زرین‌پال منتقل می‌شوید و پس از پرداخت به‌صورت خودکار به فیتاپ بازمی‌گردید.
+   924→            </p>
+   925→            {/* v49 (درخواست مالک): هشدار VPN — درگاه زرین‌پال با IP خارجی باز نمی‌شود */}
+   926→            <p className="mt-2 text-[11px] font-bold text-red-600 text-center">
+   927→              قبل از شارژ، لطفاً فیلترشکن (VPN) خود را خاموش کنید.
+   928→            </p>
+   929→          </div>
+   930→          </div>
+   931→          <DialogFooter>
+   932→            <Button variant="outline" onClick={() => setWalletOpen(false)} disabled={charging} className="rounded-xl">انصراف</Button>
+   933→            <Button
+   934→              onClick={async () => {
+   935→                if (!chargeAmount || Number(chargeAmount) <= 0) return;
+   936→                setCharging(true);
+   937→                try {
+   938→                  const res = await fetch("/api/wallet", {
+   939→                    method: "POST", headers: { "Content-Type": "application/json" },
+   940→                    body: JSON.stringify({ amount: Number(chargeAmount) }),
+   941→                  });
+   942→                  const data = await res.json().catch(() => ({}));
+   943→                  if (!res.ok || !data.ok || !data.gatewayUrl) {
+   944→                    throw new Error(data.error || "خطا در ایجاد پرداخت");
+   945→                  }
+   946→                  // هدایت به درگاه زرین‌پال — نتیجه پس از بازگشت در
+   947→                  // PaymentVerifyHandler تأیید می‌شود (?payment_verify=1)
+   948→                  toast.info("در حال انتقال به درگاه پرداخت...");
+   949→                  // 🩹 v49 (هم‌تراز با فیکس v45 مودال خرید): اگر ناوبری به هر دلیل
+   950→                  // انجام نشد، قبلاً charging برای همیشه true می‌ماند و مودال با
+   951→                  // اسپینر قفل می‌شد — حالا ۱۲ ثانیه بعد قفل آزاد می‌شود
+   952→                  // (بازگشت زودتر با pageshow/visibilitychange پوشش داده می‌شود)
+   953→                  window.setTimeout(() => setCharging(false), 12_000);
+   954→                  window.location.href = data.gatewayUrl;
+   955→                } catch (e) {
+   956→                  toast.error(e instanceof Error ? e.message : "خطا در شارژ کیف پول");
+   957→                  setCharging(false);
+   958→                }
+   959→              }}
+   960→              disabled={charging}
+   961→              className="rounded-xl text-white"
+   962→              style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   963→            >
+   964→              {charging ? <Loader2 className="w-4 h-4 animate-spin" /> : "شارژ کیف پول"}
+   965→            </Button>
+   966→          </DialogFooter>
+   967→        </DialogContent>
+   968→      </Dialog>
+   969→    </div>
+   970→  );
+   971→}
+   972→
+   973→// ═══════════════ v53: کمکی‌های سکشن «آزمایش‌های خون من» ═══════════════
+   974→
+   975→/** برچسب فارسی وضعیت هر نشانگر آزمایش خون (هم‌قرارداد با blood-test-view) */
+   976→const BLOOD_STATUS_LABELS: Record<string, string> = {
+   977→  normal: "نرمال",
+   978→  low: "پایین",
+   979→  high: "بالا",
+   980→  borderline: "مرزی",
+   981→  unknown: "نامشخص",
+   982→};
+   983→
+   984→const BLOOD_STATUS_CLASSES: Record<string, string> = {
+   985→  normal: "bg-emerald-100 text-emerald-600",
+   986→  low: "bg-amber-100 text-amber-600",
+   987→  high: "bg-red-100 text-red-600",
+   988→  borderline: "bg-orange-100 text-orange-600",
+   989→  unknown: "bg-slate-100 text-slate-500",
+   990→};
+   991→
+   992→/** خلاصهٔ کوتاه یک آزمایش خون برای ردیف لیست — امتیاز + تعداد نشانگرها/غیرنرمال‌ها */
+   993→function bloodTestSummary(result: any): string {
+   994→  if (!result || typeof result !== "object") return "نتیجهٔ تحلیل موجود است";
+   995→  const parts: string[] = [];
+   996→  if (typeof result.score === "number") parts.push(`امتیاز ${toPersianDigits(result.score)}`);
+   997→  if (Array.isArray(result.markers) && result.markers.length > 0) {
+   998→    const high = result.markers.filter((m: any) => m?.status === "high").length;
+   999→    const low = result.markers.filter((m: any) => m?.status === "low").length;
+  1000→    parts.push(`${toPersianDigits(result.markers.length)} نشانگر`);
+  1001→    if (high > 0) parts.push(`${toPersianDigits(high)} بالا`);
+  1002→    if (low > 0) parts.push(`${toPersianDigits(low)} پایین`);
+  1003→  } else if (typeof result.overall === "string" && result.overall) {
+  1004→    return result.overall.length > 60 ? result.overall.slice(0, 60) + "…" : result.overall;
+  1005→  }
+  1006→  return parts.length > 0 ? parts.join(" · ") : "نتیجهٔ تحلیل موجود است";
+  1007→}
+  1008→
+  1009→/** برچسب فارسی نوع تراکنش کیف پول */
+  1010→function txnTypeLabel(type: string): string {
+  1011→  switch (type) {
+  1012→    case "deposit":
+  1013→      return "شارژ کیف پول";
+  1014→    case "purchase":
+  1015→      return "خرید";
+  1016→    case "refund":
+  1017→      return "بازگشت وجه";
+  1018→    case "bonus":
+  1019→      return "پاداش";
+  1020→    default:
+  1021→      return "تراکنش";
+  1022→  }
+  1023→}
+  1024→
+  1025→/** تبدیل ارقام فارسی/عربی به لاتین (ورودی مبلغ شارژ) */
+  1026→const FA_DIGITS = "۰۱۲۳۴۵۶۷۸۹";
+  1027→const AR_DIGITS = "٠١٢٣٤٥٦٧٨٩";
+  1028→function toEnDigits(s: string): string {
+  1029→  return s
+  1030→    .replace(/[۰-۹]/g, (d) => String(FA_DIGITS.indexOf(d)))
+  1031→    .replace(/[٠-٩]/g, (d) => String(AR_DIGITS.indexOf(d)));
+  1032→}
+  1033→
+  1034→/**
+  1035→ * ورودی مبلغ شارژ را به «فقط ارقام لاتین بدون جداکننده» پاک می‌کند.
+  1036→ * (state همیشه digits-only است؛ کاما فقط در نمایش است)
+  1037→ */
+  1038→function sanitizeChargeInput(raw: string): string {
+  1039→  return toEnDigits(raw).replace(/\D/g, "").replace(/^0+(?=\d)/, "");
+  1040→}
+  1041→
+  1042→/**
+  1043→ * نمایش مبلغ داخل ورودی شارژ: کاما بعد از هر ۳ رقم + ارقام فارسی.
+  1044→ * مثال: 1500000 → «۱,۵۰۰,۰۰۰»
+  1045→ */
+  1046→function formatChargeInput(digits: string): string {
+  1047→  const clean = digits.replace(/\D/g, "");
+  1048→  if (!clean) return "";
+  1049→  return toPersianDigits(Number(clean).toLocaleString("en-US"));
+  1050→}
+  1051→
+  1052→/** فرمت تاریخ شمسی + ساعت — برای نمایش در لیست تراکنش‌ها */
+  1053→function formatJalaliDateTime(iso: string): string {
+  1054→  try {
+  1055→    const d = new Date(iso);
+  1056→    const date = new Intl.DateTimeFormat("fa-IR-u-ca-persian", {
+  1057→      day: "numeric",
+  1058→      month: "long",
+  1059→    }).format(d);
+  1060→    const time = new Intl.DateTimeFormat("fa-IR", {
+  1061→      hour: "2-digit",
+  1062→      minute: "2-digit",
+  1063→    }).format(d);
+  1064→    return `${date} · ${time}`;
+  1065→  } catch {
+  1066→    return "";
+  1067→  }
+  1068→}
+  1069→
+  1070→function InfoRow({ label, value }: { label: string; value: string }) {
+  1071→  return (
+  1072→    <div className="flex items-center justify-between p-2.5 rounded-xl bg-muted/40 gap-2">
+  1073→      <span className="text-xs text-muted-foreground shrink-0">{label}</span>
+  1074→      <span className="text-sm font-medium text-left" dir="auto">{value}</span>
+  1075→    </div>
+  1076→  );
+  1077→}
+  1078→
+  1079→function SettingsRow({
+  1080→  icon: Icon,
+  1081→  label,
+  1082→  action,
+  1083→  onClick,
+  1084→  chevron,
+  1085→  highlight,
+  1086→}: {
+  1087→  icon: any;
+  1088→  label: string;
+  1089→  action?: React.ReactNode;
+  1090→  onClick?: () => void;
+  1091→  chevron?: boolean;
+  1092→  highlight?: boolean;
+  1093→}) {
+  1094→  return (
+  1095→    <button
+  1096→      onClick={onClick}
+  1097→      className={`w-full flex items-center gap-3 p-3.5 rounded-2xl transition text-right ${
+  1098→        highlight ? "bg-primary/5 hover:bg-primary/10" : "hover:bg-muted"
+  1099→      }`}
+  1100→    >
+  1101→      <Icon className={`w-5 h-5 ${highlight ? "text-primary" : "text-muted-foreground"}`} />
+  1102→      <span className="flex-1 text-sm font-medium">{label}</span>
+  1103→      {action}
+  1104→      {chevron && <ChevronLeft className="w-4 h-4 text-muted-foreground" />}
+  1105→    </button>
+  1106→  );
+  1107→}
+  1108→
+  1109→

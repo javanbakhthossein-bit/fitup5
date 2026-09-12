@@ -1,0 +1,1222 @@
+     1→     1→package ir.fittup.app
+     2→     2→
+     3→     3→import android.annotation.SuppressLint
+     4→     4→import android.app.Dialog
+     5→     5→import android.content.ActivityNotFoundException
+     6→     6→import android.app.NotificationChannel
+     7→     7→import android.app.NotificationManager
+     8→     8→import android.content.BroadcastReceiver
+     9→     9→import android.content.ContentValues
+    10→    10→import android.content.Context
+    11→    11→import android.content.Intent
+    12→    12→import android.content.IntentFilter
+    13→    13→import android.content.pm.PackageManager
+    14→    14→import android.graphics.Color
+    15→    15→import android.net.Uri
+    16→    16→import android.os.Build
+    17→    17→import android.os.Bundle
+    18→    18→import android.os.Environment
+    19→    19→import android.print.PrintManager
+    20→    20→import android.provider.MediaStore
+    21→    21→import android.provider.Settings
+    22→    22→import android.util.Base64
+    23→    23→import android.util.Log
+    24→    24→import android.view.View
+    25→    25→import android.view.ViewGroup
+    26→    26→import android.webkit.CookieManager
+    27→    27→import android.webkit.JavascriptInterface
+    28→    28→import android.webkit.PermissionRequest
+    29→    29→import android.webkit.ValueCallback
+    30→    30→import android.webkit.WebChromeClient
+    31→    31→import android.webkit.WebResourceError
+    32→    32→import android.webkit.WebResourceRequest
+    33→    33→import android.webkit.WebResourceResponse
+    34→    34→import android.webkit.WebSettings
+    35→    35→import android.webkit.WebView
+    36→    36→import android.webkit.WebViewClient
+    37→    37→import android.widget.Button
+    38→    38→import android.widget.LinearLayout
+    39→    39→import android.widget.TextView
+    40→    40→import android.widget.Toast
+    41→    41→import androidx.activity.result.ActivityResultLauncher
+    42→    42→import androidx.activity.result.contract.ActivityResultContracts
+    43→    43→import androidx.appcompat.app.AlertDialog
+    44→    44→import androidx.appcompat.app.AppCompatActivity
+    45→    45→import androidx.core.app.NotificationCompat
+    46→    46→import androidx.core.content.ContextCompat
+    47→    47→import com.google.android.gms.auth.api.phone.SmsRetriever
+    48→    48→import ir.cafebazaar.poolakey.Connection
+    49→    49→import ir.cafebazaar.poolakey.Payment
+    50→    50→import ir.cafebazaar.poolakey.config.PaymentConfiguration
+    51→    51→import ir.cafebazaar.poolakey.config.SecurityCheck
+    52→    52→import ir.cafebazaar.poolakey.request.PurchaseRequest
+    53→    53→import org.json.JSONArray
+    54→    54→import org.json.JSONObject
+    55→    55→import java.io.File
+    56→    56→import java.io.FileOutputStream
+    57→    57→import java.net.URI
+    58→    58→
+    59→    59→/**
+    60→    60→ * FitUp — اپ کافه‌بازار (v1.5.3)
+    61→    61→ *
+    62→    62→ * پوسته اندرویدی (WebView) پنل کاربری فیتاپ + پرداخت درون‌برنامه‌ای بازار (پولکی).
+    63→    63→ *
+    64→    64→ * ⛔ قانون مهم (فیکس ریجکشن بازار v1.5.3): این اپ هیچ UI به‌روزرسانی ندارد —
+    65→    65→ * نه چک نسخه، نه دیالوگ/توست/پیام آپدیت. به‌روزرسانی فقط از طریق خود بازار انجام می‌شود.
+    66→    66→ *
+    67→    67→ * ⚠️ طبق قوانین انتشار بازار: فقط پنل کاربری (بدون پنل مدیریت) و پرداخت اشتراک
+    68→    68→ * دیجیتال فقط از IAB بازار.
+    69→    69→ *
+    70→    70→ * پل JS (window.FitUpNative) — متدهای سایت:
+    71→    71→ *  - isBazaarApp(): Boolean                    → تشخیص محیط بازار
+    72→    72→ *  - appVersion(): String                      → نسخه اپ
+    73→    73→ *  - purchaseSubscription(sku, payload, cbId, dynamicPriceToken) → خرید محصول/اشتراک بازار
+    74→    74→ *  - consumePurchase(purchaseToken)            → مصرف خرید (برای خرید مجدد/تمدید)
+    75→    75→ *  - isPaymentAvailable(): Boolean             → اتصال پرداخت برقرار است؟
+    76→    76→ *  - downloadFile(filename, dataUrl)           → ذخیره خروجی PNG/PDF در Downloads
+    77→    77→ *  - printPage()                               → چاپ صفحه (PrintManager)
+    78→    78→ *  - showNotification(title, body)             → نوتیف سیستم اندروید
+    79→    79→ *  - requestNotificationPermission()           → مجوز POST_NOTIFICATIONS
+    80→    80→ *
+    81→    81→ * سایت (page-client) هم window.__fitupBazaarRestore(purchases) را فراهم می‌کند که
+    82→    82→ * خریدهای consume-نشده بعد از اتصال پولکی به آن فرستاده می‌شوند (بازیابی خرید).
+    83→    83→ */
+    84→    84→class MainActivity : AppCompatActivity() {
+    85→    85→
+    86→    86→    private lateinit var binding: ir.fittup.app.databinding.ActivityMainBinding
+    87→    87→    private lateinit var webView: WebView
+    88→    88→    private lateinit var swipeRefresh: androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+    89→    89→    private lateinit var splash: LinearLayout
+    90→    90→    private lateinit var errorView: LinearLayout
+    91→    91→    private lateinit var errorRetry: Button
+    92→    92→
+    93→    93→    private var payment: Payment? = null
+    94→    94→    private var connection: Connection? = null
+    95→    95→    @Volatile private var paymentReady = false
+    96→    96→    /** کلید RSA معتبر است؟ اگر نه، خریدها fail-closed خطا می‌دهند (امنیت) */
+    97→    97→    private var rsaKeyValid = false
+    98→    98→
+    99→    99→    // آپلود فایل (عکس/ویدیو در چت و آنالیزها) — بدون این، input file در WebView کار نمی‌کند
+   100→   100→    private var filePathCallback: ValueCallback<Array<Uri>>? = null
+   101→   101→    private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
+   102→   102→
+   103→   103→    /** callback فعال پرداخت — پرداخت‌ها یکی‌یکی (single flight) */
+   104→   104→    private var activePaymentCallbackId: String? = null
+   105→   105→
+   106→   106→    /** URL اصلی (فریم اصلی) — برای چک origin پل JS */
+   107→   107→    @Volatile private var lastMainUrl: String? = null
+   108→   108→
+   109→   109→    private lateinit var notifPermissionLauncher: ActivityResultLauncher<String>
+   110→   110→
+   111→   111→    // ─── دوربین/میکروفون وب (getUserMedia): مجوز دقیقاً در زمان استفاده ───
+   112→   112→    /** درخواست معلقِ WebChromeClient.onPermissionRequest — با نتیجه دیالوگ/مجوز resolve می‌شود */
+   113→   113→    private var pendingWebPermissionRequest: PermissionRequest? = null
+   114→   114→    private val mediaPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+   115→   115→        pendingWebPermissionRequest?.let { req ->
+   116→   116→            pendingWebPermissionRequest = null
+   117→   117→            val ok = grants.values.all { it }
+   118→   118→            runOnUiThread { if (ok) req.grant(req.resources) else req.deny() }
+   119→   119→        }
+   120→   120→    }
+   121→   121→
+   122→   122→    // ─── OTP خودکار (بدون هیچ پرمیشن پیامک) ───
+   123→   123→    // ۱) کیبورد/سیستم: ورودی کد در سایت autocomplete="one-time-code" دارد →
+   124→   124→    //    اندروید کد پیامک را بدون هیچ مجوزی پیشنهاد می‌دهد (اندروید ۹+)
+   125→   125→    // ۲) کلیپ‌بورد: اگر کاربر کد را کپی کند، در onResume اتو-درج می‌شود
+   126→   126→    // ⛔ خواندن مستقیم پیامک (RECEIVE_SMS) عمداً حذف شد — از اندروید ۱۳+ پرمیشن
+   127→   127→    //    SMS برای اپ‌های خارج از گوگل‌پلی (از جمله بازار) «محدود» است؛
+   128→   128→    //    دیالوگ ترسناک «App was denied access» می‌آمد و اجازه هم هیچ‌وقت داده
+   129→   129→    //    نمی‌شد. قانون حریم خصوصی بازار هم با حذفش راضی‌تر است.
+   130→   130→    /** آخرین متن کلیپ‌بورد dispatch شده — جلوگیری از dispatch تکراری */
+   131→   131→    private var lastClipboardDispatched: String? = null
+   132→   132→
+   133→   133→    @SuppressLint("SetJavaScriptEnabled")
+   134→   134→    override fun onCreate(savedInstanceState: Bundle?) {
+   135→   135→        super.onCreate(savedInstanceState)
+   136→   136→        binding = ir.fittup.app.databinding.ActivityMainBinding.inflate(layoutInflater)
+   137→   137→        setContentView(binding.root)
+   138→   138→
+   139→   139→        webView = binding.webView
+   140→   140→        swipeRefresh = binding.swipeRefresh
+   141→   141→        splash = binding.splash
+   142→   142→        errorView = binding.errorView
+   143→   143→        errorRetry = binding.errorRetry
+   144→   144→
+   145→   145→        // 🩹 v1.5.5 (باگ بحرانی «دکمهٔ تلاش مجدد کار نمی‌کند»): دکمهٔ تلاش مجدد
+   146→   146→        // صفحهٔ خطا bind شده بود ولی هیچ listener نداشت! کاربری که زرین‌پال برایش
+   147→   147→        // باز نشده (VPN/قطعی شبکه) در صفحهٔ خطا گیر می‌کرد. حالا: reload WebView —
+   148→   148→        // onPageStarted خودش hideError را صدا می‌زند.
+   149→   149→        errorRetry.setOnClickListener {
+   150→   150→            errorView.visibility = View.GONE
+   151→   151→            swipeRefresh.isRefreshing = true
+   152→   152→            webView.reload()
+   153→   153→        }
+   154→   154→
+   155→   155→        setupFileChooser()
+   156→   156→        setupWebView()
+   157→   157→        setupPayment()
+   158→   158→        setupNotifications()
+   159→   159→        setupOtpRetrieverReceiver()
+   160→   160→
+   161→   161→        // v31 — «اعلان‌ها حتی وقتی برنامه بسته است» (کم‌مصرف — WorkManager):
+   162→   162→        // زمان‌بندی دوره‌ای ۶ ساعته + همگام‌سازی فوری در باز شدن اپ
+   163→   163→        NotificationSync.schedulePeriodic(this)
+   164→   164→        NotificationSync.syncNow(this)
+   165→   165→        OtpRetriever.dispatcher = { code -> dispatchOtpCode(code) }
+   166→   166→
+   167→   167→        if (savedInstanceState != null) {
+   168→   168→            webView.restoreState(savedInstanceState)
+   169→   169→        } else {
+   170→   170→            // v1.5.4 — شروع با لینک عمیق (App Link / fitup_link اعلان) اگر هست؛
+   171→   171→            // وگرنه شروع مستقیم با OTP/پنل — ?screen=auth: اگر سشن هست → پنل، وگرنه صفحه ورود
+   172→   172→            webView.loadUrl(deepLinkUrl(intent) ?: startUrl())
+   173→   173→        }
+   174→   174→
+   175→   175→        // ⛔ چک نسخه حذف شد (ریجکشن بازار): اپ بازار هرگز هیچ پیام به‌روزرسانی
+   176→   176→        // نشان نمی‌دهد — به‌روزرسانی فقط از طریق خود کافه‌بازار انجام می‌شود.
+   177→   177→    }
+   178→   178→
+   179→   179→    /** شروع با ?screen=auth — کاربر لاگین‌شده مستقیم پنل را می‌بیند (نیاز کلیک «ورود» نیست) */
+   180→   180→    private fun startUrl(): String {
+   181→   181→        val base = BuildConfig.SITE_URL.trimEnd('/')
+   182→   182→        return if (base.contains("?")) "$base&screen=auth" else "$base?screen=auth"
+   183→   183→    }
+   184→   184→
+   185→   185→    /**
+   186→   186→     * v1.5.5 — لینک عمیق ورودی (App Link یا اسکیم fitup:// یا اعلان) یا null:
+   187→   187→     *  ۱) extra «fitup_link» از NotificationSync — مسیر/کوئری نسبی مثل
+   188→   188→     *     "?tab=progress&section=checkup" یا "/panel" → SITE_URL + آن
+   189→   189→     *  ۲) dataِ https روی دامنهٔ خودمان (fittup.ir) → همان URL — پارامترهای
+   190→   190→     *     ?tab= ?ref= ?renewal= ?screen= ?article= دست‌نخورده می‌مانند
+   191→   191→     *  ۳) v1.5.5 — اسکیم اختصاصی fitup://open?url=<encoded> از صفحهٔ /go سایت
+   192→   192→     *     (لینک‌های هوشمند پیامک — فقط URL دامنهٔ خودمان پذیرفته می‌شود)
+   193→   193→     * (null-امن — هرگز به‌خاطر لینک خراب کرش نمی‌کند)
+   194→   194→     */
+   195→   195→    private fun deepLinkUrl(from: Intent?): String? {
+   196→   196→        if (from == null) return null
+   197→   197→        try {
+   198→   198→            val extra = from.getStringExtra("fitup_link")
+   199→   199→            if (!extra.isNullOrBlank() && (extra.startsWith("/") || extra.startsWith("?"))) {
+   200→   200→                return BuildConfig.SITE_URL.trimEnd('/') + extra
+   201→   201→            }
+   202→   202→            val data = from.data ?: return null
+   203→   203→            val scheme = data.scheme?.lowercase()
+   204→   204→            // ─── v1.5.5: fitup://open?url=<encoded> — از لینک هوشمند /go سایت ───
+   205→   205→            if (scheme == "fitup") {
+   206→   206→                val target = data.getQueryParameter("url") ?: return null
+   207→   207→                if (target.startsWith("/")) {
+   208→   208→                    // مسیر نسبی روی دامنهٔ خودمان
+   209→   209→                    return BuildConfig.SITE_URL.trimEnd('/') + target
+   210→   210→                }
+   211→   211→                val t = android.net.Uri.parse(target)
+   212→   212→                val tScheme = t.scheme?.lowercase()
+   213→   213→                val tHost = t.host?.lowercase() ?: return null
+   214→   214→                if (isAllowedHost(tHost) && tScheme == "https") return target
+   215→   215→                return null
+   216→   216→            }
+   217→   217→            if (scheme != "https") return null
+   218→   218→            val host = data.host?.lowercase() ?: return null
+   219→   219→            // فقط دامنه‌های مجاز — همان منطق isAllowedHost (فیتاپ و زیردامنه‌ها)
+   220→   220→            if (isAllowedHost(host)) return data.toString()
+   221→   221→        } catch (_: Exception) {
+   222→   222→        }
+   223→   223→        return null
+   224→   224→    }
+   225→   225→
+   226→   226→    /** v1.5.4 — لینک عمیق وقتی اپ باز است (launchMode=singleTask → onNewIntent) */
+   227→   227→    override fun onNewIntent(intent: Intent) {
+   228→   228→        super.onNewIntent(intent)
+   229→   229→        setIntent(intent)
+   230→   230→        // WebView ممکن است هنوز آماده نباشد — هرگز کرش نکن
+   231→   231→        if (!::webView.isInitialized) return
+   232→   232→        val url = deepLinkUrl(intent) ?: return
+   233→   233→        runOnUiThread {
+   234→   234→            try {
+   235→   235→                webView.loadUrl(url)
+   236→   236→            } catch (_: Exception) {
+   237→   237→            }
+   238→   238→        }
+   239→   239→    }
+   240→   240→
+   241→   241→    /* ───────────── WebView ───────────── */
+   242→   242→
+   243→   243→    @SuppressLint("SetJavaScriptEnabled")
+   244→   244→    private fun setupWebView() {
+   245→   245→        val s: WebSettings = webView.settings
+   246→   246→        s.javaScriptEnabled = true
+   247→   247→        s.domStorageEnabled = true          // برای سشن لاگین OTP
+   248→   248→        s.databaseEnabled = true
+   249→   249→        s.loadWithOverviewMode = true
+   250→   250→        s.useWideViewPort = true
+   251→   251→        s.mediaPlaybackRequiresUserGesture = false   // ویدیوهای تمرین
+   252→   252→        s.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+   253→   253→        s.allowFileAccess = false
+   254→   254→        s.allowContentAccess = true          // برای انتخاب فایل (دوربین/گالری)
+   255→   255→        s.userAgentString = (s.userAgentString ?: "") + " FitUpBazaar/" + BuildConfig.VERSION_NAME
+   256→   256→        s.cacheMode = WebSettings.LOAD_DEFAULT
+   257→   257→        // مقیاس متن ثابت — «تجربه اپ واقعی»: فونت سیستم اندروید نباید layout سایت را
+   258→   258→        // بشکند یا متن‌ها ناهماهنگ بزرگ/کوچک شود (WebView پیش‌فرض textZoom را با
+   259→   259→        // fontScale سیستم تغییر می‌دهد)
+   260→   260→        s.textZoom = 100
+   261→   261→
+   262→   262→        // کوکی‌ها را از قبل به WebView وصل کن (سشن OTP بین restartها زنده می‌ماند)
+   263→   263→        try {
+   264→   264→            CookieManager.getInstance().setAcceptCookie(true)
+   265→   265→        } catch (_: Exception) {}
+   266→   266→
+   267→   267→        // پس‌زمینه سفید — بدون فلش تیره هنگام بارگذاری
+   268→   268→        webView.setBackgroundColor(Color.WHITE)
+   269→   269→
+   270→   270→        webView.addJavascriptInterface(NativeBridge(), "FitUpNative")
+   271→   271→
+   272→   272→        // v1.5.6 — دانلود فایل‌های data: (PNG/PDF برنامه‌های تمرینی/تغذیه/مکمل)
+   273→   273→        // از پل MediaStore. مسیر اصلی از FitUpNative.downloadFile می‌گذرد؛ این
+   274→   274→        // لیسنر برای هر مسیر جانبی است.
+   275→   275→        // ⚠️ سیاست کافه‌بازار: آپدیت اپ فقط از طریق خود بازار — عمداً لینک‌های
+   276→   276→        // http/https/APK را نمی‌گیریم تا دانلود مستقیم APK داخل اپ ممکن نشود.
+   277→   277→        webView.setDownloadListener { url, _, _, mimetype, _ ->
+   278→   278→            try {
+   279→   279→                if (url.startsWith("data:", ignoreCase = true)) {
+   280→   280→                    val ext = when {
+   281→   281→                        mimetype.contains("pdf", true) -> "pdf"
+   282→   282→                        mimetype.contains("png", true) -> "png"
+   283→   283→                        mimetype.contains("jpeg", true) || mimetype.contains("jpg", true) -> "jpg"
+   284→   284→                        mimetype.contains("webp", true) -> "webp"
+   285→   285→                        else -> "bin"
+   286→   286→                    }
+   287→   287→                    downloadDataUrl("fitup-${System.currentTimeMillis()}.$ext", url)
+   288→   288→                }
+   289→   289→            } catch (_: Exception) {
+   290→   290→                toast("دانلود ممکن نشد")
+   291→   291→            }
+   292→   292→        }
+   293→   293→
+   294→   294→        webView.webViewClient = object : WebViewClient() {
+   295→   295→            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+   296→   296→                super.onPageStarted(view, url, favicon)
+   297→   297→                lastMainUrl = url
+   298→   298→                hideError()
+   299→   299→            }
+   300→   300→
+   301→   301→            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+   302→   302→                val url = request.url
+   303→   303→                val scheme = url.scheme?.lowercase() ?: return false
+   304→   304→
+   305→   305→                // اسکیم‌های غیر http — باید native هندل شوند (tel/mailto/intent…)
+   306→   306→                if (scheme != "http" && scheme != "https") {
+   307→   307→                    return handleExternalScheme(url)
+   308→   308→                }
+   309→   309→
+   310→   310→                // فقط دامنه‌های خودمان + درگاه پرداخت داخل WebView؛ بقیه (لینک بیرونی
+   311→   311→                // مقالات) → مرورگر. 🩹 v1.5.5 (باگ بحرانی «رفتن به درگاه پرداخت هیچ
+   312→   312→                // کاری نمی‌کند»): قبلاً زرین‌پال/شاپرک هم به مرورگر بیرونی
+   313→   313→                // openExternal می‌شد — بدون مرورگر، catch خالی = هیچ اتفاقی نمی‌افتاد
+   314→   314→                // (دکمهٔ بی‌خاصیت)؛ و با مرورگر هم سشن/بازگشت خودکار (payment_verify)
+   315→   315→                // از دست می‌رفت → تراکنش برای همیشه «در انتظار» می‌ماند. حالا درگاه
+   316→   316→                // مثل اپ اختصاصی داخل WebView باز می‌شود و کاربر به سایت برمی‌گردد.
+   317→   317→                val host = url.host ?: return false
+   318→   318→                if (!isAllowedHost(host) && !isPaymentHost(host)) {
+   319→   319→                    openExternal(url)
+   320→   320→                    return true
+   321→   321→                }
+   322→   322→                return false
+   323→   323→            }
+   324→   324→
+   325→   325→            override fun onPageFinished(view: WebView, url: String) {
+   326→   326→                splash.visibility = View.GONE
+   327→   327→                swipeRefresh.isRefreshing = false
+   328→   328→                injectBridgeHelper()
+   329→   329→                // بازیابی خریدهای consume-نشده — بعد از هر بارگذاری کامل صفحه
+   330→   330→                maybeRestorePurchases()
+   331→   331→            }
+   332→   332→
+   333→   333→            /** خطای بارگذاری فریم اصلی → صفحه خطای فارسی با دکمه تلاش مجدد */
+   334→   334→            override fun onReceivedError(
+   335→   335→                view: WebView,
+   336→   336→                request: WebResourceRequest,
+   337→   337→                error: WebResourceError
+   338→   338→            ) {
+   339→   339→                super.onReceivedError(view, request, error)
+   340→   340→                if (request.isForMainFrame) showError()
+   341→   341→            }
+   342→   342→
+   343→   343→            /** کرش رندرر (targetSdk 34) → بازسازی اکتویتی به‌جای صفحه سیاه */
+   344→   344→            override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
+   345→   345→                Log.e("FitUp", "WebView renderer gone — recreating activity")
+   346→   346→                recreate()
+   347→   347→                return true
+   348→   348→            }
+   349→   349→        }
+   350→   350→
+   351→   351→        webView.webChromeClient = object : WebChromeClient() {
+   352→   352→            override fun onShowFileChooser(
+   353→   353→                view: WebView,
+   354→   354→                callback: ValueCallback<Array<Uri>>,
+   355→   355→                params: FileChooserParams
+   356→   356→            ): Boolean {
+   357→   357→                filePathCallback?.onReceiveValue(null)
+   358→   358→                filePathCallback = callback
+   359→   359→                return try {
+   360→   360→                    val intent = params.createIntent()
+   361→   361→                    // انتخاب چندگانه عکس (چت/آنالیز بدن چند زاویه)
+   362→   362→                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+   363→   363→                    fileChooserLauncher.launch(intent)
+   364→   364→                    true
+   365→   365→                } catch (e: ActivityNotFoundException) {
+   366→   366→                    filePathCallback = null
+   367→   367→                    false
+   368→   368→                }
+   369→   369→            }
+   370→   370→
+   371→   371→            /**
+   372→   372→             * ─── مجوز دوربین/میکروفون وب — دقیقاً در زمان استفاده ───
+   373→   373→             * سایت برای ضبط صدا (ویس چت) یا ویدیو (آنالیز ویدیویی تمرین/بدن) از
+   374→   374→             * navigator.mediaDevices.getUserMedia استفاده می‌کند؛ این کال‌بک فقط
+   375→   375→             * در همان لحظه اجرا می‌شود (نه در استارتاپ). الگوی سایت: دیالوگ کوتاه
+   376→   376→             * فارسی اجازه → سپس مجوز runtime اندروید.
+   377→   377→             */
+   378→   378→            override fun onPermissionRequest(request: PermissionRequest) {
+   379→   379→                val resources = request.resources
+   380→   380→                val needsVideo = resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)
+   381→   381→                val needsAudio = resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
+   382→   382→                if (!needsVideo && !needsAudio) {
+   383→   383→                    request.deny()
+   384→   384→                    return
+   385→   385→                }
+   386→   386→                runOnUiThread {
+   387→   387→                    val what = when {
+   388→   388→                        needsVideo && needsAudio -> "ضبط ویدیو (دوربین و میکروفون)"
+   389→   389→                        needsVideo -> "استفاده از دوربین"
+   390→   390→                        else -> "استفاده از میکروفون"
+   391→   391→                    }
+   392→   392→                    // دیالوگ کوتاه، نه متن طولانی رباتی — الگوی دیالوگ پیامک OTP
+   393→   393→                    AlertDialog.Builder(this@MainActivity)
+   394→   394→                        .setTitle("اجازه دسترسی")
+   395→   395→                        .setMessage("برای $what اجازه می‌دهی؟")
+   396→   396→                        .setPositiveButton("اجازه می‌دهم") { _, _ ->
+   397→   397→                            requestMediaRuntimePermissions(request)
+   398→   398→                        }
+   399→   399→                        .setNegativeButton("نه") { _, _ -> request.deny() }
+   400→   400→                        .show()
+   401→   401→                }
+   402→   402→            }
+   403→   403→        }
+   404→   404→
+   405→   405→        swipeRefresh.setOnRefreshListener { webView.reload() }
+   406→   406→        // رنگ برند فیتاپ
+   407→   407→        swipeRefresh.setColorSchemeColors(Color.parseColor("#f97316"))
+   408→   408→
+   409→   409→        // ─── FIX: اسکرول به بالا → رفرش نمی‌شود ───
+   410→   410→        // باگ: SwipeRefreshLayout همیشه فعال بود؛ وقتی صفحه اسکرول‌شده بود و
+   411→   411→        // کاربر انگشت را به پایین می‌کشید (برای برگشتن به بالای صفحه)، به‌جای
+   412→   412→        // اسکرول، pull-to-refresh فعال می‌شد و صفحه رفرش می‌شد. رفع: refresh فقط
+   413→   413→        // وقتی مجاز است که WebView دقیقاً در بالای صفحه است (scrollY == 0).
+   414→   414→        swipeRefresh.isEnabled = true
+   415→   415→        webView.setOnScrollChangeListener { _, _, scrollY, _, _ ->
+   416→   416→            swipeRefresh.isEnabled = scrollY == 0
+   417→   417→        }
+   418→   418→    }
+   419→   419→
+   420→   420→    /** آیا این host دامنه مجاز ماست؟ */
+   421→   421→    private fun isAllowedHost(host: String): Boolean {
+   422→   422→        val siteHost = try { URI(BuildConfig.SITE_URL).host } catch (_: Exception) { null }
+   423→   423→        if (host == "fittup.ir" || host.endsWith(".fittup.ir")) return true
+   424→   424→        if (siteHost != null && (host == siteHost || host.endsWith(".$siteHost"))) return true
+   425→   425→        return false
+   426→   426→    }
+   427→   427→
+   428→   428→    /**
+   429→   429→     * 🩹 v1.5.5 — درگاه پرداخت باید مثل اپ اختصاصی داخل WebView باز شود.
+   430→   430→     * فقط برای مسیریابی ناوبری استفاده می‌شود؛ پل JS (bridgeAllowed) عمداً
+   431→   431→     * فقط دامنهٔ خودمان را قبول می‌کند (امنیت، بدون تغییر).
+   432→   432→     */
+   433→   433→    private fun isPaymentHost(host: String): Boolean {
+   434→   434→        return host == "zarinpal.com" || host.endsWith(".zarinpal.com") ||
+   435→   435→            host == "zarin.link" || host.endsWith(".zarin.link") ||
+   436→   436→            host == "shaparak.ir" || host.endsWith(".shaparak.ir")
+   437→   437→    }
+   438→   438→
+   439→   439→    /** اسکیم‌های غیر وب — tel/mailto/intent و غیره */
+   440→   440→    private fun handleExternalScheme(uri: Uri): Boolean {
+   441→   441→        try {
+   442→   442→            when (uri.scheme?.lowercase()) {
+   443→   443→                "tel" -> startActivity(Intent(Intent.ACTION_DIAL, uri))
+   444→   444→                "mailto" -> startActivity(Intent(Intent.ACTION_SENDTO, uri))
+   445→   445→                "sms" -> startActivity(Intent(Intent.ACTION_SENDTO, uri))
+   446→   446→                "intent" -> {
+   447→   447→                    val intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME)
+   448→   448→                    // v1.5.4 — سخت‌سازی امنیتی (ضد intent-redirection؛ هم‌تراز اپ اختصاصی):
+   449→   449→                    // فقط ACTION_VIEW عمومی — بدون component/package/selector تا
+   450→   450→                    // نتوان به اپ دلخواه (از جمله خود اپ با extraهای دلخواه) هدایت شد
+   451→   451→                    intent.component = null
+   452→   452→                    intent.selector = null
+   453→   453→                    intent.setPackage(null)
+   454→   454→                    startActivity(intent)
+   455→   455→                }
+   456→   456→                else -> startActivity(Intent(Intent.ACTION_VIEW, uri))
+   457→   457→            }
+   458→   458→        } catch (_: Exception) {
+   459→   459→            // اپی برای این لینک نیست — نادیده بگیر (صفحه خطای WebView نشان نده)
+   460→   460→        }
+   461→   461→        return true
+   462→   462→    }
+   463→   463→
+   464→   464→    private fun openExternal(uri: Uri) {
+   465→   465→        try {
+   466→   466→            startActivity(Intent(Intent.ACTION_VIEW, uri))
+   467→   467→        } catch (_: ActivityNotFoundException) {
+   468→   468→            // مرورگری نیست — نادیده بگیر
+   469→   469→        }
+   470→   470→    }
+   471→   471→
+   472→   472→    /* ───────────── صفحه خطا ───────────── */
+   473→   473→
+   474→   474→    private fun showError() {
+   475→   475→        runOnUiThread {
+   476→   476→            splash.visibility = View.GONE
+   477→   477→            errorView.visibility = View.VISIBLE
+   478→   478→            swipeRefresh.isRefreshing = false
+   479→   479→        }
+   480→   480→    }
+   481→   481→
+   482→   482→    private fun hideError() {
+   483→   483→        runOnUiThread { errorView.visibility = View.GONE }
+   484→   484→    }
+   485→   485→
+   486→   486→    /* ───────────── helper سمت سایت ───────────── */
+   487→   487→
+   488→   488→    /** helper سمت سایت — پرامیس تمیز برای خرید بازار + هندلر restore */
+   489→   489→    private fun injectBridgeHelper() {
+   490→   490→        val js = """
+   491→   491→            (function() {
+   492→   492→              if (window.__fitupBazaarInjected) return;
+   493→   493→              window.__fitupBazaarInjected = true;
+   494→   494→              window.__bazaarPending = {};
+   495→   495→              // نتیجه پرداخت از نیتیو — id + آبجکت نتیجه
+   496→   496→              window.__bazaarPaymentResult = function(id, result) {
+   497→   497→                var p = window.__bazaarPending[id];
+   498→   498→                if (p) { delete window.__bazaarPending[id]; p(result); }
+   499→   499→              };
+   500→   500→              // آیا داخل اپ بازار هستیم؟
+   501→   501→              window.isFitUpBazaarApp = function() {
+   502→   502→                try { return !!(window.FitUpNative && window.FitUpNative.isBazaarApp && window.FitUpNative.isBazaarApp()); }
+   503→   503→                catch (e) { return false; }
+   504→   504→              };
+   505→   505→              // خرید از بازار → پرامیس {ok, purchaseToken, orderId, productId, error}
+   506→   506→              // dynamicPriceToken (اختیاری): شناسه قیمت پویا برای پرداخت با مبلغ تخفیف‌دار
+   507→   507→              window.fitupBazaarPurchase = function(sku, payload, dynamicPriceToken) {
+   508→   508→                return new Promise(function(resolve) {
+   509→   509→                  var id = 'cb' + Date.now() + Math.floor(Math.random() * 1000);
+   510→   510→                  window.__bazaarPending[id] = resolve;
+   511→   511→                  try {
+   512→   512→                    var token = (dynamicPriceToken == null) ? '' : String(dynamicPriceToken);
+   513→   513→                    window.FitUpNative.purchaseSubscription(String(sku), JSON.stringify(payload || {}), id, token);
+   514→   514→                  } catch (e) {
+   515→   515→                    delete window.__bazaarPending[id];
+   516→   516→                    resolve({ ok: false, error: String(e) });
+   517→   517→                  }
+   518→   518→                });
+   519→   519→              };
+   520→   520→            })();
+   521→   521→        """.trimIndent()
+   522→   522→        runOnUiThread {
+   523→   523→            webView.evaluateJavascript(js, null)
+   524→   524→        }
+   525→   525→    }
+   526→   526→
+   527→   527→    /* ───────────── آپلود فایل ───────────── */
+   528→   528→
+   529→   529→    private fun setupFileChooser() {
+   530→   530→        fileChooserLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+   531→   531→            val callback = filePathCallback ?: return@registerForActivityResult
+   532→   532→            filePathCallback = null
+   533→   533→            val uris: Array<Uri>? = if (result.resultCode == RESULT_OK) {
+   534→   534→                val data = result.data
+   535→   535→                // انتخاب چندگانه (عکس چت)
+   536→   536→                val clip = data?.clipData
+   537→   537→                if (clip != null) {
+   538→   538→                    Array(clip.itemCount) { i -> clip.getItemAt(i).uri }
+   539→   539→                } else {
+   540→   540→                    data?.data?.let { arrayOf(it) }
+   541→   541→                }
+   542→   542→            } else null
+   543→   543→            callback.onReceiveValue(uris ?: arrayOf())
+   544→   544→        }
+   545→   545→    }
+   546→   546→
+   547→   547→    /* ───────────── پرداخت درون‌برنامه‌ای بازار (پولکی) ───────────── */
+   548→   548→
+   549→   549→    private fun setupPayment() {
+   550→   550→        // کلید RSA از پیشخان توسعه‌دهندگان بازار (تب «پرداخت درون‌برنامه‌ای» برنامه)
+   551→   551→        val configuredKey = BuildConfig.BAZAAR_RSA_PUBLIC_KEY.trim()
+   552→   552→        rsaKeyValid = configuredKey.isNotEmpty() && configuredKey != "PASTE_YOUR_RSA_KEY_HERE"
+   553→   553→        if (!rsaKeyValid) {
+   554→   554→            Log.w("FitUp", "⚠️ BAZAAR_RSA_PUBLIC_KEY تنظیم نشده — خرید fail-closed می‌شود (امنیت). کلید را از پیشخان بازار بگیرید و در app/build.gradle.kts قرار دهید.")
+   555→   555→        }
+   556→   556→        val securityCheck = if (rsaKeyValid) {
+   557→   557→            SecurityCheck.Enable(rsaPublicKey = configuredKey)
+   558→   558→        } else {
+   559→   559→            // اتصال برای query/restore باز می‌ماند؛ خود خرید fail-closed است (startBazaarPurchase)
+   560→   560→            SecurityCheck.Disable
+   561→   561→        }
+   562→   562→
+   563→   563→        val config = PaymentConfiguration(localSecurityCheck = securityCheck)
+   564→   564→        payment = Payment(context = this, config = config)
+   565→   565→
+   566→   566→        // اتصال به سرویس پرداخت بازار — DSL با receiver
+   567→   567→        connection = payment?.connect {
+   568→   568→            connectionSucceed {
+   569→   569→                paymentReady = true
+   570→   570→                // بازیابی خریدهای consume-نشده (کرش بین پرداخت و فعال‌سازی سرور)
+   571→   571→                queryUnconsumedPurchases()
+   572→   572→            }
+   573→   573→            connectionFailed { _ ->
+   574→   574→                paymentReady = false
+   575→   575→            }
+   576→   576→            disconnected {
+   577→   577→                paymentReady = false
+   578→   578→            }
+   579→   579→        }
+   580→   580→    }
+   581→   581→
+   582→   582→    /** بازیابی خریدها — فقط وقتی صفحه JS آماده است (پس از onPageFinished صدا زده می‌شود) */
+   583→   583→    private var jsReadyForRestore = false
+   584→   584→    private fun maybeRestorePurchases() {
+   585→   585→        jsReadyForRestore = true
+   586→   586→        if (paymentReady) queryUnconsumedPurchases()
+   587→   587→    }
+   588→   588→
+   589→   589→    /** خریدهای consume-نشده → به سایت (idempotent) → سایت بعد از فعال‌سازی consume می‌کند */
+   590→   590→    private fun queryUnconsumedPurchases() {
+   591→   591→        if (!jsReadyForRestore) return
+   592→   592→        try {
+   593→   593→            payment?.getPurchasedProducts {
+   594→   594→                querySucceed { purchaseList ->
+   595→   595→                    val items = purchaseList.filter { !it.purchaseToken.isNullOrBlank() }
+   596→   596→                    if (items.isEmpty()) return@querySucceed
+   597→   597→                    val arr = JSONArray()
+   598→   598→                    for (p in items) {
+   599→   599→                        arr.put(
+   600→   600→                            JSONObject()
+   601→   601→                                .put("productId", p.productId ?: "")
+   602→   602→                                .put("purchaseToken", p.purchaseToken ?: "")
+   603→   603→                                .put("orderId", p.orderId ?: "")
+   604→   604→                                // v1.5.7 — امضای خرید برای مسیر پشتیبان RSA سرور
+   605→   605→                                .put("dataJson", p.originalJson ?: "")
+   606→   606→                                .put("signature", p.dataSignature ?: "")
+   607→   607→                        )
+   608→   608→                    }
+   609→   609→                    runOnUiThread {
+   610→   610→                        webView.evaluateJavascript(
+   611→   611→                            "window.__fitupBazaarRestore && window.__fitupBazaarRestore($arr);",
+   612→   612→                            null
+   613→   613→                        )
+   614→   614→                    }
+   615→   615→                }
+   616→   616→                queryFailed { _ ->
+   617→   617→                    // بازار قدیمی/نصب‌نشده — نادیده بگیر
+   618→   618→                }
+   619→   619→            }
+   620→   620→        } catch (e: Exception) {
+   621→   621→            Log.w("FitUp", "queryPurchases failed: ${e.message}")
+   622→   622→        }
+   623→   623→    }
+   624→   624→
+   625→   625→    /** شروع خرید از بازار — نتیجه به وب برمی‌گردد. fail-closed بدون کلید RSA.
+   626→   626→     *  dynamicPriceToken: شناسه قیمت پویا (تخفیف/اعتبار ارتقا) — خالی = قیمت پایه SKU */
+   627→   627→    private fun startBazaarPurchase(sku: String, payloadJson: String, callbackId: String, dynamicPriceToken: String) {
+   628→   628→        // پاسخ به وب: window.__bazaarPaymentResult(id, resultObject)
+   629→   629→        fun respond(json: JSONObject) {
+   630→   630→            runOnUiThread {
+   631→   631→                webView.evaluateJavascript(
+   632→   632→                    "window.__bazaarPaymentResult && window.__bazaarPaymentResult('$callbackId', $json);",
+   633→   633→                    null
+   634→   634→                )
+   635→   635→            }
+   636→   636→        }
+   637→   637→
+   638→   638→        if (!rsaKeyValid) {
+   639→   639→            // fail-closed (ممیزی 2-d باگ #1): بدون کلید RSA، خرید هرگز انجام نمی‌شود —
+   640→   640→            // نه SecurityCheck.Disable با «خرید بدون وریفای محلی».
+   641→   641→            respond(
+   642→   642→                JSONObject()
+   643→   643→                    .put("ok", false)
+   644→   644→                    .put("error", "پرداخت درون‌برنامه‌ای پیکربندی نشده است (کلید RSA). لطفاً از نسخه وب سایت خرید کنید یا اپ را به‌روزرسانی کنید.")
+   645→   645→            )
+   646→   646→            return
+   647→   647→        }
+   648→   648→        if (!paymentReady) {
+   649→   649→            respond(
+   650→   650→                JSONObject()
+   651→   651→                    .put("ok", false)
+   652→   652→                    .put("error", "اتصال به پرداخت بازار برقرار نیست. برنامه بازار را باز کنید، وارد حساب شوید و دوباره تلاش کنید.")
+   653→   653→            )
+   654→   654→            return
+   655→   655→        }
+   656→   656→        if (activePaymentCallbackId != null) {
+   657→   657→            respond(JSONObject().put("ok", false).put("error", "یک پرداخت دیگر در حال انجام است."))
+   658→   658→            return
+   659→   659→        }
+   660→   660→        activePaymentCallbackId = callbackId
+   661→   661→
+   662→   662→        val finish: (JSONObject) -> Unit = { json ->
+   663→   663→            activePaymentCallbackId = null
+   664→   664→            respond(json)
+   665→   665→        }
+   666→   666→
+   667→   667→        val request = PurchaseRequest(
+   668→   668→            productId = sku,
+   669→   669→            payload = payloadJson,
+   670→   670→            dynamicPriceToken = dynamicPriceToken.ifBlank { null } // قیمت پویا (تخفیف) اگر سایت ثبت کرده باشد
+   671→   671→        )
+   672→   672→        payment?.purchaseProduct(
+   673→   673→            registry = activityResultRegistry,
+   674→   674→            request = request,
+   675→   675→        ) {
+   676→   676→            purchaseSucceed { purchaseInfo ->
+   677→   677→                val json = JSONObject()
+   678→   678→                    .put("ok", true)
+   679→   679→                    .put("purchaseToken", purchaseInfo.purchaseToken ?: "")
+   680→   680→                    .put("orderId", purchaseInfo.orderId ?: "")
+   681→   681→                    .put("productId", purchaseInfo.productId ?: sku)
+   682→   682→                    .put("payload", purchaseInfo.payload ?: payloadJson)
+   683→   683→                    .put("purchaseTime", purchaseInfo.purchaseTime ?: 0L)
+   684→   684→                    // v1.5.7 — امضای خرید (originalJson + signature) به سایت می‌رود تا
+   685→   685→                    // سرور بتواند در نبود API بازار، امضا را با کلید RSA پنل
+   686→   686→                    // راستی‌آزمایی کند (رفع ایراد بازرسی بازار درباره پیغام
+   687→   687→                    // «اعتبارنامه‌های API بازار تنظیم نیست» بعد از خرید موفق)
+   688→   688→                    .put("dataJson", purchaseInfo.originalJson ?: "")
+   689→   689→                    .put("signature", purchaseInfo.dataSignature ?: "")
+   690→   690→                // سایت خودش purchaseToken را برای فعال‌سازی به /api/payment/bazaar/purchase
+   691→   691→                // می‌فرستد و بعد از موفقیت consumePurchase را صدا می‌زند (تمدید ممکن می‌شود)
+   692→   692→                finish(json)
+   693→   693→            }
+   694→   694→            purchaseFailed { throwable ->
+   695→   695→                finish(
+   696→   696→                    JSONObject()
+   697→   697→                        .put("ok", false)
+   698→   698→                        .put("error", "پرداخت ناموفق: ${throwable?.message ?: "خطای نامشخص"}")
+   699→   699→                )
+   700→   700→            }
+   701→   701→            purchaseCanceled {
+   702→   702→                finish(
+   703→   703→                    JSONObject()
+   704→   704→                        .put("ok", false)
+   705→   705→                        .put("canceled", true)
+   706→   706→                        .put("error", "پرداخت توسط شما لغو شد.")
+   707→   707→                )
+   708→   708→            }
+   709→   709→            purchaseFlowBegan {
+   710→   710→                // جریان خرید شروع شد — نیازی به عمل نیست
+   711→   711→            }
+   712→   712→            failedToBeginFlow { throwable ->
+   713→   713→                // شروع جریان شکست خورد (بازار قدیمی/نصب‌نشده) — گارد single-flight آزاد می‌شود
+   714→   714→                finish(
+   715→   715→                    JSONObject()
+   716→   716→                        .put("ok", false)
+   717→   717→                        .put("error", "امکان شروع پرداخت نبود: ${throwable?.message ?: "برنامه بازار به‌روز نیست یا نصب نیست"}")
+   718→   718→                )
+   719→   719→            }
+   720→   720→        }
+   721→   721→    }
+   722→   722→
+   723→   723→    /** consume خرید — بعد از فعال‌سازی موفق روی سرور از سمت سایت صدا زده می‌شود */
+   724→   724→    private fun consumePurchaseToken(purchaseToken: String) {
+   725→   725→        try {
+   726→   726→            payment?.consumeProduct(purchaseToken) {
+   727→   727→                consumeSucceed {
+   728→   728→                    Log.d("FitUp", "purchase consumed: ${purchaseToken.take(24)}…")
+   729→   729→                }
+   730→   730→                consumeFailed { throwable ->
+   731→   731→                    Log.w("FitUp", "consume failed: ${throwable?.message}")
+   732→   732→                }
+   733→   733→            }
+   734→   734→        } catch (e: Exception) {
+   735→   735→            Log.w("FitUp", "consume exception: ${e.message}")
+   736→   736→        }
+   737→   737→    }
+   738→   738→
+   739→   739→    /* ───────────── دانلود / چاپ ───────────── */
+   740→   740→
+   741→   741→    /** ذخیره data URL (PNG/PDF) در Downloads اندروید */
+   742→   742→    @SuppressLint("InlinedApi")
+   743→   743→    private fun downloadDataUrl(filename: String, dataUrl: String) {
+   744→   744→        try {
+   745→   745→            val safeName = filename.ifBlank { "fitup-${System.currentTimeMillis()}" }
+   746→   746→                .replace(Regex("[^A-Za-z0-9._-\\u0600-\\u06FF ]"), "_")
+   747→   747→            val comma = dataUrl.indexOf(',')
+   748→   748→            if (comma < 0 || !dataUrl.startsWith("data:", ignoreCase = true)) {
+   749→   749→                runOnUiThread { toast("فایل قابل ذخیره نیست") }
+   750→   750→                return
+   751→   751→            }
+   752→   752→            val meta = dataUrl.substring(5, comma)
+   753→   753→            val mime = meta.substringBefore(";").ifBlank { "application/octet-stream" }
+   754→   754→            val isBase64 = meta.contains("base64", ignoreCase = true)
+   755→   755→            val bytes = if (isBase64) {
+   756→   756→                Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT)
+   757→   757→            } else {
+   758→   758→                dataUrl.substring(comma + 1).toByteArray(Charsets.UTF_8)
+   759→   759→            }
+   760→   760→
+   761→   761→            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+   762→   762→                // اندروید ۱۰+ — MediaStore (بدون نیاز به مجوز)
+   763→   763→                val values = ContentValues().apply {
+   764→   764→                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
+   765→   765→                    put(MediaStore.Downloads.MIME_TYPE, mime)
+   766→   766→                    put(MediaStore.Downloads.IS_PENDING, 1)
+   767→   767→                }
+   768→   768→                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+   769→   769→                if (uri == null) {
+   770→   770→                    runOnUiThread { toast("خطا در ذخیره فایل") }
+   771→   771→                    return
+   772→   772→                }
+   773→   773→                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+   774→   774→                values.clear()
+   775→   775→                values.put(MediaStore.Downloads.IS_PENDING, 0)
+   776→   776→                contentResolver.update(uri, values, null, null)
+   777→   777→            } else {
+   778→   778→                // اندروید ۹ و پایین‌تر — پوشه اپ (بدون مجوز نوشتن)
+   779→   779→                val dir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+   780→   780→                val file = File(dir, safeName)
+   781→   781→                FileOutputStream(file).use { it.write(bytes) }
+   782→   782→            }
+   783→   783→            runOnUiThread { toast("«$safeName» ذخیره شد ✓") }
+   784→   784→        } catch (e: Exception) {
+   785→   785→            Log.e("FitUp", "download failed: ${e.message}")
+   786→   786→            runOnUiThread { toast("خطا در ذخیره فایل") }
+   787→   787→        }
+   788→   788→    }
+   789→   789→
+   790→   790→    /** چاپ صفحه فعلی WebView با PrintManager اندروید */
+   791→   791→    private fun printCurrentPage() {
+   792→   792→        runOnUiThread {
+   793→   793→            try {
+   794→   794→                val printManager = getSystemService(Context.PRINT_SERVICE) as PrintManager
+   795→   795→                val jobName = "FitUp ${BuildConfig.VERSION_NAME}"
+   796→   796→                printManager.print(jobName, webView.createPrintDocumentAdapter(jobName), null)
+   797→   797→            } catch (e: Exception) {
+   798→   798→                toast("چاپ در این دستگاه ممکن نیست")
+   799→   799→            }
+   800→   800→        }
+   801→   801→    }
+   802→   802→
+   803→   803→    /* ───────────── نوتیفیکیشن native ───────────── */
+   804→   804→
+   805→   805→    private fun setupNotifications() {
+   806→   806→        // کانال نوتیف (اندروید ۸+)
+   807→   807→        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+   808→   808→            val channel = NotificationChannel(
+   809→   809→                CHANNEL_ID,
+   810→   810→                "اعلان‌های فیتاپ",
+   811→   811→                NotificationManager.IMPORTANCE_DEFAULT
+   812→   812→            ).apply { description = "یادآوری‌ها و خبرهای برنامه" }
+   813→   813→            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+   814→   814→            nm.createNotificationChannel(channel)
+   815→   815→        }
+   816→   816→        // ─── مجوز POST_NOTIFICATIONS دیگر «خودکار در استارتاپ» گرفته نمی‌شود ───
+   817→   817→        // درخواست مالک: «دسترسی‌ها باید شخصی‌سازی‌شده اجازه بگیرن — الان انگار
+   818→   818→        // کروم داره اجازه دسترسی می‌گیره». دیالوگ سیستمی بی‌سبق در لحظه‌ی باز
+   819→   819→        // شدن اپ، همان حس «کروم اجازه می‌خواهد» را می‌داد. حالا فقط کانال ساخته
+   820→   820→        // می‌شود و مجوز از پل JS (requestNotificationPermission) وقتی کاربر در
+   821→   821→        // خود سایت روی «فعال‌سازی اعلان‌ها» کلیک می‌کند، خواسته می‌شود — با
+   822→   822→        // توضیح زیبا در خود سایت قبل از دیالوگ کوتاه سیستمی.
+   823→   823→        notifPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+   824→   824→    }
+   825→   825→
+   826→   826→    /** مجوز اعلان — از پل JS با توضیح زیبا در سایت، بعد از رضایت کاربر */
+   827→   827→    private fun maybeRequestNotificationPermission() {
+   828→   828→        try {
+   829→   829→            if (Build.VERSION.SDK_INT >= 33 &&
+   830→   830→                ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+   831→   831→            ) {
+   832→   832→                notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+   833→   833→            }
+   834→   834→        } catch (_: Exception) {}
+   835→   835→    }
+   836→   836→
+   837→   837→    /* ───────────── دوربین/میکروفون WebView (getUserMedia) ───────────── */
+   838→   838→
+   839→   839→    /**
+   840→   840→     * مجوز runtime دوربین/میکروفون — دقیقاً وقتی سایت ضبط صدا/ویدیو می‌خواهد
+   841→   841→     * (WebChromeClient.onPermissionRequest، بعد از دیالوگ اجازه فارسی).
+   842→   842→     * اگر همه مجوزها از قبل داده شده باشند مستقیم grant می‌شود؛ وگرنه
+   843→   843→     * دیالوگ سیستمی اندروید.
+   844→   844→     */
+   845→   845→    private fun requestMediaRuntimePermissions(webRequest: PermissionRequest) {
+   846→   846→        // درخواست معلق قبلی را رد کن (درخواست همزمان/تکراری از صفحه)
+   847→   847→        pendingWebPermissionRequest?.let { if (it !== webRequest) it.deny() }
+   848→   848→        pendingWebPermissionRequest = webRequest
+   849→   849→        val perms = mutableListOf<String>()
+   850→   850→        if (webRequest.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) {
+   851→   851→            perms.add(android.Manifest.permission.CAMERA)
+   852→   852→        }
+   853→   853→        if (webRequest.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+   854→   854→            perms.add(android.Manifest.permission.RECORD_AUDIO)
+   855→   855→        }
+   856→   856→        val alreadyGranted = perms.all {
+   857→   857→            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+   858→   858→        }
+   859→   859→        if (perms.isEmpty() || alreadyGranted) {
+   860→   860→            pendingWebPermissionRequest = null
+   861→   861→            runOnUiThread { webRequest.grant(webRequest.resources) }
+   862→   862→        } else {
+   863→   863→            try {
+   864→   864→                mediaPermissionLauncher.launch(perms.toTypedArray())
+   865→   865→            } catch (_: Exception) {
+   866→   866→                // دیالوگ سیستم باز نشد (مثلاً گوشی خاص) — fail بسته
+   867→   867→                pendingWebPermissionRequest = null
+   868→   868→                runOnUiThread { webRequest.deny() }
+   869→   869→            }
+   870→   870→        }
+   871→   871→    }
+   872→   872→
+   873→   873→    /** نمایش نوتیف سیستم — از پل JS (main-app polling) صدا زده می‌شود */
+   874→   874→    private fun showNativeNotification(title: String, body: String) {
+   875→   875→        try {
+   876→   876→            if (Build.VERSION.SDK_INT >= 33 &&
+   877→   877→                ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+   878→   878→            ) {
+   879→   879→                return // بدون مجوز، بی‌صدا رد شو
+   880→   880→            }
+   881→   881→            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+   882→   882→                .setSmallIcon(R.mipmap.ic_launcher)
+   883→   883→                .setContentTitle(title)
+   884→   884→                .setContentText(body)
+   885→   885→                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+   886→   886→                .setAutoCancel(true)
+   887→   887→                // باز کردن اپ با لمس نوتیف
+   888→   888→                .setContentIntent(
+   889→   889→                    android.app.PendingIntent.getActivity(
+   890→   890→                        this, 0,
+   891→   891→                        Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+   892→   892→                        android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+   893→   893→                    )
+   894→   894→                )
+   895→   895→                .build()
+   896→   896→            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+   897→   897→            nm.notify((System.currentTimeMillis() % 100000).toInt(), notification)
+   898→   898→        } catch (e: Exception) {
+   899→   899→            Log.w("FitUp", "notification failed: ${e.message}")
+   900→   900→        }
+   901→   901→    }
+   902→   902→
+   903→   903→    /* ───────────── OTP خودکار: کلیپ‌بورد (بدون پرمیشن) ───────────── */
+   904→   904→
+   905→   905→    /**
+   906→   906→     * درج کد OTP در صفحه ورود سایت — سایت window.__fitupNativeSmsCode را
+   907→   907→     * فقط روی صفحه OTP فعال می‌کند (auth-screen)؛ خارج از آن فراخوانی بی‌اثر است.
+   908→   908→     */
+   909→   909→    private fun dispatchOtpCode(code: String) {
+   910→   910→        runOnUiThread {
+   911→   911→            webView.evaluateJavascript(
+   912→   912→                "window.__fitupNativeSmsCode && window.__fitupNativeSmsCode('$code');",
+   913→   913→                null
+   914→   914→            )
+   915→   915→        }
+   916→   916→    }
+   917→   917→
+   918→   918→    /** کد OTP از کلیپ‌بورد — v1.5.7: هم کدِ خالص و هم «متن کامل پیامک» کپی‌شده.
+   919→   919→     *  برای جلوگیری از درج اشتباه عدد ۴-رقمی نامرتبط (مثل سال «1404»)، استخراج
+   920→   920→     *  گروه ۴-رقمی فقط وقتی انجام می‌شود که متن شامل «فیتاپ» یا fittup باشد یا
+   921→   921→     *  خود کلیپ‌بورد دقیقاً کد ۴-رقمی باشد. */
+   922→   922→    private fun maybeDispatchClipboardOtp() {
+   923→   923→        try {
+   924→   924→            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager ?: return
+   925→   925→            val text = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim() ?: return
+   926→   926→            if (text == lastClipboardDispatched) return
+   927→   927→            val code = when {
+   928→   928→                Regex("^\\d{4}$").matches(text) -> text
+   929→   929→                text.contains("فیتاپ") || text.contains("fittup", ignoreCase = true) ->
+   930→   930→                    Regex("(?<!\\d)\\d{4}(?!\\d)").findAll(text).map { it.value }.lastOrNull()
+   931→   931→                else -> null
+   932→   932→            }
+   933→   933→            if (code != null) {
+   934→   934→                lastClipboardDispatched = text
+   935→   935→                dispatchOtpCode(code)
+   936→   936→            }
+   937→   937→        } catch (_: Exception) {}
+   938→   938→    }
+   939→   939→
+   940→   940→    /* ───────────── OTP خودکار: SMS Retriever (v31 — بدون پرمیشن) ───────────── */
+   941→   941→    // پیامکی که متنش با هش ۱۱-کاراکتری اپ امضا شده (سرور — ارسال خام sms.ir)
+   942→   942→    // مستقیم به OtpRetrieverReceiver می‌رسد؛ بدون RECEIVE_SMS و بدون هیچ دیالوگی —
+   943→   943→    // سازگار کامل با قانون حریم خصوصی بازار.
+   944→   944→
+   945→   945→    private val otpReceiver = OtpRetrieverReceiver()
+   946→   946→
+   947→   947→    private fun setupOtpRetrieverReceiver() {
+   948→   948→        try {
+   949→   949→            // فرستنده = Google Play Services (اپ دیگر) → EXPORTED لازم است
+   950→   950→            ContextCompat.registerReceiver(
+   951→   951→                this, otpReceiver,
+   952→   952→                IntentFilter(SmsRetriever.SMS_RETRIEVED_ACTION),
+   953→   953→                ContextCompat.RECEIVER_EXPORTED
+   954→   954→            )
+   955→   955→        } catch (_: Exception) {}
+   956→   956→    }
+   957→   957→
+   958→   958→    /** از پل وب (صفحهٔ ورود کد) — فعال‌سازی شنوندهٔ ۵ دقیقه‌ای */
+   959→   959→    private fun startOtpSmsRetriever() {
+   960→   960→        try {
+   961→   961→            val task = SmsRetriever.getClient(this).startSmsRetriever()
+   962→   962→            task.addOnSuccessListener { Log.i("FitUpBazaar", "SMS Retriever armed") }
+   963→   963→            task.addOnFailureListener { Log.w("FitUpBazaar", "SMS Retriever unavailable: ${it.message}") }
+   964→   964→        } catch (e: Exception) {
+   965→   965→            // دستگاه بدون سرویس گوگل — fail-safe (ورود دستی/کلیپ‌بورد سر جایشان)
+   966→   966→            Log.w("FitUpBazaar", "SMS Retriever start failed: ${e.message}")
+   967→   967→        }
+   968→   968→    }
+   969→   969→
+   970→   970→    /* ───────────── اعلان‌ها حتی وقتی برنامه بسته است (v31) ───────────── */
+   971→   971→
+   972→   972→    /**
+   973→   973→     * دیالوگ فارسی یک‌بار-محور: «بهینه‌سازی باتری برای فیتاپ غیرفعال شود؟»
+   974→   974→     * هدف: جلوی کشتن فرآیند WorkManager توسط بهینه‌سازهای تهاجمی — مخصوصاً
+   975→   975→     * شیائومی/سامسونگ. مصرف باتری به‌طور محسوسی بالا نمی‌رود (فقط JobScheduler).
+   976→   976→     * از پل وب بعد از رضایت اعلان‌ها صدا زده می‌شود؛ رد → دیگر پرسیده نمی‌شود.
+   977→   977→     */
+   978→   978→    private fun maybeRequestBatteryExemption() {
+   979→   979→        try {
+   980→   980→            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+   981→   981→            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+   982→   982→            val prefs = getSharedPreferences("fitup_settings", Context.MODE_PRIVATE)
+   983→   983→            if (prefs.getBoolean("battery_prompt_dismissed", false)) return
+   984→   984→            AlertDialog.Builder(this)
+   985→   985→                .setTitle("اعلان‌ها حتی وقتی برنامه بسته است")
+   986→   986→                .setMessage("برای اینکه یادآوری‌ها و خبرهای فیتاپ حتی وقتی برنامه را بسته‌ای به دستت برسند، بهینه‌سازی باتری را برای فیتاپ غیرفعال کن. مصرف باتری به‌طور محسوسی افزایش پیدا نمی‌کند.")
+   987→   987→                .setPositiveButton("فعال‌سازی اعلان‌ها") { _, _ ->
+   988→   988→                    try {
+   989→   989→                        startActivity(
+   990→   990→                            Intent(
+   991→   991→                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+   992→   992→                                Uri.parse("package:$packageName")
+   993→   993→                            )
+   994→   994→                        )
+   995→   995→                    } catch (_: Exception) {}
+   996→   996→                }
+   997→   997→                .setNegativeButton("بعداً") { _, _ ->
+   998→   998→                    prefs.edit().putBoolean("battery_prompt_dismissed", true).apply()
+   999→   999→                }
+  1000→  1000→                .show()
+  1001→  1001→        } catch (_: Exception) {}
+  1002→  1002→    }
+  1003→  1003→
+  1004→  1004→    private fun toast(msg: String) {
+  1005→  1005→        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+  1006→  1006→    }
+  1007→  1007→
+  1008→  1008→    /* ───────────── پل JS ───────────── */
+  1009→  1009→
+  1010→  1010→    /** چک origin — پل فقط از دامنه خودمان قابل فراخوانی است (امنیت) */
+  1011→  1011→    private fun bridgeAllowed(): Boolean {
+  1012→  1012→        val u = lastMainUrl ?: return false
+  1013→  1013→        return try {
+  1014→  1014→            val host = URI(u).host ?: return false
+  1015→  1015→            isAllowedHost(host)
+  1016→  1016→        } catch (_: Exception) {
+  1017→  1017→            false
+  1018→  1018→        }
+  1019→  1019→    }
+  1020→  1020→
+  1021→  1021→    inner class NativeBridge {
+  1022→  1022→        @JavascriptInterface
+  1023→  1023→        fun isBazaarApp(): Boolean = bridgeAllowed()
+  1024→  1024→
+  1025→  1025→        @JavascriptInterface
+  1026→  1026→        fun appVersion(): String = BuildConfig.VERSION_NAME
+  1027→  1027→
+  1028→  1028→        @JavascriptInterface
+  1029→  1029→        fun isPaymentAvailable(): Boolean = paymentReady && rsaKeyValid
+  1030→  1030→
+  1031→  1031→        @JavascriptInterface
+  1032→  1032→        fun purchaseSubscription(sku: String, payloadJson: String, callbackId: String, dynamicPriceToken: String) {
+  1033→  1033→            if (!bridgeAllowed()) return
+  1034→  1034→            runOnUiThread { startBazaarPurchase(sku, payloadJson, callbackId, dynamicPriceToken) }
+  1035→  1035→        }
+  1036→  1036→
+  1037→  1037→        @JavascriptInterface
+  1038→  1038→        fun consumePurchase(purchaseToken: String) {
+  1039→  1039→            if (!bridgeAllowed()) return
+  1040→  1040→            consumePurchaseToken(purchaseToken)
+  1041→  1041→        }
+  1042→  1042→
+  1043→  1043→        @JavascriptInterface
+  1044→  1044→        fun downloadFile(filename: String, dataUrl: String) {
+  1045→  1045→            if (!bridgeAllowed()) return
+  1046→  1046→            downloadDataUrl(filename, dataUrl)
+  1047→  1047→        }
+  1048→  1048→
+  1049→  1049→        @JavascriptInterface
+  1050→  1050→        fun printPage() {
+  1051→  1051→            if (!bridgeAllowed()) return
+  1052→  1052→            printCurrentPage()
+  1053→  1053→        }
+  1054→  1054→
+  1055→  1055→        @JavascriptInterface
+  1056→  1056→        fun showNotification(title: String, body: String) {
+  1057→  1057→            if (!bridgeAllowed()) return
+  1058→  1058→            showNativeNotification(title, body)
+  1059→  1059→        }
+  1060→  1060→
+  1061→  1061→        /**
+  1062→  1062→         * مجوز اعلان‌های اندروید — از وب‌سایت با UI جذاب خودش صدا زده می‌شود
+  1063→  1063→         * (بعد از توضیح و رضایت کاربر)، نه بی‌سبق در استارتاپ.
+  1064→  1064→         */
+  1065→  1065→        @JavascriptInterface
+  1066→  1066→        fun requestNotificationPermission() {
+  1067→  1067→            if (!bridgeAllowed()) return
+  1068→  1068→            runOnUiThread { maybeRequestNotificationPermission() }
+  1069→  1069→        }
+  1070→  1070→
+  1071→  1071→        /** v31 — همگام‌سازی فوری اعلان‌ها (ورود به پنل) */
+  1072→  1072→        @JavascriptInterface
+  1073→  1073→        fun syncNotificationsNow() {
+  1074→  1074→            if (!bridgeAllowed()) return
+  1075→  1075→            NotificationSync.syncNow(applicationContext)
+  1076→  1076→        }
+  1077→  1077→
+  1078→  1078→        /** v31 — دیالوگ بهینه‌سازی باتری (بعد از رضایت اعلان‌ها) */
+  1079→  1079→        @JavascriptInterface
+  1080→  1080→        fun requestBatteryOptimization() {
+  1081→  1081→            if (!bridgeAllowed()) return
+  1082→  1082→            runOnUiThread { maybeRequestBatteryExemption() }
+  1083→  1083→        }
+  1084→  1084→
+  1085→  1085→        /** v31 — SMS Retriever بدون پرمیشن (صفحهٔ ورود کد) */
+  1086→  1086→        @JavascriptInterface
+  1087→  1087→        fun startOtpSmsRetriever() {
+  1088→  1088→            if (!bridgeAllowed()) return
+  1089→  1089→            startOtpSmsRetriever()
+  1090→  1090→        }
+  1091→  1091→
+  1092→  1092→        /**
+  1093→  1093→         * ─── قفل pull-to-refresh برای اسکرول داخلی صفحه (فیکس باگ پروفایل) ───
+  1094→  1094→         * باگ گزارش‌شده: در منوی پروفایل (و هر لیست داخلی اسکرول‌شونده)،
+  1095→  1095→         * کشیدن انگشت به پایین برای «بالا بردن محتوا» باعث رفرش کامل صفحه
+  1096→  1096→         * می‌شد — چون WebView در scrollY=0 بود و SwipeRefreshLayout فعال.
+  1097→  1097→         * ریشه: اسکرولِ داخل عناصر داخلی (Sheet ها و لیست‌های overflow-y)
+  1098→  1098→         * برای WebView نامرئی است. فیکس: سایت در لحظه‌ی شروع لمس روی هر
+  1099→  1099→         * عنصر اسکرول‌شونده داخلی، این پل را با false صدا می‌زند → رفرش
+  1100→  1100→         * قفل می‌شود؛ بعد از پایان لمس دوباره باز می‌شود. با این کار در هیچ
+  1101→  1101→         * جای اپ، اسکرول به بالا باعث رفرش نمی‌شود و رفرش فقط از «واقعاً
+  1102→  1102→         * بالای صفحه اصلی» کار می‌کند.
+  1103→  1103→         */
+  1104→  1104→        @JavascriptInterface
+  1105→  1105→        fun setSwipeRefreshEnabled(enabled: Boolean) {
+  1106→  1106→            if (!bridgeAllowed()) return
+  1107→  1107→            runOnUiThread { swipeRefresh.isEnabled = enabled }
+  1108→  1108→        }
+  1109→  1109→    }
+  1110→  1110→
+  1111→  1111→    /* ───────────── چرخه حیات ───────────── */
+  1112→  1112→
+  1113→  1113→    /* ───────────── ناوبری دکمه back (درخواست مالک) ───────────── */
+  1114→  1114→    // بک اول از هر قسمتی به جز داشبورد → داشبورد (از طریق پل SPA — بدون رفرش صفحه)
+  1115→  1115→    // بک روی داشبورد → مودال تأیید خروج؛ تأیید → خروج واقعی از برنامه
+  1116→  1116→    // پل وب: window.__fitupNativeBack() در page-client.tsx تعریف شده و برمی‌گرداند:
+  1117→  1117→    //   'overlay'   → فقط اورلی بسته شد (هیچ کاری نکن)
+  1118→  1118→    //   'dashboard' → وب خودش به داشبورد پرید (هیچ کاری نکن)
+  1119→  1119→    //   'home'      → روی داشبورد هستیم → مودال خروج
+  1120→  1120→    //   'unknown'   → پل وب در دسترس نیست (صفحه هنوز لود نشده) → مودال خروج
+  1121→  1121→    @Deprecated("Deprecated in Java")
+  1122→  1122→    override fun onBackPressed() {
+  1123→  1123→        // 🩹 v1.5.5 (باگ «بک در درگاه پرداخت از برنامه خارج می‌کند»):
+  1124→  1124→        // روی صفحهٔ غیر از سایت خودمان (زرین‌پال/بانک/شاپرک)، پل وب وجود ندارد →
+  1125→  1125→        // 'unknown' → قبلاً مستقیم دیالوگ خروج! حالا اول webView.goBack؛ فقط اگر
+  1126→  1126→        // جایی برای برگشتن نبود، دیالوگ خروج. رفتار داشبورد سایت دست‌نخورده ماند.
+  1127→  1127→        val currentHost = try {
+  1128→  1128→            URI(webView.url ?: "").host?.lowercase()
+  1129→  1129→        } catch (_: Exception) {
+  1130→  1130→            null
+  1131→  1131→        }
+  1132→  1132→        val siteHost = try { URI(BuildConfig.SITE_URL).host?.lowercase() } catch (_: Exception) { null }
+  1133→  1133→        val onOurSite = currentHost != null && siteHost != null &&
+  1134→  1134→            (currentHost == siteHost || currentHost.endsWith(".$siteHost"))
+  1135→  1135→        if (!onOurSite) {
+  1136→  1136→            if (webView.canGoBack()) {
+  1137→  1137→                webView.goBack()
+  1138→  1138→            } else {
+  1139→  1139→                showExitConfirmDialog()
+  1140→  1140→            }
+  1141→  1141→            return
+  1142→  1142→        }
+  1143→  1143→        webView.evaluateJavascript(
+  1144→  1144→            "(function(){try{if(window.__fitupNativeBack){return window.__fitupNativeBack();}}catch(e){}return 'unknown';})()"
+  1145→  1145→        ) { result ->
+  1146→  1146→            val where = result?.trim()?.removePrefix("\"")?.removeSuffix("\"") ?: "unknown"
+  1147→  1147→            if (where == "home" || where == "unknown") {
+  1148→  1148→                showExitConfirmDialog()
+  1149→  1149→            }
+  1150→  1150→        }
+  1151→  1151→    }
+  1152→  1152→
+  1153→  1153→    /** مودال تأیید خروج از برنامه (بک دوم روی داشبورد) — دیالوگ برندشدهٔ سفارشی */
+  1154→  1154→    private var exitConfirmDialog: Dialog? = null
+  1155→  1155→
+  1156→  1156→    private fun showExitConfirmDialog() {
+  1157→  1157→        if (exitConfirmDialog?.isShowing == true) return
+  1158→  1158→        val dialog = Dialog(this)
+  1159→  1159→        exitConfirmDialog = dialog
+  1160→  1160→        dialog.setContentView(R.layout.dialog_exit)
+  1161→  1161→        dialog.setCancelable(true)             // دکمهٔ بک → بستن
+  1162→  1162→        dialog.setCanceledOnTouchOutside(true) // لمس بیرون کارت → بستن
+  1163→  1163→        dialog.window?.apply {
+  1164→  1164→            // کارت سفیدِ گرد خودش پس‌زمینه است — پس‌زمینهٔ پنجره باید شفاف باشد
+  1165→  1165→            setBackgroundDrawableResource(android.R.color.transparent)
+  1166→  1166→            // چیدمان راست‌به‌چپ در خود layout با android:layoutDirection="rtl" ست شده
+  1167→  1167→            // عرض: ۸۸٪ صفحه، حداکثر ۳۶۰dp — روی تبلت هم خوش‌فرم می‌ماند
+  1168→  1168→            val dm = resources.displayMetrics
+  1169→  1169→            setLayout(
+  1170→  1170→                minOf((dm.widthPixels * 0.88f).toInt(), (360 * dm.density).toInt()),
+  1171→  1171→                ViewGroup.LayoutParams.WRAP_CONTENT
+  1172→  1172→            )
+  1173→  1173→            // انیمیشن فید ساده برای باز/بسته شدن
+  1174→  1174→            attributes.windowAnimations = R.style.FitUpExitDialogAnimation
+  1175→  1175→        }
+  1176→  1176→        // «موندن» → فقط بستن دیالوگ
+  1177→  1177→        dialog.findViewById<TextView>(R.id.btnExitStay).setOnClickListener { dialog.dismiss() }
+  1178→  1178→        // «خروج» → بستن دیالوگ + خروج کامل از برنامه
+  1179→  1179→        dialog.findViewById<TextView>(R.id.btnExitLeave).setOnClickListener {
+  1180→  1180→            dialog.dismiss()
+  1181→  1181→            finishAffinity()
+  1182→  1182→        }
+  1183→  1183→        dialog.show()
+  1184→  1184→    }
+  1185→  1185→
+  1186→  1186→    override fun onResume() {
+  1187→  1187→        super.onResume()
+  1188→  1188→        // OTP: شاید کد از کلیپ‌بورد آمده (کپی از نوتیف پیامک) — بدون پرمیشن
+  1189→  1189→        maybeDispatchClipboardOtp()
+  1190→  1190→        // OTP: کد رسیده در زمان بسته‌بودن اکتیویتی (SMS Retriever) — v31
+  1191→  1191→        OtpRetriever.takePending(this)?.let { dispatchOtpCode(it) }
+  1192→  1192→        // همگام‌سازی اعلان‌های از-دست-رفته در هر باز شدن
+  1193→  1193→        NotificationSync.syncNow(applicationContext)
+  1194→  1194→    }
+  1195→  1195→
+  1196→  1196→    override fun onPause() {
+  1197→  1197→        // سشن OTP/لاگین — کوکی‌ها را فوراً روی دیسک flush کن (کرش/کشتن پروسه)
+  1198→  1198→        try {
+  1199→  1199→            CookieManager.getInstance().flush()
+  1200→  1200→        } catch (_: Exception) {}
+  1201→  1201→        super.onPause()
+  1202→  1202→    }
+  1203→  1203→
+  1204→  1204→    override fun onSaveInstanceState(outState: Bundle) {
+  1205→  1205→        super.onSaveInstanceState(outState)
+  1206→  1206→        webView.saveState(outState)
+  1207→  1207→    }
+  1208→  1208→
+  1209→  1209→    override fun onDestroy() {
+  1210→  1210→        try { unregisterReceiver(otpReceiver) } catch (_: Exception) {}
+  1211→  1211→        OtpRetriever.dispatcher = null
+  1212→  1212→        connection?.disconnect()
+  1213→  1213→        payment = null
+  1214→  1214→        super.onDestroy()
+  1215→  1215→    }
+  1216→  1216→
+  1217→  1217→    companion object {
+  1218→  1218→        /** کانال اعلان — برای NotificationSyncWorker هم لازم است (public const) */
+  1219→  1219→        const val CHANNEL_ID = "fitup_general"
+  1220→  1220→    }
+  1221→  1221→}
+  1222→  1222→

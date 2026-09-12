@@ -1,0 +1,620 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useRef, useState } from "react";
+     4→import { motion } from "framer-motion";
+     5→import {
+     6→  X,
+     7→  Video,
+     8→  Upload,
+     9→  Loader2,
+    10→  CheckCircle2,
+    11→  AlertCircle,
+    12→  Sparkles,
+    13→  RefreshCw,
+    14→  Camera,
+    15→  Clock,
+    16→  FileVideo,
+    17→  Maximize,
+    18→  Lightbulb,
+    19→  Shirt,
+    20→  Eye,
+    21→  AlertTriangle,
+    22→  type LucideIcon,
+    23→} from "lucide-react";
+    24→import { useAppStore } from "@/lib/fitness/store";
+    25→import { Button } from "@/components/ui/button";
+    26→import {
+    27→  AlertDialog,
+    28→  AlertDialogAction,
+    29→  AlertDialogCancel,
+    30→  AlertDialogContent,
+    31→  AlertDialogDescription,
+    32→  AlertDialogFooter,
+    33→  AlertDialogHeader,
+    34→  AlertDialogTitle,
+    35→} from "@/components/ui/alert-dialog";
+    36→import { toPersianDigits, getCapabilities } from "@/lib/fitness/types";
+    37→import { toast } from "sonner";
+    38→
+    39→// ─── v74: پارامترهای poll نتیجهٔ تحلیل پس‌زمینه ───
+    40→// هر ۵ ثانیه GET می‌زنیم؛ حداکثر ۱۲ دقیقه صبر می‌کنیم (هم‌سقف گیت‌وی/تحلیل VLM)
+    41→const ANALYSIS_POLL_MS = 5_000;
+    42→const ANALYSIS_POLL_MAX_MS = 12 * 60 * 1000;
+    43→
+    44→const GUIDE_ITEMS: { icon: LucideIcon; title: string; desc: string; color: string }[] = [
+    45→  { icon: Shirt, title: "لباس مناسب", desc: "لباس تنگ یا ورزشی که فرم بدن مشخص باشد", color: "#f59e0b" },
+    46→  { icon: Camera, title: "زاویه دوربین", desc: "از روبرو، پهلو و پشت — سه زاویه", color: "#f97316" },
+    47→  { icon: Clock, title: "مدت زمان", desc: "۳۰ ثانیه تا ۱ دقیقه برای هر زاویه", color: "#10b981" },
+    48→  { icon: FileVideo, title: "فرمت فایل", desc: "MP4، MOV یا WebM", color: "#06b6d4" },
+    49→  { icon: Maximize, title: "بدون دغدغهٔ حجم", desc: "تا ۳۰۰ مگابایت — خودمان بهینه‌اش می‌کنیم", color: "#8b5cf6" },
+    50→  { icon: Lightbulb, title: "نور محیط", desc: "نور کافی و یکنواخت", color: "#eab308" },
+    51→  { icon: Eye, title: "نکته ضبط", desc: "بدون کفش، روی سطح صاف بایستید", color: "#ec4899" },
+    52→];
+    53→
+    54→export function VideoAnalysisView() {
+    55→  const { setOverlay, setMainTab, user, setUser } = useAppStore();
+    56→  const [file, setFile] = useState<File | null>(null);
+    57→  const [videoUrl, setVideoUrl] = useState<string>("");
+    58→  const [analyzing, setAnalyzing] = useState(false);
+    59→  const [result, setResult] = useState<any>(null);
+    60→  const [skipping, setSkipping] = useState(false);
+    61→  /** دایالوگ تأیید «آپلود نمی‌کنم» — طبق درخواست مالک، قبل از رد شدن،
+    62→   * از کاربر تأیید صریح گرفته می‌شود که می‌داند در طول پلن جاری دیگر
+    63→   * امکان ارسال نیست و این مورد در طراحی برنامه نادیده گرفته می‌شود. */
+    64→  const [confirmDecline, setConfirmDecline] = useState(false);
+    65→  // ─── v74: تحلیل پس‌زمینه + poll ───
+    66→  // سرور بعد از ذخیرهٔ ویدیو، فشرده‌سازی/تحلیل را در پس‌زمینه (void async)
+    67→  // اجرا می‌کند و فوراً {started:true, status:"analyzing"} برمی‌گرداند؛
+    68→  // این صفحه با poll هر ۵ ثانیه‌ای (حداکثر ۱۲ دقیقه) نتیجه را از GET می‌گیرد —
+    69→  // حتی اگر کاربر وسط کار صفحه را بسته و دوباره باز کرده باشد.
+    70→  const [analysisFailed, setAnalysisFailed] = useState(false);
+    71→  const [forceUploadUI, setForceUploadUI] = useState(false);
+    72→  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    73→  const pollInFlightRef = useRef(false);
+    74→  const pollDeadlineRef = useRef(0);
+    75→  // createdAt نتیجهٔ «قبلی» — تشخیص نتیجهٔ جدید بدون وابستگی به ساعت کلاینت
+    76→  const pollBaselineRef = useRef<string | null>(null);
+    77→  // آیا کاربر تعیین تکلیف کرده؟ — بر اساس وضعیت واقعی user از store
+    78→  const decided = user?.videoStatus === "uploaded" || user?.videoStatus === "skipped";
+    79→
+    80→  // === سقف استفاده واقعی از پلن کاربر ===
+    81→  const limit = getCapabilities(user?.planName ?? null).videoAnalysisLimit;
+    82→  const usedCount = user?.videoAnalysisUsed ?? 0;
+    83→  const limitReached = limit > 0 && usedCount >= limit;
+    84→
+    85→  // === بارگذاری آخرین نتیجه ذخیره‌شده در DB (تا رفرش صفحه اطلاعات را از دست ندهد) ===
+    86→  // v74: اگر سرور بگوید تحلیل پس‌زمینه هنوز در جریان است (analyzing=true)،
+    87→  // از همین‌جا وضعیت «در حال تحلیل» + poll از سر گرفته می‌شود.
+    88→  useEffect(() => {
+    89→    (async () => {
+    90→      try {
+    91→        const res = await fetch("/api/coach/analyze-video", { cache: "no-store" });
+    92→        if (!res.ok) return;
+    93→        const data = await res.json();
+    94→        if (data?.analyzing) {
+    95→          setAnalyzing(true);
+    96→          startPolling(typeof data?.createdAt === "string" ? data.createdAt : null);
+    97→        } else if (data?.result) {
+    98→          setResult(data.result);
+    99→        }
+   100→      } catch {
+   101→        // سکوت
+   102→      }
+   103→    })();
+   104→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   105→  }, []);
+   106→
+   107→  // ─── v74: poll نتیجهٔ تحلیل پس‌زمینه (هر ۵ ثانیه — حداکثر ۱۲ دقیقه) ───
+   108→  function stopPolling() {
+   109→    if (pollTimerRef.current) {
+   110→      clearInterval(pollTimerRef.current);
+   111→      pollTimerRef.current = null;
+   112→    }
+   113→  }
+   114→
+   115→  /** پایان موفق — نتیجهٔ جدید از poll آمد */
+   116→  function handleAnalysisSuccess(result: any) {
+   117→    stopPolling();
+   118→    setAnalysisFailed(false);
+   119→    setResult(result);
+   120→    setAnalyzing(false);
+   121→    // آپدیت فوری شمارنده استفاده + وضعیت ویدیو در store — بدون نیاز به رفرش
+   122→    // (باگ 2-b: قبلاً فقط شمارنده آپدیت می‌شد؛ videoStatus عقب می‌ماند و کارت
+   123→    // سبز «تعیین تکلیف شده» تا رفرش صفحه نمایش داده نمی‌شد)
+   124→    useAppStore.setState((s) => ({
+   125→      user: s.user
+   126→        ? {
+   127→            ...s.user,
+   128→            videoAnalysisUsed: (s.user.videoAnalysisUsed ?? 0) + 1,
+   129→            videoStatus: "uploaded",
+   130→          }
+   131→        : s.user,
+   132→    }));
+   133→    if (typeof window !== "undefined") {
+   134→      window.dispatchEvent(new CustomEvent("prereq-updated"));
+   135→    }
+   136→    toast.success("آنالیز ویدیویی کامل شد! 🎯");
+   137→  }
+   138→
+   139→  /** پایان ناموفق (analyzing=false بدون نتیجهٔ جدید، یا عبور از ددلاین) */
+   140→  function handleAnalysisFailure(msg: string) {
+   141→    stopPolling();
+   142→    setAnalysisFailed(true);
+   143→    setAnalyzing(false);
+   144→    // سرور videoStatus را به "uploaded" برگردانده — سهمیه مصرف نشده و retry آزاد است
+   145→    useAppStore.setState((s) => ({
+   146→      user: s.user ? { ...s.user, videoStatus: "uploaded" } : s.user,
+   147→    }));
+   148→    if (typeof window !== "undefined") {
+   149→      window.dispatchEvent(new CustomEvent("prereq-updated"));
+   150→    }
+   151→    toast.error(msg);
+   152→  }
+   153→
+   154→  function startPolling(baselineCreatedAt: string | null) {
+   155→    stopPolling();
+   156→    pollInFlightRef.current = false;
+   157→    pollBaselineRef.current = baselineCreatedAt;
+   158→    pollDeadlineRef.current = Date.now() + ANALYSIS_POLL_MAX_MS;
+   159→    pollTimerRef.current = setInterval(async () => {
+   160→      if (pollInFlightRef.current) return;
+   161→      pollInFlightRef.current = true;
+   162→      try {
+   163→        const res = await fetch("/api/coach/analyze-video", { cache: "no-store" });
+   164→        if (res.ok) {
+   165→          const data = await res.json();
+   166→          const resultCreatedAt = typeof data?.createdAt === "string" ? data.createdAt : null;
+   167→          if (data?.result && resultCreatedAt !== pollBaselineRef.current) {
+   168→            // نتیجهٔ جدید (createdAt متفاوت از پایه) — مستقل از ساعت کلاینت
+   169→            handleAnalysisSuccess(data.result);
+   170→            return;
+   171→          }
+   172→          if (data?.analyzing === false) {
+   173→            // تحلیل پس‌زمینه تمام شد ولی نتیجهٔ جدیدی ثبت نشد → شکست
+   174→            handleAnalysisFailure("تحلیل ویدیو ناتمام ماند. لطفاً دوباره تلاش کنید.");
+   175→            return;
+   176→          }
+   177→          if (Date.now() > pollDeadlineRef.current) {
+   178→            handleAnalysisFailure("تحلیل ویدیو بیش از حد انتظار طول کشید. لطفاً دوباره تلاش کنید.");
+   179→            return;
+   180→          }
+   181→        }
+   182→        // خطای گذرای شبکه/سرور → سکوت و ادامه poll تا ددلاین
+   183→      } catch {
+   184→        // ادامه poll
+   185→      } finally {
+   186→        pollInFlightRef.current = false;
+   187→      }
+   188→    }, ANALYSIS_POLL_MS);
+   189→  }
+   190→
+   191→  // v74: توقف poll هنگام unmount — تحلیل سمت سرور ادامه دارد و با بازکردن
+   192→  // دوبارهٔ صفحه، poll خودکار از GET از سر گرفته می‌شود (mount effect بالا)
+   193→  useEffect(() => {
+   194→    return () => stopPolling();
+   195→  }, []);
+   196→
+   197→  // تابع رد کردن ویدیو (تعیین تکلیف: آپلود نمی‌کنم)
+   198→  // ─── بعد از تأیید صریح کاربر در دایالوگ اجرا می‌شود و بلافاصله به داشبورد
+   199→  // برمی‌گردد تا کارت پیش‌نیاز با تیک «تعیین تکلیف شده» را ببیند (درخواست مالک) ───
+   200→  async function skipVideo() {
+   201→    setSkipping(true);
+   202→    try {
+   203→      const r = await fetch("/api/video-status", {
+   204→        method: "PATCH",
+   205→        headers: { "Content-Type": "application/json" },
+   206→        body: JSON.stringify({ status: "skipped" }),
+   207→      });
+   208→      if (!r.ok) throw new Error("خطا");
+   209→      toast.success("باشه! برنامه بدون تحلیل ویدیو طراحی می‌شود.");
+   210→      // آپدیت user در store
+   211→      if (user) setUser({ ...user, videoStatus: "skipped" });
+   212→      // اعلام به PrerequisitesBanner برای refresh بدون رفرش صفحه
+   213→      if (typeof window !== "undefined") {
+   214→        window.dispatchEvent(new CustomEvent("prereq-updated"));
+   215→      }
+   216→      // برگشت به داشبورد — کارت پیش‌نیاز تیک می‌خورد
+   217→      setMainTab("dashboard");
+   218→      setOverlay(null);
+   219→    } catch (e) {
+   220→      toast.error(e instanceof Error ? e.message : "خطا");
+   221→    } finally {
+   222→      setSkipping(false);
+   223→    }
+   224→  }
+   225→
+   226→  // ─── v53: بدون سقف کاربر-پسند — فقط سقف نرم فنی ۳۰۰ مگابایت (هم‌قرارداد سرور) ───
+   227→  // فایل‌های بزرگ‌تر بعد از آپلود سمت سرور فشرده می‌شوند؛ کلاینت فقط گارد سخت می‌گذارد.
+   228→  const MAX_VIDEO_MB = 300;
+   229→  const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
+   230→
+   231→  /** حجم خوانا برای نمایش فایل انتخاب‌شده (مثلاً «۴۸.۲ مگابایت») */
+   232→  function formatSizeMB(bytes: number): string {
+   233→    return toPersianDigits((bytes / (1024 * 1024)).toFixed(1));
+   234→  }
+   235→
+   236→  function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+   237→    const f = e.target.files?.[0];
+   238→    if (!f) return;
+   239→    if (!f.type.startsWith("video/")) {
+   240→      toast.error("فقط فایل ویدیویی مجاز است");
+   241→      return;
+   242→    }
+   243→    setAnalysisFailed(false);
+   244→    // سقف نرم فنی ۳۰۰MB — ویدیوی بزرگ‌تر: «ویدیوی بسیار بزرگ است»
+   245→    // (فشرده‌سازی پس از آپلود سمت سرور انجام می‌شود؛ اینجا فقط گارد سخت)
+   246→    if (f.size > MAX_VIDEO_BYTES) {
+   247→      const mb = Math.round(f.size / (1024 * 1024));
+   248→      toast.error(`ویدیوی بسیار بزرگ است (${toPersianDigits(mb)} مگابایت) — حداکثر ${toPersianDigits(MAX_VIDEO_MB)} مگابایت`);
+   249→      return;
+   250→    }
+   251→    setFile(f);
+   252→    setVideoUrl(URL.createObjectURL(f));
+   253→    setResult(null);
+   254→  }
+   255→
+   256→  async function analyze() {
+   257→    if (!file) return;
+   258→    if (limitReached) {
+   259→      toast.error("سقف استفاده از این قابلیت پر شده است.");
+   260→      return;
+   261→    }
+   262→    // گارد سخت دوباره (در برابر تغییر فایل) — سقف نرم ۳۰۰MB
+   263→    if (file.size > MAX_VIDEO_BYTES) {
+   264→      toast.error("ویدیوی بسیار بزرگ است — حداکثر ۳۰۰ مگابایت");
+   265→      return;
+   266→    }
+   267→    setAnalyzing(true);
+   268→    setAnalysisFailed(false);
+   269→    try {
+   270→      // ─── ارسال به‌صورت multipart/form-data (نه base64) ───
+   271→      // base64 حجم payload را ~۱.۳۳ برابر می‌کند و باعث خطای «Unexpected token»
+   272→      // در پاسخ‌های بزرگ می‌شود. FormData از حالت باینری استفاده می‌کند.
+   273→      const formData = new FormData();
+   274→      formData.append("video", file);
+   275→      formData.append("userContext", "تحلیل فرم بدن و تکنیک حرکات ورزشی");
+   276→
+   277→      // v74: پایهٔ createdAt نتیجهٔ قبلی (قبل از POST) — برای تشخیص «نتیجهٔ جدید»
+   278→      // در poll بدون وابستگی به ساعت کلاینت
+   279→      let baselineCreatedAt: string | null = null;
+   280→      try {
+   281→        const pre = await fetch("/api/coach/analyze-video", { cache: "no-store" });
+   282→        if (pre.ok) {
+   283→          const preData = await pre.json();
+   284→          baselineCreatedAt = typeof preData?.createdAt === "string" ? preData.createdAt : null;
+   285→        }
+   286→      } catch {
+   287→        // poll با پایهٔ null هم درست کار می‌کند (نتیجهٔ جدید همیشه createdAt متفاوت دارد)
+   288→      }
+   289→
+   290→      const res = await fetch("/api/coach/analyze-video", {
+   291→        method: "POST",
+   292→        body: formData,
+   293→        // هدر Content-Type خودکار توسط browser برای FormData با boundary تنظیم می‌شود.
+   294→        // نباید دستی set شود.
+   295→      });
+   296→      // ─── بررسی وضعیت قبل از JSON parse ───
+   297→      // اگر سرور HTML برگرداند (مثلاً خطای 500)، res.json() خطای
+   298→      // "Unexpected token" می‌دهد. ابتدا res.ok را بررسی می‌کنیم.
+   299→      if (!res.ok) {
+   300→        let errMsg = "خطا در تحلیل ویدیو";
+   301→        try {
+   302→          const errData = await res.json();
+   303→          errMsg = errData?.error || errMsg;
+   304→        } catch {
+   305→          // اگر JSON parse ناموفق بود (مثلاً HTML خطا یا پاسخ خالی)
+   306→          errMsg = `خطای سرور (${res.status}). لطفاً دوباره تلاش کنید.`;
+   307→        }
+   308→        throw new Error(errMsg);
+   309→      }
+   310→      const data = await res.json();
+   311→
+   312→      if (data?.status === "analyzing" || data?.started) {
+   313→        // ─── v74: پاسخ فوری سرور — تحلیل در پس‌زمینه شروع شد ───
+   314→        // وضعیت واقعی «در حال تحلیل» می‌ماند و GET هر ۵ ثانیه poll می‌شود
+   315→        // تا نتیجه بیاید (حتی با بستن صفحه، نتیجه در DB ذخیره می‌شود).
+   316→        useAppStore.setState((s) => ({
+   317→          user: s.user ? { ...s.user, videoStatus: "analyzing" } : s.user,
+   318→        }));
+   319→        if (typeof window !== "undefined") {
+   320→          window.dispatchEvent(new CustomEvent("prereq-updated"));
+   321→        }
+   322→        startPolling(baselineCreatedAt);
+   323→        return;
+   324→      }
+   325→
+   326→      // مسیر همگام (سازگاری با پاسخ قدیمی سرور) — نتیجه مستقیم در همان POST
+   327→      handleAnalysisSuccess(data);
+   328→    } catch (e) {
+   329→      setAnalyzing(false);
+   330→      toast.error(e instanceof Error ? e.message : "خطا در تحلیل");
+   331→    }
+   332→  }
+   333→
+   334→  function reset() {
+   335→    if (videoUrl) URL.revokeObjectURL(videoUrl);
+   336→    setFile(null);
+   337→    setVideoUrl("");
+   338→    setResult(null);
+   339→    setAnalysisFailed(false);
+   340→  }
+   341→
+   342→  return (
+   343→    <div className="flex flex-col h-full">
+   344→      {/* Header */}
+   345→      <div className="flex items-center justify-between p-4 border-b glass-strong">
+   346→        <div className="flex items-center gap-2">
+   347→          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center">
+   348→            <Video className="w-5 h-5 text-white" />
+   349→          </div>
+   350→          <div>
+   351→            <h2 className="font-bold text-sm">آنالیز ویدیویی بدن</h2>
+   352→            <p className="text-[10px] text-muted-foreground">
+   353→              {limitReached
+   354→                ? "سقف استفاده پر شده"
+   355→                : `پلن حرفه‌ای — ${toPersianDigits(usedCount)}/${toPersianDigits(limit)} استفاده`}
+   356→            </p>
+   357→          </div>
+   358→        </div>
+   359→        <Button variant="ghost" size="icon" onClick={() => setOverlay(null)} className="rounded-full">
+   360→          <X className="w-5 h-5" />
+   361→        </Button>
+   362→      </div>
+   363→
+   364→      <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-4 max-w-2xl mx-auto w-full">
+   365→        <div className="glass-yellow rounded-2xl p-4 text-sm text-center">
+   366→          <Sparkles className="w-5 h-5 text-primary mx-auto mb-1" />
+   367→          ویدیوی تمرینت رو آپلود کن تا هوش مصنوعی فرم بدن، تقارن و تکنیکت رو آنالیز کنه
+   368→        </div>
+   369→
+   370→        {/* Recording guide */}
+   371→        <div className="bg-white rounded-2xl border-2 border-orange-200 overflow-hidden">
+   372→          <div
+   373→            className="flex items-center gap-2 px-4 py-3 text-white"
+   374→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   375→          >
+   376→            <Camera className="w-4 h-4" />
+   377→            <h3 className="font-bold text-sm">راهنمای ضبط ویدیو</h3>
+   378→          </div>
+   379→          <div className="p-4 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+   380→            {GUIDE_ITEMS.map((item, i) => (
+   381→              <motion.div
+   382→                key={i}
+   383→                initial={{ opacity: 0, x: -10 }}
+   384→                animate={{ opacity: 1, x: 0 }}
+   385→                transition={{ delay: i * 0.06 }}
+   386→                className="flex items-start gap-2.5 p-2.5 rounded-xl bg-orange-50/40"
+   387→              >
+   388→                <div
+   389→                  className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0"
+   390→                  style={{ background: `${item.color}1a` }}
+   391→                >
+   392→                  <item.icon className="w-4 h-4" style={{ color: item.color }} />
+   393→                </div>
+   394→                <div className="flex-1 min-w-0">
+   395→                  <p className="text-xs font-bold text-slate-900">{item.title}</p>
+   396→                  <p className="text-[11px] text-slate-500 leading-relaxed">{item.desc}</p>
+   397→                </div>
+   398→              </motion.div>
+   399→            ))}
+   400→          </div>
+   401→          <div className="px-4 pb-3">
+   402→            <div className="rounded-xl bg-amber-50 border border-amber-200 p-2.5 flex items-start gap-2">
+   403→              <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+   404→              <p className="text-[11px] text-amber-700 leading-relaxed">
+   405→                ویدیوی باکیفیت‌تر، آنالیز دقیق‌تری به شما می‌دهد. هر سه زاویه را در یک فایل یا فایل‌های جداگانه آپلود کنید.
+   406→              </p>
+   407→            </div>
+   408→          </div>
+   409→        </div>
+   410→
+   411→        {!file ? (
+   412→          limitReached ? (
+   413→            <div className="glass rounded-3xl border-2 border-amber-300 bg-amber-50/50 p-8 text-center">
+   414→              <AlertTriangle className="w-12 h-12 text-amber-500 mx-auto mb-3" />
+   415→              <p className="font-bold text-amber-700 mb-1">سقف استفاده از این قابلیت پر شده است</p>
+   416→              <p className="text-xs text-amber-600">
+   417→                شما از {toPersianDigits(usedCount)} از {toPersianDigits(limit)} تحلیل مجاز پلن حرفه‌ای خود استفاده کرده‌اید.
+   418→              </p>
+   419→            </div>
+   420→          ) : analysisFailed ? (
+   421→            // ─── v74: پایان ناموفق تحلیل پس‌زمینه — خطا + دکمهٔ تلاش مجدد ───
+   422→            <div className="glass rounded-3xl border-2 border-rose-300 bg-rose-50/50 p-8 text-center">
+   423→              <AlertTriangle className="w-12 h-12 text-rose-500 mx-auto mb-3" />
+   424→              <p className="font-bold text-rose-700 mb-1">تحلیل ویدیو ناتمام ماند</p>
+   425→              <p className="text-xs text-rose-600 mb-4">
+   426→                مشکل موقتی در تحلیل پیش آمد — سهمیهٔ شما مصرف نشده است. می‌توانید دوباره تلاش کنید.
+   427→              </p>
+   428→              <Button
+   429→                onClick={() => {
+   430→                  setAnalysisFailed(false);
+   431→                  setForceUploadUI(true);
+   432→                }}
+   433→                className="rounded-xl"
+   434→              >
+   435→                <RefreshCw className="w-4 h-4" /> تلاش مجدد
+   436→              </Button>
+   437→            </div>
+   438→          ) : decided && !forceUploadUI ? (
+   439→            <div className="glass rounded-3xl border-2 border-emerald-300 bg-emerald-50/50 p-8 text-center">
+   440→              <CheckCircle2 className="w-12 h-12 text-emerald-500 mx-auto mb-3" />
+   441→              <p className="font-bold text-emerald-700 mb-1">
+   442→                {user?.videoStatus === "uploaded" ? "ویدیو آپلود شده ✓" : "ویدیو رد شد ✓"}
+   443→              </p>
+   444→              <p className="text-xs text-emerald-600">
+   445→                شما این پیش‌نیاز را تعیین تکلیف کرده‌اید.
+   446→              </p>
+   447→            </div>
+   448→          ) : (
+   449→            <div className="space-y-4">
+   450→              <label className="block">
+   451→                <div className="glass rounded-3xl border-2 border-dashed border-border hover:border-primary/50 transition p-10 text-center cursor-pointer">
+   452→                  <motion.div animate={{ y: [0, -8, 0] }} transition={{ duration: 2, repeat: Infinity }} className="w-16 h-16 rounded-2xl bg-primary/15 flex items-center justify-center mx-auto mb-4">
+   453→                    <Upload className="w-8 h-8 text-primary" />
+   454→                  </motion.div>
+   455→                  <p className="font-bold mb-1">ویدیو را اینجا بکش یا کلیک کن</p>
+   456→                  <p className="text-xs text-muted-foreground">فرمت: MP4, MOV, WebM — بدون محدودیت حجم (تا {toPersianDigits(MAX_VIDEO_MB)} مگابایت)</p>
+   457→                </div>
+   458→                <input type="file" accept="video/*" className="hidden" onChange={handleFile} />
+   459→              </label>
+   460→              {/* «آپلود نمی‌کنم» — اول تأیید صریح کاربر گرفته می‌شود (درخواست مالک):
+   461→                  در صورت عدم آپلود، در طول پلن جاری امکان ارسال نیست و این مورد
+   462→                  در طراحی برنامه نادیده گرفته می‌شود. */}
+   463→              <Button
+   464→                variant="outline"
+   465→                className="w-full rounded-xl h-12 font-bold text-slate-600 border-2 border-slate-200 hover:bg-slate-50"
+   466→                disabled={skipping}
+   467→                onClick={() => setConfirmDecline(true)}
+   468→              >
+   469→                {skipping ? (
+   470→                  <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> در حال ثبت...</span>
+   471→                ) : (
+   472→                  "آپلود نمی‌کنم"
+   473→                )}
+   474→              </Button>
+   475→            </div>
+   476→          )
+   477→        ) : null}
+   478→
+   479→        {file && !result && (
+   480→          <div className="space-y-3">
+   481→            <div className="glass rounded-2xl overflow-hidden">
+   482→              <video src={videoUrl} controls preload="metadata" playsInline className="w-full max-h-64" />
+   483→              <div className="p-3 flex items-center justify-between">
+   484→                <div className="min-w-0">
+   485→                  <p className="text-xs text-muted-foreground truncate">{file.name}</p>
+   486→                  <p className="text-[10px] text-slate-400 mt-0.5">حجم: {formatSizeMB(file.size)} مگابایت — بعد از آپلود بهینه می‌شود</p>
+   487→                </div>
+   488→                <button onClick={reset} className="text-xs text-destructive flex items-center gap-1 shrink-0">
+   489→                  <RefreshCw className="w-3.5 h-3.5" /> تغییر
+   490→                </button>
+   491→              </div>
+   492→            </div>
+   493→            <Button onClick={analyze} disabled={analyzing} className="w-full rounded-xl h-12 font-bold">
+   494→              {analyzing ? (
+   495→                <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> در حال بهینه‌سازی و تحلیل…</span>
+   496→              ) : (
+   497→                <span className="flex items-center gap-2"><Sparkles className="w-4 h-4" /> شروع آنالیز ویدیو</span>
+   498→              )}
+   499→            </Button>
+   500→            {/* v74: خطای تحلیل پس‌زمینه — فایل هنوز انتخاب است، retry با همان دکمه */}
+   501→            {analysisFailed && (
+   502→              <div className="rounded-xl bg-red-50 border border-red-200 p-3 flex items-start gap-2">
+   503→                <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+   504→                <p className="text-[11px] text-red-700 leading-relaxed">
+   505→                  تحلیل ویدیو ناتمام ماند — سهمیهٔ شما مصرف نشده است. می‌توانید دوباره «شروع آنالیز» را بزنید یا ویدیوی دیگری انتخاب کنید.
+   506→                </p>
+   507→              </div>
+   508→            )}
+   509→          </div>
+   510→        )}
+   511→
+   512→        {analyzing && (
+   513→          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-3">
+   514→            <div className="space-y-2">
+   515→              {["بررسی فرم بدن...", "آنالیز تقارن...", "بررسی تکنیک حرکت...", "تولید توصیه‌ها..."].map((s, i) => (
+   516→                <motion.div
+   517→                  key={i}
+   518→                  initial={{ opacity: 0, x: -20 }}
+   519→                  animate={{ opacity: 1, x: 0 }}
+   520→                  transition={{ delay: i * 0.7 }}
+   521→                  className="flex items-center gap-2 text-sm"
+   522→                >
+   523→                  <CheckCircle2 className="w-4 h-4 text-primary" />
+   524→                  {s}
+   525→                </motion.div>
+   526→              ))}
+   527→            </div>
+   528→            {/* v74: تحلیل روی سرور در پس‌زمینه انجام می‌شود — بستن صفحه مشکلی نمی‌سازد */}
+   529→            <div className="rounded-xl bg-violet-50 border border-violet-200 p-3 flex items-start gap-2">
+   530→              <Loader2 className="w-3.5 h-3.5 text-violet-500 shrink-0 mt-0.5 animate-spin" />
+   531→              <p className="text-[11px] text-violet-700 leading-relaxed">
+   532→                تحلیل روی سرور در حال انجام است و حتی با بستن این صفحه ادامه می‌دهد؛ نتیجه ذخیره می‌شود و با بازکردن دوبارهٔ همین صفحه نمایش داده می‌شود.
+   533→              </p>
+   534→            </div>
+   535→          </motion.div>
+   536→        )}
+   537→
+   538→        {result && (
+   539→          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-3">
+   540→            {/* Score */}
+   541→            <div className="glass rounded-2xl p-5 text-center">
+   542→              <p className="text-xs text-muted-foreground mb-2">امتیاز فرم بدن</p>
+   543→              <div className="relative w-24 h-24 mx-auto mb-2">
+   544→                <svg className="w-24 h-24 -rotate-90" viewBox="0 0 36 36">
+   545→                  <circle cx="18" cy="18" r="15" fill="none" stroke="currentColor" strokeWidth="3" className="text-muted/30" />
+   546→                  <motion.circle cx="18" cy="18" r="15" fill="none" stroke="#F4C542" strokeWidth="3"
+   547→                    strokeDasharray={`${(result.score / 100) * 94.2} 94.2`} strokeLinecap="round"
+   548→                    initial={{ strokeDasharray: "0 94.2" }} animate={{ strokeDasharray: `${(result.score / 100) * 94.2} 94.2` }}
+   549→                    style={{ filter: "drop-shadow(0 0 4px #F4C54280)" }}
+   550→                  />
+   551→                </svg>
+   552→                <div className="absolute inset-0 flex items-center justify-center text-2xl font-black gradient-text">{toPersianDigits(result.score)}</div>
+   553→              </div>
+   554→              <p className="text-sm font-bold">وضعیت فرم: {result.posture}</p>
+   555→              <p className="text-xs text-muted-foreground">تقارن بدن: {toPersianDigits(result.symmetry)}٪</p>
+   556→            </div>
+   557→
+   558→            {/* Issues */}
+   559→            <div className="glass rounded-2xl p-4">
+   560→              <h4 className="font-bold text-sm flex items-center gap-2 mb-2"><AlertCircle className="w-4 h-4 text-amber-500" /> نقاط قابل بهبود</h4>
+   561→              <ul className="space-y-1.5">
+   562→                {result.issues.map((issue: string, i: number) => (
+   563→                  <li key={i} className="text-xs text-muted-foreground flex items-start gap-2">
+   564→                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 mt-1.5 shrink-0" /> {issue}
+   565→                  </li>
+   566→                ))}
+   567→              </ul>
+   568→            </div>
+   569→
+   570→            {/* Recommendations */}
+   571→            <div className="glass rounded-2xl p-4">
+   572→              <h4 className="font-bold text-sm flex items-center gap-2 mb-2"><Sparkles className="w-4 h-4 text-primary" /> توصیه‌های تخصصی</h4>
+   573→              <ul className="space-y-1.5">
+   574→                {result.recommendations.map((rec: string, i: number) => (
+   575→                  <li key={i} className="text-xs text-muted-foreground flex items-start gap-2">
+   576→                    <CheckCircle2 className="w-3.5 h-3.5 text-primary shrink-0 mt-0.5" /> {rec}
+   577→                  </li>
+   578→                ))}
+   579→              </ul>
+   580→            </div>
+   581→
+   582→            <Button onClick={reset} variant="outline" className="w-full rounded-xl">
+   583→              <RefreshCw className="w-4 h-4" /> آنالیز ویدیوی جدید
+   584→            </Button>
+   585→          </motion.div>
+   586→        )}
+   587→      </div>
+   588→
+   589→      {/* ─── دایالوگ تأیید «آپلود نمی‌کنم» (درخواست مالک) ───
+   590→          قبل از رد شدن، از کاربر تأیید صریح گرفته می‌شود. تأیید یعنی:
+   591→          در طول پلن جاری دیگر امکان ارسال نیست و این مورد در طراحی
+   592→          برنامه نادیده گرفته می‌شود. */}
+   593→      <AlertDialog open={confirmDecline} onOpenChange={setConfirmDecline}>
+   594→        <AlertDialogContent dir="rtl" className="max-w-sm rounded-2xl">
+   595→          <AlertDialogHeader className="text-right sm:text-right">
+   596→            <AlertDialogTitle className="text-base font-black text-slate-900 flex items-center gap-2">
+   597→              <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0" />
+   598→              مطمئنی ویدیو را آپلود نمی‌کنی؟
+   599→            </AlertDialogTitle>
+   600→            <AlertDialogDescription className="text-xs text-slate-600 leading-relaxed text-right">
+   601→              در صورت آپلود نکردن، دیگر در طول پلن جاری امکان ارسال ویدیو نداری و با تأیید، این مورد در طراحی برنامه تو نادیده گرفته می‌شود.
+   602→            </AlertDialogDescription>
+   603→          </AlertDialogHeader>
+   604→          <AlertDialogFooter className="flex-row-reverse gap-2 sm:gap-0 sm:flex-row">
+   605→            <AlertDialogAction
+   606→              onClick={skipVideo}
+   607→              className="rounded-xl font-bold bg-rose-600 hover:bg-rose-700 text-white"
+   608→            >
+   609→              بله، آپلود نمی‌کنم
+   610→            </AlertDialogAction>
+   611→            <AlertDialogCancel className="rounded-xl font-bold">
+   612→              انصراف
+   613→            </AlertDialogCancel>
+   614→          </AlertDialogFooter>
+   615→        </AlertDialogContent>
+   616→      </AlertDialog>
+   617→    </div>
+   618→  );
+   619→}
+   620→

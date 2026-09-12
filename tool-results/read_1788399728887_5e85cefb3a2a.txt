@@ -1,0 +1,951 @@
+     1→/**
+     2→ * تحویل خرید پلن — هسته مشترک بین verify و recover و (بازگشت از درگاه).
+     3→ *
+     4→ * چرا این فایل وجود دارد؟
+     5→ *  ─── باگ «پرداخت موفق ولی در پنل در انتظار می‌ماند» ───
+     6→ *  سناریوی واقعی که کاربران داشتند: کاربر در درگاه زرین‌پال پرداخت می‌کند؛
+     7→ *  سرور verify زرین‌پال را صدا می‌زند (پول تایید می‌شود) اما پیش از commit
+     8→ *  نهایی DB (کرش/ری‌استارت/timeout گیت‌وی) پروسه می‌میرد. رکورد Payment
+     9→ *  pending می‌ماند. بازگشت دوم کاربر → زرین‌پال کد ۱۰۱ («قبلاً verify شده»)
+    10→ *  می‌دهد → منطق قبلی این را «replay» تلقی و پرداخت را failed می‌کرد:
+    11→ *  پول گرفته شد، پلن تحویل نشد، برنامه ساخته نشد، ادمین دستی فعال می‌کرد.
+    12→ *
+    13→ *  این کتابخانه + سیاست کد ۱۰۱ (پایین) + endpoint بازیابی (recover) + جاروی
+    14→ *  cron این کلاس باگ را در همه مسیرها ریشه‌کن می‌کند.
+    15→ *
+    16→ * سیاست کد ۱۰۱ (alreadyVerified) — جدید:
+    17→ *   • اگر Payment موفق «دیگری» با همان authority وجود دارد → replay واقعی → رد
+    18→ *   • در غیر این صورت → این authority پرداخت شده است (معمولاً یعنی تلاش قبلی
+    19→ *     ما پیش از commit مرده) → تحویل قطعی پلن
+    20→ *
+    21→ * سیافت خطای شبکه (transport):
+    22→ *   • خطای شبکه زرین‌پال ≠ پرداخت ناموفق → claim آزاد می‌شود (pending می‌ماند)
+    23→ *     و بعداً recover/کرون دوباره تلاش می‌کند. هرگز failed نمی‌شود.
+    24→ */
+    25→
+    26→import { db } from "@/lib/db";
+    27→import { buildUserDto } from "@/lib/fitness/auth";
+    28→import { toPersianDigits, type Plan } from "@/lib/fitness/types";
+    29→import { getActivePlan } from "@/lib/fitness/pricing";
+    30→import { processReferralReward } from "@/lib/fitness/referral";
+    31→import { createNotification } from "@/lib/fitness/notifications";
+    32→import { PENDING_WINDOW_DAYS } from "@/lib/fitness/subscription";
+    33→import { startProgramGenerationInBackground } from "@/lib/fitness/program-generation";
+    34→
+    35→/** خطای کد تخفیف نامعتبر — message همان متن فارسی پاسخ 400 */
+    36→export class DiscountInvalidError extends Error {}
+    37→
+    38→export interface ComputedAmount {
+    39→  finalAmount: number;
+    40→  originalAmount: number;
+    41→  discountValue: number;
+    42→  discountCode: string | null;
+    43→  userDiscountCodeUsed: boolean;
+    44→  upgradeCredit: number;
+    45→  isUpgrade: boolean;
+    46→}
+    47→
+    48→/**
+    49→ * محاسبه مبلغ نهایی خرید پلن — همان منطق checkout (قیمت - تخفیف - اعتبار ارتقا).
+    50→ * استفاده مشترک: checkout / bazaar dynamic-price / bazaar purchase (ثبت مبلغ واقعی).
+    51→ * خطا: DiscountInvalidError با پیام فارسی (کالر → 400).
+    52→ */
+    53→export async function computePlanFinalAmount(
+    54→  userId: string,
+    55→  plan: { id: string; price: number },
+    56→  opts: { discountCode?: string; userDiscountCode?: string } = {}
+    57→): Promise<ComputedAmount> {
+    58→  let finalAmount = plan.price;
+    59→  const originalAmount = plan.price;
+    60→  let discountValue = 0;
+    61→  let appliedCode: string | null = null;
+    62→  let userDiscountCodeUsed = false;
+    63→  let upgradeCredit = 0;
+    64→  let isUpgrade = false;
+    65→
+    66→  // ─── تخفیف عمومی ───
+    67→  if (opts.discountCode) {
+    68→    const code = opts.discountCode.trim().toUpperCase();
+    69→    const dc = await db.discountCode.findUnique({ where: { code } });
+    70→    if (!dc || !dc.active) throw new DiscountInvalidError("کد تخفیف نامعتبر است.");
+    71→    if (dc.validUntil && dc.validUntil < new Date())
+    72→      throw new DiscountInvalidError("کد تخفیف منقضی شده است.");
+    73→    if (dc.maxUses !== -1 && dc.usedCount >= dc.maxUses)
+    74→      throw new DiscountInvalidError("سقف استفاده از این کد تخفیف تکمیل شده است.");
+    75→    if (dc.applicablePlans !== "all") {
+    76→      const allowed = dc.applicablePlans.split(",");
+    77→      if (!allowed.includes(plan.id))
+    78→        throw new DiscountInvalidError("این کد تخفیف برای پلن انتخاب‌شده قابل استفاده نیست.");
+    79→    }
+    80→    appliedCode = dc.code;
+    81→    discountValue =
+    82→      dc.type === "percent"
+    83→        ? Math.round((originalAmount * dc.value) / 100)
+    84→        : Math.min(dc.value, originalAmount);
+    85→  }
+    86→
+    87→  // ─── کد اختصاصی کاربر (اولویت روی کد عمومی) ───
+    88→  if (opts.userDiscountCode) {
+    89→    const code = opts.userDiscountCode.trim().toUpperCase();
+    90→    const udc = await db.userDiscountCode.findUnique({ where: { code } });
+    91→    if (!udc) throw new DiscountInvalidError("کد تخفیف اختصاصی یافت نشد.");
+    92→    if (udc.userId !== userId)
+    93→      throw new DiscountInvalidError("این کد تخفیف متعلق به حساب شما نیست.");
+    94→    if (udc.isUsed) throw new DiscountInvalidError("این کد تخفیف قبلاً استفاده شده است.");
+    95→    if (udc.validUntil && udc.validUntil < new Date())
+    96→      throw new DiscountInvalidError("کد تخفیف اختصاصی منقضی شده است.");
+    97→    // کد اختصاصی بر کد عمومی ارجحیت دارد
+    98→    if (appliedCode) {
+    99→      discountValue = 0;
+   100→      appliedCode = null;
+   101→    }
+   102→    appliedCode = udc.code;
+   103→    userDiscountCodeUsed = true;
+   104→    discountValue =
+   105→      udc.type === "percent"
+   106→        ? Math.round((originalAmount * udc.value) / 100)
+   107→        : Math.min(udc.value, originalAmount);
+   108→  }
+   109→
+   110→  // ─── اعتبار ارتقا ───
+   111→  const now = new Date();
+   112→  const [activeSub, pendingSubs] = await Promise.all([
+   113→    db.subscription.findFirst({
+   114→      where: { userId, status: "active", endDate: { gt: now } },
+   115→      orderBy: { endDate: "desc" },
+   116→    }),
+   117→    db.subscription.findMany({
+   118→      where: {
+   119→        userId,
+   120→        status: "pending",
+   121→        OR: [{ endDate: null }, { endDate: { gt: now } }],
+   122→      },
+   123→      orderBy: { createdAt: "desc" },
+   124→    }),
+   125→  ]);
+   126→  if (activeSub && activeSub.endDate && activeSub.plan !== plan.id) {
+   127→    const oldPlan = await getActivePlan(activeSub.plan as Plan);
+   128→    if (oldPlan) {
+   129→      const daysLeft = activeSub.endDate
+   130→        ? Math.ceil((activeSub.endDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+   131→        : 0;
+   132→      if (daysLeft > 0) {
+   133→        upgradeCredit = Math.round((activeSub.pricePaid / activeSub.durationDays) * daysLeft);
+   134→        isUpgrade = true;
+   135→      }
+   136→    }
+   137→  }
+   138→  for (const pSub of pendingSubs) {
+   139→    upgradeCredit += pSub.pricePaid;
+   140→    isUpgrade = true;
+   141→  }
+   142→
+   143→  finalAmount = Math.max(0, originalAmount - discountValue - upgradeCredit);
+   144→
+   145→  return {
+   146→    finalAmount,
+   147→    originalAmount,
+   148→    discountValue,
+   149→    discountCode: appliedCode,
+   150→    userDiscountCodeUsed,
+   151→    upgradeCredit,
+   152→    isUpgrade,
+   153→  };
+   154→}
+   155→
+   156→/** خطای داخلی برای کسر ناموفق کیف پول (تراکنش اتمیک rollback می‌شود) */
+   157→export class WalletInsufficientError extends Error {
+   158→  constructor() {
+   159→    super("INSUFFICIENT_WALLET");
+   160→  }
+   161→}
+   162→
+   163→/** حداکثر عمر وضعیت "verifying" قبل از اینکه پرداخت «گیرکرده» تلقی شود */
+   164→export const VERIFYING_STUCK_MS = 15 * 60 * 1000; // ۱۵ دقیقه
+   165→
+   166→/** بازه پرداخت‌هایی که recover باید پوشش دهد (از تاریخ ایجاد) */
+   167→export const RECOVER_WINDOW_MS = 72 * 60 * 60 * 1000; // ۷۲ ساعت
+   168→
+   169→/**
+   170→ * ─── برش بازیابی خودکار (Legacy Cutoff) ───
+   171→ *
+   172→ * درخواست صریح مالک: پرداخت‌های معلقِ «قبل از» این نسخه نباید هرگز به‌صورت
+   173→ * خودکار تحویل شوند — بعضی از آن‌ها را ادمین «دستی» فعال کرده (اگر تحویل
+   174→ * خودکار می‌شد، اشتراک دوم روی قبلی سوار می‌شد) و بقیه اصلاً پرداخت نکرده‌اند
+   175→ * (فقط وارد درگاه شده و خارج شده‌اند). این‌ها در لحظه استقرار نسخه جدید یک‌بار
+   176→ * برای همیشه به وضعیت manual_resolved («رسیدگی دستی») بسته می‌شوند تا:
+   177→ *   ۱) کرون/بازیابی خودکار هرگز سراغشان نرود
+   178→ *   ۲) در پنل ادمین به‌عنوان «در انتظار» دروغین باقی نمانند
+   179→ * فقط پرداخت‌های ایجادشده «بعد از» این لحظه مشمول بازیابی خودکار هستند.
+   180→ */
+   181→const RECOVERY_CUTOFF_SETTING = "payment_auto_recover_start";
+   182→
+   183→/**
+   184→ * مهلت ۴۵ دقیقه‌ای برای کاربرانی که «همین حالا» داخل درگاه زرین‌پال هستند:
+   185→ * پرداخت‌های ایجادشده در ۴۵ دقیقه آخر قبل از استقرار، pending می‌مانند و جاروی
+   186→ * جدید همچنان پوششان می‌دهد (کاربر که برمی‌گردد تحویل می‌گیرد) — چون سشن درگاه
+   187→ * حداکثر ~۱۵ دقیقه است، ۴۵ دقیقه خیلی امن است. قدیمی‌ترها = قطعاً legacy.
+   188→ */
+   189→const RECOVERY_CUTOFF_GRACE_MS = 45 * 60 * 1000;
+   190→
+   191→/** نتیجه getRecoveryCutoff — firstRun یعنی تنظیم همین حالا ایجاد شد */
+   192→export interface RecoveryCutoffInfo {
+   193→  cutoff: Date;
+   194→  /** true = این فراخوان مقدار را ایجاد کرد (legacy sweep باید اجرا شود) */
+   195→  firstRun: boolean;
+   196→}
+   197→
+   198→export async function getRecoveryCutoff(): Promise<RecoveryCutoffInfo> {
+   199→  const existing = await db.siteSetting.findUnique({
+   200→    where: { key: RECOVERY_CUTOFF_SETTING },
+   201→  });
+   202→  if (existing) {
+   203→    const d = new Date(existing.value);
+   204→    if (!isNaN(d.getTime())) return { cutoff: d, firstRun: false };
+   205→  }
+   206→
+   207→  // اولین اجرا (بعد از deploy) — مقدار را «۴۵ دقیقه قبل از الان» قفل کن تا
+   208→  // خریدارهای در-حال-پرداخت هم پوشش داده شوند (race-safe با کلید یکتا)
+   209→  const effectiveCutoff = new Date(Date.now() - RECOVERY_CUTOFF_GRACE_MS);
+   210→  try {
+   211→    await db.siteSetting.create({
+   212→      data: {
+   213→        key: RECOVERY_CUTOFF_SETTING,
+   214→        value: effectiveCutoff.toISOString(),
+   215→        label: "شروع بازیابی خودکار پرداخت‌ها (پیش از این: رسیدگی دستی)",
+   216→      },
+   217→    });
+   218→  } catch (e: any) {
+   219→    if (e?.code === "P2002") {
+   220→      // فراخوان موازی برنده شد — مقدارش معتبر است
+   221→      const winner = await db.siteSetting.findUnique({
+   222→        where: { key: RECOVERY_CUTOFF_SETTING },
+   223→      });
+   224→      if (winner) {
+   225→        const d = new Date(winner.value);
+   226→        if (!isNaN(d.getTime())) return { cutoff: d, firstRun: false };
+   227→      }
+   228→      return { cutoff: effectiveCutoff, firstRun: false };
+   229→    }
+   230→    throw e;
+   231→  }
+   232→
+   233→  // ─── FIX (درخواست مالک ۱۴۰۵-۰۶: «همه پرداخت‌های موفق وریفای شوند») ───
+   234→  // قبلاً: همه معلق‌های قدیمی‌تر از برش «کورکورانه» manual_resolved می‌شدند —
+   235→  // حتی پرداخت‌هایی که کاربر واقعاً پول داده بود! حالا معلق‌های legacy با
+   236→  // استعلام واقعی زرین‌پال تعیین‌تکلیف می‌شوند (resolveLegacyPendingPayments
+   237→  // توسط کرون/جاروی داخلی صدا زده می‌شود):
+   238→  //   • زرین‌پال پرداخت را تأیید کند (100/101) → تحویل کامل پلن/کیف پول
+   239→  //   • پاسخ قطعی منفی → manual_resolved (رسیدگی دستی — پولی نداده)
+   240→  //   • خطای شبکه → pending می‌ماند (جاروی بعدی دوباره)
+   241→  return { cutoff: effectiveCutoff, firstRun: true };
+   242→}
+   243→
+   244→/**
+   245→ * تعیین‌تکلیف آگاهانه معلق‌های legacy (قدیمی‌تر از برش) — به‌جای بستن کورکورانه.
+   246→ *
+   247→ * فقط همان‌جا اجرا می‌شود که cutoff «برای اولین بار» ایجاد شده (firstRun).
+   248→ * برای هر پرداخت معلق قدیمی:
+   249→ *  - درگاهی + authority → zarinpalVerify (استعلام واقعی پول):
+   250→ *      • ok (100/101 بدون replay) → تحویل پلن یا شارژ کیف پول → success
+   251→ *      • خطای قطعی (پرداخت‌نشده) → manual_resolved («رسیدگی دستی (قدیمی)»)
+   252→ *      • خطای شبکه → pending می‌ماند؛ جاروی بعدی دوباره می‌کوشد
+   253→ *  - کیف‌پولی (بدون درگاه) → expired (پولی کسر نشده؛ ناگهان کسر نکن)
+   254→ *
+   255→ * امنیت: claim اتمیک مثل بقیه مسیرها — دو اجرای موازی یکی را انجام می‌دهند.
+   256→ */
+   257→export async function resolveLegacyPendingPayments(
+   258→  cutoff: Date
+   259→): Promise<{
+   260→  scanned: number;
+   261→  delivered: number;
+   262→  closed: number;
+   263→  results: Array<{ paymentId: string; status: string; message?: string }>;
+   264→}> {
+   265→  const legacy = await db.payment.findMany({
+   266→    where: {
+   267→      status: { in: ["pending", "verifying"] },
+   268→      createdAt: { lt: cutoff },
+   269→    },
+   270→    orderBy: { createdAt: "asc" },
+   271→    take: 200,
+   272→  });
+   273→  const results: Array<{ paymentId: string; status: string; message?: string }> = [];
+   274→  let delivered = 0;
+   275→  let closed = 0;
+   276→
+   277→  // ایمپورت تنبل برای جلوگیری از circular dependency (zarinpal → provider)
+   278→  const { zarinpalVerify } = await import("@/lib/fitness/zarinpal");
+   279→
+   280→  for (let payment of legacy) {
+   281→    // verifying گیرکرده → ریست اتمیک به pending قبل از claim
+   282→    if (payment.status === "verifying") {
+   283→      const reset = await db.payment.updateMany({
+   284→        where: { id: payment.id, status: "verifying" },
+   285→        data: { status: "pending" },
+   286→      });
+   287→      if (reset.count === 1) {
+   288→        payment = { ...payment, status: "pending" };
+   289→      }
+   290→    }
+   291→
+   292→    const claim = await claimPayment(payment);
+   293→    if (claim !== "claimed") {
+   294→      // busy (فراخوان دیگری) / processed (تعیین‌تکلیف شده) / stuck (ریست شد)
+   295→      results.push({ paymentId: payment.id, status: claim });
+   296→      continue;
+   297→    }
+   298→
+   299→    try {
+   300→      // کیف‌پولی قدیمی → بسته (پولی کسر نشده — کسر ناگهانی نکن)
+   301→      if (payment.paymentMethod !== "gateway" || !payment.authority) {
+   302→        await markPaymentExpired(payment.id);
+   303→        closed++;
+   304→        results.push({ paymentId: payment.id, status: "closed-wallet-legacy" });
+   305→        continue;
+   306→      }
+   307→
+   308→      const zRes = await zarinpalVerify({
+   309→        authority: payment.authority,
+   310→        amount: payment.amount,
+   311→      });
+   312→
+   313→      if (!zRes.ok) {
+   314→        if (zRes.transportError) {
+   315→          // شبکه — نتیجه قطعی نیست؛ pending بماند برای جاروی بعدی
+   316→          await releaseClaim(payment.id);
+   317→          results.push({ paymentId: payment.id, status: "network-error-pending" });
+   318→          continue;
+   319→        }
+   320→        // زرین‌پال قطعیاً پرداختی ندارد → منقضی (پولی نداده — قابل بازیابی دستی)
+   321→        await markPaymentExpired(payment.id);
+   322→        closed++;
+   323→        results.push({ paymentId: payment.id, status: "closed-unpaid" });
+   324→        continue;
+   325→      }
+   326→
+   327→      // ok (100/101) — چک replay
+   328→      if (zRes.code === 101 || zRes.alreadyVerified) {
+   329→        if (await isAuthorityUsedElsewhere(payment.authority, payment.id)) {
+   330→          await markPaymentFailed(payment.id, zRes.refId ?? null);
+   331→          results.push({ paymentId: payment.id, status: "failed-replay" });
+   332→          continue;
+   333→        }
+   334→      }
+   335→
+   336→      const refId =
+   337→        zRes.refId ?? payment.refId ?? `${Date.now()}${Math.floor(Math.random() * 10000)}`;
+   338→
+   339→      // شارژ کیف پول legacy → helper مشترک
+   340→      if (payment.plan === "wallet_topup") {
+   341→        await deliverWalletTopupPayment({
+   342→          payment,
+   343→          refId,
+   344→          cardPan: zRes.cardPan ?? null,
+   345→          cardHash: zRes.cardHash ?? null,
+   346→          fee: zRes.fee ?? null,
+   347→        });
+   348→      } else {
+   349→        await deliverPlanPayment({
+   350→          userId: payment.userId,
+   351→          payment,
+   352→          refId,
+   353→          cardPan: zRes.cardPan ?? null,
+   354→          cardHash: zRes.cardHash ?? null,
+   355→          fee: zRes.fee ?? null,
+   356→        });
+   357→      }
+   358→
+   359→      delivered++;
+   360→      results.push({ paymentId: payment.id, status: "delivered-legacy" });
+   361→      console.log(
+   362→        `[payment-delivery] legacy pending ${payment.id} → تحویل شد (refId=${refId})`
+   363→      );
+   364→    } catch (err) {
+   365→      console.error("[payment-delivery] legacy resolve error:", payment.id, err);
+   366→      await releaseClaim(payment.id);
+   367→      results.push({ paymentId: payment.id, status: "error-pending" });
+   368→    }
+   369→  }
+   370→
+   371→  return { scanned: legacy.length, delivered, closed, results };
+   372→}
+   373→
+   374→/**
+   375→ * تحویل شارژ کیف پول (wallet_topup) — تراکنش اتمیک idempotent.
+   376→ * مشترک بین: verify route / recover route / cron sweep / legacy sweep.
+   377→ * (قبلاً این منطق فقط داخل recover route بود — cron به آن دسترسی نداشت.)
+   378→ */
+   379→export async function deliverWalletTopupPayment(params: {
+   380→  payment: PaymentRecord;
+   381→  refId: string;
+   382→  cardPan?: string | null;
+   383→  cardHash?: string | null;
+   384→  fee?: number | null;
+   385→}): Promise<{ newBalance: number }> {
+   386→  const { payment, refId } = params;
+   387→
+   388→  // ذخیره اطلاعات کارت/کارمزد
+   389→  if (params.cardPan || params.cardHash || params.fee != null) {
+   390→    await db.payment.update({
+   391→      where: { id: payment.id },
+   392→      data: {
+   393→        cardPan: params.cardPan ?? null,
+   394→        cardHash: params.cardHash ?? null,
+   395→        fee: params.fee ?? null,
+   396→      },
+   397→    });
+   398→  }
+   399→
+   400→  const newBalance = await db.$transaction(async (tx) => {
+   401→    // اگر همین پرداخت هم‌زمان توسط فراخوان دیگری success شد → skip (idempotent)
+   402→    const fresh = await tx.payment.findUnique({
+   403→      where: { id: payment.id },
+   404→      select: { status: true },
+   405→    });
+   406→    if (fresh?.status === "success") {
+   407→      const u = await tx.user.findUnique({
+   408→        where: { id: payment.userId },
+   409→        select: { walletBalance: true },
+   410→      });
+   411→      return u?.walletBalance ?? 0;
+   412→    }
+   413→
+   414→    await tx.user.update({
+   415→      where: { id: payment.userId },
+   416→      data: { walletBalance: { increment: payment.amount } },
+   417→    });
+   418→    const u2 = await tx.user.findUnique({
+   419→      where: { id: payment.userId },
+   420→      select: { walletBalance: true },
+   421→    });
+   422→    const balance = u2?.walletBalance ?? 0;
+   423→    await tx.walletTransaction.create({
+   424→      data: {
+   425→        userId: payment.userId,
+   426→        type: "deposit",
+   427→        amount: payment.amount,
+   428→        balance,
+   429→        description: `شارژ کیف پول — ${payment.amount.toLocaleString("en-US")} تومان`,
+   430→        refId: payment.id,
+   431→      },
+   432→    });
+   433→    await tx.payment.update({
+   434→      where: { id: payment.id },
+   435→      data: {
+   436→        status: "success",
+   437→        refId,
+   438→        verifiedAt: new Date(),
+   439→        cardPan: params.cardPan ?? null,
+   440→        cardHash: params.cardHash ?? null,
+   441→        fee: params.fee ?? null,
+   442→      },
+   443→    });
+   444→    return balance;
+   445→  });
+   446→
+   447→  try {
+   448→    const { createNotification } = await import("@/lib/fitness/notifications");
+   449→    await createNotification(
+   450→      payment.userId,
+   451→      "system",
+   452→      "کیف پول شما شارژ شد ✅",
+   453→      `مبلغ ${payment.amount.toLocaleString("en-US")} تومان به کیف پول شما اضافه شد. موجودی فعلی: ${newBalance.toLocaleString("en-US")} تومان.`,
+   454→      "?tab=dashboard"
+   455→    );
+   456→  } catch {}
+   457→
+   458→  return { newBalance };
+   459→}
+   460→
+   461→/** بستن پرداخت بی‌پرداختِ ازپنجره‌خارج‌شده — فقط با تأیید منفی زرین‌پال */
+   462→export async function markPaymentExpired(paymentId: string): Promise<void> {
+   463→  await db.payment.update({
+   464→    where: { id: paymentId },
+   465→    data: { status: "expired", verifiedAt: new Date() },
+   466→  });
+   467→}
+   468→
+   469→export interface PaymentRecord {
+   470→  id: string;
+   471→  userId: string;
+   472→  amount: number;
+   473→  originalAmount: number;
+   474→  plan: string;
+   475→  paymentMethod: string;
+   476→  authority: string | null;
+   477→  status: string;
+   478→  discountCode: string | null;
+   479→  verifiedAt: Date | null;
+   480→}
+   481→
+   482→/** نتیجه عملیات claim */
+   483→export type ClaimResult = "claimed" | "busy" | "stuck" | "processed";
+   484→
+   485→/**
+   486→ * F12: claim اتمیک وضعیت pending → verifying.
+   487→ * دو فراخوانی همزمان روی همان paymentId فقط یکی را عبور می‌دهد.
+   488→ * - "claimed": ما claim کردیم (ادامه بده)
+   489→ * - "busy": فراخوان دیگری در حال پردازش است (بعداً دوباره)
+   490→ * - "stuck": claim قبلی >۱۵ دقیقه معلق مانده (پروسه قبلی مرده) → failed
+   491→ *            شده تا قابل تکرار باشد (کالر باید پیام مناسب بدهد)
+   492→ * - "processed": وضعیت نهایی است (success/failed/cancelled/...)
+   493→ */
+   494→export async function claimPayment(payment: PaymentRecord): Promise<ClaimResult> {
+   495→  if (payment.status !== "pending") {
+   496→    if (payment.status !== "verifying") return "processed";
+   497→    const stuckFor = payment.verifiedAt ? Date.now() - payment.verifiedAt.getTime() : 0;
+   498→    if (payment.verifiedAt && stuckFor > VERIFYING_STUCK_MS) {
+   499→      await db.payment.update({
+   500→        where: { id: payment.id },
+   501→        data: { status: "failed" },
+   502→      });
+   503→      return "stuck";
+   504→    }
+   505→    return "busy";
+   506→  }
+   507→  const claimed = await db.payment.updateMany({
+   508→    where: { id: payment.id, status: "pending" },
+   509→    data: { status: "verifying", verifiedAt: new Date() },
+   510→  });
+   511→  return claimed.count === 0 ? "busy" : "claimed";
+   512→}
+   513→
+   514→/** آزادسازی claim در خطاهای غیرقطعی (شبکه) — پرداخت دوباره pending می‌شود */
+   515→export async function releaseClaim(paymentId: string): Promise<void> {
+   516→  await db.payment.updateMany({
+   517→    where: { id: paymentId, status: "verifying" },
+   518→    data: { status: "pending" },
+   519→  });
+   520→}
+   521→
+   522→/** mark failed — فقط برای خطاهای قطعی درگاه */
+   523→export async function markPaymentFailed(paymentId: string, refId?: string | null): Promise<void> {
+   524→  await db.payment.update({
+   525→    where: { id: paymentId },
+   526→    data: { status: "failed", verifiedAt: new Date(), ...(refId != null ? { refId } : {}) },
+   527→  });
+   528→}
+   529→
+   530→/**
+   531→ * آیا این authority قبلاً روی «پرداخت دیگری» success شده؟ (replay واقعی)
+   532→ * excludeId = پرداخت فعلی که همین حالا در حال deliver شدن است.
+   533→ */
+   534→export async function isAuthorityUsedElsewhere(authority: string, excludeId: string): Promise<boolean> {
+   535→  const other = await db.payment.findFirst({
+   536→    where: { authority, status: "success", id: { not: excludeId } },
+   537→    select: { id: true },
+   538→  });
+   539→  return !!other;
+   540→}
+   541→
+   542→export interface DeliverPlanParams {
+   543→  userId: string;
+   544→  payment: PaymentRecord;
+   545→  refId: string;
+   546→  cardPan?: string | null;
+   547→  cardHash?: string | null;
+   548→  fee?: number | null;
+   549→}
+   550→
+   551→/**
+   552→ * تحویل کامل خرید پلن — کسر کیف پول (در صورت روش wallet) + اشتراک +
+   553→ * ProgramRequest + آپدیت User + مصرف کد تخفیف + نوتیف‌ها + تولید برنامه
+   554→ * پس‌زمینه + پاداش معرفی — در یک $transaction اتمیک، سپس مراحل پس از tx.
+   555→ *
+   556→ * خروجی: همان shape پاسخ موفق verify (برای Response.json مستقیم).
+   557→ * خطا: WalletInsufficientError → کالر باید پرداخت را failed کند.
+   558→ */
+   559→export async function deliverPlanPayment(params: DeliverPlanParams) {
+   560→  const { userId, payment, refId } = params;
+   561→  const now = new Date();
+   562→  const plan = await getActivePlan(payment.plan as Plan);
+   563→  if (!plan) {
+   564→    throw new Error("پلن نامعتبر است.");
+   565→  }
+   566→
+   567→  // ذخیره اطلاعات کارت/کارمزد (اگر verify زرین‌پال داده)
+   568→  if (params.cardPan || params.cardHash || params.fee != null) {
+   569→    await db.payment.update({
+   570→      where: { id: payment.id },
+   571→      data: {
+   572→        cardPan: params.cardPan ?? null,
+   573→        cardHash: params.cardHash ?? null,
+   574→        fee: params.fee ?? null,
+   575→      },
+   576→    });
+   577→  }
+   578→
+   579→  const txResult = await db.$transaction(async (tx) => {
+   580→    let newBalance = 0;
+   581→    if (payment.paymentMethod === "wallet") {
+   582→      // کسر شرطی اتمیک — دو فراخوانی همزمان نمی‌توانند یک موجودی را دو بار خرج کنند
+   583→      const res = await tx.user.updateMany({
+   584→        where: { id: userId, walletBalance: { gte: payment.amount } },
+   585→        data: { walletBalance: { decrement: payment.amount } },
+   586→      });
+   587→      if (res.count === 0) {
+   588→        throw new WalletInsufficientError();
+   589→      }
+   590→      const fresh = await tx.user.findUnique({
+   591→        where: { id: userId },
+   592→        select: { walletBalance: true },
+   593→      });
+   594→      newBalance = fresh?.walletBalance ?? 0;
+   595→      await tx.walletTransaction.create({
+   596→        data: {
+   597→          userId,
+   598→          type: "purchase",
+   599→          amount: -payment.amount,
+   600→          balance: newBalance,
+   601→          description: `خرید پلن ${plan.label}`,
+   602→          refId: payment.id,
+   603→        },
+   604→      });
+   605→    }
+   606→
+   607→    // محاسبه تاریخ انقضا — تمدید همان پلن روزهای باقی‌مانده را حفظ می‌کند
+   608→    let remainingDaysPreserved = 0;
+   609→    const oldActiveSub = await tx.subscription.findFirst({
+   610→      where: { userId, status: "active" },
+   611→      orderBy: { endDate: "desc" },
+   612→    });
+   613→    if (
+   614→      oldActiveSub &&
+   615→      oldActiveSub.endDate &&
+   616→      oldActiveSub.endDate.getTime() > now.getTime() &&
+   617→      oldActiveSub.plan === plan.id
+   618→    ) {
+   619→      const msLeft = oldActiveSub.endDate.getTime() - now.getTime();
+   620→      const daysLeftOld = Math.ceil(msLeft / (1000 * 60 * 60 * 24));
+   621→      if (daysLeftOld > 0) {
+   622→        remainingDaysPreserved = Math.min(daysLeftOld, plan.durationDays);
+   623→      }
+   624→    }
+   625→
+   626→    const endDate = new Date();
+   627→    endDate.setDate(endDate.getDate() + plan.durationDays + remainingDaysPreserved);
+   628→
+   629→    // غیرفعال کردن اشتراک‌های قبلی
+   630→    await tx.subscription.updateMany({
+   631→      where: { userId, status: "active" },
+   632→      data: { status: "expired" },
+   633→    });
+   634→    await tx.subscription.updateMany({
+   635→      where: { userId, status: "pending" },
+   636→      data: { status: "cancelled" },
+   637→    });
+   638→
+   639→    // پلن‌های advanced/ultimate → pending تا تکمیل پیش‌نیازها (۴۵ روزه از آن لحظه شروع)
+   640→    const needsBodyPhoto = plan.id === "advanced" || plan.id === "ultimate";
+   641→
+   642→    if (needsBodyPhoto) {
+   643→      const pendingWindowEnd = new Date(now);
+   644→      pendingWindowEnd.setDate(pendingWindowEnd.getDate() + PENDING_WINDOW_DAYS);
+   645→      await tx.subscription.create({
+   646→        data: {
+   647→          userId,
+   648→          plan: plan.id,
+   649→          status: "pending",
+   650→          startDate: null,
+   651→          endDate: pendingWindowEnd,
+   652→          durationDays: plan.durationDays,
+   653→          pricePaid: payment.amount,
+   654→          discountCode: payment.discountCode,
+   655→          paymentId: payment.id, // F11: پیوند دقیق پرداخت ↔ اشتراک
+   656→        },
+   657→      });
+   658→    } else {
+   659→      await tx.subscription.create({
+   660→        data: {
+   661→          userId,
+   662→          plan: plan.id,
+   663→          status: "active",
+   664→          startDate: now,
+   665→          endDate,
+   666→          durationDays: plan.durationDays,
+   667→          pricePaid: payment.amount,
+   668→          discountCode: payment.discountCode,
+   669→          paymentId: payment.id,
+   670→        },
+   671→      });
+   672→    }
+   673→
+   674→    // آپدیت وضعیت payment → success (داخل tx — با تحویل اتمیک)
+   675→    await tx.payment.update({
+   676→      where: { id: payment.id },
+   677→      data: {
+   678→        status: "success",
+   679→        refId,
+   680→        verifiedAt: now,
+   681→      },
+   682→    });
+   683→
+   684→    // فیلدهای پلن روی User
+   685→    await tx.user.update({
+   686→      where: { id: userId },
+   687→      data: {
+   688→        planName: plan.id,
+   689→        planExpiresAt: needsBodyPhoto ? null : endDate,
+   690→        planStartedAt: needsBodyPhoto ? null : now,
+   691→        videoAnalysisUsed: 0,
+   692→        bloodTestUsed: 0,
+   693→        videoStatus: null,
+   694→        bloodTestStatus: null,
+   695→      },
+   696→    });
+   697→
+   698→    // درخواست تولید برنامه
+   699→    const progReq = await tx.programRequest.create({
+   700→      data: {
+   701→        userId,
+   702→        plan: plan.id,
+   703→        billingPeriod: "monthly",
+   704→        status: needsBodyPhoto ? "pending_body_photo" : "pending_generation",
+   705→        paymentId: payment.id,
+   706→      },
+   707→    });
+   708→
+   709→    // F9: اعتبارسنجی مجدد و اتمیک کد تخفیف قبل از مصرف
+   710→    if (payment.discountCode) {
+   711→      const udc = await tx.userDiscountCode.findUnique({
+   712→        where: { code: payment.discountCode },
+   713→      });
+   714→      if (udc) {
+   715→        if (udc.userId === userId) {
+   716→          const upd = await tx.userDiscountCode.updateMany({
+   717→            where: {
+   718→              id: udc.id,
+   719→              userId,
+   720→              isUsed: false,
+   721→              validUntil: { gt: now },
+   722→            },
+   723→            data: { isUsed: true },
+   724→          });
+   725→          if (upd.count === 0) {
+   726→            console.error(
+   727→              "[payment-delivery] discount re-validation failed (user code already used/expired):",
+   728→              payment.discountCode
+   729→            );
+   730→          }
+   731→        } else {
+   732→          console.error(
+   733→            "[payment-delivery] discount code belongs to another user — not consumed:",
+   734→            payment.discountCode
+   735→          );
+   736→        }
+   737→      } else {
+   738→        const dc = await tx.discountCode.findUnique({
+   739→          where: { code: payment.discountCode },
+   740→        });
+   741→        if (dc) {
+   742→          const upd = await tx.discountCode.updateMany({
+   743→            where: {
+   744→              code: dc.code,
+   745→              active: true,
+   746→              OR: [{ validUntil: null }, { validUntil: { gt: now } }],
+   747→              ...(dc.maxUses !== -1 ? { usedCount: { lt: dc.maxUses } } : {}),
+   748→            },
+   749→            data: { usedCount: { increment: 1 } },
+   750→          });
+   751→          if (upd.count === 0) {
+   752→            console.error(
+   753→              "[payment-delivery] discount re-validation failed (expired/inactive/exhausted):",
+   754→              payment.discountCode
+   755→            );
+   756→            // گزارش عبور از سقف به ادمین‌ها
+   757→            try {
+   758→              const adminIds = await tx.user.findMany({
+   759→                where: { role: "ADMIN", isBlocked: false },
+   760→                select: { id: true },
+   761→              });
+   762→              if (adminIds.length > 0) {
+   763→                await tx.notification.createMany({
+   764→                  data: adminIds.map((a) => ({
+   765→                    userId: a.id,
+   766→                    type: "system",
+   767→                    title: "سقف کد تخفیف رد شد ⚠️",
+   768→                    body: `پرداخت ${payment.id} با کد «${payment.discountCode}» تأیید شد در حالی که سقف/اعتبار کد تکمیل شده بود. (مبلغ: ${payment.amount} تومان)`,
+   769→                    link: "?screen=admin",
+   770→                    read: false,
+   771→                    meta: JSON.stringify({
+   772→                      scenario: "discount_overuse",
+   773→                      paymentId: payment.id,
+   774→                      code: payment.discountCode,
+   775→                      maxUses: dc.maxUses,
+   776→                      usedCount: dc.usedCount,
+   777→                    }),
+   778→                  })),
+   779→                });
+   780→              }
+   781→            } catch {
+   782→              // نوتیف نباید جریان پول را متوقف کند
+   783→            }
+   784→          }
+   785→        }
+   786→      }
+   787→    }
+   788→
+   789→    return {
+   790→      newBalance,
+   791→      remainingDaysPreserved,
+   792→      progReqId: progReq.id,
+   793→      needsBodyPhoto,
+   794→      subscriptionEnd: endDate,
+   795→    };
+   796→  });
+   797→
+   798→  const { newBalance, remainingDaysPreserved, progReqId, needsBodyPhoto, subscriptionEnd: endDate } =
+   799→    txResult;
+   800→
+   801→  // --- تولید برنامه در پس‌زمینه / اطلاع پیش‌نیازها ---
+   802→  const canSubmitVideo = plan.id === "ultimate";
+   803→
+   804→  if (needsBodyPhoto) {
+   805→    await db.programRequest.update({
+   806→      where: { id: progReqId },
+   807→      data: { status: "pending_body_photo" },
+   808→    });
+   809→
+   810→    const noticeBody = canSubmitVideo
+   811→      ? "برای دریافت برنامه اختصاصی، ارسال عکس‌های بدن (۴ زاویه) الزامی است. ارسال ویدیوی فرم حرکات اختیاری است اما به دقت برنامه کمک می‌کند. همچنین می‌توانید بعداً از بخش «آزمایش خون» در پنل، عکس آزمایش خون خود را برای تحلیل ارسال کنید (دلبخواه)."
+   812→      : "برای دریافت برنامه اختصاصی، عکس‌های بدن خود (۴ زاویه) را ارسال کنید. سپس فیتاپ هوشمند برنامه شما را طراحی می‌کند.";
+   813→
+   814→    await createNotification(
+   815→      userId,
+   816→      "system",
+   817→      "ارسال عکس بدن الزامی است 📸",
+   818→      noticeBody,
+   819→      "?tab=dashboard&open=bodyAnalysis"
+   820→    );
+   821→
+   822→    if (canSubmitVideo) {
+   823→      await createNotification(
+   824→        userId,
+   825→        "system",
+   826→        "آزمایش خون خود را ارسال کنید (اختیاری) 🩸",
+   827→        "برای داشتن یک برنامه ورزشی و تغذیه‌ای کاملاً شخصی‌سازی‌شده، می‌توانید آزمایش خون خود را به فیتاپ بسپارید. " +
+   828→          "از بخش «آزمایش خون» در پنل، ابتدا فرم آزمایش را دانلود کرده و به آزمایشگاه ببرید. " +
+   829→          "سپس یکی از گزینه‌ها را انتخاب کنید: «آزمایش دادم و منتظر جوابم» (تا آپلود نتایج، تولید برنامه متوقف می‌ماند) یا «آپلود نمی‌کنم» (برنامه بدون آزمایش خون طراحی می‌شود).",
+   830→        "?tab=dashboard&open=bloodTest"
+   831→      );
+   832→
+   833→      await createNotification(
+   834→        userId,
+   835→        "system",
+   836→        "ارسال ویدیوی فرم حرکات (اختیاری) 🎥",
+   837→        "برای دقت بالاتر در طراحی برنامه، می‌توانید ویدیویی از فرم اجرای حرکات خود ارسال کنید. این مرحله اختیاری است اما به مربی هوشمند کمک می‌کند نقاط ضعف فرم بدن شما را شناسایی کند. " +
+   838→          "از بخش داشبورد می‌توانید ویدیو را آپلود کنید یا «آپلود نمی‌کنم» را انتخاب کنید. " +
+   839→          "تا زمان تعیین تکلیف این مرحله، ساخت برنامه شما متوقف می‌ماند.",
+   840→        "?tab=dashboard&open=bodyAnalysis"
+   841→      );
+   842→    }
+   843→
+   844→    const baselineCheckup = await db.checkup.findFirst({
+   845→      where: { userId, phaseNumber: 0 },
+   846→      orderBy: { createdAt: "desc" },
+   847→    });
+   848→    const hasMeasurements =
+   849→      !!baselineCheckup?.waistMeasurement && !!baselineCheckup?.neckMeasurement;
+   850→    if (!hasMeasurements) {
+   851→      await createNotification(
+   852→        userId,
+   853→        "system",
+   854→        "برای برنامه دقیق‌تر، اندازه‌های بدنی خود را وارد کنید 📏",
+   855→        "با وارد کردن دور کمر، گردن و سایر اندازه‌ها، فیتاپ هوشمند درصد چربی بدن شما را با فرمول علمی US Navy محاسبه می‌کند و برنامه دقیق‌تری طراحی می‌کند. می‌توانید این مرحله را رد کنید.",
+   856→        "?tab=progress"
+   857→      );
+   858→    }
+   859→  } else {
+   860→    // تولید برنامه در پس‌زمینه
+   861→    try {
+   862→      const gen = await startProgramGenerationInBackground(userId);
+   863→      if (!gen.started && gen.reason !== "already_generating") {
+   864→        await db.programRequest.update({
+   865→          where: { id: progReqId },
+   866→          data: { status: "failed" },
+   867→        });
+   868→        await createNotification(
+   869→          userId,
+   870→          "system",
+   871→          "خطا در تولید برنامه — از تب برنامه‌ها دوباره تلاش کنید ⚠️",
+   872→          `تولید برنامه ورزشی و غذایی شما شروع نشد (${gen.reason ?? "دلیل نامشخص"}). لطفاً از بخش «برنامه‌ها» دوباره تلاش کنید یا با پشتیبانی در ارتباط باشید.`,
+   873→          "?tab=programs",
+   874→          { from: "payment", action: "plan_generation_failed_prep", plan: plan.id }
+   875→        );
+   876→      } else {
+   877→        await createNotification(
+   878→          userId,
+   879→          "system",
+   880→          "برنامه شما در حال طراحی است ⏳",
+   881→          "فیتاپ هوشمند طراحی برنامه تمرینی و غذایی شخصی‌سازی‌شده شما را شروع کرد. پس از آماده‌سازی به شما اطلاع می‌دهیم.",
+   882→          "?tab=programs"
+   883→        );
+   884→      }
+   885→    } catch (prepErr) {
+   886→      console.error("[payment-delivery] plan generation prep failed:", prepErr);
+   887→      await db.programRequest.update({
+   888→        where: { id: progReqId },
+   889→        data: { status: "failed" },
+   890→      });
+   891→      try {
+   892→        await createNotification(
+   893→          userId,
+   894→          "system",
+   895→          "خطا در تولید برنامه — از تب برنامه‌ها دوباره تلاش کنید ⚠️",
+   896→          "تولید برنامه ورزشی و غذایی شما با خطا مواجه شد. لطفاً از بخش «برنامه‌ها» دوباره تلاش کنید یا با پشتیبانی در ارتباط باشید.",
+   897→          "?tab=programs",
+   898→          { from: "payment", action: "plan_generation_failed_prep", plan: plan.id }
+   899→        );
+   900→      } catch {}
+   901→    }
+   902→  }
+   903→
+   904→  // نوتیفیکیشن خرید موفق
+   905→  const preservedNote =
+   906→    remainingDaysPreserved > 0
+   907→      ? ` ${toPersianDigits(remainingDaysPreserved)} روز از اشتراک قبلی شما به اشتراک جدید اضافه شد 🎁`
+   908→      : "";
+   909→  const bodyText = needsBodyPhoto
+   910→    ? `پلن ${plan.label} با موفقیت خریداری شد. برای شروع دوره ۴۵ روزه، عکس‌های بدن خود را ارسال کنید.${preservedNote}`
+   911→    : `پلن ${plan.label} با موفقیت خریداری شد. تا ${endDate.toLocaleDateString("fa-IR")} فعال است.${preservedNote} برنامه شما در حال تولید توسط فیتاپ هوشمند است — به‌زودی آماده می‌شود.`;
+   912→  await createNotification(
+   913→    userId,
+   914→    "subscription",
+   915→    needsBodyPhoto ? "پلن شما ثبت شد! ✅" : "پلن شما فعال شد! ✅",
+   916→    bodyText,
+   917→    "?tab=dashboard",
+   918→    { planId: plan.id, refId, remainingDaysPreserved }
+   919→  );
+   920→
+   921→  // پاداش معرفی — فقط برای اشتراک بلافاصله فعال
+   922→  if (!needsBodyPhoto) {
+   923→    try {
+   924→      await processReferralReward({
+   925→        buyerUserId: userId,
+   926→        paymentId: payment.id,
+   927→      });
+   928→    } catch (refErr) {
+   929→      console.error("[payment-delivery] referral reward failed:", refErr);
+   930→    }
+   931→  }
+   932→
+   933→  const updatedDto = await buildUserDto(userId);
+   934→
+   935→  return {
+   936→    success: true,
+   937→    status: "success" as const,
+   938→    message: "پرداخت با موفقیت انجام شد.",
+   939→    refId,
+   940→    amount: payment.amount,
+   941→    originalAmount: payment.originalAmount,
+   942→    plan: plan.label,
+   943→    planId: plan.id,
+   944→    subscriptionEnd: needsBodyPhoto ? null : endDate.toISOString(),
+   945→    subscriptionStatus: needsBodyPhoto ? ("pending" as const) : ("active" as const),
+   946→    remainingDaysPreserved,
+   947→    walletBalance: newBalance,
+   948→    user: updatedDto,
+   949→  };
+   950→}
+   951→

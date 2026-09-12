@@ -1,0 +1,1185 @@
+     1→package ir.fittup.panel
+     2→
+     3→import android.annotation.SuppressLint
+     4→import android.app.Dialog
+     5→import android.app.DownloadManager
+     6→import android.app.NotificationChannel
+     7→import android.app.NotificationManager
+     8→import android.content.ActivityNotFoundException
+     9→import android.content.BroadcastReceiver
+    10→import android.content.ContentValues
+    11→import android.content.Context
+    12→import android.content.Intent
+    13→import android.content.IntentFilter
+    14→import android.content.pm.PackageManager
+    15→import android.graphics.Color
+    16→import android.net.Uri
+    17→import android.os.Build
+    18→import android.os.Bundle
+    19→import android.os.Environment
+    20→import android.print.PrintManager
+    21→import android.provider.MediaStore
+    22→import android.provider.Settings
+    23→import android.util.Base64
+    24→import android.util.Log
+    25→import android.view.View
+    26→import android.view.ViewGroup
+    27→import android.webkit.CookieManager
+    28→import android.webkit.JavascriptInterface
+    29→import android.webkit.PermissionRequest
+    30→import android.webkit.ValueCallback
+    31→import android.webkit.WebChromeClient
+    32→import android.webkit.WebResourceError
+    33→import android.webkit.WebResourceRequest
+    34→import android.webkit.WebSettings
+    35→import android.webkit.WebView
+    36→import android.webkit.WebViewClient
+    37→import android.widget.Button
+    38→import android.widget.LinearLayout
+    39→import android.widget.TextView
+    40→import android.widget.Toast
+    41→import androidx.activity.result.ActivityResultLauncher
+    42→import androidx.activity.result.contract.ActivityResultContracts
+    43→import androidx.appcompat.app.AlertDialog
+    44→import androidx.appcompat.app.AppCompatActivity
+    45→import androidx.core.app.NotificationCompat
+    46→import androidx.core.content.ContextCompat
+    47→import com.google.android.gms.auth.api.phone.SmsRetriever
+    48→import org.json.JSONObject
+    49→import java.io.File
+    50→import java.io.FileOutputStream
+    51→import java.net.HttpURLConnection
+    52→import java.net.URI
+    53→import java.net.URL
+    54→import kotlin.concurrent.thread
+    55→
+    56→/**
+    57→ * FitUp — اپ اندروید «اختصاصی» فیتاپ (نسخه سایت — v1.2.8)
+    58→ *
+    59→ * پوسته اندرویدی (WebView) پنل کاربری فیتاپ — دقیقاً همان ساختار خود سایت:
+    60→ *  - شروع با صفحه OTP (?screen=auth) → آنبوردینگ → پنل ورزشکار
+    61→ *  - پرداخت از درگاه خود سایت (زرین‌پال/شاپرک) داخل WebView
+    62→ *  - آپدیت (v1.2.8): سایت داخل WebView مودال زیبا نشان می‌دهد؛ دانلود/نصب APK
+    63→ *    با «مرورگر بیرونی» انجام می‌شود — اپ دیگر مجوز REQUEST_INSTALL_PACKAGES
+    64→ *    ندارد (پرچم قرمز Play Protect و عامل مسدودشدن اپ روی بعضی گوشی‌ها)
+    65→ *  - همیشه به‌روز: HTML همیشه تازه از سایت (asset های hash دار)
+    66→ *
+    67→ * v1.1.0 — مجوزها با مودال زیبای سایت (pre-permission rationale):
+    68→ *  سایت قبل از هر دیالوگ سیستمی، مودال انیمه‌دار خودش را نشان می‌دهد
+    69→ *  (permission-gate) و بعد پل نیتیو مجوز اندروید را «در لحظهٔ استفاده»
+    70→ *  می‌گیرد: نوتیف بعد از ورود، میکروفون/دوربین لحظهٔ ضبط، گالری اولین انتخاب.
+    71→ *
+    72→ * پل JS (window.FitUpNative) — متدهای سایت:
+    73→ *  - isOwnApp(): Boolean                → تشخیص محیط اپ اختصاصی
+    74→ *  - getAppVersionCode(): Int           → برای مقایسه با /api/app/own/latest
+    75→ *  - getAppVersionName(): String        → نمایش نسخه
+    76→ *  - downloadUpdate(url)                → دانلود APK جدید با مرورگر بیرونی (v1.2.8)
+    77→ *  - showNotification(title, body)      → نوتیف سیستم اندروید
+    78→ *  - requestNotificationPermission()    → مجوز POST_NOTIFICATIONS
+    79→ *  - syncNotificationsNow()             → همگام‌سازی فوری اعلان‌ها (WorkManager)
+    80→ *  - requestBatteryOptimization()       → دیالوگ غیرفعال‌سازی بهینه‌سازی باتری (یک‌بار)
+    81→ *  - startOtpSmsRetriever()             → SMS Retriever رسمی گوگل (بدون پرمیشن)
+    82→ *  - requestSmsAutoRead()               → حذف‌شده از v29 (پرمیشن محدود) — جایگزین: بالا
+    83→ *  - downloadFile(filename, dataUrl)    → ذخیره PNG/PDF در Downloads
+    84→ *  - printPage()                        → چاپ صفحه (PrintManager)
+    85→ *  - setSwipeRefreshEnabled(b)          → قفل pull-to-refresh هنگام اسکرول داخلی
+    86→ */
+    87→class MainActivity : AppCompatActivity() {
+    88→
+    89→    private lateinit var binding: ir.fittup.panel.databinding.ActivityMainBinding
+    90→    private lateinit var webView: WebView
+    91→    private lateinit var swipeRefresh: androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+    92→    private lateinit var splash: LinearLayout
+    93→    private lateinit var errorView: LinearLayout
+    94→    private lateinit var errorRetry: Button
+    95→
+    96→    /** URL اصلی (فریم اصلی) — برای چک origin پل JS */
+    97→    @Volatile private var lastMainUrl: String? = null
+    98→
+    99→    /** وضعیت دانلود در جریان — در SharedPreferences است، نه متغیر حافظه:
+   100→     *  اگر اکتیویتی بازسازی شد یا اپ بسته/باز شد، پایان دانلود گم نمی‌شود
+   101→     *  (بخشی از ریشه‌یابی باگ «دانلود شروع می‌شود ولی هیچ اتفاقی نمی‌افتد») */
+   102→    private val downloadPrefs by lazy { getSharedPreferences("fitup_download", Context.MODE_PRIVATE) }
+   103→
+   104→    /** جلوگیری از تکرار دیالوگ آپدیت اجباری */
+   105→    private var forceDialogShown = false
+   106→
+   107→    // آپلود فایل (عکس/ویدیو در چت و آنالیزها)
+   108→    private var filePathCallback: ValueCallback<Array<Uri>>? = null
+   109→    private lateinit var fileChooserLauncher: ActivityResultLauncher<Intent>
+   110→
+   111→    private lateinit var notifPermissionLauncher: ActivityResultLauncher<String>
+   112→
+   113→    // ─── دوربین/میکروفون وب (getUserMedia): مجوز دقیقاً در زمان استفاده ───
+   114→    private var pendingWebPermissionRequest: PermissionRequest? = null
+   115→    private val mediaPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+   116→        pendingWebPermissionRequest?.let { req ->
+   117→            pendingWebPermissionRequest = null
+   118→            val ok = grants.values.all { it }
+   119→            runOnUiThread { if (ok) req.grant(req.resources) else req.deny() }
+   120→        }
+   121→    }
+   122→
+   123→    // ─── OTP خودکار (بدون هیچ پرمیشن پیامک) ───
+   124→    // ۱) کیبورد/سیستم: ورودی کد در سایت autocomplete="one-time-code" دارد →
+   125→    //    اندروید کد پیامک را بدون هیچ مجوزی پیشنهاد می‌دهد (اندروید ۹+)
+   126→    // ۲) کلیپ‌بورد: اگر کاربر کد را کپی کند، در onResume اتو-درج می‌شود
+   127→    // ⛔ خواندن مستقیم پیامک (RECEIVE_SMS) عمداً حذف شد — از اندروید ۱۳+ پرمیشن
+   128→    //    SMS برای اپ‌های خارج از پلی «محدود» است؛ دیالوگ ترسناک
+   129→    //    «App was denied access» می‌آمد و اجازه هم هیچ‌وقت داده نمی‌شد.
+   130→    private var lastClipboardDispatched: String? = null
+   131→
+   132→    @SuppressLint("SetJavaScriptEnabled")
+   133→    override fun onCreate(savedInstanceState: Bundle?) {
+   134→        super.onCreate(savedInstanceState)
+   135→        binding = ir.fittup.panel.databinding.ActivityMainBinding.inflate(layoutInflater)
+   136→        setContentView(binding.root)
+   137→
+   138→        webView = binding.webView
+   139→        swipeRefresh = binding.swipeRefresh
+   140→        splash = binding.splash
+   141→        errorView = binding.errorView
+   142→        errorRetry = binding.errorRetry
+   143→
+   144→        // 🩹 v1.2.6 (باگ بحرانی «دکمهٔ تلاش مجدد کار نمی‌کند» + حلقهٔ مرگ «درگاه
+   145→        // پرداخت باز نمی‌شود»): دکمهٔ تلاش مجدد صفحهٔ خطا bind شده بود ولی هیچ
+   146→        // listener نداشت! کاربری که زرین‌پال برایش باز نشده (VPN/IP/قطعی شبکه)
+   147→        // در صفحهٔ خطا گیر می‌کرد و هیچ راهی برای reload نداشت. حالا: reload
+   148→        // WebView — بعد از خاموش‌کردن VPN، درگاه در همان جای قبلی باز می‌شود؛
+   149→        // onPageStarted خودش hideError را صدا می‌زند (خطای موقت زیرصفحه‌ها هم
+   150→        // صفحهٔ خطا را نشان نمی‌دهد — فقط main frame).
+   151→        errorRetry.setOnClickListener {
+   152→            errorView.visibility = View.GONE
+   153→            swipeRefresh.isRefreshing = true
+   154→            webView.reload()
+   155→        }
+   156→
+   157→        setupFileChooser()
+   158→        setupWebView()
+   159→        setupNotifications()
+   160→        setupDownloadCompleteReceiver()
+   161→        setupOtpRetrieverReceiver()
+   162→
+   163→        // v31 — «اعلان‌ها حتی وقتی برنامه بسته است» (کم‌مصرف — WorkManager):
+   164→        // زمان‌بندی دوره‌ای ۶ ساعته + همگام‌سازی فوری در باز شدن اپ
+   165→        NotificationSync.schedulePeriodic(this)
+   166→        NotificationSync.syncNow(this)
+   167→        OtpRetriever.dispatcher = { code -> dispatchOtpCode(code) }
+   168→
+   169→        if (savedInstanceState != null) {
+   170→            webView.restoreState(savedInstanceState)
+   171→        } else {
+   172→            // v1.2.5 — شروع با لینک عمیق (App Link / fitup_link اعلان) اگر هست؛
+   173→            // وگرنه شروع مستقیم با OTP — ?screen=auth: اگر سشن هست → پنل، وگرنه صفحه ورود
+   174→            webView.loadUrl(deepLinkUrl(intent) ?: startUrl())
+   175→        }
+   176→
+   177→        checkAppVersion()
+   178→    }
+   179→
+   180→    /** شروع با ?screen=auth — کاربر لاگین‌شده مستقیم پنل را می‌بیند */
+   181→    private fun startUrl(): String {
+   182→        val base = BuildConfig.SITE_URL.trimEnd('/')
+   183→        return if (base.contains("?")) "$base&screen=auth" else "$base?screen=auth"
+   184→    }
+   185→
+   186→    /**
+   187→     * v1.2.6 — لینک عمیق ورودی (App Link یا اسکیم fitup:// یا اعلان) یا null:
+   188→     *  ۱) extra «fitup_link» از NotificationSync — مسیر/کوئری نسبی مثل
+   189→     *     "?tab=progress&section=checkup" یا "/panel" → SITE_URL + آن
+   190→     *  ۲) dataِ https روی دامنهٔ خودمان (fittup.ir) → همان URL — پارامترهای
+   191→     *     ?tab= ?ref= ?renewal= ?screen= ?article= دست‌نخورده می‌مانند
+   192→     *  ۳) v1.2.6 — اسکیم اختصاصی fitup://open?url=<encoded> از صفحهٔ /go سایت
+   193→     *     (لینک‌های هوشمند پیامک — فقط URL دامنهٔ خودمان پذیرفته می‌شود)
+   194→     * (null-امن — هرگز به‌خاطر لینک خراب کرش نمی‌کند)
+   195→     */
+   196→    private fun deepLinkUrl(from: Intent?): String? {
+   197→        if (from == null) return null
+   198→        try {
+   199→            val extra = from.getStringExtra("fitup_link")
+   200→            if (!extra.isNullOrBlank() && (extra.startsWith("/") || extra.startsWith("?"))) {
+   201→                return BuildConfig.SITE_URL.trimEnd('/') + extra
+   202→            }
+   203→            val data = from.data ?: return null
+   204→            val scheme = data.scheme?.lowercase()
+   205→            // ─── v1.2.6: fitup://open?url=<encoded> — از لینک هوشمند /go سایت ───
+   206→            if (scheme == "fitup") {
+   207→                val target = data.getQueryParameter("url") ?: return null
+   208→                if (target.startsWith("/")) {
+   209→                    // مسیر نسبی روی دامنهٔ خودمان
+   210→                    return BuildConfig.SITE_URL.trimEnd('/') + target
+   211→                }
+   212→                val t = android.net.Uri.parse(target)
+   213→                val tScheme = t.scheme?.lowercase()
+   214→                val tHost = t.host?.lowercase() ?: return null
+   215→                val isOurHost = tHost == "fittup.ir" || tHost.endsWith(".fittup.ir")
+   216→                if (isOurHost && (tScheme == "https")) return target
+   217→                return null
+   218→            }
+   219→            if (scheme != "https") return null
+   220→            val host = data.host?.lowercase() ?: return null
+   221→            // فقط دامنهٔ خودمان — همان منطق routeUrl (fittup.ir و زیردامنه‌ها)
+   222→            if (host == "fittup.ir" || host.endsWith(".fittup.ir")) return data.toString()
+   223→        } catch (_: Exception) {
+   224→        }
+   225→        return null
+   226→    }
+   227→
+   228→    /** v1.2.5 — لینک عمیق وقتی اپ باز است (launchMode=singleTask → onNewIntent) */
+   229→    override fun onNewIntent(intent: Intent) {
+   230→        super.onNewIntent(intent)
+   231→        setIntent(intent)
+   232→        // WebView ممکن است هنوز آماده نباشد — هرگز کرش نکن
+   233→        if (!::webView.isInitialized) return
+   234→        val url = deepLinkUrl(intent) ?: return
+   235→        runOnUiThread {
+   236→            try {
+   237→                webView.loadUrl(url)
+   238→            } catch (_: Exception) {
+   239→            }
+   240→        }
+   241→    }
+   242→
+   243→    /* ───────────── WebView ───────────── */
+   244→
+   245→    @SuppressLint("SetJavaScriptEnabled")
+   246→    private fun setupWebView() {
+   247→        val s: WebSettings = webView.settings
+   248→        s.javaScriptEnabled = true
+   249→        s.domStorageEnabled = true          // برای سشن لاگین OTP
+   250→        s.databaseEnabled = true
+   251→        s.loadWithOverviewMode = true
+   252→        s.useWideViewPort = true
+   253→        s.mediaPlaybackRequiresUserGesture = false   // ویدیوهای تمرین
+   254→        s.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+   255→        s.allowFileAccess = false
+   256→        s.allowContentAccess = true          // برای انتخاب فایل (دوربین/گالری)
+   257→        s.userAgentString = (s.userAgentString ?: "") + " FitUpApp/" + BuildConfig.VERSION_NAME
+   258→        s.cacheMode = WebSettings.LOAD_DEFAULT
+   259→        // مقیاس متن ثابت — «تجربه اپ واقعی» (فونت سیستم layout سایت را نشکند)
+   260→        s.textZoom = 100
+   261→
+   262→        // کوکی‌ها را از قبل به WebView وصل کن (سشن OTP بین restartها زنده می‌ماند)
+   263→        try {
+   264→            CookieManager.getInstance().setAcceptCookie(true)
+   265→        } catch (_: Exception) {}
+   266→
+   267→        // پس‌زمینه سفید — بدون فلش تیره هنگام بارگذاری
+   268→        webView.setBackgroundColor(Color.WHITE)
+   269→
+   270→        webView.addJavascriptInterface(NativeBridge(), "FitUpNative")
+   271→
+   272→        webView.webViewClient = object : WebViewClient() {
+   273→            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+   274→                super.onPageStarted(view, url, favicon)
+   275→                lastMainUrl = url
+   276→                hideError()
+   277→            }
+   278→
+   279→            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+   280→                val url = request.url
+   281→                val scheme = url.scheme?.lowercase() ?: return false
+   282→
+   283→                // اسکیم‌های غیر http — باید native هندل شوند (tel/mailto/intent…)
+   284→                if (scheme != "http" && scheme != "https") {
+   285→                    return handleExternalScheme(url)
+   286→                }
+   287→
+   288→                // مسیریابی هوشمند:
+   289→                //  - سایت فیتاپ → داخل WebView
+   290→                //  - درگاه پرداخت/بانک‌ها (زرین‌پال/شاپرک/…) → داخل WebView (برای برگشت موفق به پنل)
+   291→                //  - شبکه‌های اجتماعی و سایت‌های دیگر → مرورگر بیرونی
+   292→                return routeUrl(url)
+   293→            }
+   294→
+   295→            override fun onPageFinished(view: WebView, url: String) {
+   296→                splash.visibility = View.GONE
+   297→                swipeRefresh.isRefreshing = false
+   298→                injectBridgeHelper()
+   299→            }
+   300→
+   301→            /** خطای بارگذاری فریم اصلی → صفحه خطای فارسی با دکمه تلاش مجدد */
+   302→            override fun onReceivedError(
+   303→                view: WebView,
+   304→                request: WebResourceRequest,
+   305→                error: WebResourceError
+   306→            ) {
+   307→                super.onReceivedError(view, request, error)
+   308→                if (request.isForMainFrame) showError()
+   309→            }
+   310→
+   311→            /** کرش رندرر (targetSdk 34) → بازسازی اکتویتی به‌جای صفحه سیاه */
+   312→            override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
+   313→                Log.e("FitUpApp", "WebView renderer gone — recreating activity")
+   314→                recreate()
+   315→                return true
+   316→            }
+   317→        }
+   318→
+   319→        webView.webChromeClient = object : WebChromeClient() {
+   320→            override fun onShowFileChooser(
+   321→                view: WebView,
+   322→                callback: ValueCallback<Array<Uri>>,
+   323→                params: FileChooserParams
+   324→            ): Boolean {
+   325→                filePathCallback?.onReceiveValue(null)
+   326→                filePathCallback = callback
+   327→                return try {
+   328→                    val intent = params.createIntent()
+   329→                    // انتخاب چندگانه عکس (چت/آنالیز بدن چند زاویه)
+   330→                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+   331→                    fileChooserLauncher.launch(intent)
+   332→                    true
+   333→                } catch (e: ActivityNotFoundException) {
+   334→                    filePathCallback = null
+   335→                    false
+   336→                }
+   337→            }
+   338→
+   339→            /**
+   340→             * ─── مجوز دوربین/میکروفون وب — دقیقاً در زمان استفاده ───
+   341→             * سایت برای ضبط صدا (ویس چت) یا ویدیو (آنالیز ویدیویی تمرین/بدن) از
+   342→             * getUserMedia استفاده می‌کند؛ این کال‌بک فقط در همان لحظه اجرا می‌شود.
+   343→             *
+   344→             * v1.1.0: توضیحِ «چرا» حالا مودال زیبای خود سایت است (permission-gate،
+   345→             * انیمه‌دار با برند فیتاپ) — اینجا فقط دیالوگ سیستمی اندروید در همان
+   346→             * لحظه درخواست می‌شود (دیالوگ تکراری نیتیو حذف شد تا دوبار پرسیده نشود).
+   347→             */
+   348→            override fun onPermissionRequest(request: PermissionRequest) {
+   349→                val resources = request.resources
+   350→                val needsVideo = resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)
+   351→                val needsAudio = resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
+   352→                if (!needsVideo && !needsAudio) {
+   353→                    request.deny()
+   354→                    return
+   355→                }
+   356→                requestMediaRuntimePermissions(request)
+   357→            }
+   358→        }
+   359→
+   360→        // ─── دانلودها: APK → مرورگر بیرونی (v1.2.8)؛ فایل‌های معمولی → DownloadManager ───
+   361→        webView.setDownloadListener { url, _, contentDisposition, mimetype, _ ->
+   362→            try {
+   363→                // v1.2.7 — Safety-net: لینک‌های data: (PNG/PDF برنامه‌ها) را
+   364→                // DownloadManager پشتیبانی نمی‌کند (فقط http/https) — از پل
+   365→                // MediaStore ذخیره می‌شوند. مسیر اصلی از پل جاوااسکریپت
+   366→                // (FitUpNative.downloadFile) می‌گذرد؛ این برای هر مسیر جانبی است.
+   367→                if (url.startsWith("data:", ignoreCase = true)) {
+   368→                    val ext = when {
+   369→                        mimetype.contains("pdf", true) -> "pdf"
+   370→                        mimetype.contains("png", true) -> "png"
+   371→                        mimetype.contains("jpeg", true) || mimetype.contains("jpg", true) -> "jpg"
+   372→                        mimetype.contains("webp", true) -> "webp"
+   373→                        else -> "bin"
+   374→                    }
+   375→                    downloadDataUrl("fitup-${System.currentTimeMillis()}.$ext", url)
+   376→                    return@setDownloadListener
+   377→                }
+   378→                val fileName = guessFileName(contentDisposition, mimetype, url)
+   379→                // v1.2.8 — APK (آپدیت/دانلود مستقیم) → مرورگر بیرونی؛ اپ دیگر
+   380→                // مجوز نصب ندارد و APK از DownloadManager خود اپ نمی‌گذرد
+   381→                if (fileName.endsWith(".apk", true) ||
+   382→                    url.substringBefore('?').endsWith(".apk", true)
+   383→                ) {
+   384→                    openApkUpdateInBrowser(url)
+   385→                    return@setDownloadListener
+   386→                }
+   387→                startNativeDownload(url, fileName)
+   388→            } catch (_: Exception) {
+   389→                toast("دانلود ممکن نشد")
+   390→            }
+   391→        }
+   392→
+   393→        swipeRefresh.setOnRefreshListener { webView.reload() }
+   394→        // رنگ برند فیتاپ
+   395→        swipeRefresh.setColorSchemeColors(Color.parseColor("#f97316"))
+   396→
+   397→        // ─── FIX: اسکرول به بالا → رفرش نمی‌شود ───
+   398→        // refresh فقط وقتی مجاز است که WebView دقیقاً در بالای صفحه است (scrollY == 0).
+   399→        swipeRefresh.isEnabled = true
+   400→        webView.setOnScrollChangeListener { _, _, scrollY, _, _ ->
+   401→            swipeRefresh.isEnabled = scrollY == 0
+   402→        }
+   403→    }
+   404→
+   405→    /**
+   406→     * مسیریابی URL:
+   407→     * true  → بیرون از WebView هندل شد (مرورگر/دیالر)
+   408→     * false → داخل WebView بارگذاری شود
+   409→     */
+   410→    private fun routeUrl(url: Uri): Boolean {
+   411→        val host = url.host?.lowercase() ?: return false
+   412→        val siteHost = try { URI(BuildConfig.SITE_URL).host?.lowercase() } catch (_: Exception) { null }
+   413→
+   414→        // سایت خودمان — همیشه داخل WebView
+   415→        if (host == "fittup.ir" || host.endsWith(".fittup.ir")) return false
+   416→        if (siteHost != null && (host == siteHost || host.endsWith(".$siteHost"))) return false
+   417→
+   418→        // درگاه پرداخت سایت (زرین‌پال) و بانک‌ها (شاپراک) — داخل WebView تا کاربر
+   419→        // بعد از پرداخت به پنل برگردد (payment_verify در همان WebView اجرا می‌شود)
+   420→        if (host == "zarinpal.com" || host.endsWith(".zarinpal.com")) return false
+   421→        if (host == "zarin.link" || host.endsWith(".zarin.link")) return false
+   422→        if (host == "shaparak.ir" || host.endsWith(".shaparak.ir")) return false
+   423→
+   424→        // شبکه‌های اجتماعی/استورها/سایت‌های دیگر → مرورگر بیرونی
+   425→        openExternal(url)
+   426→        return true
+   427→    }
+   428→
+   429→    /** اسکیم‌های غیر وب — tel/mailto/intent و غیره */
+   430→    private fun handleExternalScheme(uri: Uri): Boolean {
+   431→        try {
+   432→            when (uri.scheme?.lowercase()) {
+   433→                "tel" -> startActivity(Intent(Intent.ACTION_DIAL, uri))
+   434→                "mailto" -> startActivity(Intent(Intent.ACTION_SENDTO, uri))
+   435→                "sms" -> startActivity(Intent(Intent.ACTION_SENDTO, uri))
+   436→                "intent" -> {
+   437→                    val intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME)
+   438→                    // سخت‌سازی امنیتی (ضد intent-redirection): فقط ACTION_VIEW عمومی —
+   439→                    // بدون component/package/selector تا به اپ دلخواه هدایت نشود
+   440→                    intent.component = null
+   441→                    intent.selector = null
+   442→                    intent.setPackage(null)
+   443→                    startActivity(intent)
+   444→                }
+   445→                else -> startActivity(Intent(Intent.ACTION_VIEW, uri))
+   446→            }
+   447→        } catch (_: Exception) {
+   448→            // اپی برای این لینک نیست — نادیده بگیر
+   449→        }
+   450→        return true
+   451→    }
+   452→
+   453→    private fun openExternal(uri: Uri) {
+   454→        try {
+   455→            startActivity(Intent(Intent.ACTION_VIEW, uri))
+   456→        } catch (_: ActivityNotFoundException) {
+   457→            // مرورگری نیست — نادیده بگیر
+   458→        }
+   459→    }
+   460→
+   461→    /* ───────────── صفحه خطا ───────────── */
+   462→
+   463→    private fun showError() {
+   464→        runOnUiThread {
+   465→            splash.visibility = View.GONE
+   466→            errorView.visibility = View.VISIBLE
+   467→            swipeRefresh.isRefreshing = false
+   468→        }
+   469→    }
+   470→
+   471→    private fun hideError() {
+   472→        runOnUiThread { errorView.visibility = View.GONE }
+   473→    }
+   474→
+   475→    /* ───────────── helper سمت سایت ───────────── */
+   476→
+   477→    /** helper سمت سایت — تشخیص تمیز محیط اپ اختصاصی */
+   478→    private fun injectBridgeHelper() {
+   479→        val js = """
+   480→            (function() {
+   481→              if (window.__fitupOwnAppInjected) return;
+   482→              window.__fitupOwnAppInjected = true;
+   483→              // آیا داخل اپ اختصاصی فیتاپ هستیم؟
+   484→              window.isFitUpOwnApp = function() {
+   485→                try { return !!(window.FitUpNative && window.FitUpNative.isOwnApp && window.FitUpNative.isOwnApp()); }
+   486→                catch (e) { return false; }
+   487→              };
+   488→              // کوکی pwa_standalone — سرور برای URL «/» مستقیم صفحهٔ auth را
+   489→              // رندر می‌کند (نه لندینگ) — همان رفتار وب‌اپ. اپ همیشه با
+   490→              // ?screen=auth شروع می‌شود؛ این کوکی فقط حالت رفرش/بعد از خروج
+   491→              // را هم درست نگه می‌دارد.
+   492→              try {
+   493→                if (document.cookie.indexOf('pwa_standalone=1') === -1) {
+   494→                  document.cookie = 'pwa_standalone=1; path=/; max-age=31536000; samesite=lax';
+   495→                }
+   496→              } catch (e) {}
+   497→            })();
+   498→        """.trimIndent()
+   499→        runOnUiThread {
+   500→            webView.evaluateJavascript(js, null)
+   501→        }
+   502→    }
+   503→
+   504→    /* ───────────── آپلود فایل ───────────── */
+   505→
+   506→    private fun setupFileChooser() {
+   507→        fileChooserLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+   508→            val callback = filePathCallback ?: return@registerForActivityResult
+   509→            filePathCallback = null
+   510→            val uris: Array<Uri>? = if (result.resultCode == RESULT_OK) {
+   511→                val data = result.data
+   512→                val clip = data?.clipData
+   513→                if (clip != null) {
+   514→                    Array(clip.itemCount) { i -> clip.getItemAt(i).uri }
+   515→                } else {
+   516→                    data?.data?.let { arrayOf(it) }
+   517→                }
+   518→            } else null
+   519→            callback.onReceiveValue(uris ?: arrayOf())
+   520→        }
+   521→    }
+   522→
+   523→    /* ───────────── دانلود / آپدیت APK ───────────── */
+   524→
+   525→    /*
+   526→     * v1.2.8 — بازطراحی کامل مسیر آپدیت (فیکس مسدودشدن اپ توسط Play Protect):
+   527→     *
+   528→     *  ۱) ریشهٔ مسدودشدن: مجوز REQUEST_INSTALL_PACKAGES (پیش‌نیاز نصب APK
+   529→     *     داخل اپ با FileProvider/Installer) پرچم قرمز امنیتی Play Protect است
+   530→     *     و اپ روی بعضی گوشی‌ها با پیام «Block harmful app» رد می‌شد.
+   531→     *  ۲) فیکس: اپ دیگر این مجوز را ندارد و APK هرگز با DownloadManager خود اپ
+   532→     *     دانلود/نصب نمی‌شود — لینک APK در «مرورگر بیرونی» باز می‌شود؛ مرورگر
+   533→     *     (کروم و…) خودش مجوز نصب را دارد، دانلود را با نوتیف پیشرفت انجام
+   534→     *     می‌دهد و نصب را پیشنهاد می‌دهد (استانداردترین مسیر سایدلود).
+   535→     *  ۳) DownloadManager اپ فقط برای «فایل‌های معمولی» (PDF/PNG/…) می‌ماند؛
+   536→     *     شناسهٔ دانلود در SharedPreferences است تا با بازسازی اکتیویتی گم نشود.
+   537→     */
+   538→
+   539→    /** شناسهٔ دانلود در جریان (SharedPreferences) */
+   540→    private fun pendingDownloadId(): Long = downloadPrefs.getLong(PREF_DOWNLOAD_ID, -1L)
+   541→
+   542→    private fun savePendingDownload(id: Long, fileName: String, url: String) {
+   543→        downloadPrefs.edit()
+   544→            .putLong(PREF_DOWNLOAD_ID, id)
+   545→            .putString(PREF_DOWNLOAD_FILE, fileName)
+   546→            .putString(PREF_DOWNLOAD_URL, url)
+   547→            .apply()
+   548→    }
+   549→
+   550→    private fun clearPendingDownload() {
+   551→        downloadPrefs.edit()
+   552→            .remove(PREF_DOWNLOAD_ID)
+   553→            .remove(PREF_DOWNLOAD_FILE)
+   554→            .remove(PREF_DOWNLOAD_URL)
+   555→            .apply()
+   556→    }
+   557→
+   558→    /** v1.2.8 — دانلود/آپدیت APK فقط از «مرورگر بیرونی».
+   559→     *  چرا؟ مجوز REQUEST_INSTALL_PACKAGES (پیش‌نیاز نصب داخل اپ) پرچم قرمز
+   560→     *  Play Protect بود و اپ روی بعضی گوشی‌ها مسدود می‌شد. اپ دیگر این مجوز
+   561→     *  را ندارد؛ مرورگر خودش مجوز نصب را دارد، APK را با نوتیف پیشرفت دانلود
+   562→     *  و نصب را پیشنهاد می‌دهد — استانداردترین و امن‌ترین مسیر سایدلود. */
+   563→    private fun openApkUpdateInBrowser(apkUrl: String) {
+   564→        try {
+   565→            val url = if (apkUrl.startsWith("http")) apkUrl
+   566→            else BuildConfig.SITE_URL.trimEnd('/') + (if (apkUrl.startsWith("/")) apkUrl else "/$apkUrl")
+   567→            toast("دانلود نسخه جدید در مرورگر شروع می‌شود — پس از اتمام، روی اعلان مرورگر بزنید و نصب را تأیید کنید 📥")
+   568→            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+   569→        } catch (e: Exception) {
+   570→            Log.e("FitUpApp", "open apk in browser failed: ${e.message}")
+   571→            toast("مرورگری پیدا نشد — لطفاً لینک دانلود را در مرورگر باز کنید")
+   572→        }
+   573→    }
+   574→
+   575→    /** شروع دانلود فایل معمولی با DownloadManager → پوشه Download اپ (بدون مجوز نوشتن).
+   576→     *  (APK از این مسیر نمی‌گذرد — v1.2.8)
+   577→     *  @return true = واقعاً enqueue شد؛ false = شکست */
+   578→    private fun startNativeDownload(url: String, fileName: String): Boolean {
+   579→        val safeName = fileName.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank {
+   580→            "fitup-${System.currentTimeMillis()}"
+   581→        }
+   582→        try {
+   583→            val request = DownloadManager.Request(Uri.parse(url))
+   584→                .setTitle(safeName)
+   585→                .setDescription("دانلود فایل")
+   586→                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+   587→                .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, safeName)
+   588→                .setAllowedOverMetered(true)
+   589→                .setAllowedOverRoaming(true)
+   590→            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+   591→            val id = dm.enqueue(request)
+   592→            savePendingDownload(id, safeName, url)
+   593→            return true
+   594→        } catch (e: Exception) {
+   595→            Log.e("FitUpApp", "download enqueue failed: ${e.message}")
+   596→            return false
+   597→        }
+   598→    }
+   599→
+   600→    /** جلوی دوبار اجرای پشت‌سرهم (برادکست + onResume هم‌زمان) */
+   601→    private var handlingDownloadFinish = false
+   602→
+   603→    /** پایان یک دانلود: فقط پاک‌سازی وضعیت pending.
+   604→     *  فایل‌های معمولی نوتیف خود DownloadManager را دارند؛ APK دیگر اصلاً از
+   605→     *  این مسیر نمی‌گذرد (v1.2.8 → مرورگر بیرونی). */
+   606→    private fun handleDownloadFinished(id: Long) {
+   607→        if (id <= 0 || id != pendingDownloadId()) return
+   608→        if (handlingDownloadFinish) return
+   609→        handlingDownloadFinish = true
+   610→        try {
+   611→            clearPendingDownload()
+   612→        } finally {
+   613→            handlingDownloadFinish = false
+   614→        }
+   615→    }
+   616→
+   617→    /** safety-net هر onResume: پایان دانلود فایل معمولی (برادکست گم‌شده با
+   618→     *  بازسازی اکتیویتی/بستن اپ) — فقط پاک‌سازی وضعیت pending (v1.2.8). */
+   619→    private fun checkPendingDownload() {
+   620→        val id = pendingDownloadId()
+   621→        if (id > 0) handleDownloadFinished(id)
+   622→    }
+   623→
+   624→    /** گیرندهٔ پایان دانلود (فایل‌های معمولی) → پاک‌سازی وضعیت pending.
+   625→     *  ⚠ RECEIVER_EXPORTED (نه NOT_EXPORTED): برادکست ACTION_DOWNLOAD_COMPLETE
+   626→     *  «protected» است و فقط دانلودمنیجر/سیستم می‌تواند بفرستد؛ در اندروید ۱۴+
+   627→     *  گیرندهٔ NOT_EXPORTED این برادکست را نمی‌گیرد (فرستنده DownloadProvider است). */
+   628→    private fun setupDownloadCompleteReceiver() {
+   629→        val receiver = object : BroadcastReceiver() {
+   630→            override fun onReceive(context: Context?, intent: Intent?) {
+   631→                if (intent?.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+   632→                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+   633→                handleDownloadFinished(id)
+   634→            }
+   635→        }
+   636→        try {
+   637→            if (Build.VERSION.SDK_INT >= 33) {
+   638→                registerReceiver(
+   639→                    receiver,
+   640→                    IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+   641→                    Context.RECEIVER_EXPORTED
+   642→                )
+   643→            } else {
+   644→                registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE))
+   645→            }
+   646→        } catch (_: Exception) {}
+   647→    }
+   648→
+   649→    /** نام فایل از Content-Disposition یا URL */
+   650→    private fun guessFileName(contentDisposition: String?, mimeType: String?, url: String): String {
+   651→        try {
+   652→            if (!contentDisposition.isNullOrBlank()) {
+   653→                val m = Regex("filename\\*=UTF-8''([^;]+)|filename=\"?([^\";]+)\"?", RegexOption.IGNORE_CASE)
+   654→                    .find(contentDisposition)
+   655→                if (m != null) {
+   656→                    val name = (m.groupValues[1].ifBlank { m.groupValues[2] })
+   657→                        .replace("+", " ")
+   658→                    if (name.isNotBlank()) return java.net.URLDecoder.decode(name, "UTF-8")
+   659→                }
+   660→            }
+   661→            if (!mimeType.isNullOrBlank() && mimeType.equals("application/vnd.android.package-archive", true)) {
+   662→                return "fitup-${System.currentTimeMillis()}.apk"
+   663→            }
+   664→            val path = URI(url).path ?: return "fitup-file"
+   665→            return path.substringAfterLast('/').ifBlank { "fitup-file" }
+   666→        } catch (_: Exception) {
+   667→            return "fitup-file"
+   668→        }
+   669→    }
+   670→
+   671→    /* ───────────── ذخیره data URL (PNG/PDF) ───────────── */
+   672→
+   673→    @SuppressLint("InlinedApi")
+   674→    private fun downloadDataUrl(filename: String, dataUrl: String) {
+   675→        try {
+   676→            val safeName = filename.ifBlank { "fitup-${System.currentTimeMillis()}" }
+   677→                .replace(Regex("[^A-Za-z0-9._-\\u0600-\\u06FF ]"), "_")
+   678→            val comma = dataUrl.indexOf(',')
+   679→            if (comma < 0 || !dataUrl.startsWith("data:", ignoreCase = true)) {
+   680→                runOnUiThread { toast("فایل قابل ذخیره نیست") }
+   681→                return
+   682→            }
+   683→            val meta = dataUrl.substring(5, comma)
+   684→            val mime = meta.substringBefore(";").ifBlank { "application/octet-stream" }
+   685→            val isBase64 = meta.contains("base64", ignoreCase = true)
+   686→            val bytes = if (isBase64) {
+   687→                Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT)
+   688→            } else {
+   689→                dataUrl.substring(comma + 1).toByteArray(Charsets.UTF_8)
+   690→            }
+   691→
+   692→            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+   693→                val values = ContentValues().apply {
+   694→                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
+   695→                    put(MediaStore.Downloads.MIME_TYPE, mime)
+   696→                    put(MediaStore.Downloads.IS_PENDING, 1)
+   697→                }
+   698→                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+   699→                if (uri == null) {
+   700→                    runOnUiThread { toast("خطا در ذخیره فایل") }
+   701→                    return
+   702→                }
+   703→                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+   704→                values.clear()
+   705→                values.put(MediaStore.Downloads.IS_PENDING, 0)
+   706→                contentResolver.update(uri, values, null, null)
+   707→            } else {
+   708→                val dir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+   709→                val file = File(dir, safeName)
+   710→                FileOutputStream(file).use { it.write(bytes) }
+   711→            }
+   712→            runOnUiThread { toast("«$safeName» ذخیره شد ✓") }
+   713→        } catch (e: Exception) {
+   714→            Log.e("FitUpApp", "download failed: ${e.message}")
+   715→            runOnUiThread { toast("خطا در ذخیره فایل") }
+   716→        }
+   717→    }
+   718→
+   719→    /** چاپ صفحه فعلی WebView با PrintManager اندروید */
+   720→    private fun printCurrentPage() {
+   721→        runOnUiThread {
+   722→            try {
+   723→                val printManager = getSystemService(Context.PRINT_SERVICE) as PrintManager
+   724→                val jobName = "FitUp ${BuildConfig.VERSION_NAME}"
+   725→                printManager.print(jobName, webView.createPrintDocumentAdapter(jobName), null)
+   726→            } catch (e: Exception) {
+   727→                toast("چاپ در این دستگاه ممکن نیست")
+   728→            }
+   729→        }
+   730→    }
+   731→
+   732→    /* ───────────── نوتیفیکیشن native ───────────── */
+   733→
+   734→    private fun setupNotifications() {
+   735→        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+   736→            val channel = NotificationChannel(
+   737→                CHANNEL_ID,
+   738→                "اعلان‌های فیتاپ",
+   739→                NotificationManager.IMPORTANCE_DEFAULT
+   740→            ).apply { description = "یادآوری‌ها و خبرهای برنامه" }
+   741→            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+   742→            nm.createNotificationChannel(channel)
+   743→        }
+   744→        // مجوز POST_NOTIFICATIONS فقط از پل JS (requestNotificationPermission) —
+   745→        // وقتی کاربر در خود سایت روی «فعال‌سازی اعلان‌ها» کلیک می‌کند.
+   746→        notifPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+   747→    }
+   748→
+   749→    /** مجوز اعلان — از پل JS با توضیح زیبا در سایت، بعد از رضایت کاربر */
+   750→    private fun maybeRequestNotificationPermission() {
+   751→        try {
+   752→            if (Build.VERSION.SDK_INT >= 33 &&
+   753→                ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+   754→            ) {
+   755→                notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+   756→            }
+   757→        } catch (_: Exception) {}
+   758→    }
+   759→
+   760→    /** نمایش نوتیف سیستم — از پل JS (main-app polling) صدا زده می‌شود */
+   761→    private fun showNativeNotification(title: String, body: String) {
+   762→        try {
+   763→            if (Build.VERSION.SDK_INT >= 33 &&
+   764→                ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+   765→            ) {
+   766→                return // بدون مجوز، بی‌صدا رد شو
+   767→            }
+   768→            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+   769→                .setSmallIcon(R.mipmap.ic_launcher)
+   770→                .setContentTitle(title)
+   771→                .setContentText(body)
+   772→                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+   773→                .setAutoCancel(true)
+   774→                .setContentIntent(
+   775→                    android.app.PendingIntent.getActivity(
+   776→                        this, 0,
+   777→                        Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+   778→                        android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+   779→                    )
+   780→                )
+   781→                .build()
+   782→            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+   783→            nm.notify((System.currentTimeMillis() % 100000).toInt(), notification)
+   784→        } catch (e: Exception) {
+   785→            Log.w("FitUpApp", "notification failed: ${e.message}")
+   786→        }
+   787→    }
+   788→
+   789→    /* ───────────── دوربین/میکروفون WebView ───────────── */
+   790→
+   791→    private fun requestMediaRuntimePermissions(webRequest: PermissionRequest) {
+   792→        pendingWebPermissionRequest?.let { if (it !== webRequest) it.deny() }
+   793→        pendingWebPermissionRequest = webRequest
+   794→        val perms = mutableListOf<String>()
+   795→        if (webRequest.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) {
+   796→            perms.add(android.Manifest.permission.CAMERA)
+   797→        }
+   798→        if (webRequest.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+   799→            perms.add(android.Manifest.permission.RECORD_AUDIO)
+   800→        }
+   801→        val alreadyGranted = perms.all {
+   802→            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+   803→        }
+   804→        if (perms.isEmpty() || alreadyGranted) {
+   805→            pendingWebPermissionRequest = null
+   806→            runOnUiThread { webRequest.grant(webRequest.resources) }
+   807→        } else {
+   808→            try {
+   809→                mediaPermissionLauncher.launch(perms.toTypedArray())
+   810→            } catch (_: Exception) {
+   811→                pendingWebPermissionRequest = null
+   812→                runOnUiThread { webRequest.deny() }
+   813→            }
+   814→        }
+   815→    }
+   816→
+   817→    /* ───────────── OTP خودکار: کلیپ‌بورد (بدون پرمیشن) ───────────── */
+   818→
+   819→    private fun dispatchOtpCode(code: String) {
+   820→        runOnUiThread {
+   821→            webView.evaluateJavascript(
+   822→                "window.__fitupNativeSmsCode && window.__fitupNativeSmsCode('$code');",
+   823→                null
+   824→            )
+   825→        }
+   826→    }
+   827→
+   828→    /** کد OTP از کلیپ‌بورد — v1.2.9: هم کدِ خالص و هم «متن کامل پیامک» کپی‌شده.
+   829→     *  برای جلوگیری از درج اشتباه عدد ۴-رقمی نامرتبط (مثل سال «1404»)، استخراج
+   830→     *  گروه ۴-رقمی فقط وقتی انجام می‌شود که متن شامل «فیتاپ» یا fittup باشد یا
+   831→     *  خود کلیپ‌بورد دقیقاً کد ۴-رقمی باشد. */
+   832→    private fun maybeDispatchClipboardOtp() {
+   833→        try {
+   834→            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager ?: return
+   835→            val text = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim() ?: return
+   836→            if (text == lastClipboardDispatched) return
+   837→            val code = when {
+   838→                Regex("^\\d{4}$").matches(text) -> text
+   839→                text.contains("فیتاپ") || text.contains("fittup", ignoreCase = true) ->
+   840→                    Regex("(?<!\\d)\\d{4}(?!\\d)").findAll(text).map { it.value }.lastOrNull()
+   841→                else -> null
+   842→            }
+   843→            if (code != null) {
+   844→                lastClipboardDispatched = text
+   845→                dispatchOtpCode(code)
+   846→            }
+   847→        } catch (_: Exception) {}
+   848→    }
+   849→
+   850→    /* ───────────── OTP خودکار: SMS Retriever (v31 — بدون پرمیشن) ───────────── */
+   851→    // پیامکی که متنش با هش ۱۱-کاراکتری اپ امضا شده (سرور — ارسال خام sms.ir)
+   852→    // مستقیم به OtpRetrieverReceiver می‌رسد؛ بدون RECEIVE_SMS و بدون هیچ دیالوگی.
+   853→
+   854→    private val otpReceiver = OtpRetrieverReceiver()
+   855→
+   856→    private fun setupOtpRetrieverReceiver() {
+   857→        try {
+   858→            // فرستنده = Google Play Services (اپ دیگر) → EXPORTED لازم است
+   859→            ContextCompat.registerReceiver(
+   860→                this, otpReceiver,
+   861→                IntentFilter(SmsRetriever.SMS_RETRIEVED_ACTION),
+   862→                ContextCompat.RECEIVER_EXPORTED
+   863→            )
+   864→        } catch (_: Exception) {}
+   865→    }
+   866→
+   867→    /** از پل وب (صفحهٔ ورود کد) — فعال‌سازی شنوندهٔ ۵ دقیقه‌ای */
+   868→    private fun startOtpSmsRetriever() {
+   869→        try {
+   870→            val task = SmsRetriever.getClient(this).startSmsRetriever()
+   871→            task.addOnSuccessListener { Log.i("FitUpApp", "SMS Retriever armed") }
+   872→            task.addOnFailureListener { Log.w("FitUpApp", "SMS Retriever unavailable: ${it.message}") }
+   873→        } catch (e: Exception) {
+   874→            // دستگاه بدون سرویس گوگل — fail-safe (ورود دستی/کلیپ‌بورد سر جایشان)
+   875→            Log.w("FitUpApp", "SMS Retriever start failed: ${e.message}")
+   876→        }
+   877→    }
+   878→
+   879→    /* ───────────── اعلان‌ها حتی وقتی برنامه بسته است (v31) ───────────── */
+   880→
+   881→    /**
+   882→     * دیالوگ فارسی یک‌بار-محور: «بهینه‌سازی باتری برای فیتاپ غیرفعال شود؟»
+   883→     * هدف: جلوی کشتن فرآیند WorkManager توسط بهینه‌سازهای تهاجمی — مخصوصاً
+   884→     * شیائومی/سامسونگ. مصرف باتری به‌طور محسوسی بالا نمی‌رود (فقط JobScheduler).
+   885→     * از پل وب بعد از رضایت اعلان‌ها صدا زده می‌شود؛ رد → دیگر پرسیده نمی‌شود.
+   886→     */
+   887→    private fun maybeRequestBatteryExemption() {
+   888→        try {
+   889→            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+   890→            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+   891→            val prefs = getSharedPreferences("fitup_settings", Context.MODE_PRIVATE)
+   892→            if (prefs.getBoolean("battery_prompt_dismissed", false)) return
+   893→            AlertDialog.Builder(this)
+   894→                .setTitle("اعلان‌ها حتی وقتی برنامه بسته است")
+   895→                .setMessage("برای اینکه یادآوری‌ها و خبرهای فیتاپ حتی وقتی برنامه را بسته‌ای به دستت برسند، بهینه‌سازی باتری را برای فیتاپ غیرفعال کن. مصرف باتری به‌طور محسوسی افزایش پیدا نمی‌کند.")
+   896→                .setPositiveButton("فعال‌سازی اعلان‌ها") { _, _ ->
+   897→                    try {
+   898→                        startActivity(
+   899→                            Intent(
+   900→                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+   901→                                Uri.parse("package:$packageName")
+   902→                            )
+   903→                        )
+   904→                    } catch (_: Exception) {}
+   905→                }
+   906→                .setNegativeButton("بعداً") { _, _ ->
+   907→                    prefs.edit().putBoolean("battery_prompt_dismissed", true).apply()
+   908→                }
+   909→                .show()
+   910→        } catch (_: Exception) {}
+   911→    }
+   912→
+   913→    /* ───────────── چک نسخه (fallback نیتیو) ───────────── */
+   914→
+   915→    /**
+   916→     * در هر اجرا /api/app/own/latest را می‌خواند.
+   917→     * مودال زیبای آپدیت را خود سایت (AppUpdateModal) نشان می‌دهد؛ این چک نیتیو
+   918→     * فقط safety-net است: اگر صفحه سایت بالا نیامده باشد (خطای شبکه) و نسخهٔ
+   919→     * جدید «اجباری» بود، دیالوگ نیتیو با دانلود مستقیم نشان می‌دهیم.
+   920→     */
+   921→    private fun checkAppVersion() {
+   922→        thread {
+   923→            try {
+   924→                val url = URL(BuildConfig.SITE_URL.trimEnd('/') + "/api/app/own/latest")
+   925→                val conn = url.openConnection() as HttpURLConnection
+   926→                conn.connectTimeout = 10_000
+   927→                conn.readTimeout = 10_000
+   928→                conn.instanceFollowRedirects = true
+   929→                val body = conn.inputStream.bufferedReader().use { it.readText() }
+   930→                conn.disconnect()
+   931→                val json = JSONObject(body)
+   932→                if (!json.optBoolean("available", false)) return@thread
+   933→                val latest = json.optInt("latestVersionCode", 1)
+   934→                val forced = json.optBoolean("forceUpdate", false)
+   935→                val apkUrl = BuildConfig.SITE_URL.trimEnd('/') + "/api/app/own/download"
+   936→                if (BuildConfig.VERSION_CODE < latest && forced) {
+   937→                    runOnUiThread {
+   938→                        // فقط وقتی سایت بالا نیامده (وگرنه مودال سایت خودش را نشان می‌دهد)
+   939→                        if (errorView.visibility == View.VISIBLE && !forceDialogShown) {
+   940→                            forceDialogShown = true
+   941→                            showForceUpdateDialog(apkUrl)
+   942→                        }
+   943→                    }
+   944→                }
+   945→            } catch (e: Exception) {
+   946→                // آفلاین/خطا — نادیده بگیر؛ در اجرای بعدی دوباره تلاش می‌شود
+   947→            }
+   948→        }
+   949→    }
+   950→
+   951→    /** دیالوگ آپدیت اجباری — دانلود با مرورگر بیرونی (v1.2.8) */
+   952→    private fun showForceUpdateDialog(apkUrl: String) {
+   953→        val dialog = AlertDialog.Builder(this)
+   954→            .setTitle("به‌روزرسانی لازم است")
+   955→            .setMessage("برای ادامه استفاده از فیتاپ، لطفاً نسخه جدید برنامه را دانلود و نصب کنید. دانلود در مرورگر انجام می‌شود.")
+   956→            .setCancelable(false)
+   957→            .setPositiveButton("دانلود نسخه جدید") { _, _ -> openApkUpdateInBrowser(apkUrl) }
+   958→            .setNeutralButton("تلاش مجدد") { _, _ ->
+   959→                forceDialogShown = false
+   960→                webView.reload()
+   961→                checkAppVersion()
+   962→            }
+   963→            .create()
+   964→        dialog.setCanceledOnTouchOutside(false)
+   965→        dialog.show()
+   966→    }
+   967→
+   968→    private fun toast(msg: String) {
+   969→        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+   970→    }
+   971→
+   972→    /* ───────────── پل JS ───────────── */
+   973→
+   974→    /** چک origin — پل فقط از دامنه خودمان قابل فراخوانی است (امنیت) */
+   975→    private fun bridgeAllowed(): Boolean {
+   976→        val u = lastMainUrl ?: return false
+   977→        return try {
+   978→            val host = URI(u).host ?: return false
+   979→            host == "fittup.ir" || host.endsWith(".fittup.ir") ||
+   980→                host == (try { URI(BuildConfig.SITE_URL).host } catch (_: Exception) { null } ?: host)
+   981→        } catch (_: Exception) {
+   982→            false
+   983→        }
+   984→    }
+   985→
+   986→    inner class NativeBridge {
+   987→        /** اپ اختصاصی فیتاپ — نه بازار */
+   988→        @JavascriptInterface
+   989→        fun isOwnApp(): Boolean = bridgeAllowed()
+   990→
+   991→        @JavascriptInterface
+   992→        fun isBazaarApp(): Boolean = false
+   993→
+   994→        @JavascriptInterface
+   995→        fun appVersion(): String = BuildConfig.VERSION_NAME
+   996→
+   997→        @JavascriptInterface
+   998→        fun getAppVersionCode(): Int = BuildConfig.VERSION_CODE
+   999→
+  1000→        @JavascriptInterface
+  1001→        fun getAppVersionName(): String = BuildConfig.VERSION_NAME
+  1002→
+  1003→        /** دانلود نسخه جدید (از مودال آپدیت سایت) → مرورگر بیرونی (v1.2.8 — بدون مجوز نصب) */
+  1004→        @JavascriptInterface
+  1005→        fun downloadUpdate(apkUrl: String) {
+  1006→            if (!bridgeAllowed()) return
+  1007→            runOnUiThread { openApkUpdateInBrowser(apkUrl) }
+  1008→        }
+  1009→
+  1010→        @JavascriptInterface
+  1011→        fun downloadFile(filename: String, dataUrl: String) {
+  1012→            if (!bridgeAllowed()) return
+  1013→            downloadDataUrl(filename, dataUrl)
+  1014→        }
+  1015→
+  1016→        @JavascriptInterface
+  1017→        fun printPage() {
+  1018→            if (!bridgeAllowed()) return
+  1019→            printCurrentPage()
+  1020→        }
+  1021→
+  1022→        @JavascriptInterface
+  1023→        fun showNotification(title: String, body: String) {
+  1024→            if (!bridgeAllowed()) return
+  1025→            showNativeNotification(title, body)
+  1026→        }
+  1027→
+  1028→        @JavascriptInterface
+  1029→        fun requestNotificationPermission() {
+  1030→            if (!bridgeAllowed()) return
+  1031→            runOnUiThread { maybeRequestNotificationPermission() }
+  1032→        }
+  1033→
+  1034→        /** v31 — همگام‌سازی فوری اعلان‌ها (ورود به پنل) */
+  1035→        @JavascriptInterface
+  1036→        fun syncNotificationsNow() {
+  1037→            if (!bridgeAllowed()) return
+  1038→            NotificationSync.syncNow(applicationContext)
+  1039→        }
+  1040→
+  1041→        /** v31 — دیالوگ بهینه‌سازی باتری (بعد از رضایت اعلان‌ها) */
+  1042→        @JavascriptInterface
+  1043→        fun requestBatteryOptimization() {
+  1044→            if (!bridgeAllowed()) return
+  1045→            runOnUiThread { maybeRequestBatteryExemption() }
+  1046→        }
+  1047→
+  1048→        /** v31 — SMS Retriever بدون پرمیشن (صفحهٔ ورود کد) */
+  1049→        @JavascriptInterface
+  1050→        fun startOtpSmsRetriever() {
+  1051→            if (!bridgeAllowed()) return
+  1052→            startOtpSmsRetriever()
+  1053→        }
+  1054→
+  1055→        /** قفل pull-to-refresh برای اسکرول داخلی صفحه (فیکس باگ لیست‌ها) */
+  1056→        @JavascriptInterface
+  1057→        fun setSwipeRefreshEnabled(enabled: Boolean) {
+  1058→            if (!bridgeAllowed()) return
+  1059→            runOnUiThread { swipeRefresh.isEnabled = enabled }
+  1060→        }
+  1061→    }
+  1062→
+  1063→    /* ───────────── چرخه حیات ───────────── */
+  1064→
+  1065→    /* ───────────── ناوبری دکمه back (درخواست مالک) ───────────── */
+  1066→    // بک اول از هر قسمتی به جز داشبورد → داشبورد (از طریق پل SPA — بدون رفرش صفحه)
+  1067→    // بک روی داشبورد → مودال تأیید خروج؛ تأیید → خروج واقعی از برنامه
+  1068→    // پل وب: window.__fitupNativeBack() در page-client.tsx تعریف شده و برمی‌گرداند:
+  1069→    //   'overlay'   → فقط اورلی بسته شد (هیچ کاری نکن)
+  1070→    //   'dashboard' → وب خودش به داشبورد پرید (هیچ کاری نکن)
+  1071→    //   'home'      → روی داشبورد هستیم → مودال خروج
+  1072→    //   'unknown'   → پل وب در دسترس نیست (صفحه هنوز لود نشده) → مودال خروج
+  1073→    @Deprecated("Deprecated in Java")
+  1074→    override fun onBackPressed() {
+  1075→        // 🩹 v1.2.6 (باگ «بک در درگاه پرداخت از برنامه خارج می‌کند»):
+  1076→        // اگر کاربر روی صفحهٔ غیر از سایت خودمان است (زرین‌پال/بانک/شاپرک)،
+  1077→        // پل وب (__fitupNativeBack) آنجا وجود ندارد → 'unknown' → قبلاً مستقیم
+  1078→        // دیالوگ خروج! درستش: اول history وب را پس بگیریم (webView.goBack) تا
+  1079→        // کاربر به سایت/مدال پرداخت برگردد؛ فقط وقتی جایی برای برگشتن نیست،
+  1080→        // دیالوگ خروج. رفتار داشبورد سایت (بک دوم = مودال خروج) دست‌نخورده ماند.
+  1081→        val currentHost = try {
+  1082→            URI(webView.url ?: "").host?.lowercase()
+  1083→        } catch (_: Exception) {
+  1084→            null
+  1085→        }
+  1086→        val siteHost = try { URI(BuildConfig.SITE_URL).host?.lowercase() } catch (_: Exception) { null }
+  1087→        val onOurSite = currentHost != null && siteHost != null &&
+  1088→            (currentHost == siteHost || currentHost.endsWith(".$siteHost"))
+  1089→        if (!onOurSite) {
+  1090→            if (webView.canGoBack()) {
+  1091→                webView.goBack()
+  1092→            } else {
+  1093→                showExitConfirmDialog()
+  1094→            }
+  1095→            return
+  1096→        }
+  1097→        webView.evaluateJavascript(
+  1098→            "(function(){try{if(window.__fitupNativeBack){return window.__fitupNativeBack();}}catch(e){}return 'unknown';})()"
+  1099→        ) { result ->
+  1100→            val where = result?.trim()?.removePrefix("\"")?.removeSuffix("\"") ?: "unknown"
+  1101→            if (where == "home" || where == "unknown") {
+  1102→                showExitConfirmDialog()
+  1103→            }
+  1104→        }
+  1105→    }
+  1106→
+  1107→    /** مودال تأیید خروج از برنامه (بک دوم روی داشبورد) — دیالوگ برندشدهٔ سفارشی */
+  1108→    private var exitConfirmDialog: Dialog? = null
+  1109→
+  1110→    private fun showExitConfirmDialog() {
+  1111→        if (exitConfirmDialog?.isShowing == true) return
+  1112→        val dialog = Dialog(this)
+  1113→        exitConfirmDialog = dialog
+  1114→        dialog.setContentView(R.layout.dialog_exit)
+  1115→        dialog.setCancelable(true)             // دکمهٔ بک → بستن
+  1116→        dialog.setCanceledOnTouchOutside(true) // لمس بیرون کارت → بستن
+  1117→        dialog.window?.apply {
+  1118→            // کارت سفیدِ گرد خودش پس‌زمینه است — پس‌زمینهٔ پنجره باید شفاف باشد
+  1119→            setBackgroundDrawableResource(android.R.color.transparent)
+  1120→            // چیدمان راست‌به‌چپ در خود layout با android:layoutDirection="rtl" ست شده
+  1121→            // عرض: ۸۸٪ صفحه، حداکثر ۳۶۰dp — روی تبلت هم خوش‌فرم می‌ماند
+  1122→            val dm = resources.displayMetrics
+  1123→            setLayout(
+  1124→                minOf((dm.widthPixels * 0.88f).toInt(), (360 * dm.density).toInt()),
+  1125→                ViewGroup.LayoutParams.WRAP_CONTENT
+  1126→            )
+  1127→            // انیمیشن فید ساده برای باز/بسته شدن
+  1128→            attributes.windowAnimations = R.style.FitUpExitDialogAnimation
+  1129→        }
+  1130→        // «موندن» → فقط بستن دیالوگ
+  1131→        dialog.findViewById<TextView>(R.id.btnExitStay).setOnClickListener { dialog.dismiss() }
+  1132→        // «خروج» → بستن دیالوگ + خروج کامل از برنامه
+  1133→        dialog.findViewById<TextView>(R.id.btnExitLeave).setOnClickListener {
+  1134→            dialog.dismiss()
+  1135→            finishAffinity()
+  1136→        }
+  1137→        dialog.show()
+  1138→    }
+  1139→
+  1140→    override fun onResume() {
+  1141→        super.onResume()
+  1142→        // چک نسخه در هر بازگشت (اگر نسخه اجباری جدید منتشر شده باشد)
+  1143→        checkAppVersion()
+  1144→        // پایان دانلود APK — اگر برادکست پایان-دانلود را از دست داده‌ایم
+  1145→        // (کوارک اندروید ۱۴ / بازسازی اکتیویتی / بستن و بازکردن اپ)،
+  1146→        // با برگشتن به اپ دیالوگ نصب/خطا نشان داده می‌شود
+  1147→        checkPendingDownload()
+  1148→        // OTP: شاید کد از کلیپ‌بورد آمده (کپی از نوتیف پیامک) — بدون پرمیشن
+  1149→        maybeDispatchClipboardOtp()
+  1150→        // OTP: کد رسیده در زمان بسته‌بودن اکتیویتی (SMS Retriever) — v31
+  1151→        OtpRetriever.takePending(this)?.let { dispatchOtpCode(it) }
+  1152→        // همگام‌سازی اعلان‌های از-دست-رفته در هر باز شدن
+  1153→        NotificationSync.syncNow(applicationContext)
+  1154→    }
+  1155→
+  1156→    override fun onPause() {
+  1157→        // سشن OTP/لاگین — کوکی‌ها را فوراً روی دیسک flush کن
+  1158→        try {
+  1159→            CookieManager.getInstance().flush()
+  1160→        } catch (_: Exception) {}
+  1161→        super.onPause()
+  1162→    }
+  1163→
+  1164→    override fun onDestroy() {
+  1165→        try { unregisterReceiver(otpReceiver) } catch (_: Exception) {}
+  1166→        OtpRetriever.dispatcher = null
+  1167→        super.onDestroy()
+  1168→    }
+  1169→
+  1170→    override fun onSaveInstanceState(outState: Bundle) {
+  1171→        super.onSaveInstanceState(outState)
+  1172→        webView.saveState(outState)
+  1173→    }
+  1174→
+  1175→    companion object {
+  1176→        /** کانال اعلان — برای NotificationSyncWorker هم لازم است (public const) */
+  1177→        const val CHANNEL_ID = "fitup_general"
+  1178→
+  1179→        /** کلیدهای وضعیت دانلود APK (SharedPreferences "fitup_download") */
+  1180→        private const val PREF_DOWNLOAD_ID = "download_id"
+  1181→        private const val PREF_DOWNLOAD_FILE = "download_file"
+  1182→        private const val PREF_DOWNLOAD_URL = "download_url"
+  1183→    }
+  1184→}
+  1185→

@@ -1,0 +1,819 @@
+     1→import { db } from "@/lib/db";
+     2→import { toPersianDigits, PERSIAN_WEEKDAYS } from "@/lib/fitness/types";
+     3→import { buildUserContext } from "@/lib/fitness/ai";
+     4→import type { OnboardingData, Plan } from "@/lib/fitness/types";
+     5→
+     6→/**
+     7→ * ─── پرونده ورزشی کاربر — کانتکست بودجه‌دار برای هوش مصنوعی (v53) ───
+     8→ *
+     9→ * خواستهٔ مالک: «هر چیزی که کاربر تمرین می‌کند و ثبت می‌کند باید خیلی ریز داخل
+    10→ * پرونده ورزشی تزریق بشه تا تحلیل‌های AI بهش اشراف داشته باشه؛ ولی مراقب طول
+    11→ * پرامپت باشیم — کاربر ممکنه ۶-۷ ماه یا حتی ۲ سال فعال باشه و پرونده‌اش آنقدر
+    12→ * سنگین بشه که AI نتونه پرامپت رو هندل کنه.»
+    13→ *
+    14→ * راه‌حل: یک بیلدر واحد که «همهٔ» تاریخچه کاربر را تزریق می‌کند ولی خروجی آن
+    15→ * سقف سخت کاراکتری دارد (پیش‌فرض ۹۰۰۰):
+    16→ *   • ۳۰ روز اخیر → روزبه‌روز (تغذیه از FoodLog با groupBy سمت SQL، تمرین از
+    17→ *     DayCompletion/WorkoutDayStatus، وزن‌های داخل پنجره)
+    18→ *   • ماه ۲ تا ۱۲ → جمع‌بندی ماهانه (میانگین کالری/پروتئین، روزهای تمرین، مسیر وزن)
+    19→ *   • قدیمی‌تر از ۱۲ ماه → یک خط به‌ازای هر سه‌ماهه (کاربر ۲ ساله هم ۸ خط بیشتر ندارد)
+    20→ *   • چکاپ‌ها → ۳ مورد آخر با جزئیات + یک خط روند برای قدیمی‌ترها
+    21→ *   • استریک پیوستگی (تمرین+تغذیه کامل روزهای متوالی)
+    22→ *
+    23→ * هیچ جدولی کامل خوانده نمی‌شود؛ همهٔ کوئری‌ها با where بازهٔ تاریخ/رشتهٔ تاریخ
+    24→ * و take سقف‌دار یا groupBy (یک سطر به‌ازای هر روزِ ثبت‌شده) اجرا می‌شوند.
+    25→ * اگر خروجی از بودجه عبور کند، قدیمی‌ترین بخش‌ها مرحله‌به‌مرحله خلاصه/حذف
+    26→ * می‌شوند و در انتها برش سخت با نشانگر «… (بخش‌های قدیمی‌تر خلاصه شد)».
+    27→ *
+    28→ * مرز روز = نیمه‌شب تهران (UTC+03:30 ثابت — هم‌قرارداد با /api/nutrition/log).
+    29→ * ماه‌های میانی میلادی بسته‌بندی می‌شوند ولی برچسب‌ها با Intl فارسی (مرداد ۱۴۰۴…).
+    30→ */
+    31→
+    32→/** سقف پیش‌فرض پروندهٔ کامل (کاراکتر) */
+    33→export const SPORTS_PROFILE_MAX_CHARS = 9000;
+    34→/** سقف خلاصهٔ فشرده برای تولید برنامه (کاراکتر) */
+    35→export const COMPACT_SUMMARY_MAX_CHARS = 1500;
+    36→
+    37→const TRUNCATION_MARK = "… (بخش‌های قدیمی‌تر خلاصه شد)";
+    38→const DAY_MS = 24 * 60 * 60 * 1000;
+    39→
+    40→const pd = (v: string | number): string => toPersianDigits(v);
+    41→
+    42→// ─── مرز روز به‌وقت تهران (UTC+03:30 ثابت — هم‌قرارداد با /api/nutrition/log) ───
+    43→
+    44→/** تاریخ امروز تهران به شکل YYYY-MM-DD (en-CA خروجی ISO-like می‌دهد) */
+    45→function tehranTodayStr(): string {
+    46→  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tehran" }).format(new Date());
+    47→}
+    48→
+    49→/** کلید روزِ تهران (YYYY-MM-DD) برای هر لحظه — کلید یکسان‌سازی همهٔ مدل‌ها */
+    50→function tehranDateStr(d: Date): string {
+    51→  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tehran" }).format(d);
+    52→}
+    53→
+    54→/** نیمه‌شب تهران برای رشتهٔ YYYY-MM-DD به‌صورت Date جهانی */
+    55→function tehranDayStart(dateStr: string): Date {
+    56→  return new Date(`${dateStr}T00:00:00+03:30`);
+    57→}
+    58→
+    59→/** نمایش جلالی تاریخ (مثل ۱۴۰۴/۰۶/۱۲) با ارقام فارسی */
+    60→function jalali(d: Date): string {
+    61→  return new Intl.DateTimeFormat("fa-IR", { timeZone: "Asia/Tehran" }).format(d);
+    62→}
+    63→
+    64→// ─── کلید ماه میلادی (YYYY-MM) و برچسب فارسی آن ───
+    65→
+    66→function monthKeyOf(dateStr: string): string {
+    67→  return dateStr.slice(0, 7);
+    68→}
+    69→
+    70→function addMonthsKey(key: string, delta: number): string {
+    71→  const [y, m] = key.split("-").map(Number);
+    72→  const d = new Date(Date.UTC(y, m - 1 + delta, 1));
+    73→  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+    74→}
+    75→
+    76→/** برچسب فارسی ماه (مثل «مرداد ۱۴۰۵») از کلید YYYY-MM — نیمهٔ ماه به‌عنوان نماینده */
+    77→function monthLabelFa(key: string): string {
+    78→  const [y, m] = key.split("-").map(Number);
+    79→  const mid = new Date(Date.UTC(y, m - 1, 15, 12));
+    80→  const monthName = new Intl.DateTimeFormat("fa-IR", { month: "long", timeZone: "UTC" }).format(mid);
+    81→  const yearFa = new Intl.DateTimeFormat("fa-IR", { year: "numeric", timeZone: "UTC" }).format(mid);
+    82→  return `${monthName} ${yearFa}`;
+    83→}
+    84→
+    85→/** تعداد روزهای واقعی یک ماه میلادی */
+    86→function daysInMonth(key: string): number {
+    87→  const [y, m] = key.split("-").map(Number);
+    88→  return new Date(Date.UTC(y, m, 0)).getUTCDate();
+    89→}
+    90→
+    91→// ─── برچسب‌های فارسی ───
+    92→
+    93→const MEAL_LABELS: Record<string, string> = {
+    94→  breakfast: "صبحانه",
+    95→  lunch: "ناهار",
+    96→  dinner: "شام",
+    97→  snack: "میان‌وعده",
+    98→};
+    99→
+   100→const WORKOUT_SOURCE_LABELS: Record<string, string> = {
+   101→  gym_mode: "حالت باشگاه",
+   102→  guided_session: "جلسهٔ هدایت‌شده",
+   103→};
+   104→
+   105→const WDS_STATUS_LABELS: Record<string, string> = {
+   106→  completed: "تمرین ✓",
+   107→  skipped: "تمرین جابه‌جا شد",
+   108→  rest_as_planned: "استراحت طبق برنامه",
+   109→};
+   110→
+   111→const fmt1 = (n: number): string => (Math.round(n * 10) / 10).toString();
+   112→
+   113→const signed = (n: number): string => pd(`${n > 0 ? "+" : n < 0 ? "−" : ""}${fmt1(Math.abs(n))}`);
+   114→
+   115→// ─── تایپ‌های ورودی عمومی ───
+   116→
+   117→export interface CheckupLike {
+   118→  phaseNumber: number;
+   119→  isFinalCheckup?: boolean;
+   120→  weight: number;
+   121→  chestMeasurement?: number | null;
+   122→  armMeasurement?: number | null;
+   123→  waistMeasurement?: number | null;
+   124→  hipMeasurement?: number | null;
+   125→  thighMeasurement?: number | null;
+   126→  neckMeasurement?: number | null;
+   127→  bodyFatPercent?: number | null;
+   128→  leanBodyMass?: number | null;
+   129→  fatigueLevel?: number | null;
+   130→  sleepQuality?: number | null;
+   131→  dietAdherence?: number | null;
+   132→  workoutAdherence?: number | null;
+   133→  createdAt: Date | string;
+   134→}
+   135→
+   136→export interface SportsProfileOptions {
+   137→  /** سقف سخت کاراکتر خروجی (پیش‌فرض ۹۰۰۰) */
+   138→  maxChars?: number;
+   139→  /** بخش «پروفایل ثابت» (buildUserContext) هم داخل خروجی باشد؟
+   140→   *  پیش‌فرض true. در چت مربی false بدهید چون aiChat خودش buildUserContext را
+   141→   *  در system prompt تزریق می‌کند (جلوگیری از دوباره‌گویی و هدررفت توکن). */
+   142→  includeStaticProfile?: boolean;
+   143→}
+   144→
+   145→// ─── بخش چکاپ‌ها (مشترک بین پروندهٔ کامل و تحلیل جامع) ───
+   146→
+   147→/**
+   148→ * ساخت بخش «چکاپ‌های دوره‌ای»: ۳ چکاپ آخر با جزئیات + یک خط روند کلی
+   149→ * (اولین در برابر آخرین). ورودی هر تعداد چکاپ باشد، خروجی همیشه کوتاه می‌ماند —
+   150→ * این تابع مرز «لیست بی‌پایان چکاپ‌ها» در پرامپت‌هاست.
+   151→ */
+   152→export function buildCheckupSection(checkups: CheckupLike[]): string {
+   153→  if (!checkups || checkups.length === 0) return "";
+   154→  try {
+   155→    const sorted = [...checkups].sort(
+   156→      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+   157→    );
+   158→    const detail = sorted.slice(-3); // فقط ۳ مورد آخر جزئیات می‌گیرند
+   159→    const lines: string[] = [];
+   160→
+   161→    for (const c of detail) {
+   162→      const parts = [
+   163→        `فاز ${pd(c.phaseNumber)}${c.isFinalCheckup ? " (نهایی)" : ""} (${jalali(new Date(c.createdAt))})`,
+   164→        `وزن ${pd(fmt1(c.weight))}kg`,
+   165→      ];
+   166→      if (c.bodyFatPercent != null) parts.push(`چربی ${pd(fmt1(c.bodyFatPercent))}٪`);
+   167→      if (c.leanBodyMass != null) parts.push(`عضلهٔ خالص ${pd(fmt1(c.leanBodyMass))}kg`);
+   168→      if (c.waistMeasurement != null) parts.push(`کمر ${pd(fmt1(c.waistMeasurement))}cm`);
+   169→      if (c.armMeasurement != null) parts.push(`بازو ${pd(fmt1(c.armMeasurement))}cm`);
+   170→      if (c.chestMeasurement != null) parts.push(`سینه ${pd(fmt1(c.chestMeasurement))}cm`);
+   171→      if (c.thighMeasurement != null) parts.push(`ران ${pd(fmt1(c.thighMeasurement))}cm`);
+   172→      if (c.workoutAdherence != null) parts.push(`تمرین ${pd(c.workoutAdherence)}/۵`);
+   173→      if (c.dietAdherence != null) parts.push(`رژیم ${pd(c.dietAdherence)}/۵`);
+   174→      if (c.sleepQuality != null) parts.push(`خواب ${pd(c.sleepQuality)}/۵`);
+   175→      if (c.fatigueLevel != null) parts.push(`خستگی ${pd(c.fatigueLevel)}/۵`);
+   176→      lines.push(`• ${parts.join(" | ")}`);
+   177→    }
+   178→
+   179→    // روند کلی: اولین در برابر آخرین (قدیمی‌ترهای خارج از ۳ مورد آخر هم پوشش داده می‌شوند)
+   180→    const first = sorted[0];
+   181→    const last = sorted[sorted.length - 1];
+   182→    if (sorted.length > 1 && new Date(first.createdAt).getTime() !== new Date(last.createdAt).getTime()) {
+   183→      const trend: string[] = [];
+   184→      const delta = (a?: number | null, b?: number | null, unit = "") =>
+   185→        a != null && b != null && a !== b ? `${pd(fmt1(a))}→${pd(fmt1(b))} (${signed(b - a)}${unit})` : null;
+   186→      const w = delta(first.weight, last.weight, "kg");
+   187→      if (w) trend.push(`وزن ${w}`);
+   188→      const bf = delta(first.bodyFatPercent, last.bodyFatPercent, "٪");
+   189→      if (bf) trend.push(`چربی ${bf}`);
+   190→      const waist = delta(first.waistMeasurement, last.waistMeasurement, "cm");
+   191→      if (waist) trend.push(`کمر ${waist}`);
+   192→      if (trend.length > 0) {
+   193→        lines.push(
+   194→          `• روند از اولین چکاپ (${jalali(new Date(first.createdAt))}) تا کنون: ${trend.join(" · ")}` +
+   195→            (sorted.length > 3 ? ` — مجموع ${pd(sorted.length)} چکاپ ثبت شده` : "")
+   196→        );
+   197→      }
+   198→    }
+   199→
+   200→    return `🩺 چکاپ‌های دوره‌ای (۳ مورد آخر + روند):\n${lines.join("\n")}`;
+   201→  } catch (e) {
+   202→    console.error("[sports-profile] buildCheckupSection failed:", e);
+   203→    return "";
+   204→  }
+   205→}
+   206→
+   207→// ─── جمع‌بندی کمکی: تبدیل OnboardingProfile به OnboardingData (آینهٔ buildOnboardingData) ───
+   208→/**
+   209→ * نسخهٔ محلی مونتاژ OnboardingData — عمداً از program-generation.ts ایمپورت
+   210→ * نمی‌شود تا زنجیرهٔ ایمپورت حلقه‌ای نشود (program-generation این ماژول را
+   211→ * فراخوانی می‌کند). آخرین وزن از WeightLog (که جداگانه خوانده شده) پاس داده می‌شود.
+   212→ */
+   213→function profileToOnboardingData(
+   214→  profile: NonNullable<Awaited<ReturnType<typeof db.onboardingProfile.findUnique>>>,
+   215→  currentWeight: number | null
+   216→): OnboardingData {
+   217→  const safeParseList = (raw: string | null | undefined): string[] => {
+   218→    if (!raw) return [];
+   219→    const t = raw.trim();
+   220→    if (!t) return [];
+   221→    try {
+   222→      const p = JSON.parse(t);
+   223→      if (Array.isArray(p)) return p.map((x) => String(x));
+   224→      if (typeof p === "string") return p.split(",").map((s) => s.trim()).filter(Boolean);
+   225→      return [];
+   226→    } catch {
+   227→      return t.split(",").map((s) => s.trim()).filter(Boolean);
+   228→    }
+   229→  };
+   230→  const w = currentWeight ?? profile.weight ?? 70;
+   231→  let adj = 0;
+   232→  const al = profile.activityLevel;
+   233→  if (al === "active" || al === "very_active") adj = 500;
+   234→  else if (al === "moderate") adj = 250;
+   235→
+   236→  return {
+   237→    gender: profile.gender as OnboardingData["gender"],
+   238→    age: profile.age,
+   239→    height: profile.height,
+   240→    weight: w,
+   241→    targetWeight: profile.targetWeight ?? undefined,
+   242→    goal: profile.goal as OnboardingData["goal"],
+   243→    activityLevel: profile.activityLevel as OnboardingData["activityLevel"],
+   244→    workoutDays: profile.workoutDays,
+   245→    workoutDaysList: safeParseList(profile.workoutDaysList),
+   246→    workoutPlace: profile.workoutPlace as OnboardingData["workoutPlace"],
+   247→    equipment: safeParseList(profile.equipment),
+   248→    diseases: profile.diseases,
+   249→    injuries: profile.injuries,
+   250→    allergies: profile.allergies,
+   251→    dietType: profile.dietType as OnboardingData["dietType"],
+   252→    trainingExperience: (profile.trainingExperience ?? undefined) as OnboardingData["trainingExperience"],
+   253→    previousTrainingType: profile.previousTrainingType ?? undefined,
+   254→    drugAllergies: profile.drugAllergies ?? undefined,
+   255→    currentMedications: profile.currentMedications ?? undefined,
+   256→    maxLifts: profile.maxLifts ?? undefined,
+   257→    bodyFrame: (profile.bodyFrame ?? undefined) as OnboardingData["bodyFrame"],
+   258→    sleepHours: profile.sleepHours ?? undefined,
+   259→    stressLevel: profile.stressLevel ?? undefined,
+   260→    waterHabit: profile.waterHabit ?? undefined,
+   261→    targetDate: profile.targetDate ?? undefined,
+   262→    workoutTime: (profile.workoutTime ?? undefined) as OnboardingData["workoutTime"],
+   263→    medicalConditions: safeParseList(profile.medicalConditions) as OnboardingData["medicalConditions"],
+   264→    currentSupplements: profile.currentSupplements ?? undefined,
+   265→    dislikedFoods: profile.dislikedFoods ?? undefined,
+   266→    preferredCuisine: (profile.preferredCuisine ?? undefined) as OnboardingData["preferredCuisine"],
+   267→    waterGoalMl: Math.round(w * 35) + adj,
+   268→  };
+   269→}
+   270→
+   271→// ─── نرمال‌سازی خروجی groupBy FoodLog ───
+   272→
+   273→interface DayNutrition {
+   274→  kcal: number;
+   275→  protein: number;
+   276→  carbs: number;
+   277→  fat: number;
+   278→  meals: Set<string>;
+   279→  entries: number;
+   280→}
+   281→
+   282→function nutritionKeyMap(
+   283→  rows: {
+   284→    day: Date;
+   285→    meal?: string;
+   286→    _sum: { calories: number | null; protein: number | null; carbs: number | null; fat: number | null };
+   287→    _count: { _all: number };
+   288→  }[]
+   289→): Map<string, DayNutrition> {
+   290→  const map = new Map<string, DayNutrition>();
+   291→  for (const r of rows) {
+   292→    const key = tehranDateStr(new Date(r.day));
+   293→    let cur = map.get(key);
+   294→    if (!cur) {
+   295→      cur = { kcal: 0, protein: 0, carbs: 0, fat: 0, meals: new Set(), entries: 0 };
+   296→      map.set(key, cur);
+   297→    }
+   298→    cur.kcal += r._sum.calories ?? 0;
+   299→    cur.protein += r._sum.protein ?? 0;
+   300→    cur.carbs += r._sum.carbs ?? 0;
+   301→    cur.fat += r._sum.fat ?? 0;
+   302→    cur.entries += r._count?._all ?? 0;
+   303→    if (r.meal) cur.meals.add(r.meal);
+   304→  }
+   305→  return map;
+   306→}
+   307→
+   308→/** تاریخ دقیق رکورد WorkoutDayStatus از هفتهٔ شروع + نام روز فارسی */
+   309→function wdsDateKey(weekStart: Date, dayName: string): string {
+   310→  const idx = Math.max(0, PERSIAN_WEEKDAYS.indexOf(dayName));
+   311→  return tehranDateStr(new Date(new Date(weekStart).getTime() + idx * DAY_MS));
+   312→}
+   313→
+   314→// ─── بیلدر اصلی ───
+   315→
+   316→/**
+   317→ * پرونده ورزشی کاربر — تاریخچهٔ کامل با سقف سخت کاراکتری.
+   318→ *
+   319→ * ساختار خروجی (فارسی):
+   320→ *  ۱) پروفایل ثابت (اختیاری — includeStaticProfile)
+   321→ *  ۲) ۳۰ روز اخیر روزبه‌روز (تغذیه + تمرین + وزن)
+   322→ *  ۳) جمع‌بندی ماهانه (ماه ۲ تا ۱۲)
+   323→ *  ۴) سه‌ماهه‌های قدیمی‌تر از ۱۲ ماه
+   324→ *  ۵) چکاپ‌ها (۳ آخر + روند)
+   325→ *  ۶) استریک پیوستگی
+   326→ */
+   327→export async function buildSportsProfileContext(
+   328→  userId: string,
+   329→  opts?: SportsProfileOptions
+   330→): Promise<string> {
+   331→  const maxChars = Math.max(1500, opts?.maxChars ?? SPORTS_PROFILE_MAX_CHARS);
+   332→  const includeStaticProfile = opts?.includeStaticProfile !== false;
+   333→
+   334→  try {
+   335→    // ── مرزهای زمانی ──
+   336→    const todayStr = tehranTodayStr();
+   337→    const windowStart = new Date(tehranDayStart(todayStr).getTime() - 29 * DAY_MS); // ۳۰ روز اخیر
+   338→    const currentMonthKey = monthKeyOf(todayStr);
+   339→    const currentMonthStart = tehranDayStart(`${currentMonthKey}-01`);
+   340→    const m12Key = addMonthsKey(currentMonthKey, -12); // قدیمی‌ترین ماهِ بخش ماهانه
+   341→    const monthWindowStart = tehranDayStart(`${m12Key}-01`);
+   342→
+   343→    // ── همهٔ کوئری‌ها موازی و سقف‌دار (هیچ جدولی کامل خوانده نمی‌شود) ──
+   344→    const [
+   345→      foodWindowRows,
+   346→      foodMonthRows,
+   347→      foodOlderRows,
+   348→      dcRecent,
+   349→      dcMonthly,
+   350→      dcOlder,
+   351→      wdsRecent,
+   352→      wdsMonthly,
+   353→      wdsOlder,
+   354→      weightsDesc,
+   355→      checkups,
+   356→      profile,
+   357→      userRow,
+   358→    ] = await Promise.all([
+   359→      // ۳۰ روز اخیر — تفکیک وعده برای شمارش «وعده»ها (حداکثر ~۱۲۰ سطر)
+   360→      db.foodLog.groupBy({
+   361→        by: ["day", "meal"],
+   362→        where: { userId, day: { gte: windowStart } },
+   363→        _sum: { calories: true, protein: true, carbs: true, fat: true },
+   364→        _count: { _all: true },
+   365→        orderBy: { day: "asc" },
+   366→      }),
+   367→      // ماه ۲ تا ۱۲ — یک سطر به‌ازای هر روزِ ثبت‌شده (حداکثر ~۳۶۵ سطر)
+   368→      db.foodLog.groupBy({
+   369→        by: ["day"],
+   370→        where: { userId, day: { gte: monthWindowStart, lt: currentMonthStart } },
+   371→        _sum: { calories: true, protein: true, carbs: true, fat: true },
+   372→        _count: { _all: true },
+   373→        orderBy: { day: "asc" },
+   374→        take: 400,
+   375→      }),
+   376→      // قدیمی‌تر از ۱۲ ماه — یک سطر به‌ازای هر روز (کاربر ۲ ساله ≈ ۷۳۰ سطر)
+   377→      db.foodLog.groupBy({
+   378→        by: ["day"],
+   379→        where: { userId, day: { lt: monthWindowStart } },
+   380→        _sum: { calories: true, protein: true, carbs: true, fat: true },
+   381→        _count: { _all: true },
+   382→        orderBy: { day: "asc" },
+   383→        take: 1500,
+   384→      }),
+   385→      // DayCompletion — روزانه حداکثر ۱ سطر (امن برای خواندن)
+   386→      db.dayCompletion.findMany({
+   387→        where: { userId, date: { gte: tehranDateStr(new Date(tehranDayStart(todayStr).getTime() - 59 * DAY_MS)) } },
+   388→        select: { date: true, workoutDone: true, workoutSource: true, nutritionDone: true },
+   389→        orderBy: { date: "asc" },
+   390→      }),
+   391→      db.dayCompletion.findMany({
+   392→        where: { userId, date: { gte: `${m12Key}-01`, lt: `${currentMonthKey}-01` } },
+   393→        select: { date: true, workoutDone: true, workoutSource: true, nutritionDone: true },
+   394→        orderBy: { date: "asc" },
+   395→        take: 400,
+   396→      }),
+   397→      db.dayCompletion.findMany({
+   398→        where: { userId, date: { lt: `${m12Key}-01` } },
+   399→        select: { date: true, workoutDone: true, workoutSource: true, nutritionDone: true },
+   400→        orderBy: { date: "asc" },
+   401→        take: 800,
+   402→      }),
+   403→      // WorkoutDayStatus — حداکثر ۷ سطر در هفته
+   404→      db.workoutDayStatus.findMany({
+   405→        where: { userId, createdAt: { gte: new Date(windowStart.getTime() - 7 * DAY_MS) } },
+   406→        select: { dayName: true, weekStart: true, status: true, movedTo: true, createdAt: true },
+   407→        orderBy: { createdAt: "asc" },
+   408→      }),
+   409→      db.workoutDayStatus.findMany({
+   410→        where: { userId, createdAt: { gte: monthWindowStart, lt: currentMonthStart } },
+   411→        select: { dayName: true, weekStart: true, status: true, movedTo: true, createdAt: true },
+   412→        orderBy: { createdAt: "asc" },
+   413→        take: 400,
+   414→      }),
+   415→      db.workoutDayStatus.findMany({
+   416→        where: { userId, createdAt: { lt: monthWindowStart } },
+   417→        select: { dayName: true, weekStart: true, status: true, movedTo: true, createdAt: true },
+   418→        orderBy: { createdAt: "asc" },
+   419→        take: 800,
+   420→      }),
+   421→      // وزن‌ها — آخرین ۱۰۰۰ ثبت (کاربر واقعی به‌ندرت از این عبور می‌کند)
+   422→      db.weightLog.findMany({
+   423→        where: { userId },
+   424→        orderBy: { loggedAt: "desc" },
+   425→        select: { weight: true, loggedAt: true },
+   426→        take: 1000,
+   427→      }),
+   428→      // چکاپ‌ها — فازمحور و طبیعتاً کم؛ سقف ۲۴ برای اطمینان
+   429→      db.checkup.findMany({
+   430→        where: { userId },
+   431→        orderBy: { createdAt: "asc" },
+   432→        select: {
+   433→          phaseNumber: true, isFinalCheckup: true, weight: true,
+   434→          chestMeasurement: true, armMeasurement: true, waistMeasurement: true,
+   435→          hipMeasurement: true, thighMeasurement: true, neckMeasurement: true,
+   436→          bodyFatPercent: true, leanBodyMass: true,
+   437→          fatigueLevel: true, sleepQuality: true, dietAdherence: true, workoutAdherence: true,
+   438→          createdAt: true,
+   439→        },
+   440→        take: 24,
+   441→      }),
+   442→      db.onboardingProfile.findUnique({ where: { userId } }),
+   443→      db.user.findUnique({ where: { id: userId }, select: { planName: true } }),
+   444→    ]);
+   445→
+   446→    const weightsAsc = [...weightsDesc].reverse(); // قدیمی → جدید
+   447→    const latestWeight = weightsAsc.length > 0 ? weightsAsc[weightsAsc.length - 1].weight : null;
+   448→
+   449→    // ── ۱) پروفایل ثابت ──
+   450→    const sections: { key: string; header?: string; lines: string[] }[] = [];
+   451→    if (includeStaticProfile) {
+   452→      try {
+   453→        if (profile) {
+   454→          const ctx = buildUserContext(
+   455→            profileToOnboardingData(profile, latestWeight),
+   456→            (userRow?.planName as Plan) ?? null
+   457→          );
+   458→          if (ctx) {
+   459→            // فشرده‌سازی خطوط خالیِ فیلدهای اختیاریِ پرنشده (کاهش بودجه بدون از دست دادن اطلاعات)
+   460→            sections.push({ key: "profile", lines: ctx.replace(/\n{3,}/g, "\n\n").split("\n") });
+   461→          }
+   462→        }
+   463→      } catch (e) {
+   464→        console.error("[sports-profile] static profile section failed:", e);
+   465→      }
+   466→    }
+   467→
+   468→    // ── داده‌های کمکی برای خطوط روزانه ──
+   469→    const nutrition = nutritionKeyMap(foodWindowRows as never);
+   470→    const workoutByDate = new Map<string, string>();
+   471→    for (const r of dcRecent) {
+   472→      workoutByDate.set(
+   473→        r.date,
+   474→        r.workoutDone
+   475→          ? `تمرین ✓${r.workoutSource ? ` (${WORKOUT_SOURCE_LABELS[r.workoutSource] || r.workoutSource})` : ""}`
+   476→          : "تمرین ✗"
+   477→      );
+   478→    }
+   479→    for (const r of wdsRecent) {
+   480→      const key = wdsDateKey(r.weekStart, r.dayName);
+   481→      if (!workoutByDate.has(key)) {
+   482→        workoutByDate.set(
+   483→          key,
+   484→          WDS_STATUS_LABELS[r.status] || r.status + (r.status === "skipped" && r.movedTo ? ` به ${r.movedTo}` : "")
+   485→        );
+   486→      }
+   487→    }
+   488→    const weightByDate = new Map<string, number>();
+   489→    for (const w of weightsAsc) {
+   490→      weightByDate.set(tehranDateStr(new Date(w.loggedAt)), w.weight);
+   491→    }
+   492→
+   493→    // ── ۲) ۳۰ روز اخیر — روزبه‌روز (قدیمی → جدید) ──
+   494→    {
+   495→      const lines: string[] = [];
+   496→      for (let i = 0; i < 30; i++) {
+   497→        const d = new Date(windowStart.getTime() + i * DAY_MS);
+   498→        const key = tehranDateStr(d);
+   499→        const n = nutrition.get(key);
+   500→        const wo = workoutByDate.get(key);
+   501→        const wt = weightByDate.get(key);
+   502→        if (!n && !wo && wt == null) continue; // روز کاملاً خالی — بدون نویز
+   503→        const parts: string[] = [];
+   504→        if (n && n.kcal > 0) {
+   505→          parts.push(
+   506→            `${pd(Math.round(n.kcal))} کالری · پ ${pd(Math.round(n.protein))} · ک ${pd(Math.round(n.carbs))} · چ ${pd(Math.round(n.fat))} · ${pd(n.meals.size)} وعده`
+   507→          );
+   508→        }
+   509→        if (wo) parts.push(wo);
+   510→        if (wt != null) parts.push(`وزن ${pd(fmt1(wt))}kg`);
+   511→        if (parts.length > 0) lines.push(`${jalali(d)}: ${parts.join(" · ")}`);
+   512→      }
+   513→      if (lines.length > 0) sections.push({ key: "recent30", header: "📅 ۳۰ روز اخیر (روزبه‌روز):", lines });
+   514→    }
+   515→
+   516→    // ── ۳) جمع‌بندی ماهانه (ماه ۲ تا ۱۲ — قدیمی → جدید) ──
+   517→    {
+   518→      const nutritionMonths = nutritionKeyMap(foodMonthRows as never);
+   519→      const monthKeys: string[] = [];
+   520→      for (let i = 1; i <= 12; i++) monthKeys.push(addMonthsKey(currentMonthKey, -i));
+   521→      const lines: string[] = [];
+   522→      for (const mk of monthKeys) {
+   523→        const parts: string[] = [];
+   524→        const agg = [...nutritionMonths.entries()].filter(([d]) => monthKeyOf(d) === mk);
+   525→        if (agg.length > 0) {
+   526→          const totKcal = agg.reduce((s, [, v]) => s + v.kcal, 0);
+   527→          const totP = agg.reduce((s, [, v]) => s + v.protein, 0);
+   528→          parts.push(
+   529→            `میانگین ${pd(Math.round(totKcal / agg.length))} کالری/روز · پ ${pd(Math.round(totP / agg.length))}g · ${pd(agg.length)} روز ثبت`
+   530→          );
+   531→        }
+   532→        // تمرین: اولویت DayCompletion؛ در نبودش WorkoutDayStatus (ماه‌های قبل از v52)
+   533→        const dcRows = dcMonthly.filter((r) => monthKeyOf(r.date) === mk);
+   534→        const doneDc = dcRows.filter((r) => r.workoutDone).length;
+   535→        if (dcRows.length > 0) {
+   536→          parts.push(`تمرین ${pd(doneDc)} روز از ${pd(daysInMonth(mk))}`);
+   537→        } else {
+   538→          const wdsRows = wdsMonthly.filter(
+   539→            (r) => monthKeyOf(tehranDateStr(new Date(r.createdAt))) === mk
+   540→          );
+   541→          if (wdsRows.length > 0) {
+   542→            const done = wdsRows.filter((r) => r.status === "completed").length;
+   543→            parts.push(`ثبت تمرین ${pd(done)}/${pd(wdsRows.length)}`);
+   544→          }
+   545→        }
+   546→        const monthWeights = weightsAsc.filter((w) => monthKeyOf(tehranDateStr(new Date(w.loggedAt))) === mk);
+   547→        if (monthWeights.length === 1) {
+   548→          parts.push(`وزن ${pd(fmt1(monthWeights[0].weight))}kg`);
+   549→        } else if (monthWeights.length > 1) {
+   550→          const a = monthWeights[0].weight;
+   551→          const b = monthWeights[monthWeights.length - 1].weight;
+   552→          parts.push(`وزن ${pd(fmt1(a))}→${pd(fmt1(b))} (${signed(b - a)})`);
+   553→        }
+   554→        if (parts.length > 0) lines.push(`${monthLabelFa(mk)}: ${parts.join(" · ")}`);
+   555→      }
+   556→      if (lines.length > 0) sections.push({ key: "monthly", header: "🗓 جمع‌بندی ماهانه (ماه‌های ۲ تا ۱۲):", lines });
+   557→    }
+   558→
+   559→    // ── ۴) قدیمی‌تر از ۱۲ ماه — یک خط به‌ازای هر سه‌ماهه ──
+   560→    {
+   561→      const oldNutrition = nutritionKeyMap(foodOlderRows as never);
+   562→      const quarterAgg = new Map<string, { kcal: number; protein: number; days: number; first?: [string, number]; last?: [string, number] }>();
+   563→      for (const [d, v] of oldNutrition) {
+   564→        const [y, m] = d.split("-").map(Number);
+   565→        const qk = `${y}-Q${Math.ceil(m / 3)}`;
+   566→        let q = quarterAgg.get(qk);
+   567→        if (!q) {
+   568→          q = { kcal: 0, protein: 0, days: 0 };
+   569→          quarterAgg.set(qk, q);
+   570→        }
+   571→        q.kcal += v.kcal;
+   572→        q.protein += v.protein;
+   573→        q.days += 1;
+   574→      }
+   575→      // تمرین و وزن قدیمی‌تر
+   576→      const oldDcDone = new Map<string, number>();
+   577→      for (const r of dcOlder) {
+   578→        if (!r.workoutDone) continue;
+   579→        const [y, m] = r.date.split("-").map(Number);
+   580→        const qk = `${y}-Q${Math.ceil(m / 3)}`;
+   581→        oldDcDone.set(qk, (oldDcDone.get(qk) || 0) + 1);
+   582→      }
+   583→      const oldWds = new Map<string, { done: number; total: number }>();
+   584→      for (const r of wdsOlder) {
+   585→        const dStr = tehranDateStr(new Date(r.createdAt));
+   586→        const [y, m] = dStr.split("-").map(Number);
+   587→        const qk = `${y}-Q${Math.ceil(m / 3)}`;
+   588→        const cur = oldWds.get(qk) || { done: 0, total: 0 };
+   589→        cur.total += 1;
+   590→        if (r.status === "completed") cur.done += 1;
+   591→        oldWds.set(qk, cur);
+   592→      }
+   593→      const oldWeights = new Map<string, number[]>();
+   594→      for (const w of weightsAsc) {
+   595→        const dStr = tehranDateStr(new Date(w.loggedAt));
+   596→        if (new Date(w.loggedAt).getTime() >= monthWindowStart.getTime()) continue;
+   597→        const [y, m] = dStr.split("-").map(Number);
+   598→        const qk = `${y}-Q${Math.ceil(m / 3)}`;
+   599→        const arr = oldWeights.get(qk) || [];
+   600→        arr.push(w.weight);
+   601→        oldWeights.set(qk, arr);
+   602→      }
+   603→      const lines: string[] = [];
+   604→      for (const qk of [...quarterAgg.keys()].sort()) {
+   605→        const q = quarterAgg.get(qk)!;
+   606→        const parts: string[] = [
+   607→          `میانگین ${pd(Math.round(q.kcal / q.days))} کالری/روز · پ ${pd(Math.round(q.protein / q.days))}g · ${pd(q.days)} روز ثبت`,
+   608→        ];
+   609→        const dc = oldDcDone.get(qk);
+   610→        const wds = oldWds.get(qk);
+   611→        if (dc) parts.push(`تمرین ${pd(dc)} روز`);
+   612→        else if (wds) parts.push(`ثبت تمرین ${pd(wds.done)}/${pd(wds.total)}`);
+   613→        const ws = oldWeights.get(qk);
+   614→        if (ws && ws.length > 1) parts.push(`وزن ${pd(fmt1(ws[0]))}→${pd(fmt1(ws[ws.length - 1]))} (${signed(ws[ws.length - 1] - ws[0])})`);
+   615→        else if (ws && ws.length === 1) parts.push(`وزن ${pd(fmt1(ws[0]))}kg`);
+   616→        lines.push(`${pd(`فصل ${qk.split("-Q")[1]} سال ${qk.split("-")[0]}`)}: ${parts.join(" · ")}`);
+   617→      }
+   618→      if (lines.length > 0) sections.push({ key: "quarterly", header: "🕰 قدیمی‌تر از ۱۲ ماه (خلاصهٔ فصلی):", lines });
+   619→    }
+   620→
+   621→    // ── ۵) چکاپ‌ها ──
+   622→    {
+   623→      const cs = buildCheckupSection(checkups);
+   624→      if (cs) sections.push({ key: "checkups", lines: cs.split("\n") });
+   625→    }
+   626→
+   627→    // ── ۶) استریک پیوستگی (روزهای متوالی تمرین+تغذیه کامل، سقف نمایش ۳۰) ──
+   628→    try {
+   629→      const complete = new Set(dcRecent.filter((r) => r.workoutDone && r.nutritionDone).map((r) => r.date));
+   630→      let streak = 0;
+   631→      // اگر امروز هنوز کامل نشده، از دیروز شمارش را ادامه بده (روز جاری ناتمام است)
+   632→      let cursor = complete.has(todayStr) ? tehranDayStart(todayStr) : new Date(tehranDayStart(todayStr).getTime() - DAY_MS);
+   633→      while (complete.has(tehranDateStr(cursor)) && streak < 365) {
+   634→        streak++;
+   635→        cursor = new Date(cursor.getTime() - DAY_MS);
+   636→      }
+   637→      if (streak > 0) {
+   638→        sections.push({
+   639→          key: "streak",
+   640→          lines: [
+   641→            `🔥 پیوستگی فعال: ${pd(Math.min(streak, 30))} روز متوالی تمرین+تغذیهٔ کامل${streak > 30 ? " (نمایش تا سقف ۳۰)" : ""}`,
+   642→          ],
+   643→        });
+   644→      }
+   645→    } catch (e) {
+   646→      console.error("[sports-profile] streak section failed:", e);
+   647→    }
+   648→
+   649→    // ── مونتاژ با بودجهٔ سخت ──
+   650→    const HEADER = "═══ پرونده ورزشی کاربر (تاریخچه کامل) ═══";
+   651→    const render = (): string => {
+   652→      const body = sections
+   653→        .filter((s) => s.lines.length > 0)
+   654→        .map((s) => (s.header ? `${s.header}\n${s.lines.join("\n")}` : s.lines.join("\n")))
+   655→        .join("\n\n");
+   656→      return body ? `${HEADER}\n${body}` : "";
+   657→    };
+   658→
+   659→    const degradeStep = (): boolean => {
+   660→      const find = (k: string) => sections.find((s) => s.key === k);
+   661→      // ترتیب قربانی‌ها: فصلی‌ها → ماهانه → ریز ۳۰ روزه → پروفایل ثابت
+   662→      const q = find("quarterly");
+   663→      if (q && q.lines.length > 2) {
+   664→        q.lines = [q.lines[0], TRUNCATION_MARK, ...q.lines.slice(-2)];
+   665→        return true;
+   666→      }
+   667→      const m = find("monthly");
+   668→      if (m && m.lines.length > 6) {
+   669→        m.lines = [TRUNCATION_MARK, ...m.lines.slice(-6)];
+   670→        return true;
+   671→      }
+   672→      if (q) {
+   673→        sections.splice(sections.indexOf(q), 1);
+   674→        return true;
+   675→      }
+   676→      const r = find("recent30");
+   677→      if (r && r.lines.length > 15) {
+   678→        r.lines = [TRUNCATION_MARK, ...r.lines.slice(-15)];
+   679→        return true;
+   680→      }
+   681→      const m2 = find("monthly");
+   682→      if (m2 && m2.lines.length > 3) {
+   683→        m2.lines = [TRUNCATION_MARK, ...m2.lines.slice(-3)];
+   684→        return true;
+   685→      }
+   686→      const p = find("profile");
+   687→      if (p && p.lines.join("\n").length > 1200) {
+   688→        p.lines = [...p.lines.join("\n").slice(0, 1200).split("\n").slice(0, -1), TRUNCATION_MARK];
+   689→        return true;
+   690→      }
+   691→      if (m2) {
+   692→        sections.splice(sections.indexOf(m2), 1);
+   693→        return true;
+   694→      }
+   695→      const r2 = find("recent30");
+   696→      if (r2 && r2.lines.length > 7) {
+   697→        r2.lines = [TRUNCATION_MARK, ...r2.lines.slice(-7)];
+   698→        return true;
+   699→      }
+   700→      return false; // دیگر چیزی برای خلاصه‌کردن نیست → برش سخت نهایی
+   701→    };
+   702→
+   703→    let out = render();
+   704→    if (out.length > maxChars) {
+   705→      let guard = 0;
+   706→      while (out.length > maxChars && guard++ < 20 && degradeStep()) {
+   707→        out = render();
+   708→      }
+   709→      if (out.length > maxChars) {
+   710→        out = out.slice(0, Math.max(0, maxChars - TRUNCATION_MARK.length - 1)) + "\n" + TRUNCATION_MARK;
+   711→      }
+   712→    }
+   713→    return out;
+   714→  } catch (e) {
+   715→    // هرگز caller را نمی‌شکنیم — فلوی AI نباید به‌خاطر کانتکست کمکی خطا بدهد
+   716→    console.error("[sports-profile] buildSportsProfileContext failed:", e);
+   717→    return "";
+   718→  }
+   719→}
+   720→
+   721→// ─── خلاصهٔ فشرده برای تولید برنامه (سقف ۱۵۰۰ کاراکتر) ───
+   722→
+   723→export interface CompactSummaryOptions {
+   724→  /** چکاپ‌های آخر در خلاصه بیاید؟ (در renewalContext که خودش چکاپ دارد false بدهید) */
+   725→  includeCheckups?: boolean;
+   726→}
+   727→
+   728→/**
+   729→ * خلاصهٔ ≤۱۵۰۰ کاراکتری پیشرفت کاربر: میانگین‌های ۳۰ روز اخیر + مجموع تمرین‌ها
+   730→ * + مسیر وزن + ۲ چکاپ آخر. برای تزریق به renewalContext تولید برنامه.
+   731→ */
+   732→export async function buildCompactProgressSummary(
+   733→  userId: string,
+   734→  opts?: CompactSummaryOptions
+   735→): Promise<string> {
+   736→  const includeCheckups = opts?.includeCheckups !== false;
+   737→  try {
+   738→    const todayStr = tehranTodayStr();
+   739→    const windowStart = new Date(tehranDayStart(todayStr).getTime() - 29 * DAY_MS);
+   740→
+   741→    const [foodRows, dcWindow, totalWorkouts, weightsDesc, checkups] = await Promise.all([
+   742→      db.foodLog.groupBy({
+   743→        by: ["day"],
+   744→        where: { userId, day: { gte: windowStart } },
+   745→        _sum: { calories: true, protein: true, carbs: true, fat: true },
+   746→        _count: { _all: true },
+   747→        orderBy: { day: "asc" },
+   748→        take: 40,
+   749→      }),
+   750→      db.dayCompletion.findMany({
+   751→        where: { userId, date: { gte: tehranDateStr(windowStart) } },
+   752→        select: { date: true, workoutDone: true, nutritionDone: true },
+   753→        orderBy: { date: "asc" },
+   754→      }),
+   755→      db.dayCompletion.count({ where: { userId, workoutDone: true } }),
+   756→      db.weightLog.findMany({
+   757→        where: { userId },
+   758→        orderBy: { loggedAt: "desc" },
+   759→        select: { weight: true, loggedAt: true },
+   760→        take: 500,
+   761→      }),
+   762→      includeCheckups
+   763→        ? db.checkup.findMany({
+   764→            where: { userId },
+   765→            orderBy: { createdAt: "desc" },
+   766→            select: { phaseNumber: true, weight: true, bodyFatPercent: true, workoutAdherence: true, dietAdherence: true, createdAt: true },
+   767→            take: 2,
+   768→          })
+   769→        : Promise.resolve([] as { phaseNumber: number; weight: number; bodyFatPercent: number | null; workoutAdherence: number; dietAdherence: number; createdAt: Date }[]),
+   770→    ]);
+   771→
+   772→    const lines: string[] = [];
+   773→
+   774→    if (foodRows.length > 0) {
+   775→      const totKcal = foodRows.reduce((s, r) => s + (r._sum.calories ?? 0), 0);
+   776→      const totP = foodRows.reduce((s, r) => s + (r._sum.protein ?? 0), 0);
+   777→      lines.push(
+   778→        `• تغذیهٔ ۳۰ روز اخیر: میانگین ${pd(Math.round(totKcal / foodRows.length))} کالری · پ ${pd(Math.round(totP / foodRows.length))}g در روز (${pd(foodRows.length)} روز ثبت از ۳۰)`
+   779→      );
+   780→    }
+   781→    if (dcWindow.length > 0) {
+   782→      const done = dcWindow.filter((r) => r.workoutDone).length;
+   783→      const nut = dcWindow.filter((r) => r.nutritionDone).length;
+   784→      lines.push(`• تمرین ۳۰ روز اخیر: ${pd(done)} روز کامل · تغذیهٔ کامل: ${pd(nut)} روز`);
+   785→    }
+   786→    if (totalWorkouts > 0) {
+   787→      lines.push(`• مجموع تمرین‌های ثبت‌شده در کل دوره: ${pd(totalWorkouts)} روز`);
+   788→    }
+   789→    if (weightsDesc.length > 0) {
+   790→      const first = weightsDesc[weightsDesc.length - 1];
+   791→      const last = weightsDesc[0];
+   792→      if (weightsDesc.length === 1) {
+   793→        lines.push(`• وزن فعلی: ${pd(fmt1(last.weight))}kg (${jalali(new Date(last.loggedAt))})`);
+   794→      } else {
+   795→        lines.push(
+   796→          `• مسیر وزن: ${pd(fmt1(first.weight))} → ${pd(fmt1(last.weight))}kg (${signed(last.weight - first.weight)}) در ${pd(weightsDesc.length)} ثبت`
+   797→        );
+   798→      }
+   799→    }
+   800→    for (const c of checkups) {
+   801→      lines.push(
+   802→        `• چکاپ فاز ${pd(c.phaseNumber)} (${jalali(new Date(c.createdAt))}): وزن ${pd(fmt1(c.weight))}kg${c.bodyFatPercent != null ? ` · چربی ${pd(fmt1(c.bodyFatPercent))}٪` : ""} · پیروی تمرین ${pd(c.workoutAdherence)}/۵ · رژیم ${pd(c.dietAdherence)}/۵`
+   803→      );
+   804→    }
+   805→
+   806→    if (lines.length === 0) return "";
+   807→
+   808→    const header = "📊 خلاصهٔ پیشرفت کاربر (برای طراحی برنامهٔ جدید):";
+   809→    let out = `${header}\n${lines.join("\n")}`;
+   810→    if (out.length > COMPACT_SUMMARY_MAX_CHARS) {
+   811→      out = out.slice(0, COMPACT_SUMMARY_MAX_CHARS - TRUNCATION_MARK.length - 1) + TRUNCATION_MARK;
+   812→    }
+   813→    return out;
+   814→  } catch (e) {
+   815→    console.error("[sports-profile] buildCompactProgressSummary failed:", e);
+   816→    return "";
+   817→  }
+   818→}
+   819→

@@ -1,0 +1,640 @@
+     1→/**
+     2→ * SMS.ir OTP Gateway helper
+     3→ * Docs: https://api.sms.ir/v1/send/verify
+     4→ *
+     5→ * Authentication: HTTP header `x-api-key: <API_KEY>` (NOT Bearer).
+     6→ * Mobile format: endpoint «verify» (قالب) موبایل را با صفر ابتدا می‌خواهد
+     7→ * («09123456789» — فرمت رسمی مستندات sms.ir؛ در postVerify خودکار اضافه می‌شود).
+     8→ * فرمت داخلی/داپ (SmsLog): همیشه «9123456789» (خروجی normalizeMobileForSmsIr).
+     9→ * Body (verify): { mobile, templateId, parameters: [{ name, value }] }
+    10→ * Response: { status: 1, message: "موفق", data: { messageId, cost } }
+    11→ *
+    12→ * ─── v61 — دیریکتیو مالک: «همهٔ پیامک‌های فیتاپ تحویل قالبی است، نه بولک» ───
+    13→ * مالک خط اختصاصی ندارد؛ خط سرویس‌دهنده، خط خدماتی خود sms.ir (+98500033003)
+    14→ * است که فقط «تحویل قالبی» را پشتیبانی می‌کند — endpoint bulk با آن همیشه
+    15→ * خطای ۱۰۱ می‌دهد (تست زندهٔ v60 با ۴ فرمت شماره). بنابراین:
+    16→ *   • تمام مسیرهای bulk/متن-آزاد (WebOTP خام، فال‌بک متن آزاد ترک خرید) حذف شدند.
+    17→ *   • OTP همیشه مستقیم از endpoint قالب (verify) می‌رود — یک فراخوانی، بدون فال‌بک.
+    18→ *   • درج خودکار کد در اپ‌های موبایل از «سرور خودمان» است (OTP Bridge — v57)،
+    19→ *     نه از روی پیامک؛ حذف bulk هیچ قابلیتی از اپ‌ها نمی‌گیرد.
+    20→ *   • متغیر SMSIR_USE_RAW_SEND در env دیگر هیچ اثری ندارد (حذفش اختیاری است).
+    21→ */
+    22→
+    23→import { db } from "@/lib/db";
+    24→import { getSmsCostPerMessageToman, logSmsCost } from "@/lib/fitness/costs";
+    25→import { fixPersianTypography } from "@/lib/fitness/persian-typography";
+    26→
+    27→const SMSIR_API_URL = "https://api.sms.ir/v1/send/verify";
+    28→
+    29→export interface SmsIrResult {
+    30→  success: boolean;
+    31→  status?: number;
+    32→  raw?: unknown;
+    33→  error?: string;
+    34→  /** v52 — هزینهٔ گزارش‌شدهٔ این ارسال از پاسخ sms.ir (data.data.cost) — در صورت وجود */
+    35→  cost?: number;
+    36→}
+    37→
+    38→/**
+    39→ * v52 حسابداری — استخراج عددی «هزینهٔ ارسال» از بدنهٔ پاسخ sms.ir.
+    40→ * verify:  { status, message, data: { messageId, cost } }
+    41→ * bulk:    ساختار data ممکن است آبجکت یا آرایهٔ نتیجه‌ها باشد — هر دو پوشش داده می‌شود.
+    42→ * اگر هزینه‌ای گزارش نشد undefined برمی‌گردد (لاگر خودش نرخ پیش‌فرض می‌گذارد).
+    43→ */
+    44→function extractSmsCost(data: unknown): number | undefined {
+    45→  if (!data || typeof data !== "object") return undefined;
+    46→  const d = data as Record<string, unknown>;
+    47→  const candidates: unknown[] = [d.cost];
+    48→  const inner = d.data;
+    49→  if (inner && typeof inner === "object") {
+    50→    if (Array.isArray(inner)) {
+    51→      const first = inner[0];
+    52→      if (first && typeof first === "object") {
+    53→        candidates.push((first as Record<string, unknown>).cost);
+    54→      }
+    55→    } else {
+    56→      candidates.push((inner as Record<string, unknown>).cost);
+    57→    }
+    58→  }
+    59→  for (const c of candidates) {
+    60→    if (typeof c === "number" && Number.isFinite(c) && c > 0) return c;
+    61→    if (typeof c === "string" && c.trim() !== "" && Number.isFinite(Number(c))) return Number(c);
+    62→  }
+    63→  return undefined;
+    64→}
+    65→
+    66→/**
+    67→ * v52 حسابداری — ثبت هزینه/وضعیت یک ارسال پیامک در SmsMessageLog (best-effort).
+    68→ * ⚠️ جدول SmsLog (داپ ابدی) کاملاً دست‌نخورده می‌ماند — این فقط لاگ مالی است
+    69→ * و شکستش هرگز نتیجهٔ ارسال پیامک را تغییر نمی‌دهد (logSmsCost خودش try/catch است).
+    70→ * واحد cost «تومان» فرض شده است؛ اگر sms.ir هزینه گزارش نکند نرخ پیش‌فرض ادمین
+    71→ * (sms_cost_per_message_toman) جایگزین می‌شود.
+    72→ */
+    73→async function logSmsResultCost(opts: {
+    74→  normalizedMobile: string;
+    75→  scenario: string;
+    76→  templateId: string | null;
+    77→  result: SmsIrResult;
+    78→  userId?: string | null;
+    79→}): Promise<void> {
+    80→  try {
+    81→    if (opts.result.success) {
+    82→      const reported = typeof opts.result.cost === "number" && opts.result.cost > 0
+    83→        ? Math.round(opts.result.cost)
+    84→        : null;
+    85→      await logSmsCost({
+    86→        mobile: opts.normalizedMobile,
+    87→        scenario: opts.scenario,
+    88→        templateId: opts.templateId,
+    89→        status: "sent",
+    90→        cost: reported ?? (await getSmsCostPerMessageToman()),
+    91→        userId: opts.userId ?? null,
+    92→      });
+    93→    } else {
+    94→      await logSmsCost({
+    95→        mobile: opts.normalizedMobile,
+    96→        scenario: opts.scenario,
+    97→        templateId: opts.templateId,
+    98→        status: "failed",
+    99→        cost: 0,
+   100→        error: opts.result.error ?? null,
+   101→        userId: opts.userId ?? null,
+   102→      });
+   103→    }
+   104→  } catch (e) {
+   105→    // لاگ مالی هرگز ارسال پیامک را خراب نمی‌کند (دفاع مضاعف)
+   106→    console.warn("[smsir] logSmsResultCost failed:", e instanceof Error ? e.message : e);
+   107→  }
+   108→}
+   109→
+   110→/**
+   111→ * Normalize an Iranian mobile number to the INTERNAL format (SmsLog/داپ/bulk):
+   112→ *   "09123456789"  → "9123456789"
+   113→ *   "989123456789" → "9123456789"
+   114→ *   "+989123456789"→ "9123456789"
+   115→ *   "00989123456789"→ "9123456789"
+   116→ * ⚠️ برای endpoint «verify» (قالب) در postVerify خودکار «۰» اول اضافه می‌شود
+   117→ * (فرمت رسمی sms.ir) — خروجی این تابع مستقیماً روی سیم verify نمی‌رود.
+   118→ */
+   119→export function normalizeMobileForSmsIr(mobile: string): string {
+   120→  let m = mobile.replace(/\s/g, "").replace(/[+\-()]/g, "");
+   121→  // Strip country code variants
+   122→  if (m.startsWith("0098")) m = m.slice(4);
+   123→  else if (m.startsWith("98")) m = m.slice(2);
+   124→  // Strip leading 0
+   125→  if (m.startsWith("0")) m = m.slice(1);
+   126→  return m;
+   127→}
+   128→
+   129→/**
+   130→ * ارسال OTP با قالب (endpoint verify) — مستقل از حالت raw تا در زنجیرهٔ
+   131→ * fallback قابل استفاده باشد.
+   132→ * v56: انتخاب قالب بر اساس واریانت اپ — قالب اپ باید در پنل sms.ir با
+   133→ * «<#>هش اپ» تمام شود تا SMS Retriever کد را خودکار جاگذاری کند.
+   134→ */
+   135→async function sendOtpViaTemplate(
+   136→  normalizedMobile: string,
+   137→  code: string,
+   138→  apiKey: string,
+   139→  appVariant: "own" | "bazaar" | "web" = "web"
+   140→): Promise<SmsIrResult> {
+   141→  const templateIdRaw =
+   142→    (appVariant === "own" && process.env.SMSIR_TEMPLATE_OTP_OWN?.trim()) ||
+   143→    (appVariant === "bazaar" && process.env.SMSIR_TEMPLATE_OTP_BAZAAR?.trim()) ||
+   144→    process.env.SMSIR_TEMPLATE_ID;
+   145→  if (!templateIdRaw) {
+   146→    return { success: false, error: "SMSIR_TEMPLATE_ID تنظیم نشده است." };
+   147→  }
+   148→  const templateId = Number(templateIdRaw);
+   149→  if (!Number.isFinite(templateId) || templateId <= 0) {
+   150→    return { success: false, error: "SMSIR_TEMPLATE_ID نامعتبر است." };
+   151→  }
+   152→  // Parameter name must match the placeholder key defined in the sms.ir
+   153→  // panel template (CODE). ارسال + parse پاسخ در postVerify مشترک است.
+   154→  // timeout ۸ ثانیه‌ای: OTP نباید کاربر را سرِ صفحهٔ ورود نگه دارد —
+   155→  // بدترین حالت ≤ ~۹ ثانیه و مرورگر/fetch هرگز timeout نمی‌خورد.
+   156→  return postVerify(
+   157→    normalizedMobile,
+   158→    templateId,
+   159→    [{ name: "CODE", value: code }],
+   160→    apiKey,
+   161→    "(otp)",
+   162→    8_000
+   163→  );
+   164→}
+   165→
+   166→/**
+   167→ * Send a verification OTP via sms.ir — مسیر واحد و قطعی (فیکس ریشه‌ای v45).
+   168→ *
+   169→ * @param mobile Iranian mobile number (any common format — will be normalized)
+   170→ * @param code   4-digit code as a string (e.g. "1234")
+   171→ *
+   172→ * 🩹 گزارش مالک: OTP خیلی دیر می‌رسد / مرورگر «failed to fetch» می‌دهد / در
+   173→ * پنل sms.ir خطای «POST /v1/send/bulk — کد ۱۰۱ شماره خط نامعتبر میباشد».
+   174→ *
+   175→ * ریشهٔ اصلی: SMSIR_USE_RAW_SEND=true در production باعث می‌شد OTP اول از
+   176→ * endpoint «bulk» برود؛ بدنهٔ bulk بدون فیلد اجباری «line» (متغیر SMSIR_LINE
+   177→ * در env تعریف نشده) → HTTP 400 کد ۱۰۱ → بعد فال‌بک قالبی (رفت‌وبرگشت مضاعف
+   178→ * = تأخیر) و مدارشکنِ حافظه‌ای هم با هر ری‌استارت سرور ریست می‌شد، پس خطای
+   179→ * ۱۰۱ هر بار از نو تکرار می‌شد.
+   180→ *
+   181→ * v61 — راه‌حل نهایی (دیریکتیو مالک: «همهٔ پیامک‌ها قالبی است نه بولک»):
+   182→ *   OTP فقط و فقط از endpoint قالب (verify — قالب 829644/قالب اختصاصی اپ)
+   183→ *   با یک فراخوانی و timeout ۸ ثانیه‌ای ارسال می‌شود. مسیر bulk/WebOTP کلاً
+   184→ *   حذف شد (با خط خدماتی مالک همیشه ۱۰۱ می‌داد و فقط تأخیر/نویز می‌ساخت).
+   185→ *   درج خودکار کد در اپ‌های موبایل مسیر سروری دارد (OTP Bridge — v57) و به
+   186→ *   پیامک وابسته نیست.
+   187→ */
+   188→export async function sendOtpSms(
+   189→  mobile: string,
+   190→  code: string,
+   191→  // v52 حسابداری — اختیاری؛ مسیرهای فعلی نمی‌فرستند (OTP قبل از لاگین است)
+   192→  // v56 — appVariant: از User-Agent در send-otp تشخیص داده می‌شود تا
+   193→  //  • پیامک خام (WebOTP) فقط هشِ همان اپ را داشته باشد (فیکس SMS Retriever)
+   194→  //  • قالب OTP اختصاصی هر اپ (SMSIR_TEMPLATE_OTP_OWN / _BAZAAR) انتخاب شود —
+   195→  //    متن قالب در پنل sms.ir باید با «<#>هش اپ» تمام شود تا Retriever کار کند.
+   196→  opts?: { userId?: string | null; appVariant?: "own" | "bazaar" | "web" }
+   197→): Promise<SmsIrResult> {
+   198→  const apiKey = process.env.SMSIR_API_KEY;
+   199→
+   200→  if (!apiKey) {
+   201→    return {
+   202→      success: false,
+   203→      error: "SMSIR_API_KEY تنظیم نشده است.",
+   204→    };
+   205→  }
+   206→
+   207→  const normalized = normalizeMobileForSmsIr(mobile);
+   208→  if (!/^9\d{9}$/.test(normalized)) {
+   209→    return {
+   210→      success: false,
+   211→      error: `شماره موبایل نرمال‌شده نامعتبر است: ${normalized}`,
+   212→    };
+   213→  }
+   214→
+   215→  // v61 — تک‌مسیرِ قطعی: قالب (verify). بدون bulk، بدون فال‌بک، بدون ۱۰۱.
+   216→  const result = await sendOtpViaTemplate(normalized, code, apiKey, opts?.appVariant ?? "web");
+   217→  await logSmsResultCost({ normalizedMobile: normalized, scenario: "otp", templateId: process.env.SMSIR_TEMPLATE_ID ?? null, result, userId: opts?.userId });
+   218→  return result;
+   219→}
+   220→
+   221→/**
+   222→ * ارسال پیامک با قالب عمومی verify (استفاده داخلی).
+   223→ * ساختار پاسخ sms.ir: { status: 1, message: "موفق", data: {...} }
+   224→ */
+   225→async function postVerify(
+   226→  normalizedMobile: string,
+   227→  templateId: number,
+   228→  parameters: Array<{ name: string; value: string }>,
+   229→  apiKey: string,
+   230→  label: string,
+   231→  timeoutMs = 15_000
+   232→): Promise<SmsIrResult> {
+   233→  try {
+   234→    const res = await fetch(SMSIR_API_URL, {
+   235→      method: "POST",
+   236→      headers: {
+   237→        "Content-Type": "application/json",
+   238→        Accept: "application/json",
+   239→        // CRITICAL: sms.ir uses `x-api-key`, NOT `Authorization: Bearer`.
+   240→        "x-api-key": apiKey,
+   241→      },
+   242→      // 🩹 v58 — فیکس باگ پیامک (گزارش مالک: قالب 248945 → HTTP 400 «101 شماره
+   243→      // خط نامعتبر» با بدنهٔ بدون-صفر): endpoint رسمی «verify» موبایل را با صفر
+   244→      // ابتدا می‌خواهد (فرمت مستندات sms.ir: «09123456789»). فرمت داخلی/داپ
+   245→      // (SmsLog) همچنان بدون-صفر می‌ماند — فقط سیمِ درخواست تغییر می‌کند.
+   246→      body: JSON.stringify({ mobile: `0${normalizedMobile}`, templateId, parameters }),
+   247→      cache: "no-store",
+   248→      signal: AbortSignal.timeout(timeoutMs),
+   249→    });
+   250→
+   251→    let data: unknown = null;
+   252→    try {
+   253→      data = await res.json();
+   254→    } catch {
+   255→      // Non-JSON response — keep data null.
+   256→    }
+   257→
+   258→    if (!res.ok) {
+   259→      // 🩹 v45: کد وضعیت و پیام sms.ir (مثل «۱۰۱ — شماره خط نامعتبر میباشد»)
+   260→      // هم در status/error بیاید تا لاگ pm2 دقیقاً مثل پنل خوانا باشد
+   261→      // (هم‌تراز با رفتار bulk از v35).
+   262→      const bodyMsg =
+   263→        data && typeof data === "object" && "message" in data
+   264→          ? String((data as { message: unknown }).message ?? "")
+   265→          : "";
+   266→      const bodyStatus =
+   267→        data && typeof data === "object" && "status" in data
+   268→          ? (data as { status: unknown }).status
+   269→          : undefined;
+   270→      return {
+   271→        success: false,
+   272→        status: typeof bodyStatus === "number" ? bodyStatus : res.status,
+   273→        raw: data,
+   274→        error: `sms.ir ${label} خطای HTTP ${res.status}${
+   275→          bodyStatus !== undefined ? ` (کد وضعیت ${String(bodyStatus)})` : ""
+   276→        }${bodyMsg ? ` — ${bodyMsg}` : ""}`,
+   277→      };
+   278→    }
+   279→
+   280→    const statusField =
+   281→      data && typeof data === "object" && "status" in data
+   282→        ? (data as { status: unknown }).status
+   283→        : undefined;
+   284→
+   285→    if (statusField !== undefined && statusField !== 1) {
+   286→      const messageField =
+   287→        data && typeof data === "object" && "message" in data
+   288→          ? (data as { message: unknown }).message
+   289→          : undefined;
+   290→      return {
+   291→        success: false,
+   292→        status: typeof statusField === "number" ? statusField : res.status,
+   293→        raw: data,
+   294→        error: `sms.ir ${label} خطای وضعیت ${String(statusField)}${
+   295→          messageField ? ` — ${String(messageField)}` : ""
+   296→        }`,
+   297→      };
+   298→    }
+   299→
+   300→    return { success: true, status: res.status, raw: data, cost: extractSmsCost(data) };
+   301→  } catch (e) {
+   302→    return {
+   303→      success: false,
+   304→      error: e instanceof Error ? e.message : `خطای ناشناخته در اتصال به sms.ir (${label})`,
+   305→    };
+   306→  }
+   307→}
+   308→
+   309→/**
+   310→ * ارسال پیامک «تیکت جدید» با قالب اختصاصی sms.ir — کد قالب ۹۴۲۷۶۳.
+   311→ *
+   312→ * قالب فقط یک متغیر دارد: #NAME# (نام کاربر) — متن کامل پیامک در پنل sms.ir
+   313→ * تعریف و توسط sms.ir تأیید می‌شود. تا زمان تأیید قالب، ارسال خطای وضعیت
+   314→ * می‌خورد که کاملاً بی‌اثر است (جریان ساخت تیکت هرگز نباید به پیامک وابسته باشد).
+   315→ *
+   316→ * تنظیمات env:
+   317→ *   SMSIR_TICKET_TEMPLATE_ID  → کد قالب (پیش‌فرض 942763)
+   318→ */
+   319→export async function sendTicketSms(
+   320→  mobile: string,
+   321→  name: string,
+   322→  // v52 حسابداری — اختیاری؛ مسیرهای فعلی نمی‌فرستند و رفتار تغییری نکرده است
+   323→  opts?: { userId?: string | null }
+   324→): Promise<SmsIrResult> {
+   325→  const apiKey = process.env.SMSIR_API_KEY;
+   326→  const templateIdRaw = process.env.SMSIR_TICKET_TEMPLATE_ID || "942763";
+   327→  const normalized = normalizeMobileForSmsIr(mobile);
+   328→
+   329→  if (!apiKey) {
+   330→    return { success: false, error: "SMSIR_API_KEY تنظیم نشده است." };
+   331→  }
+   332→  if (!/^9\d{9}$/.test(normalized)) {
+   333→    return { success: false, error: `شماره موبایل نرمال‌شده نامعتبر است: ${normalized}` };
+   334→  }
+   335→  const templateId = Number(templateIdRaw);
+   336→  if (!Number.isFinite(templateId) || templateId <= 0) {
+   337→    return { success: false, error: "SMSIR_TICKET_TEMPLATE_ID نامعتبر است." };
+   338→  }
+   339→
+   340→  // v42 — دیریکتیو مالک: هیچ پیامکی نباید به‌جای نام «کاربر» بنویسد.
+   341→  // اگر نام کاربر ثبت نشده باشد، پیامک تیکت ارسال نمی‌شود (جریان تیکت
+   342→  // هرگز به پیامک وابسته نیست و این شکست non-blocking است).
+   343→  const safeName = String(name || "")
+   344→    .replace(/[\r\n\t]/g, " ")
+   345→    .trim()
+   346→    .slice(0, 40);
+   347→  if (!safeName) {
+   348→    return { success: false, error: "نام کاربر ثبت نشده است؛ پیامک تیکت بدون نام ارسال نمی‌شود." };
+   349→  }
+   350→
+   351→  const result = await postVerify(
+   352→    normalized,
+   353→    templateId,
+   354→    [{ name: "NAME", value: safeName }],
+   355→    apiKey,
+   356→    "(ticket)"
+   357→  );
+   358→  await logSmsResultCost({ normalizedMobile: normalized, scenario: "ticket", templateId: String(templateId), result, userId: opts?.userId ?? null });
+   359→  return result;
+   360→}
+   361→
+   362→// v61 — هش‌های SMS Retriever اپ‌ها (own: hVswmB0y7Qr / bazaar: 5W389jh9yas)
+   363→// دیگر در کد استفاده نمی‌شوند چون مسیر پیامک خام (bulk/WebOTP/SMS Retriever)
+   364→// با دیریکتیو مالک («همهٔ پیامک‌ها قالبی») حذف شد. درج خودکار کد در اپ‌ها از
+   365→// سرور (OTP Bridge — v57) انجام می‌شود. اگر روزی خط اختصاصی گرفته شد، هش‌ها
+   366→// در worklog v57 مستندند.
+   367→
+   368→/**
+   369→ * v56: تشخیص واریانت اپ از User-Agent — برای انتخاب قالب OTP درست.
+   370→ * MainActivity هر دو اپ در UA عبارت «FitUpApp/» یا «FitUpBazaar/» می‌گذارد.
+   371→ */
+   372→export function detectOtpAppVariant(ua?: string | null): "own" | "bazaar" | "web" {
+   373→  const s = (ua ?? "").toLowerCase();
+   374→  if (s.includes("fitupapp/")) return "own";
+   375→  if (s.includes("fitupbazaar/")) return "bazaar";
+   376→  return "web";
+   377→}
+   378→
+   379→// ═══════════════════════════════════════════════════════════════════════════
+   380→// پیامک‌های تمپلیتی سیستمی (قالب‌های تأییدشدهٔ sms.ir) — v32/v33
+   381→// ═══════════════════════════════════════════════════════════════════════════
+   382→// هر سناریو یک کلید (key) و یک env-template دارد. شناسه قالب‌ها از env خوانده
+   383→// می‌شوند؛ اگر متغیر تنظیم نشده باشد سناریو «بی‌صدا» رد می‌شود (skip) تا دیپلوی
+   384→// بدون کلید sms.ir هرگز نشکند. متن قالب‌ها در پنل sms.ir تعریف و تأیید شده‌اند
+   385→// و اینجا فقط پارامترها (NAME/CODE/LINK) پر می‌شوند.
+   386→//
+   387→//   کلید                | قالب   | پارامترها     | env
+   388→//   --------------------|--------|---------------|----------------------------------
+   389→//   onboarding_nudge    | 669068 | NAME          | SMSIR_TEMPLATE_ONBOARDING_NUDGE
+   390→//   onboarding_winback  | 461291 | NAME, CODE    | SMSIR_TEMPLATE_ONBOARDING_WINBACK
+   391→//   program_ready       | 663678 | NAME          | SMSIR_TEMPLATE_PROGRAM_READY
+   392→//   checkup_reminder    | 761137 | NAME          | SMSIR_TEMPLATE_CHECKUP_REMINDER
+   393→//   plan_expired        | 322780 | NAME, LINK    | SMSIR_TEMPLATE_PLAN_EXPIRED
+   394→//   plan_expiring_soon  | 184777 | NAME, LINK    | SMSIR_TEMPLATE_PLAN_EXPIRING
+   395→//   invite_friend       | 852193 | NAME, LINK    | SMSIR_TEMPLATE_INVITE_FRIEND
+   396→//   expired_winback     | 604678 | NAME, CODE, LINK | SMSIR_TEMPLATE_EXPIRED_WINBACK
+   397→//   purchase_advanced   | 423726 | NAME?         | SMSIR_TEMPLATE_PURCHASE_ADVANCED
+   398→//   purchase_ultimate   | 612405 | NAME?         | SMSIR_TEMPLATE_PURCHASE_ULTIMATE
+   399→//   purchase_basic      | 565185 | NAME?         | SMSIR_TEMPLATE_PURCHASE_BASIC
+   400→//   plan_upgrade_premium  | 275042 | NAME, PLANBASE, PLANUPDATE | SMSIR_TEMPLATE_PLAN_UPGRADE_PREMIUM
+   401→//   plan_upgrade_standard | 324322 | NAME, PLANBASE, PLANUPDATE | SMSIR_TEMPLATE_PLAN_UPGRADE_STANDARD
+   402→//   wallet_topup          | 556023 | NAME?, AMOUNT?  | SMSIR_TEMPLATE_WALLET_TOPUP
+   403→//   welcome_offer         | 612964 | NAME, CODE      | SMSIR_TEMPLATE_WELCOME_OFFER
+   404→//   renewal_boost         | 883325 | NAME, CODE, LINK| SMSIR_TEMPLATE_RENEWAL_BOOST
+   405→//
+   406→//   (_purchase_* = پیامک‌های خرید موفق v33 — بلافاصله بعد از تأیید پرداخت درگاه؛
+   407→//    «NAME?» یعنی اگر قالب متغیر داشته باشد NAME پر می‌شود، وگرنه بدون پارامتر
+   408→//    ارسال می‌شود — خودترمیم در sms-flows.ts)
+   409→//   plan_upgrade_* = پیامک‌های ارتقای پلن v36 (متغیرها: #NAME# + #PLANBASE# + #PLANUPDATE#)
+   410→//   wallet_topup   = پیامک شارژ موفق کیف پول v36 — بعد از تأیید پرداخت درگاه
+   411→//   welcome_offer  = پیامک «۸ روز بعد از ثبت موبایل» v47 — قهرمان بازگشت به خرید
+   412→//                    (NAME = «ورزشکار» برای کاربر بدون آنبوردینگ، CODE = تخفیف خوش‌آمدگویی)
+   413→//   renewal_boost  = پیامک «۸ روز از انقضای پلن» v47 — هم‌خانوادهٔ 604678 با
+   414→//                    لینک هوشمند go/renew (اپ باز می‌شود، نه مرورگر)
+   415→
+   416→export const SMS_TEMPLATE_ENV_KEYS = {
+   417→  onboarding_nudge: "SMSIR_TEMPLATE_ONBOARDING_NUDGE",
+   418→  onboarding_winback: "SMSIR_TEMPLATE_ONBOARDING_WINBACK",
+   419→  program_ready: "SMSIR_TEMPLATE_PROGRAM_READY",
+   420→  checkup_reminder: "SMSIR_TEMPLATE_CHECKUP_REMINDER",
+   421→  plan_expired: "SMSIR_TEMPLATE_PLAN_EXPIRED",
+   422→  plan_expiring_soon: "SMSIR_TEMPLATE_PLAN_EXPIRING",
+   423→  invite_friend: "SMSIR_TEMPLATE_INVITE_FRIEND",
+   424→  expired_winback: "SMSIR_TEMPLATE_EXPIRED_WINBACK",
+   425→  welcome_offer: "SMSIR_TEMPLATE_WELCOME_OFFER",
+   426→  renewal_boost: "SMSIR_TEMPLATE_RENEWAL_BOOST",
+   427→  purchase_advanced: "SMSIR_TEMPLATE_PURCHASE_ADVANCED",
+   428→  purchase_ultimate: "SMSIR_TEMPLATE_PURCHASE_ULTIMATE",
+   429→  purchase_basic: "SMSIR_TEMPLATE_PURCHASE_BASIC",
+   430→  plan_upgrade_premium: "SMSIR_TEMPLATE_PLAN_UPGRADE_PREMIUM",
+   431→  plan_upgrade_standard: "SMSIR_TEMPLATE_PLAN_UPGRADE_STANDARD",
+   432→  wallet_topup: "SMSIR_TEMPLATE_WALLET_TOPUP",
+   433→} as const;
+   434→
+   435→export type SmsTemplateKey = keyof typeof SMS_TEMPLATE_ENV_KEYS;
+   436→
+   437→export interface SendTemplateSmsOptions {
+   438→  key: SmsTemplateKey | string; // کلید دداپ (برای invite_friend می‌تواند پسوند داشته باشد)
+   439→  /** v53 — با templateIdOverride اختیاری شد (ارسال با شناسهٔ صریح از SiteSetting) */
+   440→  templateEnvKey?: SmsTemplateKey; // کدام env برای شناسه قالب
+   441→  mobile: string;
+   442→  params: Array<{ name: string; value: string }>;
+   443→  userId?: string | null;
+   444→  /** true = دداپ (mobile,key) نادیده گرفته می‌شود — فقط برای ارسال دستی/تستی ادمین */
+   445→  force?: boolean;
+   446→  /**
+   447→   * v53 — شناسهٔ قالب صریح (مثلاً از SiteSetting مثل abandoned_cart_sms_template_id).
+   448→   * اگر تنظیم شود بر env مربوط به templateEnvKey ارجحیت دارد؛ خالی/نال = رفتار قبلی (env).
+   449→   */
+   450→  templateIdOverride?: string | number | null;
+   451→}
+   452→
+   453→export interface SendTemplateSmsResult {
+   454→  sent: boolean;
+   455→  /** "already_sent" = قبلاً همین سناریو به این شماره رفته (داپ) | "no_template" = env تنظیم نیست | "no_name" = نام کاربر ثبت نشده */
+   456→  skipped?: "already_sent" | "no_template" | "invalid_mobile" | "no_name";
+   457→  error?: string;
+   458→}
+   459→
+   460→/**
+   461→ * v43 — دیریکتیو مالک: برای کاربری که آنبوردینگ را تکمیل نکرده و نام ندارد،
+   462→ * پیامک یادآوری آنبوردینگ (قالب 669068) باید بفرستد و به‌جای نام «ورزشکار»
+   463→ * نوشته شود — نه متغیر خالی، نه skip. بقیهٔ قالب‌ها استثنا ندارند (skip).
+   464→ *
+   465→ * v47 — قالب 612964 هم به همین خانواده اضافه شد: دیریکتیو صریح مالک —
+   466→ * «اگر کاربر آنبوردینگ رو تکمیل نکرده بود بجای متغیر نیم باید بنویسی ورزشکار
+   467→ * و در صورت تکمیل اسمش رو.»
+   468→ */
+   469→const NAME_FALLBACK_BY_TEMPLATE: Partial<Record<SmsTemplateKey, string>> = {
+   470→  onboarding_nudge: "ورزشکار",
+   471→  welcome_offer: "ورزشکار",
+   472→};
+   473→
+   474→/**
+   475→ * ارسال پیامک با قالب sms.ir + دداپ ابدی با جدول SmsLog.
+   476→ *
+   477→ * هر (mobile, key) فقط یک بار در عمر سیستم «sent» می‌شود؛ تلاش‌های بعدی
+   478→ * skipped:"already_sent" برمی‌گردانند — پس اجرای مجدد backfill یا sweep هرگز
+   479→ * پیامک تکراری نمی‌فرستد. اگر ارسال failed شود، رکورد با status=failed ثبت
+   480→ * می‌شود ولی چون unique constraint فقط بعد از sent سد می‌شود (رکورد failed
+   481→ * با upsert ثبت و در صورت موفقیت بعدی به sent تبدیل می‌شود)، ارسال دوباره
+   482→ * در sweep بعدی ممکن است.
+   483→ */
+   484→export async function sendTemplateSms(opts: SendTemplateSmsOptions): Promise<SendTemplateSmsResult> {
+   485→  const apiKey = process.env.SMSIR_API_KEY;
+   486→
+   487→  // v53 — شناسهٔ صریح (templateIdOverride) بر env ارجحیت دارد
+   488→  const overrideRaw =
+   489→    opts.templateIdOverride != null ? String(opts.templateIdOverride).trim() : "";
+   490→  const templateIdRaw = overrideRaw
+   491→    ? overrideRaw
+   492→    : opts.templateEnvKey
+   493→      ? process.env[SMS_TEMPLATE_ENV_KEYS[opts.templateEnvKey as SmsTemplateKey]]
+   494→      : undefined;
+   495→
+   496→  const normalized = normalizeMobileForSmsIr(opts.mobile);
+   497→  if (!/^9\d{9}$/.test(normalized)) {
+   498→    return { sent: false, skipped: "invalid_mobile", error: `شماره نامعتبر: ${normalized}` };
+   499→  }
+   500→
+   501→  // ─── دداپ ابدی ───
+   502→  if (!opts.force) {
+   503→    const existing = await db.smsLog.findUnique({
+   504→      where: { mobile_key: { mobile: normalized, key: opts.key } },
+   505→      select: { status: true },
+   506→    });
+   507→    if (existing?.status === "sent") {
+   508→      return { sent: false, skipped: "already_sent" };
+   509→    }
+   510→  }
+   511→
+   512→  if (!apiKey) {
+   513→    // بدون کلید API — سناریو بی‌صدا رد می‌شود (سیستم پیامک اختیاری است)
+   514→    return { sent: false, skipped: "no_template", error: "SMSIR_API_KEY تنظیم نشده است." };
+   515→  }
+   516→  if (!templateIdRaw) {
+   517→    return { sent: false, skipped: "no_template", error: "شناسه قالب تنظیم نشده است (env یا override)." };
+   518→  }
+   519→  const templateId = Number(templateIdRaw);
+   520→  if (!Number.isFinite(templateId) || templateId <= 0) {
+   521→    return { sent: false, skipped: "no_template", error: "شناسه قالب نامعتبر است." };
+   522→  }
+   523→
+   524→  let params = opts.params;
+   525→
+   526→  // ─── v57 — ضد چسبیدگی در پارامترهای متنی فارسی (دیریکتیو مالک: هیچ
+   527→  // پیامکی کلمهٔ چسبیده نداشته باشد) ───
+   528→  // فقط پارامترهای «متنِ خالص فارسی» را اصلاح می‌کنیم؛ LINK هرگز! چون
+   529→  // fixPersianTypography بعد از نقطه فاصله می‌گذارد و URL را خراب می‌کند.
+   530→  params = params.map((p) =>
+   531→    p.name === "NAME" || p.name === "PLANBASE" || p.name === "PLANUPDATE"
+   532→      ? { ...p, value: fixPersianTypography(String(p.value ?? "")) }
+   533→      : p
+   534→  );
+   535→
+   536→  // ─── v48 گارد طول پارامتر — فیکس ریشه‌ای خطای 114 sms.ir ───
+   537→  // «طول رشته مقدار پارامتر، بیش از حد مجاز (۲۵ کاراکتر) میباشد»
+   538→  //  • NAME طولانی → به ۲۵ کاراکتر کوتاه می‌شود (پیامک می‌رود)
+   539→  //  • هر پارامتر دیگر (LINK و…) اگر بعد از این گارد هنوز بلند باشد → حذف
+   540→  //    می‌شود (مثل نردبان خودترمیمِ بدون لینک) تا هرگز 400/114 نخوریم.
+   541→  // لینک‌های تمدید حالا از sms-short-link.ts می‌آیند (r/XXXXXXXX = ۱۰ کاراکتر)
+   542→  // و عملاً هرگز به این شاخه نمی‌خورند — این گارد ایمنیِ ساختاری است.
+   543→  {
+   544→    const MAX = 25;
+   545→    const clamped: Array<{ name: string; value: string }> = [];
+   546→    for (const p of params) {
+   547→      const v = String(p.value ?? "");
+   548→      if (v.length > MAX) {
+   549→        if (p.name === "NAME") {
+   550→          clamped.push({ name: p.name, value: v.slice(0, MAX) });
+   551→          console.warn(`[sendTemplateSms] (${opts.key}) NAME > ${MAX} chars → truncated to ${MAX}`);
+   552→        } else {
+   553→          console.warn(
+   554→            `[sendTemplateSms] (${opts.key}) پارامتر ${p.name} طولش ${v.length} بود (سقف ${MAX}) → حذف شد (ضد خطای 114)`
+   555→          );
+   556→          // پارامتر حذف می‌شود
+   557→        }
+   558→      } else {
+   559→        clamped.push(p);
+   560→      }
+   561→    }
+   562→    params = clamped;
+   563→  }
+   564→
+   565→  // ─── v42 گارد نام خالی — دیریکتیو مالک ───
+   566→  // «در هیچ‌کدام از پیام‌ها نباید به‌جای نام کاربر «کاربر» نوشته شود.»
+   567→  // اگر پارامتر NAME خالی است (کاربر هنوز نامش را ثبت نکرده — مثل کاربرانی که
+   568→  // فقط با OTP وارد شده‌اند و آنبوردینگ را تمام نکرده‌اند)، پیامک با نامِ
+   569→  // جعلی «کاربر» نمی‌رود.
+   570→  //
+   571→  // 🩹 v43 — اصلاح دیریکتیو مالک (قالب 669068):
+   572→  // «همون برای کاربری که انبوردینگ تکمیل نکرده و اسمش نیست بجای اینکه متغیر
+   573→  //  نیم رو خالی بذاری یا پیامک نفرستی. پیامک بفرست و بنویس ورزشکار.»
+   574→  // → قالب onboarding_nudge استثناست: NAME خالی خودکار با «ورزشکار» پر و
+   575→  //   پیامک ارسال می‌شود. بقیهٔ قالب‌ها همان گارد سخت v42 را دارند (skip
+   576→  //   با no_name — پیامک بدون نام یا با placeholder هرگز نمی‌رود).
+   577→  const fallbackName =
+   578→    NAME_FALLBACK_BY_TEMPLATE[opts.templateEnvKey as SmsTemplateKey];
+   579→  if (opts.params.some((p) => p.name === "NAME" && !String(p.value ?? "").trim())) {
+   580→    if (fallbackName) {
+   581→      params = opts.params.map((p) =>
+   582→        p.name === "NAME" ? { ...p, value: fallbackName } : p
+   583→      );
+   584→      console.info(
+   585→        `[sendTemplateSms] (${opts.key}) NAME خالی بود → «${fallbackName}» (دیریکتیو مالک v43 — قالب 669068)`
+   586→      );
+   587→    } else {
+   588→      console.warn(
+   589→        `[sendTemplateSms] (${opts.key}) skipped: empty NAME param — user has no registered name yet`
+   590→      );
+   591→      return {
+   592→        sent: false,
+   593→        skipped: "no_name",
+   594→        error: "نام کاربر ثبت نشده است؛ پیامک بدون نام ارسال نمی‌شود.",
+   595→      };
+   596→    }
+   597→  }
+   598→
+   599→  const result = await postVerify(normalized, templateId, params, apiKey, `(${opts.key})`);
+   600→
+   601→  // ─── v52 حسابداری — لاگ هزینهٔ ارسال (best-effort، مستقل از داپ) ───
+   602→  await logSmsResultCost({
+   603→    normalizedMobile: normalized,
+   604→    scenario: opts.key,
+   605→    templateId: String(templateId),
+   606→    result,
+   607→    userId: opts.userId ?? null,
+   608→  });
+   609→
+   610→  // ─── ثبت در SmsLog (upsert — رکورد failed قبلی به sent ارتقا می‌یابد) ───
+   611→  try {
+   612→    await db.smsLog.upsert({
+   613→      where: { mobile_key: { mobile: normalized, key: opts.key } },
+   614→      create: {
+   615→        mobile: normalized,
+   616→        key: opts.key,
+   617→        templateId: String(templateId),
+   618→        userId: opts.userId ?? null,
+   619→        status: result.success ? "sent" : "failed",
+   620→        error: result.success ? null : (result.error ?? null),
+   621→      },
+   622→      update: {
+   623→        templateId: String(templateId),
+   624→        userId: opts.userId ?? undefined,
+   625→        status: result.success ? "sent" : "failed",
+   626→        error: result.success ? null : (result.error ?? null),
+   627→        createdAt: result.success ? new Date() : undefined,
+   628→      },
+   629→    });
+   630→  } catch (e) {
+   631→    // دداپ هرگز نباید نتیجهٔ ارسال را خراب کند
+   632→    console.warn("[sendTemplateSms] smsLog upsert failed:", e);
+   633→  }
+   634→
+   635→  if (!result.success) {
+   636→    return { sent: false, error: result.error };
+   637→  }
+   638→  return { sent: true };
+   639→}
+   640→

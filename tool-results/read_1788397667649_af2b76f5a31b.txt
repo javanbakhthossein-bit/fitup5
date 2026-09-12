@@ -1,0 +1,704 @@
+     1→/**
+     2→ * Google Search Console Integration (T4) — با مدیریت کوتای API رایگان (T6)
+     3→ *
+     4→ * احراز هویت: Search Console API فقط OAuth2/سرویس‌اکانت می‌پذیرد (کلید API ساده
+     5→ * پشتیبانی نمی‌شود — تست شد و ۴۰۱ برگرداند). روش استاندارد برای اپ‌های سرور:
+     6→ * سرویس‌اکانت گوگل کلاد + افزودن ایمیل SA به‌عنوان کاربر محدود (restricted/delegated)
+     7→ * در پراپرتی Search Console.
+     8→ *
+     9→ * راهنمای راه‌اندازی (در پنل ادمین هم نمایش داده می‌شود):
+    10→ *  ۱. console.cloud.google.com → پروژه جدید (یا موجود)
+    11→ *  ۲. APIs & Services → Library → «Google Search Console API» → Enable
+    12→ *  ۳. APIs & Services → Credentials → Create Credentials → Service Account
+    13→ *  ۴. تب Keys → Add Key → JSON → دانلود فایل JSON
+    14→ *  ۵. search.google.com/search-console → Settings → Users & permissions →
+    15→ *     Add user → ایمیل سرویس‌اکانت (xxx@yyy.iam.gserviceaccount.com) →
+    16→ *     دسترسی «Restricted»
+    17→ *  ۶. در پنل ادمین فیتاپ → تب سرچ کنسول: JSON + آدرس سایت را وارد کنید
+    18→ *
+    19→ * مدیریت کوتا (T6 — همیشه بهینه از API رایگان):
+    20→ *  - کش ۲۴ ساعته‌ی داده‌ها در دیتابیس (SiteSetting: gsc_cache)
+    21→ *  - سقف ۵ فراخوانی واقعی API در ساعت (rate limit درون‌حافظه‌ای)
+    22→ *  - توکن دسترسی SA فقط هر ~۵۰ دقیقه یک‌بار exchange می‌شود (کش درون‌حافظه‌ای)
+    23→ *  - دیتای ۲۸ روز، top 50 ردیف — سبک و کافی برای استراتژی
+    24→ */
+    25→
+    26→import { createSign, createHash } from "crypto";
+    27→import { db } from "@/lib/db";
+    28→
+    29→/* ─────────────────────── پروکسی برای APIهای گوگل (FIX ۴۰۳ ایران) ───────────────────────
+    30→ *
+    31→ * مشکل واقعی: برخی سرورها (به‌ویژه سرورهای داخل ایران) توسط گوگل روی
+    32→ * searchconsole.googleapis.com بلاک می‌شوند — پاسخ، صفحه‌ی HTML
+    33→ * «Error 403 (Forbidden)!!1» است بدون کد خطای JSON. کلید سرویس‌اکانت در
+    34→ * این حالت سالم است (تبادل توکن oauth2 موفق بوده) و مشکل فقط IP است.
+    35→ *
+    36→ * راه‌حل: عبور ترافیکِ فراخوانی‌های گوگل از پروکسی:
+    37→ *   GSC_PROXY_URL=http://user:pass@host:port   (یا socks)
+    38→ * در .env سرور — با ری‌استارت اپ، dispatcher تعویض می‌شود.
+    39→ */
+    40→let cachedDispatcher: object | null | undefined;
+    41→
+    42→async function googleDispatch(): Promise<object | undefined> {
+    43→  if (cachedDispatcher !== undefined) return cachedDispatcher ?? undefined;
+    44→  const proxyUrl =
+    45→    process.env.GSC_PROXY_URL ||
+    46→    process.env.HTTPS_PROXY ||
+    47→    process.env.HTTP_PROXY;
+    48→  if (!proxyUrl) {
+    49→    cachedDispatcher = null;
+    50→    return undefined;
+    51→  }
+    52→  try {
+    53→    // undici کنار پروژه نصب است؛ ProxyAgent با fetch بومی Node سازگار است.
+    54→    const { ProxyAgent } = await import("undici");
+    55→    cachedDispatcher = new ProxyAgent(proxyUrl) as object;
+    56→    const safeHost = proxyUrl.split("@").pop() ?? proxyUrl;
+    57→    console.log(`[gsc] ترافیک API گوگل از پروکسی عبور می‌کند (${safeHost})`);
+    58→    return cachedDispatcher;
+    59→  } catch (e) {
+    60→    console.warn("[gsc] ساخت ProxyAgent ناموفق — اتصال مستقیم:", e);
+    61→    cachedDispatcher = null;
+    62→    return undefined;
+    63→  }
+    64→}
+    65→
+    66→/** fetch با پروکسیِ اختیاری برای دامنه‌های گوگل (oauth2 / searchconsole) */
+    67→async function googleFetch(
+    68→  url: string,
+    69→  init: RequestInit = {}
+    70→): Promise<Response> {
+    71→  const dispatcher = await googleDispatch();
+    72→  if (dispatcher) {
+    73→    // Node fetch (undici) گزینه‌ی dispatcher را می‌فهمد — تایپ استاندارد ندارد.
+    74→    const initWithDispatcher = { ...init, dispatcher } as RequestInit;
+    75→    return fetch(url, initWithDispatcher);
+    76→  }
+    77→  return fetch(url, init);
+    78→}
+    79→
+    80→/** آیا متن خطا صفحه‌ی HTML گوگل است (نه JSON خطای API)? */
+    81→function isHtmlErrorPage(msg: string): boolean {
+    82→  const head = msg.trim().slice(0, 200).toLowerCase();
+    83→  return head.startsWith("<!doctype html") || head.startsWith("<html");
+    84→}
+    85→
+    86→/** پیام قابل‌اقدام برای ۴۰۳ِ صفحه‌ی HTML — بلاکِ IP توسط گوگل (رایج در ایران) */
+    87→function googleIpBlockedMessage(): string {
+    88→  const hasProxy = Boolean(
+    89→    process.env.GSC_PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY
+    90→  );
+    91→  return (
+    92→    "گوگل درخواست را در ورودی خود بلاک کرد (پاسخ HTML 403 — بدون کد خطای API). " +
+    93→    "شایع‌ترین علت: IP سرور شما توسط گوگل محدود شده است (برای سرورهای ایرانی بسیار رایج). " +
+    94→    "کلید سرویس‌اکانت شما احتمالاً سالم است — چون تبادل توکن موفق بوده و خطا از سمت فراخوانی API است. " +
+    95→    (hasProxy
+    96→      ? "پروکسی تنظیم شده ولی همچنان پاسخ ۴۰۳ می‌آید — آدرس/اعتبار پروکسی (GSC_PROXY_URL) را بررسی کنید. "
+    97→      : "راه‌حل: در فایل .env سرور، GSC_PROXY_URL=http://user:pass@host:port (پروکسی معتبر خارجی) را تنظیم و اپ را ری‌استارت کنید تا ترافیک گوگل از پروکسی عبور کند. ") +
+    98→    "اگر به پروکسی دسترسی ندارید، داده‌ی سرچ کنسول را می‌توان از سرور خارجی هم تست کرد (کلید و SA همان‌جا کار می‌کند)."
+    99→  );
+   100→}
+   101→
+   102→/* ─────────────────────── انواع داده ─────────────────────── */
+   103→
+   104→export interface GscQueryRow {
+   105→  keys: string[]; // [query] یا [page]
+   106→  clicks: number;
+   107→  impressions: number;
+   108→  ctr: number;
+   109→  position: number;
+   110→}
+   111→
+   112→export interface GscDailyRow {
+   113→  date: string; // YYYY-MM-DD
+   114→  clicks: number;
+   115→  impressions: number;
+   116→  ctr: number;
+   117→  position: number;
+   118→}
+   119→
+   120→export interface GscOverview {
+   121→  clicks: number;
+   122→  impressions: number;
+   123→  ctr: number; // 0..1
+   124→  position: number;
+   125→  daily: GscDailyRow[];
+   126→  queries: GscQueryRow[];
+   127→  pages: GscQueryRow[];
+   128→}
+   129→
+   130→export interface GscCacheInfo {
+   131→  fetchedAt: string | null; // ISO
+   132→  stale: boolean;
+   133→  ttlHours: number;
+   134→}
+   135→
+   136→export interface GscStatus {
+   137→  configured: boolean; // SA JSON + siteUrl موجود است
+   138→  siteUrl: string | null;
+   139→  lastError: string | null;
+   140→  cache: GscCacheInfo;
+   141→}
+   142→
+   143→export interface GscResult {
+   144→  ok: boolean;
+   145→  data?: GscOverview;
+   146→  error?: string; // پیام فارسی قابل نمایش
+   147→  status: GscStatus;
+   148→}
+   149→
+   150→/* ─────────────────────── تنظیمات ─────────────────────── */
+   151→
+   152→interface ServiceAccountJson {
+   153→  client_email: string;
+   154→  private_key: string;
+   155→}
+   156→
+   157→const SETTING_SA = "gsc_service_account";
+   158→const SETTING_SITE = "gsc_site_url";
+   159→const SETTING_APIKEY = "gsc_api_key";
+   160→const SETTING_CACHE = "gsc_cache";
+   161→
+   162→/** مدت اعتبار کش: ۲۴ ساعت (کوتا-محور) */
+   163→const CACHE_TTL_HOURS = 24;
+   164→/** حداکثر فراخوانی واقعی API در ساعت — محافظت از کوتای رایگان */
+   165→const MAX_FETCH_PER_HOUR = 5;
+   166→/** اندازه پنجره‌ی گزارش: ۲۸ روز آخر */
+   167→const REPORT_DAYS = 28;
+   168→
+   169→async function getSetting(key: string): Promise<string | null> {
+   170→  try {
+   171→    const row = await db.siteSetting.findUnique({ where: { key } });
+   172→    return row?.value ?? null;
+   173→  } catch {
+   174→    return null;
+   175→  }
+   176→}
+   177→
+   178→async function setSetting(key: string, value: string, label = ""): Promise<void> {
+   179→  await db.siteSetting.upsert({
+   180→    where: { key },
+   181→    create: { key, value, label },
+   182→    update: { value },
+   183→  });
+   184→}
+   185→
+   186→/** پیکربندی سرچ کنسول — JSON سرویس‌اکانت و آدرس سایت */
+   187→export async function saveGscConfig(saJson: string, siteUrl: string, apiKey?: string): Promise<{ ok: boolean; error?: string }> {
+   188→  const trimmed = saJson.trim();
+   189→  if (trimmed) {
+   190→    try {
+   191→      const parsed = JSON.parse(trimmed) as ServiceAccountJson;
+   192→      if (!parsed.client_email || !parsed.private_key) {
+   193→        return { ok: false, error: "JSON سرویس‌اکانت ناقص است — فیلدهای client_email و private_key لازم است." };
+   194→      }
+   195→    } catch {
+   196→      return { ok: false, error: "JSON سرویس‌اکانت نامعتبر است — کل فایل دانلودی از گوگل کلاد را کامل paste کنید." };
+   197→    }
+   198→  }
+   199→  const site = siteUrl.trim();
+   200→  // فرمت‌های مجاز: sc-domain:fittup.ir | https://fittup.ir | http://... | fittup.ir (دامنه‌ی خالی — بعداً خودکار با پراپرتی گوگل تطبیق می‌شود)
+   201→  if (site && !/^(sc-domain:|https?:\/\/)(\S+\.)\S+$/i.test(site) && !/^(\S+\.)\S{2,}$/i.test(site)) {
+   202→    return { ok: false, error: "آدرس سایت نامعتبر است. نمونه‌های درست: sc-domain:fittup.ir یا https://fittup.ir یا فقط fittup.ir" };
+   203→  }
+   204→  await setSetting(SETTING_SA, trimmed, "Google Search Console — Service Account JSON");
+   205→  await setSetting(SETTING_SITE, site, "Google Search Console — Site URL");
+   206→  if (apiKey !== undefined) await setSetting(SETTING_APIKEY, apiKey.trim(), "Google API Key");
+   207→  // تغییر پیکربندی → کش باطل
+   208→  await setSetting(SETTING_CACHE, "", "GSC cache");
+   209→  // ریست کش توکن دسترسی درون‌حافظه‌ای (ممیزی 2-c P2): تا ~۵۰ دقیقه توکن SA قدیمی
+   210→  // برمی‌گشت و تستِ فوری بعد از save-config با اعتبار قبلی انجام می‌شد (نتیجه گمراه‌کننده).
+   211→  tokenCache = null;
+   212→  return { ok: true };
+   213→}
+   214→
+   215→export async function getGscApiKey(): Promise<string | null> {
+   216→  return getSetting(SETTING_APIKEY);
+   217→}
+   218→
+   219→/* ─────────────────────── توکن OAuth2 (JWT RS256) ─────────────────────── */
+   220→
+   221→let tokenCache: { token: string; exp: number } | null = null;
+   222→
+   223→async function getAccessToken(sa: ServiceAccountJson): Promise<string> {
+   224→  const now = Math.floor(Date.now() / 1000);
+   225→  // کش توکن — ۵۰ دقیقه (توکن گوگل ۱ ساعت اعتبار دارد؛ margin امن)
+   226→  if (tokenCache && tokenCache.exp > now + 300) return tokenCache.token;
+   227→
+   228→  const header = { alg: "RS256", typ: "JWT" };
+   229→  const claims = {
+   230→    iss: sa.client_email,
+   231→    scope: "https://www.googleapis.com/auth/webmasters.readonly",
+   232→    aud: "https://oauth2.googleapis.com/token",
+   233→    iat: now,
+   234→    exp: now + 3600,
+   235→  };
+   236→  const b64url = (o: object | string) =>
+   237→    Buffer.from(typeof o === "string" ? o : JSON.stringify(o)).toString("base64url");
+   238→  const unsigned = `${b64url(header)}.${b64url(claims)}`;
+   239→  let signature: Buffer;
+   240→  try {
+   241→    signature = createSign("RSA-SHA256").update(unsigned).sign(sa.private_key);
+   242→  } catch {
+   243→    tokenCache = null;
+   244→    throw new Error(
+   245→      "کلید خصوصی سرویس‌اکانت نامعتبر است — کل فایل JSON دانلودی از گوگل کلاد را بدون تغییر paste کنید."
+   246→    );
+   247→  }
+   248→  const jwt = `${unsigned}.${signature.toString("base64url")}`;
+   249→
+   250→  const res = await googleFetch("https://oauth2.googleapis.com/token", {
+   251→    method: "POST",
+   252→    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+   253→    body: new URLSearchParams({
+   254→      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+   255→      assertion: jwt,
+   256→    }),
+   257→    signal: AbortSignal.timeout(20_000),
+   258→  });
+   259→  // بدنه را اول به‌صورت متن می‌خوانیم — اگر صفحه‌ی HTML باشد (بلاک IP) JSON.parse می‌شکند
+   260→  const rawBody = await res.text().catch(() => "");
+   261→  let data: { access_token?: string; expires_in?: number; error_description?: string } = {};
+   262→  try {
+   263→    data = JSON.parse(rawBody) as typeof data;
+   264→  } catch {
+   265→    /* بدنه JSON نبود */
+   266→  }
+   267→  if (!res.ok || !data.access_token) {
+   268→    tokenCache = null;
+   269→    if (isHtmlErrorPage(rawBody)) {
+   270→      throw new Error(googleIpBlockedMessage());
+   271→    }
+   272→    throw new Error(
+   273→      data.error_description === "Invalid JWT Signature"
+   274→        ? "کلید خصوصی این سرویس‌اکانت دیگر در گوگل معتبر نیست — در گوگل کلاد (IAM → Service Accounts → fitup-551 → Keys → Add Key → JSON) یک کلید جدید بسازید و در تب پیکربندی جایگذاری کنید."
+   275→        : `احراز هویت گوگل ناموفق: ${data.error_description || res.status} — JSON سرویس‌اکانت و دسترسی آن به پراپرتی را بررسی کنید.`
+   276→    );
+   277→  }
+   278→  tokenCache = { token: data.access_token, exp: now + (data.expires_in ?? 3600) };
+   279→  return data.access_token;
+   280→}
+   281→
+   282→/* ─────────────────────── rate limit درون‌حافظه‌ای ─────────────────────── */
+   283→
+   284→const fetchTimestamps: number[] = [];
+   285→function tryAcquireFetchSlot(): boolean {
+   286→  const hourAgo = Date.now() - 3600_000;
+   287→  while (fetchTimestamps.length && fetchTimestamps[0] < hourAgo) fetchTimestamps.shift();
+   288→  if (fetchTimestamps.length >= MAX_FETCH_PER_HOUR) return false;
+   289→  fetchTimestamps.push(Date.now());
+   290→  return true;
+   291→}
+   292→
+   293→/* ─────────────────────── فراخوانی API ─────────────────────── */
+   294→
+   295→const GSC_API = "https://searchconsole.googleapis.com/webmasters/v3/sites";
+   296→
+   297→/** خواندن دقیق بدنه‌ی خطای گوگل — متن خام را هم برمی‌گرداند تا هیچ ۴۰۳ «خاموشی» نداشته باشیم */
+   298→async function readGoogleError(res: Response): Promise<string> {
+   299→  const raw = await res.text().catch(() => "");
+   300→  if (raw) {
+   301→    try {
+   302→      const j = JSON.parse(raw) as { error?: { message?: string; errors?: { message?: string }[] } };
+   303→      const msg = j?.error?.message || j?.error?.errors?.[0]?.message;
+   304→      if (msg) return msg;
+   305→    } catch {
+   306→      // بدنه JSON نیست — خود متن را برسان (بریده‌شده)
+   307→      return raw.slice(0, 300);
+   308→    }
+   309→  }
+   310→  return `HTTP ${res.status}`;
+   311→}
+   312→
+   313→/** آیا خطا «API غیرفعال در پروژه» است؟ — رایج‌ترین علت ۴۰۳ برای سرویس‌اکانت‌های تازه */
+   314→function isApiDisabledError(msg: string): boolean {
+   315→  const m = msg.toLowerCase();
+   316→  return m.includes("has not been used in project") || m.includes("it is disabled") || m.includes("api not enabled");
+   317→}
+   318→
+   319→/** استخراج لینک فعال‌سازی مستقیم API از پیام خطای گوگل (یا ساخت لینک با شماره پروژه) */
+   320→function extractEnableLink(msg: string): string | null {
+   321→  const inMsg = msg.match(/https:\/\/console[^\s"']+/)?.[0];
+   322→  if (inMsg) return inMsg;
+   323→  const project = /project (\d+)/.exec(msg)?.[1];
+   324→  if (project) return `https://console.cloud.google.com/apis/library/searchconsole.googleapis.com?project=${project}`;
+   325→  return null;
+   326→}
+   327→
+   328→/** فرسی‌سازی خطای «API غیرفعال» با لینک فعال‌سازی */
+   329→function apiDisabledMessage(msg: string): string {
+   330→  const link = extractEnableLink(msg);
+   331→  return `⚠️ API «Google Search Console» در پروژه گوگل‌کلاد شما فعال نیست — این رایج‌ترین علت خطای ۴۰۳ است.${link ? ` فعال‌سازی: ${link} — روی Enable کلیک کنید، ۱-۲ دقیقه صبر کنید و دوباره «ذخیره و تست اتصال» را بزنید.` : " در console.cloud.google.com → APIs & Services → Library → «Google Search Console API» → Enable"} (جزئیات: ${msg.slice(0, 160)})`;
+   332→}
+   333→
+   334→async function querySearchAnalytics(
+   335→  token: string,
+   336→  siteUrl: string,
+   337→  body: Record<string, unknown>
+   338→): Promise<{ rows: GscQueryRow[] }> {
+   339→  const url = `${GSC_API}/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
+   340→  const res = await googleFetch(url, {
+   341→    method: "POST",
+   342→    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+   343→    body: JSON.stringify(body),
+   344→    signal: AbortSignal.timeout(30_000),
+   345→  });
+   346→  if (!res.ok) {
+   347→    const msg = await readGoogleError(res);
+   348→    if (res.status === 403) {
+   349→      if (isApiDisabledError(msg)) throw new Error(apiDisabledMessage(msg));
+   350→      // صفحه‌ی HTML 403 = بلاکِ IP توسط گوگل (سرورهای ایرانی) — نه مشکل کلید
+   351→      if (isHtmlErrorPage(msg)) throw new Error(googleIpBlockedMessage());
+   352→      throw new Error(
+   353→        `دسترسی به پراپرتی «${siteUrl}» رد شد (403). علت‌ها: ۱) ایمیل سرویس‌اکانت در Search Console (Settings → Users & permissions) با دسترسی Restricted اضافه نشده، ۲) فرمت آدرس با پراپرتی یکسان نیست. جزئیات گوگل: ${msg}`
+   354→      );
+   355→    }
+   356→    throw new Error(`خطای Search Console API (${res.status}): ${msg}`);
+   357→  }
+   358→  const data = (await res.json().catch(() => ({}))) as { rows?: GscQueryRow[] };
+   359→  return { rows: data.rows ?? [] };
+   360→}
+   361→
+   362→/* ─────────────────────── تشخیص خودکار پراپرتی (Diagnose) ─────────────────────── */
+   363→
+   364→/** لیست پراپرتی‌هایی که سرویس‌اکانت به آن‌ها دسترسی دارد (sites.list — ۱ واحد کوتا)
+   365→ *
+   366→ * FIX: قبلاً دو باگ بود که sites.list را همیشه با خطای 400 «Invalid field selection
+   367→ * site» می‌شکست (و تشخیص خودکار پراپرتی‌ها هرگز کار نمی‌کرد):
+   368→ *  ۱) پارامتر fields غلط: "site.siteUrl,site.permissionLevel" → مسیر صحیح در
+   369→ *     پاسخ sites.list، "siteEntry" است نه "site"
+   370→ *  ۲) پارزش پاسخ: کلید واقعی JSON پاسخ "siteEntry" است نه "site"
+   371→ */
+   372→async function listAccessibleSites(token: string): Promise<{ ok: boolean; sites: string[]; error?: string }> {
+   373→  const res = await googleFetch(`${GSC_API}?fields=siteEntry(siteUrl,permissionLevel)`, {
+   374→    headers: { Authorization: `Bearer ${token}` },
+   375→    signal: AbortSignal.timeout(20_000),
+   376→  });
+   377→  if (!res.ok) {
+   378→    const msg = await readGoogleError(res);
+   379→    if (res.status === 403 && isApiDisabledError(msg)) {
+   380→      return { ok: false, sites: [], error: apiDisabledMessage(msg) };
+   381→    }
+   382→    // صفحه‌ی HTML 403 = بلاکِ IP توسط گوگل (سرورهای ایرانی) — پیام قابل‌اقدام بده
+   383→    if (res.status === 403 && isHtmlErrorPage(msg)) {
+   384→      return { ok: false, sites: [], error: googleIpBlockedMessage() };
+   385→    }
+   386→    return { ok: false, sites: [], error: `خطای گوگل (${res.status}): ${msg}` };
+   387→  }
+   388→  const data = (await res.json().catch(() => ({}))) as { siteEntry?: { siteUrl?: string }[] };
+   389→  const sites = (data.siteEntry ?? []).map((s) => (s.siteUrl ?? "").trim()).filter(Boolean);
+   390→  return { ok: true, sites };
+   391→}
+   392→
+   393→/**
+   394→ * تطبیق آدرس واردشده با پراپرتی‌های واقعی گوگل — کاربر لازم نیست فرمت دقیق بداند.
+   395→ * ترتیب: تطابق دقیق → نرمال‌شده (بدون اسلش/پروتکل/ بزرگ‌ و کوچک حروف) → دامنه‌ی خالی → www.
+   396→ */
+   397→export function resolveSiteUrl(entered: string, sites: string[]): { match: string | null; corrected: boolean } {
+   398→  const e = entered.trim();
+   399→  if (!e) return { match: null, corrected: false };
+   400→  const lower = e.toLowerCase();
+   401→  // ۱) تطابق دقیق
+   402→  const exact = sites.find((s) => s.toLowerCase() === lower);
+   403→  if (exact) return { match: exact, corrected: exact !== e };
+   404→
+   405→  const norm = (u: string) => {
+   406→    let x = u.trim().toLowerCase();
+   407→    if (/^https?:\/\//.test(x) && x.endsWith("/")) x = x.slice(0, -1);
+   408→    return x;
+   409→  };
+   410→  const nE = norm(e);
+   411→
+   412→  // ۲) پراپرتی دامنه‌ای — فقط با همان sc-domain: خودش معنی‌الیک است
+   413→  if (nE.startsWith("sc-domain:")) {
+   414→    const dm = sites.find((s) => norm(s) === nE);
+   415→    return { match: dm ?? null, corrected: dm !== null && dm !== e };
+   416→  }
+   417→
+   418→  // ۳) URL-prefix نرمال‌شده (https://fittup.ir == https://fittup.ir/)
+   419→  const urlMatch = sites.find((s) => !s.toLowerCase().startsWith("sc-domain:") && norm(s) === nE);
+   420→  if (urlMatch) return { match: urlMatch, corrected: urlMatch !== e };
+   421→
+   422→  // ۴) ورودی دامنه‌ی خالی (fittup.ir بدون پروتکل) — اول پراپرتی دامنه‌ای (پوشش کامل‌تر)، بعد https
+   423→  const bare = nE.replace(/^https?:\/\//, "");
+   424→  const dm = sites.find((s) => s.toLowerCase() === `sc-domain:${bare}`);
+   425→  if (dm) return { match: dm, corrected: true };
+   426→  const hm = sites.find((s) => ["https", "http"].some((p) => norm(s) === `${p}://${bare}`));
+   427→  if (hm) return { match: hm, corrected: true };
+   428→
+   429→  // ۵) متغیر www — https://fittup.ir ↔ https://www.fittup.ir
+   430→  const stripWww = (u: string) => u.replace(/^https?:\/\//, "").replace(/^www\./, "");
+   431→  const wm = sites.find((s) => {
+   432→    const ns = norm(s);
+   433→    return !ns.startsWith("sc-domain:") && stripWww(ns) === stripWww(nE);
+   434→  });
+   435→  if (wm) return { match: wm, corrected: true };
+   436→
+   437→  return { match: null, corrected: false };
+   438→}
+   439→
+   440→export interface GscTestResult {
+   441→  ok: boolean;
+   442→  message: string; // پیام فارسی کامل
+   443→  resolvedSiteUrl?: string | null;
+   444→  availableSites?: string[];
+   445→}
+   446→
+   447→/**
+   448→ * تست اتصال کامل با تشخیص خودکار مرحله‌به‌مرحله:
+   449→ *  ۱. اعتبار JSON و کلید خصوصی  ۲. تبادل توکن  ۳. sites.list (API فعال؟ دسترسی؟)
+   450→ *  ۴. تطبیق/اصلاح خودکار آدرس پراپرتی  ۵. یک کوئری آزمایشی سبک
+   451→ */
+   452→export async function testGscConnection(): Promise<GscTestResult> {
+   453→  const [saRaw, siteUrl] = await Promise.all([getSetting(SETTING_SA), getSetting(SETTING_SITE)]);
+   454→  if (!saRaw || !siteUrl) {
+   455→    return { ok: false, message: "ابتدا JSON سرویس‌اکانت و آدرس سایت را ذخیره کنید." };
+   456→  }
+   457→  let sa: ServiceAccountJson;
+   458→  try {
+   459→    sa = JSON.parse(saRaw) as ServiceAccountJson;
+   460→  } catch {
+   461→    return { ok: false, message: "JSON سرویس‌اکانت ذخیره‌شده نامعتبر است — دوباره کل فایل را paste کنید." };
+   462→  }
+   463→
+   464→  // ۲) توکن — خطای کلید/ایمیل اینجا مشخص می‌شود
+   465→  let token: string;
+   466→  try {
+   467→    token = await getAccessToken(sa);
+   468→  } catch (e) {
+   469→    return { ok: false, message: e instanceof Error ? e.message : "خطا در احراز هویت گوگل" };
+   470→  }
+   471→
+   472→  // ۳) sites.list — تشخیص فعال‌بودن API و دسترسی واقعی
+   473→  const list = await listAccessibleSites(token);
+   474→  if (!list.ok) {
+   475→    return { ok: false, message: list.error ?? "خطای ناشناخته در sites.list", availableSites: [] };
+   476→  }
+   477→  if (list.sites.length === 0) {
+   478→    return {
+   479→      ok: false,
+   480→      message:
+   481→        "سرویس‌اکانت به هیچ پراپرتی‌ای دسترسی ندارد. در search.google.com/search-console → Settings → Users & permissions → Add user، ایمیل زیر را با دسترسی Restricted اضافه کنید و ~۵ دقیقه صبر کنید: " +
+   482→        sa.client_email,
+   483→      availableSites: [],
+   484→    };
+   485→  }
+   486→
+   487→  // ۴) تطبیق آدرس — اگر فرمت دقیق نبود، خودمان اصلاحش می‌کنیم
+   488→  const r = resolveSiteUrl(siteUrl, list.sites);
+   489→  if (!r.match) {
+   490→    return {
+   491→      ok: false,
+   492→      message: `آدرس «${siteUrl}» با هیچ‌کدام از پراپرتی‌های قابل‌دسترس مطابقت ندارد. پراپرتی‌های شما: ${list.sites.join(" | ")} — عیناً یکی از همین‌ها (یا فقط نام دامنه) را وارد کنید.`,
+   493→      availableSites: list.sites,
+   494→    };
+   495→  }
+   496→  if (r.corrected) {
+   497→    await setSetting(SETTING_SITE, r.match, "Google Search Console — Site URL");
+   498→  }
+   499→
+   500→  // ۵) کوئری آزمایشی سبک (تجمیع ۲۸ روز، بدون بُعد)
+   501→  try {
+   502→    const endDate = new Date();
+   503→    const startDate = new Date(endDate.getTime() - REPORT_DAYS * 86400_000);
+   504→    await querySearchAnalytics(token, r.match, {
+   505→      startDate: isoDate(startDate),
+   506→      endDate: isoDate(endDate),
+   507→      dimensions: [],
+   508→      dataState: "final",
+   509→    });
+   510→    return {
+   511→      ok: true,
+   512→      message: r.corrected
+   513→        ? `فرمت پراپرتی به‌صورت خودکار به «${r.match}» اصلاح شد و اتصال برقرار است ✓`
+   514→        : "اتصال به سرچ کنسول برقرار است ✓",
+   515→      resolvedSiteUrl: r.match,
+   516→      availableSites: list.sites,
+   517→    };
+   518→  } catch (e) {
+   519→    const msg = e instanceof Error ? e.message : "خطا در کوئری آزمایشی";
+   520→    return {
+   521→      ok: false,
+   522→      message: r.corrected ? `${msg} (آدرس به «${r.match}» اصلاح شد)` : msg,
+   523→      resolvedSiteUrl: r.match,
+   524→      availableSites: list.sites,
+   525→    };
+   526→  }
+   527→}
+   528→
+   529→function isoDate(d: Date): string {
+   530→  return d.toISOString().slice(0, 10);
+   531→}
+   532→
+   533→/** واکشی کامل داده‌های ۲۸ روز: خلاصه + روند روزانه + کوئری‌ها + صفحه‌ها */
+   534→async function fetchFreshData(sa: ServiceAccountJson, siteUrl: string): Promise<GscOverview> {
+   535→  const token = await getAccessToken(sa);
+   536→  const endDate = new Date();
+   537→  const startDate = new Date(endDate.getTime() - REPORT_DAYS * 86400_000);
+   538→
+   539→  const base = { startDate: isoDate(startDate), endDate: isoDate(endDate), dataState: "final" };
+   540→  // سه کوئری در هر refresh — سبک برای کوتا
+   541→  const [aggRes, dailyRes, queriesRes, pagesRes] = await Promise.all([
+   542→    querySearchAnalytics(token, siteUrl, { ...base, dimensions: [] }),
+   543→    querySearchAnalytics(token, siteUrl, { ...base, dimensions: ["date"] }),
+   544→    querySearchAnalytics(token, siteUrl, { ...base, dimensions: ["query"], rowLimit: 50 }),
+   545→    querySearchAnalytics(token, siteUrl, { ...base, dimensions: ["page"], rowLimit: 50 }),
+   546→  ]);
+   547→
+   548→  const agg = aggRes.rows[0];
+   549→  const daily: GscDailyRow[] = dailyRes.rows
+   550→    .map((r) => ({ date: r.keys[0], clicks: r.clicks, impressions: r.impressions, ctr: r.ctr, position: r.position }))
+   551→    .sort((a, b) => (a.date < b.date ? -1 : 1));
+   552→
+   553→  return {
+   554→    clicks: agg?.clicks ?? 0,
+   555→    impressions: agg?.impressions ?? 0,
+   556→    ctr: agg?.ctr ?? 0,
+   557→    position: agg?.position ?? 0,
+   558→    daily,
+   559→    queries: queriesRes.rows.sort((a, b) => b.clicks - a.clicks),
+   560→    pages: pagesRes.rows.sort((a, b) => b.clicks - a.clicks),
+   561→  };
+   562→}
+   563→
+   564→/* ─────────────────────── کش و API عمومی ─────────────────────── */
+   565→
+   566→interface CachePayload {
+   567→  data: GscOverview;
+   568→  fetchedAt: string;
+   569→}
+   570→
+   571→/**
+   572→ * دریافت داده‌های سرچ کنسول — همیشه از کش (T6)؛ فقط در صورت کهنه‌شدن و
+   573→ * در محدوده‌ی rate limit از API واقعی واکشی می‌شود.
+   574→ */
+   575→export async function getSearchConsoleData(force = false): Promise<GscResult> {
+   576→  const [saRaw, siteUrl, cacheRaw] = await Promise.all([
+   577→    getSetting(SETTING_SA),
+   578→    getSetting(SETTING_SITE),
+   579→    getSetting(SETTING_CACHE),
+   580→  ]);
+   581→
+   582→  const configured = !!saRaw && !!siteUrl;
+   583→
+   584→  const readCache = (): CachePayload | null => {
+   585→    if (!cacheRaw) return null;
+   586→    try {
+   587→      const p = JSON.parse(cacheRaw) as CachePayload;
+   588→      return p?.data ? p : null;
+   589→    } catch {
+   590→      return null;
+   591→    }
+   592→  };
+   593→  const cached = readCache();
+   594→  const stale =
+   595→    !cached || Date.now() - new Date(cached.fetchedAt).getTime() > CACHE_TTL_HOURS * 3600_000;
+   596→
+   597→  const statusBase: GscStatus = {
+   598→    configured,
+   599→    siteUrl: siteUrl || null,
+   600→    lastError: null,
+   601→    cache: { fetchedAt: cached?.fetchedAt ?? null, stale, ttlHours: CACHE_TTL_HOURS },
+   602→  };
+   603→
+   604→  if (!configured) {
+   605→    return {
+   606→      ok: false,
+   607→      error: "سرچ کنسول پیکربندی نشده — JSON سرویس‌اکانت و آدرس سایت را در همین صفحه وارد کنید.",
+   608→      status: statusBase,
+   609→    };
+   610→  }
+   611→
+   612→  // کش تازه (و بدون force) → سرو از کش
+   613→  if (!force && cached && !stale) {
+   614→    return { ok: true, data: cached.data, status: statusBase };
+   615→  }
+   616→
+   617→  // کوتا: سقف فراخوانی ساعتی
+   618→  if (!tryAcquireFetchSlot()) {
+   619→    return {
+   620→      ok: false,
+   621→      error: "سقف فراخوانی ساعتی Search Console API پر است (۵ بار — محافظت از کوتای رایگان). بعداً یا از کش استفاده کنید.",
+   622→      status: {
+   623→        ...statusBase,
+   624→        lastError: "rate-limited",
+   625→        // اگر کشِ کهنه موجود است، همان را برگردان (بهتر از هیچ)
+   626→      },
+   627→      data: cached?.data,
+   628→    };
+   629→  }
+   630→
+   631→  try {
+   632→    const sa = JSON.parse(saRaw!) as ServiceAccountJson;
+   633→    const data = await fetchFreshData(sa, siteUrl!);
+   634→    const payload: CachePayload = { data, fetchedAt: new Date().toISOString() };
+   635→    await setSetting(SETTING_CACHE, JSON.stringify(payload), "GSC cache");
+   636→    return {
+   637→      ok: true,
+   638→      data,
+   639→      status: { ...statusBase, cache: { fetchedAt: payload.fetchedAt, stale: false, ttlHours: CACHE_TTL_HOURS } },
+   640→    };
+   641→  } catch (e) {
+   642→    const msg = e instanceof Error ? e.message : "خطای ناشناخته در Search Console";
+   643→    // خطا → اگر کشِ کهنه داریم همان را برگردان
+   644→    return {
+   645→      ok: false,
+   646→      error: msg,
+   647→      status: { ...statusBase, lastError: msg },
+   648→      data: cached?.data,
+   649→    };
+   650→  }
+   651→}
+   652→
+   653→/* ─────────────────────── خلاصه برای سئوی هوشمند ─────────────────────── */
+   654→
+   655→/**
+   656→ * خلاصه‌ی متنی داده‌های GSC برای تزریق به پرامپت استراتژی/آپدیت محتوا (T4).
+   657→ * همیشه از کش می‌خواند — هیچ فراخوانی AI-ای هزینه‌ی API گوگل اضافه نمی‌کند (T6).
+   658→ */
+   659→export async function getGscSummaryForSeo(): Promise<string> {
+   660→  try {
+   661→    const res = await getSearchConsoleData(false);
+   662→    if (!res.ok || !res.data) return "";
+   663→    const d = res.data;
+   664→    const topQueries = d.queries
+   665→      .slice(0, 30)
+   666→      .map((q) => `- «${q.keys[0]}» — ${q.clicks} کلیک، ${q.impressions} نمایش، جایگاه ${q.position.toFixed(1)}`)
+   667→      .join("\n");
+   668→    const opportunities = d.queries
+   669→      .filter((q) => q.position >= 4 && q.position <= 20 && q.impressions >= 50)
+   670→      .slice(0, 15)
+   671→      .map((q) => `- «${q.keys[0]}» — جایگاه ${q.position.toFixed(1)} (فرصت رشد تا صفحه اول)`)
+   672→      .join("\n");
+   673→    const topPages = d.pages
+   674→      .slice(0, 15)
+   675→      .map((p) => `- ${p.keys[0]} — ${p.clicks} کلیک، جایگاه ${p.position.toFixed(1)}`)
+   676→      .join("\n");
+   677→    return `\n\n═══ داده‌های واقعی گوگل سرچ کنسول (۲۸ روز اخیر) — هنگام انتخاب کلمات و اولویت‌ها از این داده‌های واقعی استفاده کن ═══
+   678→جمع‌ کلیک‌ها: ${d.clicks} | نمایش‌ها: ${d.impressions} | CTR: ${(d.ctr * 100).toFixed(1)}٪ | میانگین جایگاه: ${d.position.toFixed(1)}
+   679→
+   680→پرکلیک‌ترین کوئری‌های واقعی کاربران:
+   681→${topQueries || "(داده‌ای نیست)"}
+   682→
+   683→فرصت‌های رشد (جایگاه ۴ تا ۲۰ = فاصله‌ی ضربه‌ای تا صفحه اول — اولویت آپدیت محتوا):
+   684→${opportunities || "(یافت نشد)"}
+   685→
+   686→پرتکرارترین صفحه‌ها:
+   687→${topPages || "(داده‌ای نیست)"}
+   688→`;
+   689→  } catch {
+   690→    return "";
+   691→  }
+   692→}
+   693→
+   694→/** آدرس صفحه‌ی مقاله‌ی سایت از slug — برای تطبیق کوئری/صفحه */
+   695→export function articlePageUrl(slug: string): string {
+   696→  const base = process.env.NEXT_PUBLIC_SITE_URL || "https://fittup.ir";
+   697→  return `${base}/?article=${slug}`;
+   698→}
+   699→
+   700→/** هش ساده برای idempotency رفرش محتوا */
+   701→export function hashString(s: string): string {
+   702→  return createHash("sha256").update(s).digest("hex").slice(0, 16);
+   703→}
+   704→

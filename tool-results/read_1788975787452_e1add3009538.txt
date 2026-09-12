@@ -1,0 +1,559 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useEffect, useState } from "react";
+     4→     4→import dynamic from "next/dynamic";
+     5→     5→import { motion, AnimatePresence } from "framer-motion";
+     6→     6→import {
+     7→     7→  LayoutDashboard,
+     8→     8→  Apple,
+     9→     9→  TrendingUp,
+    10→    10→  MessageCircle,
+    11→    11→  Crown,
+    12→    12→  ClipboardList,
+    13→    13→  Dumbbell,
+    14→    14→  Gift,
+    15→    15→  Headphones,
+    16→    16→  Smartphone,
+    17→    17→  Loader2,
+    18→    18→} from "lucide-react";
+    19→    19→import {
+    20→    20→  useAppStore,
+    21→    21→  restoreActiveSession,
+    22→    22→  restorePlanCache,
+    23→    23→  refreshUserIfNeeded,
+    24→    24→  type MainTab,
+    25→    25→} from "@/lib/fitness/store";
+    26→    26→import { isAppShellMode } from "@/lib/fitness/app-bridge";
+    27→    27→import { isFitUpBazaarApp } from "@/lib/fitness/bazaar-bridge";
+    28→    28→import { isFitUpOwnApp } from "@/lib/fitness/app-bridge";
+    29→    29→import { ProgramsView } from "@/components/fitness/views/programs-view";
+    30→    30→import { WorkoutsView } from "@/components/fitness/views/workouts-view";
+    31→    31→import { NutritionView } from "@/components/fitness/views/nutrition-view";
+    32→    32→import { PlansView } from "@/components/fitness/views/plans-view";
+    33→    33→import { ReferralView } from "@/components/fitness/views/referral-view";
+    34→    34→import { SupportView } from "@/components/fitness/views/support-view";
+    35→    35→import { MobileAppView } from "@/components/fitness/views/mobile-app-view";
+    36→    36→import { ViewErrorBoundary } from "@/components/fitness/view-error-boundary";
+    37→    37→import { NotificationsOverlay } from "@/components/fitness/views/notifications-overlay";
+    38→    38→import { ProfileOverlay } from "@/components/fitness/views/profile-overlay";
+    39→    39→import { SubscriptionOverlay } from "@/components/fitness/views/subscription-overlay";
+    40→    40→// v15: ویو قفل برای تب‌های نیازمند پلن (کاربر بدون پلن فعال)
+    41→    41→import { PlanLockedView } from "@/components/fitness/views/plan-locked-view";
+    42→    42→import { TopBar } from "@/components/fitness/top-bar";
+    43→    43→import { Sidebar } from "@/components/fitness/sidebar";
+    44→    44→// ─── تور راهنمای ورود اول (Task 3-c) — خودش با فلگ localStorage گیت می‌شود ───
+    45→    45→import { PanelTour } from "@/components/fitness/panel-tour";
+    46→    46→import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+    47→    47→// ─── Dialog وسط‌چین برای ویدیو/آزمایش خون (درخواست مالک v15) ───
+    48→    48→// قبلاً این دو صفحه Sheet پایین‌چین (side="bottom") بودند که در موبایل به
+    49→    49→// پایین صفحه «چسبیده» دیده می‌شدند. الان Dialog وسط صفحه‌اند — و Radix
+    50→    50→// Dialog خودش اسکرول پشت مودال را قفل می‌کند.
+    51→    51→import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+    52→    52→
+    53→    53→// ─── Lazy-load کامپوننت‌های سنگین (درخواست مالک: اپ نرم‌تر و سریع‌تر) ───
+    54→    54→// این کامپوننت‌ها هزاران خط کد + recharts + markdown دارند ولی فقط در
+    55→    55→// لحظه‌ی نیاز باز می‌شوند — با جدا کردنشان از باندل اصلی، اولین بارگذاری
+    56→    56→// پنل برای همه کاربران (موبایل/WebView بازار) به‌طور محسوسی سبک‌تر می‌شود.
+    57→    57→// Skeleton مشترک برای همه:
+    58→    58→const ViewSkeleton = () => (
+    59→    59→  <div className="flex flex-col items-center justify-center py-16 gap-2 h-full">
+    60→    60→    <Loader2 className="w-6 h-6 animate-spin text-orange-500" />
+    61→    61→    <p className="text-xs text-slate-400">در حال بارگذاری…</p>
+    62→    62→  </div>
+    63→    63→);
+    64→    64→
+    65→    65→// تب‌های سنگین (نمودار/چت) — فقط با باز شدن تب لود می‌شوند
+    66→    66→const DashboardView = dynamic(() => import("@/components/fitness/views/dashboard-view").then((m) => m.DashboardView), { ssr: false, loading: ViewSkeleton });
+    67→    67→const ProgressView = dynamic(() => import("@/components/fitness/views/progress-view").then((m) => m.ProgressView), { ssr: false, loading: ViewSkeleton });
+    68→    68→const ChatView = dynamic(() => import("@/components/fitness/views/chat-view").then((m) => m.ChatView), { ssr: false, loading: ViewSkeleton });
+    69→    69→
+    70→    70→// Overlayهای سنگین — ادمین (۹هزار خط!) فقط برای ادمین‌ها لود می‌شود
+    71→    71→const AdminOverlay = dynamic(() => import("@/components/fitness/views/admin-overlay").then((m) => m.AdminOverlay), { ssr: false, loading: ViewSkeleton });
+    72→    72→const GymModeView = dynamic(() => import("@/components/fitness/views/gym-mode-view").then((m) => m.GymModeView), { ssr: false, loading: ViewSkeleton });
+    73→    73→const VideoAnalysisView = dynamic(() => import("@/components/fitness/views/video-analysis-view").then((m) => m.VideoAnalysisView), { ssr: false, loading: ViewSkeleton });
+    74→    74→const BloodTestView = dynamic(() => import("@/components/fitness/views/blood-test-view").then((m) => m.BloodTestView), { ssr: false, loading: ViewSkeleton });
+    75→    75→const SurveyOverlay = dynamic(() => import("@/components/fitness/views/survey-overlay").then((m) => m.SurveyOverlay), { ssr: false, loading: ViewSkeleton });
+    76→    76→const ExerciseDetailOverlay = dynamic(() => import("@/components/fitness/views/exercise-detail-overlay").then((m) => m.ExerciseDetailOverlay), { ssr: false, loading: ViewSkeleton });
+    77→    77→const ActiveWorkoutSession = dynamic(() => import("@/components/fitness/views/active-workout-session").then((m) => m.ActiveWorkoutSession), { ssr: false, loading: ViewSkeleton });
+    78→    78→// صفحه تمدید — فقط وقتی کاربر بخواهد تمدید کند
+    79→    79→const RenewalOverlay = dynamic(() => import("@/components/fitness/views/renewal-overlay").then((m) => m.RenewalOverlay), { ssr: false, loading: ViewSkeleton });
+    80→    80→
+    81→    81→const NAV_ITEMS_ALL: { id: MainTab; label: string; icon: any }[] = [
+    82→    82→  { id: "dashboard", label: "داشبورد", icon: LayoutDashboard },
+    83→    83→  { id: "programs", label: "برنامه‌ها", icon: ClipboardList },
+    84→    84→  { id: "workouts", label: "تمرین‌ها", icon: Dumbbell },
+    85→    85→  { id: "nutrition", label: "دستیار تغذیه", icon: Apple },
+    86→    86→  { id: "progress", label: "پیشرفت", icon: TrendingUp },
+    87→    87→  { id: "chat", label: "چت با فیتاپ", icon: MessageCircle },
+    88→    88→  { id: "referral", label: "معرفی به دوست", icon: Gift },
+    89→    89→  { id: "support", label: "پشتیبانی", icon: Headphones },
+    90→    90→  { id: "mobileapp", label: "اپ موبایل", icon: Smartphone },
+    91→    91→  { id: "plans", label: "پلن‌ها", icon: Crown },
+    92→    92→];
+    93→    93→
+    94→    94→// ═══ FE-M8: دکمه back اندروید/مرورگر اول overlay (Sheet) را می‌بندد ═══
+    95→    95→// وقتی overlay (پروفایل/اعلان/اشتراک/...) باز است، popstate (back) فقط overlay
+    96→    96→// را می‌بندد، نه خروج از پنل/landing.
+    97→    97→// مهم: این listener در سطح module ثبت می‌شود تا قبل از popstate handler اصلی
+    98→    98→// (page-client — که در useEffect بعد از mount ثبت می‌شود) اجرا شود؛ به این
+    99→    99→// ترتیب stopImmediatePropagation مانع reset شدن تب/رفتن به landing/confirm
+   100→   100→// خروج در PWA می‌شود. فلگ روی window از ثبت تکراری در HMR جلوگیری می‌کند.
+   101→   101→if (typeof window !== "undefined" && !(window as any).__fitupOverlayBackGuard) {
+   102→   102→  (window as any).__fitupOverlayBackGuard = true;
+   103→   103→  window.addEventListener("popstate", (e: PopStateEvent) => {
+   104→   104→    const st = useAppStore.getState();
+   105→   105→    if (st.screen === "main" && st.overlay) {
+   106→   106→      st.setOverlay(null);
+   107→   107→      // یک entry دوباره push می‌کنیم تا back بعدی مستقیماً از پنل خارج نکند
+   108→   108→      try {
+   109→   109→        window.history.pushState({ fitupOverlay: true }, "", window.location.href);
+   110→   110→      } catch {}
+   111→   111→      e.stopImmediatePropagation();
+   112→   112→      e.preventDefault();
+   113→   113→    }
+   114→   114→  });
+   115→   115→}
+   116→   116→
+   117→   117→export function MainApp() {
+   118→   118→  // ─── v55 — subscription انتخابی (فیکس ریشه‌ای لگ ناوبری تمرین) ───
+   119→   119→  // قبلاً useAppStore() بدون سلکتور کل store را subscribe می‌کرد؛ یعنی هر setState
+   120→   120→  // (هر تپ «حرکت بعدی/قبلی»، هر «تکمیل ست»، هر تیک…) کل MainApp و تمام درختش
+   121→   121→  // (TopBar/Sidebar/PanelTour/همهٔ Sheetها) را re-render می‌کرد.
+   122→   122→  // حالا: activeSession به‌صورت بولی سلکت می‌شود تا در حین ناوبری جلسه (تغییر
+   123→   123→  // currentExerciseIdx) شناسه‌اش تغییر نکند و MainApp اصلاً re-render نشود؛
+   124→   124→  // فقط خود ActiveWorkoutSession (مشترکِ مستقل به activeSession) رندر می‌شود.
+   125→   125→  const mainTab = useAppStore((s) => s.mainTab);
+   126→   126→  const overlay = useAppStore((s) => s.overlay);
+   127→   127→  const hasActiveSession = useAppStore((s) => !!s.activeSession);
+   128→   128→  const user = useAppStore((s) => s.user);
+   129→   129→  const setOverlay = useAppStore((s) => s.setOverlay);
+   130→   130→  const setScreen = useAppStore((s) => s.setScreen);
+   131→   131→  const setMainTab = useAppStore((s) => s.setMainTab);
+   132→   132→
+   133→   133→  // ─── 🩹 v45: گارد کاربر شبح (باگ «بعد از خروج دکمهٔ شروع تا رفرش کار نمی‌کند») ───
+   134→   134→  // اگر به هر دلیلی (race پاسخ async، خطای مسیر خروج قدیمی) MainApp بدون
+   135→   135→  // user مونت شود، پنل خالی و مرده رندر می‌شد. حالا: رندر نمی‌شود و به
+   136→   136→  // صفحهٔ ورود (اپ) یا لندینگ (مرورگر) برمی‌گردیم.
+   137→   137→  useEffect(() => {
+   138→   138→    if (!user) {
+   139→   139→      setScreen(isAppShellMode() ? "auth" : "landing");
+   140→   140→    }
+   141→   141→  }, [user, setScreen]);
+   142→   142→
+   143→   143→  // ─── v48: تازه‌سازی زندهٔ اطلاعات کاربر — ریشه‌کنی «چت قفل است تا رفرش کنم» ───
+   144→   144→  // در WebView اپ‌ها و PWA اپ ممکن است ساعت‌ها باز بماند؛ اگر دادهٔ کاربر در
+   145→   145→  // store کهنه/ناقص باشد، همهٔ گیت‌های پلن غلط «قفل» نشان می‌دهند. حالا هر بار
+   146→   146→  // اپ mount می‌شود یا به foreground برمی‌گردد (visibilitychange/focus)،
+   147→   147→  // اطلاعات کاربر بی‌صدا از /api/auth/me تازه می‌شود (throttle ۶۰s داخل lib).
+   148→   148→  useEffect(() => {
+   149→   149→    void refreshUserIfNeeded(!useAppStore.getState().user);
+   150→   150→    const onVisible = () => {
+   151→   151→      if (document.visibilityState === "visible") {
+   152→   152→        void refreshUserIfNeeded(!useAppStore.getState().user);
+   153→   153→      }
+   154→   154→    };
+   155→   155→    const onFocus = () => void refreshUserIfNeeded(false);
+   156→   156→    document.addEventListener("visibilitychange", onVisible);
+   157→   157→    window.addEventListener("focus", onFocus);
+   158→   158→    return () => {
+   159→   159→      document.removeEventListener("visibilitychange", onVisible);
+   160→   160→      window.removeEventListener("focus", onFocus);
+   161→   161→    };
+   162→   162→  }, []);
+   163→   163→
+   164→   164→  // ─── v15: قفل تب‌های نیازمند پلن برای کاربر بدون پلن فعال (درخواست مالک) ───
+   165→   165→  // برنامه‌ها / تمرین‌ها / دستیار تغذیه / پیشرفت / چت با فیتاپ — برای کاربری که
+   166→   166→  // «هیچ پلن فعالی ندارد» قفل می‌شوند. استثناها: ادمین + کاربر pending
+   167→   167→  // (خرید کرده و در جریان تکمیل پیش‌نیازهاست — پول داده و نباید از همه‌چیز
+   168→   168→  // محروم شود؛ جریان پیش‌نیازها در داشبورد انجام می‌شود).
+   169→   169→  const PLAN_LOCKED_TABS = new Set<MainTab>(["programs", "workouts", "nutrition", "progress", "chat"]);
+   170→   170→  const planLocked =
+   171→   171→    !!user &&
+   172→   172→    user.role !== "ADMIN" &&
+   173→   173→    !user.hasActiveSubscription &&
+   174→   174→    !user.hasPendingSubscription &&
+   175→   175→    PLAN_LOCKED_TABS.has(mainTab);
+   176→   176→
+   177→   177→  // ─── v51 (قانون کافه‌بازار + درخواست مالک): تب «اپ موبایل» فقط در اپ بازار پنهان است ───
+   178→   178→  // بازار آپدیت را خودش مدیریت می‌کند و تبلیغ/دانلود APK داخل اپ بازار تخلف است
+   179→   179→  // (قبلاً برخورد گرفته بود). در اپ اختصاصی خودمان این تب «باید» بماند —
+   180→   180→  // مالک: «مدال دانلود نسخه جدید اندروید و همچنین اپ موبایل در برنامه خودمون…
+   181→   181→  // باید به آخرین نسخه و نسخه درست اشاره کنند». در مرورگر/PWA هم مثل قبل هست.
+   182→   182→  const [navItems, setNavItems] = useState(NAV_ITEMS_ALL);
+   183→   183→  useEffect(() => {
+   184→   184→    try {
+   185→   185→      if (isFitUpBazaarApp()) {
+   186→   186→        setNavItems(NAV_ITEMS_ALL.filter((n) => n.id !== "mobileapp"));
+   187→   187→      }
+   188→   188→    } catch {}
+   189→   189→  }, []);
+   190→   190→
+   191→   191→  // گارد رندر: اگر به هر روشی (URL عمیق/نوتیف قدیمی) تب mobileapp داخل اپ بازار
+   192→   192→  // فعال شود، به داشبورد برمی‌گردیم — بخش اپ موبایل در نسخه بازار اصلاً وجود ندارد.
+   193→   193→  useEffect(() => {
+   194→   194→    try {
+   195→   195→      if (mainTab === "mobileapp" && isFitUpBazaarApp()) {
+   196→   196→        setMainTab("dashboard");
+   197→   197→      }
+   198→   198→    } catch {}
+   199→   199→  }, [mainTab, setMainTab]);
+   200→   200→
+   201→   201→  // ─── Polling نوتیف‌ها ───
+   202→   202→  // وقتی overlay اعلانات باز است، polling سریع‌تر (هر ۱۰ ثانیه) می‌شود تا
+   203→   203→  // حس real-time به کاربر بدهد. در حالت عادی هر ۳۰ ثانیه poll می‌کنیم تا
+   204→   204→  // بار روی سرور کم باشد. وقتی نوتیف جدید می‌آید، setNotifications صدا
+   205→   205→  // زده می‌شود که unreadCount را هم در-store به‌روز می‌کند و badge بلافاصله
+   206→   206→  // آپدیت می‌شود.
+   207→   207→  useEffect(() => {
+   208→   208→    let cancelled = false;
+   209→   209→    // ─── نوتیف native در اپ کافه‌بازار ───
+   210→   210→    // web-push داخل WebView کار نمی‌کند؛ به‌جای آن پل JS اپ اندروید
+   211→   211→    // (window.FitUpNative.showNotification) نوتیف سیستم اندروید را نشان می‌دهد.
+   212→   212→    // فقط وقتی تعداد ناخوانده «افزایش» یافته و baseline قبلی موجود است
+   213→   213→    // (اولین poll بعد از باز شدن اپ اسپم نمی‌کند).
+   214→   214→    //
+   215→   215→    // ─── چت/نیکا در اپ‌های نیتیو اعلان سیستم ندارد ───
+   216→   216→    // درخواست صریح مالک: نوتیف‌های «چت» (نوع coach = پیام‌های چت ربات/مربی و
+   217→   217→    // نیکا) در اپ‌های نیتیو (بازار + اختصاصی) نباید به‌صورت اعلان اندروید
+   218→   218→    // نمایش داده شوند — تجربه چت داخل خود اپ کافی است.
+   219→   219→    const CHAT_NOTIFICATION_TYPES = new Set(["coach"]);
+   220→   220→    const nativeNotify = (items: any[]) => {
+   221→   221→      try {
+   222→   222→        const native = (window as any).FitUpNative;
+   223→   223→        if (!native?.showNotification) return;
+   224→   224→        // ─── اپ‌های نیتیو (بازار + اختصاصی): اعلان‌های چت فیلتر می‌شوند ───
+   225→   225→        // تجربهٔ چت داخل خود اپ کافی است؛ اعلان سیستم برای پیام‌های چت/نیکا
+   226→   226→        // آزاردهنده است (درخواست صریح مالک برای بازار — برای اپ اختصاصی هم
+   227→   227→        // همان سیاست). PWA/مرورگر دست‌نخورده.
+   228→   228→        if (isFitUpBazaarApp() || isFitUpOwnApp()) {
+   229→   229→          const newestNonChat = items.find(
+   230→   230→            (n: any) => !n?.read && !CHAT_NOTIFICATION_TYPES.has(n?.type)
+   231→   231→          );
+   232→   232→          if (newestNonChat?.title) {
+   233→   233→            native.showNotification(
+   234→   234→              String(newestNonChat.title),
+   235→   235→              String(newestNonChat.body || "")
+   236→   236→            );
+   237→   237→          }
+   238→   238→          return;
+   239→   239→        }
+   240→   240→        const newest = items.find((n: any) => !n?.read);
+   241→   241→        if (newest?.title) native.showNotification(String(newest.title), String(newest.body || ""));
+   242→   242→      } catch {}
+   243→   243→    };
+   244→   244→
+   245→   245→    const loadNotifications = async () => {
+   246→   246→      // همیشه poll می‌کنیم — حتی وقتی overlay باز است.
+   247→   247→      // store یکپارچه است و overlay از همان state می‌خواند، بنابراین
+   248→   248→      // به‌روزرسانی‌های real-time مستقیماً در overlay و badge نمایش داده می‌شود.
+   249→   249→      try {
+   250→   250→        const res = await fetch("/api/notifications", { cache: "no-store" });
+   251→   251→        if (!res.ok) return;
+   252→   252→        const data = await res.json();
+   253→   253→        if (!cancelled) {
+   254→   254→          // فقط اگر داده واقعاً تغییر کرده باشد، state را آپدیت کن (جلوگیری از flicker)
+   255→   255→          // مهم: مقایسه با آخرین state از store (getState) انجام می‌شود نه closure
+   256→   256→          // effect — قبلاً آرایه notifications از closure کهنه خوانده می‌شد و
+   257→   257→          // مقایسه همیشه با snapshot قدیمی بود (stale closure / flicker).
+   258→   258→          const newJson = JSON.stringify(data.notifications || []);
+   259→   259→          const oldJson = JSON.stringify(useAppStore.getState().notifications);
+   260→   260→          if (newJson !== oldJson) {
+   261→   261→            const prevItems = useAppStore.getState().notifications;
+   262→   262→            const prevUnread = prevItems.filter((n: any) => !n?.read).length;
+   263→   263→            const nextItems: any[] = data.notifications || [];
+   264→   264→            const nextUnread = nextItems.filter((n: any) => !n?.read).length;
+   265→   265→            useAppStore.getState().setNotifications(nextItems);
+   266→   266→            // ─── نوتیف سیستم اندروید (فقط اپ کافه‌بازار) ───
+   267→   267→            // فقط وقتی ناخوانده‌ها «افزایش» یافته‌اند و baseline قبلی موجود است
+   268→   268→            // (آرایه قبلی غیرخالی) — تا اولین poll بعد از باز شدن اپ اسپم نکند.
+   269→   269→            if (nextUnread > prevUnread && prevItems.length > 0) {
+   270→   270→              nativeNotify(nextItems);
+   271→   271→            }
+   272→   272→          }
+   273→   273→        }
+   274→   274→      } catch {}
+   275→   275→    };
+   276→   276→    loadNotifications();
+   277→   277→    // Polling تطبیقی: وقتی overlay اعلانات باز است، هر ۱۰ ثانیه؛ در غیر این
+   278→   278→    // صورت هر ۳۰ ثانیه. فقط یک interval فعال است (نه دو interval همزمان).
+   279→   279→    const pollInterval = overlay === "notifications" ? 10000 : 30000;
+   280→   280→    const interval = setInterval(loadNotifications, pollInterval);
+   281→   281→    // وقتی کاربر به تب برمی‌گردد (بعد از tab switch یا minimize)، فوراً یک
+   282→   282→    // poll اجرا می‌کنیم تا badge همیشه به‌روز باشد.
+   283→   283→    const onVisibilityChange = () => {
+   284→   284→      if (document.visibilityState === "visible" && !cancelled) {
+   285→   285→        loadNotifications();
+   286→   286→      }
+   287→   287→    };
+   288→   288→    document.addEventListener("visibilitychange", onVisibilityChange);
+   289→   289→    // ─── Real-time push listener ───
+   290→   290→    // وقتی service worker یک push notification دریافت می‌کند (حتی اگر اپ باز
+   291→   291→    // باشد)، یک پیام 'PUSH_RECEIVED' به صفحه ارسال می‌کند. این listener آن
+   292→   292→    // پیام را می‌گیرد و فوراً نوتیف‌ها را از سرور refresh می‌کند — بدون
+   293→   293→    // منتظر ماندن برای polling بعدی.
+   294→   294→    const onControllerMessage = (event: MessageEvent) => {
+   295→   295→      if (event.data?.type === "PUSH_RECEIVED" && !cancelled) {
+   296→   296→        loadNotifications();
+   297→   297→      }
+   298→   298→    };
+   299→   299→    if (navigator.serviceWorker) {
+   300→   300→      navigator.serviceWorker.addEventListener("message", onControllerMessage);
+   301→   301→    }
+   302→   302→    return () => {
+   303→   303→      cancelled = true;
+   304→   304→      clearInterval(interval);
+   305→   305→      document.removeEventListener("visibilitychange", onVisibilityChange);
+   306→   306→      if (navigator.serviceWorker) {
+   307→   307→        navigator.serviceWorker.removeEventListener("message", onControllerMessage);
+   308→   308→      }
+   309→   309→    };
+   310→   310→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   311→   311→  }, [overlay]);
+   312→   312→
+   313→   313→  // با باز شدن هر overlay یک history entry push می‌کنیم تا back آن را ببندد
+   314→   314→  // (listener سطح module بالا در popstate آن را می‌بندد)
+   315→   315→  useEffect(() => {
+   316→   316→    if (overlay) {
+   317→   317→      try {
+   318→   318→        window.history.pushState({ fitupOverlay: true }, "", window.location.href);
+   319→   319→      } catch {}
+   320→   320→    }
+   321→   321→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   322→   322→  }, [overlay]);
+   323→   323→
+   324→   324→  // ─── FE-M9: sync تب فعلی در URL ───
+   325→   325→  // با تغییر تب، URL با replaceState به‌روز می‌شود تا refresh/share تب را
+   326→   326→  // نگه دارد. پارامترها با page-client هماهنگ‌اند: ?screen=panel&tab=X
+   327→   327→  useEffect(() => {
+   328→   328→    if (typeof window === "undefined") return;
+   329→   329→    if (useAppStore.getState().screen !== "main") return;
+   330→   330→    try {
+   331→   331→      const url = new URL(window.location.href);
+   332→   332→      url.searchParams.set("screen", "panel");
+   333→   333→      url.searchParams.set("tab", mainTab);
+   334→   334→      window.history.replaceState(null, "", url.toString());
+   335→   335→    } catch {}
+   336→   336→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   337→   337→  }, [mainTab]);
+   338→   338→
+   339→   339→  // ─── اسکرول به ابتدای صفحه با هر تغییر تب (درخواست مالک) ───
+   340→   340→  // قبلاً فقط «screen» عوض می‌شد اسکرول بالا می‌رفت؛ تغییر تب داخل پنل
+   341→   341→  // (مثلاً وسط داشبورد → دستیار تغذیه) صفحه را از همان وسط باز می‌کرد.
+   342→   342→  // ⚠️ behavior باید «instant» باشد نه «auto»: چون html دارای
+   343→   343→  // scroll-behavior:smooth است، behavior:"auto" به اسکرولِ انیمیشنی تبدیل
+   344→   344→  // می‌شود — و انیمیشنِ smooth در موبایل/WebView با تغییر layout (خروج تب
+   345→   345→  // قبلی + ورود تب جدید در AnimatePresence) وسط راه «لغو» می‌شود و صفحه
+   346→   346→  // از وسط باز می‌ماند (باگ گزارش‌شده مالک برای دستیار تغذیه).
+   347→   347→  useEffect(() => {
+   348→   348→    if (typeof window === "undefined") return;
+   349→   349→    window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+   350→   350→    // بعد از mount کامل تب جدید (پایان انیمیشن خروج ۱۵۰ms) دوباره مطمئن شویم
+   351→   351→    const t = setTimeout(() => window.scrollTo(0, 0), 200);
+   352→   352→    return () => clearTimeout(t);
+   353→   353→  }, [mainTab]);
+   354→   354→
+   355→   355→  // ─── FE-H7: بازیابی جلسه تمرین فعال بعد از refresh (<۲۴ ساعت) ───
+   356→   356→  useEffect(() => {
+   357→   357→    restoreActiveSession();
+   358→   358→  }, []);
+   359→   359→
+   360→   360→  // ─── ضد فلیکر رفرش: بازیابی پلن کش‌شده بلافاصله بعد از شناختن کاربر ───
+   361→   361→  // در mount، user هنوز null است (پاسخ /api/auth/me نرسیده)؛ به‌محض رسیدن
+   362→   362→  // userId، پلن کش‌شده (TTL ۲۴ ساعت) در store بازیابی می‌شود تا اولین رندرِ
+   363→   363→  // داشبورد پلن را ببیند و از حالت «بی‌پلن» به «پلن فعال» فلیکر نکند.
+   364→   364→  // (کش فقط وقتی بازیابی می‌شود که userId ذخیره‌شده با کاربر جاری یکی باشد)
+   365→   365→  const userId = user?.id ?? null;
+   366→   366→  useEffect(() => {
+   367→   367→    if (userId) restorePlanCache(userId);
+   368→   368→  }, [userId]);
+   369→   369→
+   370→   370→  return (
+   371→   371→    <div className="min-h-screen bg-white flex">
+   372→   372→      {/* Desktop Sidebar */}
+   373→   373→      <Sidebar navItems={navItems} />
+   374→   374→
+   375→   375→      {/* Main column */}
+   376→   376→      <div className="flex-1 flex flex-col min-w-0 lg:mr-72 bg-white">
+   377→   377→        <TopBar />
+   378→   378→        {/* تور راهنمای ورود اول — فقط بار اول (فلگ fitup_tour_seen_v1) و فقط
+   379→   379→            وقتی این کامپوننت سوار است یعنی کاربر در پنل (screen=main) است؛
+   380→   380→            اجرای دوباره از مرکز راهنما با رویداد fitup:replay-tour انجام می‌شود */}
+   381→   381→        <PanelTour />
+   382→   382→
+   383→   383→        <main className="flex-1 overflow-hidden pb-8">
+   384→   384→          {/* ─── v48 فیکس لگ جابجایی تمرین‌ها (شکایت مکرر مالک) ───
+   385→   385→              حین جلسهٔ تمرین (all-screen overlay)، محتوای تب زیرین مونت نمی‌شود.
+   386→   386→              قبلاً همهٔ ویوها (داشبورد/تمرین‌ها/TopBar/…) زیر اورلی زنده بودند و
+   387→   387→              هر لمس «حرکت بعدی/قبلی» با setState جلسه، کل اپ را re-render می‌کرد →
+   388→   388→              کندی این‌ور و آن‌ور در WebView موبایل. حالا هر تپ فقط درخت جلسه را
+   389→   389→              رندر می‌کند. با پایان جلسه محتوا فوری برمی‌گردد (کش پلن ضد فلیکر). */}
+   390→   390→          {!hasActiveSession && (
+   391→   391→          <AnimatePresence mode="wait">
+   392→   392→            <motion.div
+   393→   393→              key={mainTab}
+   394→   394→              initial={{ opacity: 0 }}
+   395→   395→              animate={{ opacity: 1 }}
+   396→   396→              exit={{ opacity: 0 }}
+   397→   397→              // ─── انیمیشن سریع‌تر تب‌ها (درخواست مالک: اپ نرم‌تر) ───
+   398→   398→              // قبلاً ۰.۳ثانیه×۲ (خروج+ورود با mode=wait) = ۶۰۰ms تأخیر در
+   399→   399→              // هر تعویض تب — عامل اصلی حس «لگ» در ناوبری موبایل.
+   400→   400→              transition={{ duration: 0.15, ease: "easeOut" }}
+   401→   401→              className="h-full"
+   402→   402→            >
+   403→   403→              {/* v15: کاربر بدون پلن فعال → ویوی قفل برای تب‌های پلن‌دار */}
+   404→   404→              {planLocked ? (
+   405→   405→                <ViewErrorBoundary viewName="قفل پلن" resetKey={mainTab}>
+   406→   406→                  <PlanLockedView tab={mainTab} />
+   407→   407→                </ViewErrorBoundary>
+   408→   408→              ) : (
+   409→   409→              <>
+   410→   410→              {mainTab === "dashboard" && (
+   411→   411→                <ViewErrorBoundary viewName="داشبورد" resetKey={mainTab}>
+   412→   412→                  <DashboardView />
+   413→   413→                </ViewErrorBoundary>
+   414→   414→              )}
+   415→   415→              {mainTab === "programs" && (
+   416→   416→                <ViewErrorBoundary viewName="برنامه‌ها" resetKey={mainTab}>
+   417→   417→                  <ProgramsView />
+   418→   418→                </ViewErrorBoundary>
+   419→   419→              )}
+   420→   420→              {mainTab === "workouts" && (
+   421→   421→                <ViewErrorBoundary viewName="تمرین‌ها" resetKey={mainTab}>
+   422→   422→                  <WorkoutsView />
+   423→   423→                </ViewErrorBoundary>
+   424→   424→              )}
+   425→   425→              {mainTab === "nutrition" && (
+   426→   426→                <ViewErrorBoundary viewName="تغذیه" resetKey={mainTab}>
+   427→   427→                  <NutritionView />
+   428→   428→                </ViewErrorBoundary>
+   429→   429→              )}
+   430→   430→              {mainTab === "progress" && (
+   431→   431→                <ViewErrorBoundary viewName="پیشرفت" resetKey={mainTab}>
+   432→   432→                  <ProgressView />
+   433→   433→                </ViewErrorBoundary>
+   434→   434→              )}
+   435→   435→              {mainTab === "chat" && (
+   436→   436→                <ViewErrorBoundary viewName="چت با مربی" resetKey={mainTab}>
+   437→   437→                  <ChatView />
+   438→   438→                </ViewErrorBoundary>
+   439→   439→              )}
+   440→   440→              {mainTab === "referral" && (
+   441→   441→                <ViewErrorBoundary viewName="معرفی دوستان" resetKey={mainTab}>
+   442→   442→                  <ReferralView />
+   443→   443→                </ViewErrorBoundary>
+   444→   444→              )}
+   445→   445→              {mainTab === "support" && (
+   446→   446→                <ViewErrorBoundary viewName="پشتیبانی" resetKey={mainTab}>
+   447→   447→                  <SupportView />
+   448→   448→                </ViewErrorBoundary>
+   449→   449→              )}
+   450→   450→              {mainTab === "mobileapp" && (
+   451→   451→                <ViewErrorBoundary viewName="اپلیکیشن" resetKey={mainTab}>
+   452→   452→                  <MobileAppView />
+   453→   453→                </ViewErrorBoundary>
+   454→   454→              )}
+   455→   455→              {mainTab === "plans" && (
+   456→   456→                <ViewErrorBoundary viewName="اشتراک و پلن‌ها" resetKey={mainTab}>
+   457→   457→                  <PlansView />
+   458→   458→                </ViewErrorBoundary>
+   459→   459→              )}
+   460→   460→              </>
+   461→   461→              )}
+   462→   462→            </motion.div>
+   463→   463→          </AnimatePresence>
+   464→   464→          )}
+   465→   465→        </main>
+   466→   466→      </div>
+   467→   467→
+   468→   468→      {/* Active workout session overlay (full-screen) — با Error Boundary تا کرش رندر، کل اپ را سفید نکند */}
+   469→   469→      <AnimatePresence>
+   470→   470→        {hasActiveSession && (
+   471→   471→          <ViewErrorBoundary viewName="جلسه تمرین">
+   472→   472→            <ActiveWorkoutSession />
+   473→   473→          </ViewErrorBoundary>
+   474→   474→        )}
+   475→   475→      </AnimatePresence>
+   476→   476→
+   477→   477→      {/* Sheet overlays */}
+   478→   478→      <Sheet open={overlay === "notifications"} onOpenChange={(o) => !o && setOverlay(null)}>
+   479→   479→        <SheetContent side="bottom" showCloseButton={false} className="h-[85vh] p-0" dir="rtl">
+   480→   480→          <SheetTitle className="sr-only">اعلان‌ها</SheetTitle>
+   481→   481→          <NotificationsOverlay />
+   482→   482→        </SheetContent>
+   483→   483→      </Sheet>
+   484→   484→      <Sheet open={overlay === "profile"} onOpenChange={(o) => !o && setOverlay(null)}>
+   485→   485→        <SheetContent side="bottom" showCloseButton={false} className="h-[90vh] p-0" dir="rtl">
+   486→   486→          <SheetTitle className="sr-only">پروفایل</SheetTitle>
+   487→   487→          <ProfileOverlay />
+   488→   488→        </SheetContent>
+   489→   489→      </Sheet>
+   490→   490→      <Sheet open={overlay === "subscription"} onOpenChange={(o) => !o && setOverlay(null)}>
+   491→   491→        <SheetContent side="bottom" showCloseButton={false} className="h-[90vh] p-0" dir="rtl">
+   492→   492→          <SheetTitle className="sr-only">ارتقای اشتراک</SheetTitle>
+   493→   493→          <SubscriptionOverlay />
+   494→   494→        </SheetContent>
+   495→   495→      </Sheet>
+   496→   496→      <Sheet open={overlay === "admin"} onOpenChange={(o) => !o && setOverlay(null)}>
+   497→   497→        <SheetContent side="bottom" showCloseButton={false} className="h-[95vh] p-0" dir="rtl">
+   498→   498→          <SheetTitle className="sr-only">پنل مدیریت</SheetTitle>
+   499→   499→          <AdminOverlay />
+   500→   500→        </SheetContent>
+   501→   501→      </Sheet>
+   502→   502→      <Sheet open={overlay === "exerciseDetail"} onOpenChange={(o) => !o && setOverlay(null)}>
+   503→   503→        <SheetContent side="bottom" showCloseButton={false} className="h-[85vh] p-0" dir="rtl">
+   504→   504→          <SheetTitle className="sr-only">جزئیات حرکت</SheetTitle>
+   505→   505→          <ExerciseDetailOverlay />
+   506→   506→        </SheetContent>
+   507→   507→      </Sheet>
+   508→   508→      <Sheet open={overlay === "gymMode"} onOpenChange={(o) => !o && setOverlay(null)}>
+   509→   509→        <SheetContent side="bottom" showCloseButton={false} className="h-[95vh] p-0" dir="rtl">
+   510→   510→          <SheetTitle className="sr-only">حالت باشگاه</SheetTitle>
+   511→   511→          <GymModeView />
+   512→   512→        </SheetContent>
+   513→   513→      </Sheet>
+   514→   514→      {/* ─── آنالیز ویدیویی/آزمایش خون: Dialog وسط‌چین (v15 — درخواست مالک) ───
+   515→   515→          قبلاً Sheet پایین‌چین بود و به پایین صفحه می‌چسبید.
+   516→   516→          🩹 v44 — فیکس «مودال اسکرول نمیشه»: DialogContent پایه grid است و
+   517→   517→          ردیفِ auto با محتوا رشد می‌کند؛ h-full فرزند بی‌اثر می‌شود و انتهای
+   518→   518→          محتوا زیر overflow-hidden گم می‌شد (تست واقعی: ۴۱۰px از ۱۱۵۳px
+   519→   519→          قابل‌دیدن نبود). ردیف را دقیقاً به ارتفاع
+   520→   520→          مودال قفل می‌کند تا اسکرول داخلی (flex-1 overflow-y-auto) کار کند. */}
+   521→   521→      <Dialog open={overlay === "videoAnalysis"} onOpenChange={(o) => !o && setOverlay(null)}>
+   522→   522→        <DialogContent
+   523→   523→          showCloseButton={false}
+   524→   524→          dir="rtl"
+   525→   525→          style={{ gridTemplateRows: "minmax(0px, 1fr)" }}
+   526→   526→          className="max-w-2xl h-[88vh] p-0 gap-0 overflow-hidden rounded-2xl sm:rounded-3xl [&>*]:min-w-0"
+   527→   527→        >
+   528→   528→          <DialogTitle className="sr-only">آنالیز ویدیویی</DialogTitle>
+   529→   529→          <VideoAnalysisView />
+   530→   530→        </DialogContent>
+   531→   531→      </Dialog>
+   532→   532→      <Dialog open={overlay === "bloodTest"} onOpenChange={(o) => !o && setOverlay(null)}>
+   533→   533→        <DialogContent
+   534→   534→          showCloseButton={false}
+   535→   535→          dir="rtl"
+   536→   536→          style={{ gridTemplateRows: "minmax(0px, 1fr)" }}
+   537→   537→          className="max-w-2xl h-[88vh] p-0 gap-0 overflow-hidden rounded-2xl sm:rounded-3xl [&>*]:min-w-0"
+   538→   538→        >
+   539→   539→          <DialogTitle className="sr-only">تست خون</DialogTitle>
+   540→   540→          <BloodTestView />
+   541→   541→        </DialogContent>
+   542→   542→      </Dialog>
+   543→   543→      <Sheet open={overlay === "survey"} onOpenChange={(o) => !o && setOverlay(null)}>
+   544→   544→        <SheetContent side="bottom" showCloseButton={false} className="h-[90vh] p-0" dir="rtl">
+   545→   545→          <SheetTitle className="sr-only">نظرسنجی پایان پلن</SheetTitle>
+   546→   546→          <SurveyOverlay />
+   547→   547→        </SheetContent>
+   548→   548→      </Sheet>
+   549→   549→      {/* ─── تجربه تمدید اشتراک — صفحه اختصاصی زیبا برای نگه‌داشتن کاربر ─── */}
+   550→   550→      <Sheet open={overlay === "renewal"} onOpenChange={(o) => !o && setOverlay(null)}>
+   551→   551→        <SheetContent side="bottom" showCloseButton={false} className="h-[92vh] p-0" dir="rtl">
+   552→   552→          <SheetTitle className="sr-only">تمدید اشتراک</SheetTitle>
+   553→   553→          <RenewalOverlay />
+   554→   554→        </SheetContent>
+   555→   555→      </Sheet>
+   556→   556→    </div>
+   557→   557→  );
+   558→   558→}
+   559→   559→

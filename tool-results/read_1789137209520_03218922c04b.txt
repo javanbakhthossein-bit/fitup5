@@ -1,0 +1,824 @@
+     1→import { db } from "@/lib/db";
+     2→import { generateWorkoutPlan, generateMealPlan } from "@/lib/fitness/ai";
+     3→import type { OnboardingData, Plan } from "@/lib/fitness/types";
+     4→import { checkPrerequisites } from "@/lib/fitness/prerequisites";
+     5→import { activatePendingSubscription } from "@/lib/fitness/subscription";
+     6→import { createNotification } from "@/lib/fitness/notifications";
+     7→import { notifyProgramReadySms } from "@/lib/fitness/sms-flows";
+     8→import { buildUserDto } from "@/lib/fitness/auth";
+     9→
+    10→/**
+    11→ * تولید برنامه (تمرینی + غذایی) در پس‌زمینه — هسته مشترک.
+    12→ *
+    13→ * چرا این فایل وجود دارد:
+    14→ * تولید برنامه با هوش مصنوعی ۱ تا ۵ دقیقه طول می‌کشد (با تفکر high بیشتر).
+    15→ * اگر داخل request handler به‌صورت سینکرون اجرا شود، درخواست از سقف تایم‌اوت
+    16→ * گیت‌وی عبور می‌کند و مرورگر پاسخ HTML خطا می‌گیرد («Unexpected token '<'») —
+    17→ * در حالی که سرور کار را ادامه می‌دهد و برنامه در نهایت ساخته می‌شود؛ یعنی
+    18→ * کاربر هم خطا می‌بیند هم بعداً برنامه دارد (باگ گزارش‌شده).
+    19→ *
+    20→ * راه‌حل: همه مسیرها (خرید، آپلود عکس بدن، تعیین تکلیف ویدیو/آزمایش خون،
+    21→ * retry از تب برنامه‌ها) از این تابع استفاده می‌کنند:
+    22→ *  ۱) وضعیت ProgramRequest فوراً «generating» می‌شود (UI بنر «در حال طراحی» نشان می‌دهد)
+    23→ *  ۲) تولید در پس‌زمینه (fire-and-forget) انجام می‌شود
+    24→ *  ۳) با موفقیت: برنامه‌ها ذخیره + وضعیت ready + نوتیفیکیشن «برنامه آماده شد»
+    25→ *  ۴) با خطا: وضعیت failed + نوتیفیکیشن (کاربر از تب برنامه‌ها retry می‌کند)
+    26→ */
+    27→
+    28→/** پارس لیست ذخیره‌شده به‌صورت JSON یا CSV */
+    29→function safeParseList(raw: string | null | undefined): string[] {
+    30→  if (!raw) return [];
+    31→  const t = raw.trim();
+    32→  if (!t) return [];
+    33→  try {
+    34→    const p = JSON.parse(t);
+    35→    if (Array.isArray(p)) return p.map((x) => String(x));
+    36→    if (typeof p === "string") return p.split(",").map((s) => s.trim()).filter(Boolean);
+    37→    return [];
+    38→  } catch {
+    39→    return t.split(",").map((s) => s.trim()).filter(Boolean);
+    40→  }
+    41→}
+    42→
+    43→/** ساخت OnboardingData از پروفایل ذخیره‌شده — وزن فعلی از WeightLog */
+    44→export async function buildOnboardingData(userId: string): Promise<OnboardingData | null> {
+    45→  const profile = await db.onboardingProfile.findUnique({ where: { userId } });
+    46→  if (!profile) return null;
+    47→
+    48→  const latestWeightLog = await db.weightLog.findFirst({
+    49→    where: { userId },
+    50→    orderBy: { loggedAt: "desc" },
+    51→    select: { weight: true },
+    52→  });
+    53→  const currentWeight = latestWeightLog?.weight ?? profile.weight;
+    54→
+    55→  return {
+    56→    gender: profile.gender as OnboardingData["gender"],
+    57→    age: profile.age,
+    58→    height: profile.height,
+    59→    weight: currentWeight,
+    60→    targetWeight: profile.targetWeight ?? undefined,
+    61→    goal: profile.goal as OnboardingData["goal"],
+    62→    activityLevel: profile.activityLevel as OnboardingData["activityLevel"],
+    63→    workoutDays: profile.workoutDays,
+    64→    workoutDaysList: safeParseList(profile.workoutDaysList),
+    65→    workoutPlace: profile.workoutPlace as OnboardingData["workoutPlace"],
+    66→    equipment: safeParseList(profile.equipment),
+    67→    diseases: profile.diseases,
+    68→    injuries: profile.injuries,
+    69→    allergies: profile.allergies,
+    70→    dietType: profile.dietType as OnboardingData["dietType"],
+    71→    trainingExperience: (profile.trainingExperience ?? undefined) as OnboardingData["trainingExperience"],
+    72→    previousTrainingType: profile.previousTrainingType ?? undefined,
+    73→    drugAllergies: profile.drugAllergies ?? undefined,
+    74→    currentMedications: profile.currentMedications ?? undefined,
+    75→    maxLifts: profile.maxLifts ?? undefined,
+    76→    bodyFrame: (profile.bodyFrame ?? undefined) as OnboardingData["bodyFrame"],
+    77→    sleepHours: profile.sleepHours ?? undefined,
+    78→    stressLevel: profile.stressLevel ?? undefined,
+    79→    waterHabit: profile.waterHabit ?? undefined,
+    80→    targetDate: profile.targetDate ?? undefined,
+    81→    workoutTime: (profile.workoutTime ?? undefined) as OnboardingData["workoutTime"],
+    82→    medicalConditions: safeParseList(profile.medicalConditions) as OnboardingData["medicalConditions"],
+    83→    currentSupplements: profile.currentSupplements ?? undefined,
+    84→    dislikedFoods: profile.dislikedFoods ?? undefined,
+    85→    preferredCuisine: (profile.preferredCuisine ?? undefined) as OnboardingData["preferredCuisine"],
+    86→    // v60 — شرایط/نیاز/هدف خاص کاربر (متن آزاد) — در پرامپت برنامهٔ تمرینی/غذایی/مکمل تزریق می‌شود
+    87→    specialConditions: profile.specialConditions ?? undefined,
+    88→    waterGoalMl: (() => {
+    89→      const w = currentWeight || 70;
+    90→      const baseMl = Math.round(w * 35);
+    91→      let adj = 0;
+    92→      const al = profile.activityLevel;
+    93→      if (al === "active" || al === "very_active") adj = 500;
+    94→      else if (al === "moderate") adj = 250;
+    95→      return baseMl + adj;
+    96→    })(),
+    97→  };
+    98→}
+    99→
+   100→/** ساخت extras برای AI از نتایج تحلیل ذخیره‌شده (عکس بدن، ویدیو، آزمایش خون، تمدید) */
+   101→export async function buildGenerationExtras(userId: string): Promise<{
+   102→  bodyPhotoAnalysis?: string;
+   103→  videoAnalysisResult?: string;
+   104→  bloodTestReport?: string;
+   105→  renewalContext?: string;
+   106→}> {
+   107→  const extras: {
+   108→    bodyPhotoAnalysis?: string;
+   109→    videoAnalysisResult?: string;
+   110→    bloodTestReport?: string;
+   111→    renewalContext?: string;
+   112→  } = {};
+   113→
+   114→  // آخرین تحلیل عکس بدن
+   115→  try {
+   116→    const latestBodyPhoto = await db.analysisResult.findFirst({
+   117→      where: { userId, type: "body_photo" },
+   118→      orderBy: { createdAt: "desc" },
+   119→      select: { result: true, createdAt: true },
+   120→    });
+   121→    if (latestBodyPhoto?.result) {
+   122→      try {
+   123→        const parsed = JSON.parse(latestBodyPhoto.result);
+   124→        const analysisText = parsed.analysis ? String(parsed.analysis) : "";
+   125→        if (analysisText) {
+   126→          extras.bodyPhotoAnalysis = `آخرین تحلیل عکس بدن کاربر (تاریخ: ${new Date(latestBodyPhoto.createdAt).toLocaleDateString("fa-IR")}):\n${analysisText}`;
+   127→        } else {
+   128→          const summaryParts: string[] = [];
+   129→          if (parsed.recommendations && Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0) {
+   130→            summaryParts.push(`توصیه‌ها: ${parsed.recommendations.slice(0, 3).join("، ")}`);
+   131→          }
+   132→          if (parsed.bodyScore != null) summaryParts.push(`امتیاز فرم بدن: ${parsed.bodyScore} از ۱۰۰`);
+   133→          if (summaryParts.length > 0) {
+   134→            extras.bodyPhotoAnalysis = `آخرین تحلیل عکس بدن کاربر (تاریخ: ${new Date(latestBodyPhoto.createdAt).toLocaleDateString("fa-IR")}):\n${summaryParts.join("\n")}`;
+   135→          }
+   136→        }
+   137→      } catch {
+   138→        extras.bodyPhotoAnalysis = `آخرین تحلیل عکس بدن کاربر:\n${latestBodyPhoto.result.slice(0, 800)}`;
+   139→      }
+   140→    }
+   141→  } catch (e) {
+   142→    console.error("[program-generation] failed to load body photo analysis:", e);
+   143→  }
+   144→
+   145→  // آخرین تحلیل ویدیو
+   146→  try {
+   147→    const latestVideo = await db.analysisResult.findFirst({
+   148→      where: { userId, type: "video_analysis" },
+   149→      orderBy: { createdAt: "desc" },
+   150→      select: { result: true, createdAt: true },
+   151→    });
+   152→    if (latestVideo?.result) {
+   153→      try {
+   154→        const parsed = JSON.parse(latestVideo.result);
+   155→        if (parsed.analysis && typeof parsed.analysis === "string") {
+   156→          extras.videoAnalysisResult = `آخرین تحلیل ویدیوی فرم بدن کاربر (تاریخ: ${new Date(latestVideo.createdAt).toLocaleDateString("fa-IR")}):\n${parsed.analysis}`;
+   157→        } else {
+   158→          const summaryParts: string[] = [];
+   159→          if (parsed.posture) summaryParts.push(`پوسچر: ${parsed.posture}`);
+   160→          if (parsed.symmetry != null) summaryParts.push(`تقارن: ${parsed.symmetry} از ۱۰۰`);
+   161→          if (parsed.score != null) summaryParts.push(`امتیاز: ${parsed.score} از ۱۰۰`);
+   162→          if (parsed.issues && Array.isArray(parsed.issues) && parsed.issues.length > 0) {
+   163→            summaryParts.push(`مشکلات: ${parsed.issues.join("، ")}`);
+   164→          }
+   165→          if (parsed.recommendations && Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0) {
+   166→            summaryParts.push(`توصیه‌ها: ${parsed.recommendations.slice(0, 3).join("، ")}`);
+   167→          }
+   168→          if (summaryParts.length > 0) {
+   169→            extras.videoAnalysisResult = `آخرین تحلیل ویدیوی فرم بدن کاربر (تاریخ: ${new Date(latestVideo.createdAt).toLocaleDateString("fa-IR")}):\n${summaryParts.join("\n")}`;
+   170→          }
+   171→        }
+   172→      } catch {
+   173→        extras.videoAnalysisResult = `آخرین تحلیل ویدیوی کاربر:\n${latestVideo.result.slice(0, 800)}`;
+   174→      }
+   175→    }
+   176→  } catch (e) {
+   177→    console.error("[program-generation] failed to load video analysis:", e);
+   178→  }
+   179→
+   180→  // آخرین آزمایش خون
+   181→  try {
+   182→    const latestBloodTest = await db.analysisResult.findFirst({
+   183→      where: { userId, type: "blood_test" },
+   184→      orderBy: { createdAt: "desc" },
+   185→      select: { result: true, createdAt: true },
+   186→    });
+   187→    if (latestBloodTest?.result) {
+   188→      try {
+   189→        const parsed = JSON.parse(latestBloodTest.result);
+   190→        const summaryParts: string[] = [];
+   191→        if (parsed.summary) summaryParts.push(String(parsed.summary));
+   192→        if (parsed.abnormalities && Array.isArray(parsed.abnormalities) && parsed.abnormalities.length > 0) {
+   193→          summaryParts.push(`ناهنجاری‌ها: ${parsed.abnormalities.map((a: any) => typeof a === "string" ? a : (a?.name || a?.test || JSON.stringify(a))).join("، ")}`);
+   194→        }
+   195→        if (parsed.recommendations && Array.isArray(parsed.recommendations) && parsed.recommendations.length > 0) {
+   196→          summaryParts.push(`توصیه‌ها: ${parsed.recommendations.slice(0, 3).join("، ")}`);
+   197→        }
+   198→        if (summaryParts.length > 0) {
+   199→          extras.bloodTestReport = `آخرین آزمایش خون کاربر (تاریخ: ${new Date(latestBloodTest.createdAt).toLocaleDateString("fa-IR")}):\n${summaryParts.join("\n")}`;
+   200→        }
+   201→      } catch {
+   202→        extras.bloodTestReport = `آخرین آزمایش خون کاربر:\n${latestBloodTest.result.slice(0, 800)}`;
+   203→      }
+   204→    }
+   205→  } catch (e) {
+   206→    console.error("[program-generation] failed to load blood test:", e);
+   207→  }
+   208→
+   209→  // بستر تمدید / بازتولید — پیشرفت کاربر در دوره قبلی
+   210→  try {
+   211→    const previousSub = await db.subscription.findFirst({
+   212→      where: { userId, status: "expired" },
+   213→      orderBy: { endDate: "desc" },
+   214→      select: { plan: true, durationDays: true, endDate: true },
+   215→    });
+   216→    const previousPlan = await db.workoutPlan.findFirst({
+   217→      where: { userId },
+   218→      orderBy: { createdAt: "desc" },
+   219→    });
+   220→    if (previousSub || previousPlan) {
+   221→      const latestCheckup = await db.checkup.findFirst({
+   222→        where: { userId },
+   223→        orderBy: { createdAt: "desc" },
+   224→        select: { weight: true, bodyFatPercent: true, fatigueLevel: true, sleepQuality: true, dietAdherence: true, workoutAdherence: true, phaseNumber: true, isFinalCheckup: true },
+   225→      });
+   226→      const parts: string[] = [];
+   227→      if (previousSub) {
+   228→        parts.push(`[سیستم - تمدید اشتراک]: این کاربر قبلاً پلن ${previousSub.plan} را برای ${previousSub.durationDays} روز استفاده کرده است.`);
+   229→      } else {
+   230→        parts.push(`[سیستم - بازتولید برنامه]: کاربر قبلاً برنامه داشته است.`);
+   231→      }
+   232→      if (latestCheckup) {
+   233→        parts.push(`پیشرفت کاربر:`);
+   234→        if (latestCheckup.weight) parts.push(`- وزن فعلی: ${latestCheckup.weight}kg`);
+   235→        if (latestCheckup.bodyFatPercent) parts.push(`- درصد چربی: ${latestCheckup.bodyFatPercent}%`);
+   236→        if (latestCheckup.fatigueLevel) parts.push(`- سطح انرژی: ${latestCheckup.fatigueLevel}/5`);
+   237→        if (latestCheckup.sleepQuality) parts.push(`- کیفیت خواب: ${latestCheckup.sleepQuality}/5`);
+   238→        if (latestCheckup.dietAdherence) parts.push(`- رعایت رژیم: ${latestCheckup.dietAdherence}/5`);
+   239→        if (latestCheckup.workoutAdherence) parts.push(`- رعایت تمرین: ${latestCheckup.workoutAdherence}/5`);
+   240→        if (latestCheckup.phaseNumber) parts.push(`- فاز تکمیل‌شده: ${latestCheckup.phaseNumber}${latestCheckup.isFinalCheckup ? " (چکاپ نهایی)" : ""}`);
+   241→        parts.push(`برنامه جدید را بر اساس این پیشرفت طراحی کن:`);
+   242→        if (latestCheckup.workoutAdherence && latestCheckup.workoutAdherence >= 4) {
+   243→          parts.push(`✅ رعایت عالی تمرین — شدت بیشتر پیشنهاد بده`);
+   244→        }
+   245→        if (latestCheckup.workoutAdherence && latestCheckup.workoutAdherence <= 2) {
+   246→          parts.push(`⚠️ رعایت ضعیف تمرین — حجم کمتر و تنوع بیشتر`);
+   247→        }
+   248→        if (latestCheckup.fatigueLevel && latestCheckup.fatigueLevel <= 2) {
+   249→          parts.push(`⚠️ خستگی بالا — حجم کمتر و استراحت بیشتر`);
+   250→        }
+   251→        if (latestCheckup.dietAdherence && latestCheckup.dietAdherence >= 4) {
+   252→          parts.push(`✅ رعایت عالی رژیم — کالری دقیق‌تر`);
+   253→        }
+   254→      }
+   255→      // ─── v53: خلاصهٔ بودجه‌دار پیشرفت واقعی کاربر (تغذیه/تمرین/وزن/استریک) ───
+   256→      // خواستهٔ مالک: هر چیزی که کاربر ثبت می‌کند به AI برنامه‌ساز برسد؛ ولی
+   257→      // خروجی سقف سخت ۱۵۰۰ کاراکتر دارد و با داینامیک-ایمپورت + try/catch دوتایی
+   258→      // تضمین می‌شود که هیچ خطایی هرگز تولید برنامه را نمی‌شکند.
+   259→      try {
+   260→        const { buildCompactProgressSummary } = await import("@/lib/fitness/sports-profile-context");
+   261→        const compact = await buildCompactProgressSummary(userId, { includeCheckups: false });
+   262→        if (compact) parts.push(compact);
+   263→      } catch (compactErr) {
+   264→        console.error("[program-generation] compact progress summary failed (skipped):", compactErr);
+   265→      }
+   266→      if (parts.length > 0) extras.renewalContext = parts.join("\n");
+   267→    }
+   268→  } catch (e) {
+   269→    console.error("[program-generation] failed to build renewalContext:", e);
+   270→  }
+   271→
+   272→  return extras;
+   273→}
+   274→
+   275→export interface StartGenerationResult {
+   276→  started: boolean;
+   277→  reason?:
+   278→    | "no_profile"
+   279→    | "prerequisites_incomplete"
+   280→    | "already_generating"
+   281→    | "already_has_fresh_plan"
+   282→    | "no_plan"
+   283→    | "daily_budget";
+   284→  blockingReason?: string | null;
+   285→}
+   286→
+   287→/**
+   288→ * شروع تولید برنامه در پس‌زمینه برای کاربر.
+   289→ *
+   290→ * پیش‌شرط‌ها:
+   291→ *  - اشتراک فعال یا pending (پلن مؤثر)
+   292→ *  - پروفایل آنبوردینگ موجود
+   293→ *  - همه پیش‌نیازها تعیین تکلیف شده باشند
+   294→ *  - هیچ تولید در حال اجرای تازه‌ای وجود نداشته باشد (جلوگیری از دوباره‌کاری)
+   295→ *
+   296→ * خروجی فوری برمی‌گرداند؛ تولید در پس‌زمینه ادامه می‌یابد.
+   297→ */
+   298→export async function startProgramGenerationInBackground(userId: string): Promise<StartGenerationResult> {
+   299→  // پلن مؤثر (active یا pending داخل پنجره)
+   300→  const dto = await buildUserDto(userId);
+   301→  const effectivePlan = (dto?.planName ?? null) as Plan | null;
+   302→  if (!effectivePlan) {
+   303→    return { started: false, reason: "no_plan" };
+   304→  }
+   305→
+   306→  const profile = await db.onboardingProfile.findUnique({ where: { userId } });
+   307→  if (!profile) {
+   308→    return { started: false, reason: "no_profile" };
+   309→  }
+   310→
+   311→  // پیش‌نیازها باید تعیین تکلیف شده باشند
+   312→  const prereqCheck = await checkPrerequisites(userId, effectivePlan);
+   313→  if (!prereqCheck.canGenerateProgram) {
+   314→    return { started: false, reason: "prerequisites_incomplete", blockingReason: prereqCheck.blockingReason };
+   315→  }
+   316→
+   317→  // ─── 🩹 v45 (باگ بحرانی مالک + نشتی اعتبار AI) — دو گارد سخت ───
+   318→  // ① سقف روزانه: حداکثر ۵ شروع تولید در ۲۴ ساعت برای هر کاربر — هر منبعی
+   319→  // (پرداخت، تحلیل ویدیو/خون، watchdog، سوئیپ، ادمین) از این سقف عبور
+   320→  // نمی‌کند؛ حلقه‌های بی‌پایان دیگر نمی‌توانند اعتبار AI را بسوزانند.
+   321→  // ② گارد برنامهٔ تازه: اگر آخرین درخواست ready است و برنامهٔ فعالِ
+   322→  // ساخته‌شده بعد از آن وجود دارد، تولید دوباره بی‌معنی است (قبلاً reason
+   323→  // «already_has_fresh_plan» در interface بود ولی هرگز برگردانده نمی‌شد و
+   324→  // همین حلقهٔ «هر ۳۰ دقیقه نوتیف برنامهٔ شما آماده شد» را ساخته بود).
+   325→  const DAY_MS = 24 * 60 * 60 * 1000;
+   326→  const dayAgo = new Date(Date.now() - DAY_MS);
+   327→  const recentStarts = await db.programRequest.count({
+   328→    where: { userId, createdAt: { gte: dayAgo } },
+   329→  });
+   330→  if (recentStarts >= 5) {
+   331→    console.warn(
+   332→      `[program-generation] daily budget exhausted for ${userId} (${recentStarts} starts/24h) — refusing`
+   333→    );
+   334→    return { started: false, reason: "daily_budget" };
+   335→  }
+   336→
+   337→  // جلوگیری از تولید همزمان: اگر آخرین درخواست «generating» و تازه است، دوباره شروع نکن
+   338→  // (پنجره ۲۰ دقیقه‌ای هم‌راستا با بازیابی درخواست‌های گیرکرده — M3)
+   339→  const latestReq = await db.programRequest.findFirst({
+   340→    where: { userId },
+   341→    orderBy: { createdAt: "desc" },
+   342→  });
+   343→  const stuckWindowAgo = new Date(Date.now() - STUCK_GENERATION_WINDOW_MS);
+   344→
+   345→  // 🩹 v45 — گارد برنامهٔ تازه (بخش ②): آخرین درخواست ready + برنامهٔ فعال
+   346→  // بعد از آن = کاربر برنامه را دارد؛ تولید مجدد فقط هزینهٔ AI + نوتیف تکراری
+   347→  if (latestReq && latestReq.status === "ready") {
+   348→    const freshPlan = await db.workoutPlan.findFirst({
+   349→      where: {
+   350→        userId,
+   351→        active: true,
+   352→        createdAt: { gte: latestReq.updatedAt },
+   353→      },
+   354→      select: { id: true },
+   355→    });
+   356→    if (freshPlan) {
+   357→      return { started: false, reason: "already_has_fresh_plan" };
+   358→    }
+   359→  }
+   360→
+   361→  // ─── Claim اتمیک (رفع TOCTOU) ───
+   362→  // قبلاً «خواندن وضعیت» و «نوشتن generating» دو مرحله جدا بودند؛ دو فراخوانی
+   363→  // همزمان (مثلاً verify + submit-body-analysis) هر دو از چک رد می‌شدند و
+   364→  // تولیدِ دوباره AI (هزینه دوبرابر + برنامه تکراری) شروع می‌شد.
+   365→  // حالا خودِ به‌روزرسانی شرطی است: فقط اگر درخواست در حال generatingِ تازه
+   366→  // نباشد، وضعیت به «generating» claim می‌شود — یک برنده، بقیه متوقف.
+   367→  let reqId: string;
+   368→  if (latestReq) {
+   369→    const claimed = await db.programRequest.updateMany({
+   370→      where: {
+   371→        id: latestReq.id,
+   372→        OR: [
+   373→          { status: { not: "generating" } },
+   374→          { updatedAt: { lte: stuckWindowAgo } }, // generatingِ گیرکرده → قابل claim مجدد
+   375→        ],
+   376→      },
+   377→      data: {
+   378→        status: "generating",
+   379→        // v38: شمارش تلاش + مهر زمانی — برای سوئیپ خودکار و نمایش به ادمین
+   380→        attempts: { increment: 1 },
+   381→        lastAttemptAt: new Date(),
+   382→      },
+   383→    });
+   384→    if (claimed.count === 0) {
+   385→      return { started: false, reason: "already_generating" };
+   386→    }
+   387→    reqId = latestReq.id;
+   388→  } else {
+   389→    // اولین درخواست — create می‌کند، سپس برای امنیت دوباره چک می‌کنیم که
+   390→    // فراخوانی همزمان دیگری در همان لحظه درخواست دیگری نساخته باشد.
+   391→    const created = await db.programRequest.create({
+   392→      data: {
+   393→        userId,
+   394→        plan: effectivePlan,
+   395→        billingPeriod: "monthly",
+   396→        status: "generating",
+   397→        attempts: 1,
+   398→        lastAttemptAt: new Date(),
+   399→      },
+   400→    });
+   401→    const concurrent = await db.programRequest.findFirst({
+   402→      where: {
+   403→        userId,
+   404→        status: "generating",
+   405→        id: { not: created.id },
+   406→        updatedAt: { gt: stuckWindowAgo },
+   407→      },
+   408→      orderBy: { createdAt: "asc" },
+   409→    });
+   410→    if (concurrent) {
+   411→      // این درخواستِ دومِ همزمان است → تولیدِ تکراری را لغو کن
+   412→      await db.programRequest.update({
+   413→        where: { id: created.id },
+   414→        data: { status: "failed" },
+   415→      }).catch(() => {});
+   416→      return { started: false, reason: "already_generating" };
+   417→    }
+   418→    reqId = created.id;
+   419→  }
+   420→
+   421→  // فعال‌سازی اشتراک pending — دوره ۴۵ روزه از همین لحظه شروع می‌شود،
+   422→  // مستقل از موفقیت AI (entitlement کاربر از دست نمی‌رود)
+   423→  try {
+   424→    const activated = await activatePendingSubscription(userId);
+   425→    if (activated) {
+   426→      console.log("[program-generation] pending subscription activated:", activated.id);
+   427→    }
+   428→  } catch (e) {
+   429→    console.error("[program-generation] failed to activate pending subscription:", e);
+   430→  }
+   431→
+   432→  // ─── تولید در پس‌زمینه (fire-and-forget) — v38 تاب‌آور ───
+   433→  // reqId از بلوک بالا (update/create) می‌آید — هرگز null نیست
+   434→  void (async () => {
+   435→    const startedAt = Date.now();
+   436→    let lastErrMsg = "";
+   437→    try {
+   438→      const [planData, extras] = await Promise.all([
+   439→        buildOnboardingData(userId),
+   440→        buildGenerationExtras(userId),
+   441→      ]);
+   442→      if (!planData) throw new Error("پروفایل آنبوردینگ یافت نشد");
+   443→
+   444→      // ─── v38: تمرین و غذا مستقل از هم تولید و ذخیره می‌شوند ───
+   445→      // قبلاً Promise.all بود: اگر غذایی موفق و تمرین ناموفق بود (یا برعکس)،
+   446→      // هر دو دور ریخته می‌شد و کاربر کاملاً بدون برنامه می‌ماند. حالا:
+   447→      // ① هر کدام موفق شد فوراً ذخیره می‌شود ② فقط سمتِ ناموفق یک‌بار دیگر
+   448→      // تلاش می‌شود ③ اگر یکی در نهایت موفق بود، کاربر حداقل آن را دارد و
+   449→      // سوئیپ خودکار فردای سمتِ جاافتاده را کامل می‌کند.
+   450→      const saveWorkout = async () => {
+   451→        const workout = await generateWorkoutPlan(planData, effectivePlan, extras);
+   452→        await db.workoutPlan.updateMany({ where: { userId }, data: { active: false } });
+   453→        await db.workoutPlan.create({
+   454→          data: { userId, content: JSON.stringify(workout), active: true },
+   455→        });
+   456→      };
+   457→      const saveMeal = async () => {
+   458→        const meal = await generateMealPlan(planData, effectivePlan, extras);
+   459→        await db.mealPlan.updateMany({ where: { userId }, data: { active: false } });
+   460→        await db.mealPlan.create({
+   461→          data: { userId, content: JSON.stringify(meal), totalCal: meal.totalCalories, active: true },
+   462→        });
+   463→      };
+   464→
+   465→      const [wRes, mRes] = await Promise.allSettled([saveWorkout(), saveMeal()]);
+   466→      // v38-fix: موفقیتِ «این چرخه» با نتیجهٔ راندها سنجیده می‌شود نه وجود
+   467→      // برنامهٔ فعال در DB — وگرنه برنامهٔ فعالِ دورهٔ قبلیِ کاربرِ تمدیدی
+   468→      // تولیدِ شکست‌خورده را «آماده» جعل می‌کرد (در تست E2E دیتابیس واقعی گرفته شد)
+   469→      let workoutOk = wRes.status === "fulfilled";
+   470→      let mealOk = mRes.status === "fulfilled";
+   471→      if (wRes.status === "rejected") {
+   472→        lastErrMsg = `تمرین: ${String((wRes.reason as Error)?.message || wRes.reason).slice(0, 250)}`;
+   473→        console.error("[program-generation] workout side failed (attempt 1):", wRes.reason);
+   474→      }
+   475→      if (mRes.status === "rejected") {
+   476→        lastErrMsg = `${lastErrMsg ? lastErrMsg + " | " : ""}غذا: ${String((mRes.reason as Error)?.message || mRes.reason).slice(0, 250)}`;
+   477→        console.error("[program-generation] meal side failed (attempt 1):", mRes.reason);
+   478→      }
+   479→
+   480→      // فقط سمت‌های ناموفق → یک راند تلاش مجدد (هر سمت مستقل)
+   481→      const round2: Array<{ name: string; run: Promise<void> }> = [];
+   482→      if (!workoutOk) round2.push({ name: "workout", run: saveWorkout() });
+   483→      if (!mealOk) round2.push({ name: "meal", run: saveMeal() });
+   484→      if (round2.length > 0) {
+   485→        const r2 = await Promise.allSettled(round2.map((r) => r.run));
+   486→        r2.forEach((res, i) => {
+   487→          if (res.status === "rejected") {
+   488→            console.error(`[program-generation] ${round2[i].name} side failed (attempt 2):`, res.reason);
+   489→          } else {
+   490→            if (round2[i].name === "workout") workoutOk = true;
+   491→            else mealOk = true;
+   492→            console.log(`[program-generation] ${round2[i].name} side recovered on attempt 2`);
+   493→          }
+   494→        });
+   495→      }
+   496→
+   497→      if (workoutOk && mealOk) {
+   498→        if (reqId) {
+   499→          await db.programRequest.update({
+   500→            where: { id: reqId },
+   501→            data: { status: "ready", lastError: null },
+   502→          });
+   503→        }
+   504→        // 🩹 v45 (باگ بحرانی مالک): نوتیف «برنامهٔ شما آماده شد» حداکثر یک‌بار
+   505→        // در ۲۴ ساعت — تولیدکننده‌های مختلف (پرداخت، سوئیپ، watchdog، ادمین)
+   506→        // هرکدام مستقیم نوتیف می‌ساختند و هیچ dedupe مشترکی وجود نداشت؛
+   507→        // همین پیام هر ۳۰ دقیقه برای مالک تکرار شد.
+   508→        const DAY_MS = 24 * 60 * 60 * 1000;
+   509→        const recentReadyNotif = await db.notification.findFirst({
+   510→          where: {
+   511→            userId,
+   512→            type: "achievement",
+   513→            title: "برنامه شما آماده شد! 🎯",
+   514→            createdAt: { gte: new Date(Date.now() - DAY_MS) },
+   515→          },
+   516→          select: { id: true },
+   517→        });
+   518→        if (!recentReadyNotif) {
+   519→          await createNotification(
+   520→            userId,
+   521→            "achievement",
+   522→            "برنامه شما آماده شد! 🎯",
+   523→            "برنامه تمرینی و غذایی شخصی‌سازی‌شده شما توسط فیتاپ هوشمند ساخته شد. از بخش «تمرینات» و «تغذیه» مشاهده کنید.",
+   524→            "?tab=programs"
+   525→          );
+   526→        }
+   527→        // v32: پیامک همزمان «برنامه آماده شد» (قالب 663678)
+   528→        // v66: دداپ بر چرخهٔ تولید (reqId) — هر برنامهٔ جدید یک پیامک
+   529→        notifyProgramReadySms(userId, reqId ?? undefined);
+   530→        console.log(`[program-generation] completed for ${userId} in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+   531→        return;
+   532→      }
+   533→
+   534→      // سمتِ جاافتاده را دقیق گزارش کن
+   535→      const missing: string[] = [];
+   536→      if (!workoutOk) missing.push("برنامه تمرینی");
+   537→      if (!mealOk) missing.push("برنامه غذایی");
+   538→      throw new Error(
+   539→        `تولید ${missing.join(" و ")} پس از ۲ تلاش ناموفق بود${lastErrMsg ? ` — ${lastErrMsg}` : ""}`
+   540→      );
+   541→    } catch (err) {
+   542→      const errMsg = String((err as Error)?.message || err).slice(0, 480) || "خطای ناشناخته";
+   543→      console.error("[program-generation] background generation failed:", err);
+   544→      try {
+   545→        if (reqId) {
+   546→          await db.programRequest.update({
+   547→            where: { id: reqId },
+   548→            data: { status: "failed", lastError: errMsg },
+   549→          });
+   550→        }
+   551→      } catch {}
+   552→      try {
+   553→        await createNotification(
+   554→          userId,
+   555→          "system",
+   556→          "خطا در تولید برنامه — از تب برنامه‌ها دوباره تلاش کنید ⚠️",
+   557→          "تولید برنامه ورزشی و غذایی شما با خطا مواجه شد. لطفاً از بخش «برنامه‌ها» دوباره تلاش کنید یا با پشتیبانی در ارتباط باشید.",
+   558→          "?tab=programs",
+   559→          { from: "program-generation", action: "plan_generation_failed" }
+   560→        );
+   561→      } catch {}
+   562→    }
+   563→  })();
+   564→
+   565→  return { started: true };
+   566→}
+   567→
+   568→/** پیام فارسی استاندارد «در حال آماده‌سازی» — برای پاسخ API‌ها */
+   569→export const PROGRAM_PREPARING_MESSAGE =
+   570→  "برنامه شما در حال آماده‌سازی است — پس از آماده‌سازی به شما اطلاع می‌دهیم.";
+   571→
+   572→/**
+   573→ * پنجره «تولید گیرکرده» (M3) — باید از بدترین حالت تولید بزرگ‌تر باشد تا
+   574→ * تولیدِ هنوز-در-حال-اجرا اشتباهی «یتیم» تشخیص داده نشود و تولید موازی دوباره
+   575→ * شروع نشود (هزینه ۲× AI).
+   576→ * v38: زنجیره حالا فال‌بک مدل دوم هم دارد + راند دومِ سمتِ ناموفق →
+   577→ * بدترین حالت: زنجیرهٔ ۱۸دقیقه‌ای + راند دوم تا ۱۸ دقیقه ≈ ۳۶ دقیقه
+   578→ * → پنجره ۵۰ دقیقه.
+   579→ */
+   580→const STUCK_GENERATION_WINDOW_MS = 50 * 60 * 1000;
+   581→
+   582→/**
+   583→ * Watchdog خودترمیم — بازیابی درخواست‌های «generating» گیرکرده (یتیم‌شده).
+   584→ *
+   585→ * چرا: تولید برنامه fire-and-forget است. اگر پروسه سرور وسط تولید restart شود
+   586→ * (dev-mode memory restart، crash، دیپلوی)، پروسه پس‌زمینه می‌میرد و
+   587→ * ProgramRequest برای همیشه «generating» می‌ماند.
+   588→ *
+   589→ * رفتار:
+   590→ *  - درخواست گیرکرده (>۲۰ دقیقه بدون به‌روزرسانی) پیدا می‌شود
+   591→ *  - اگر برنامه‌ای بعد از شروع همین چرخه تولید ذخیره شده باشد → ready
+   592→ *    (تولید کامل شده ولی آپدیت status به‌خاطر مرگ پروسه نرسیده)
+   593→ *  - اگر برنامه‌ای نیست و autoRetryCount < 1:
+   594→ *      → یک‌بار به‌صورت خودکار تولید دوباره شروع می‌شود (بدون دخالت کاربر)
+   595→ *  - وگرنه: failed (کاربر از تب برنامه‌ها دکمه retry را می‌زند)
+   596→ *
+   597→ * این تابع از endpointهایی صدا زده می‌شود که فرانت‌اند موقع generating به آن‌ها
+   598→ * poll می‌کند (coach/plan GET و program-history GET) — یعنی watchdog همان‌جا
+   599→ * فعال می‌شود که کاربر منتظر برنامه است.
+   600→ */
+   601→export async function recoverStuckGenerations(userId: string): Promise<void> {
+   602→  try {
+   603→    const stuckWindowAgo = new Date(Date.now() - STUCK_GENERATION_WINDOW_MS);
+   604→    const stuck = await db.programRequest.findFirst({
+   605→      where: { userId, status: "generating", updatedAt: { lt: stuckWindowAgo } },
+   606→      orderBy: { createdAt: "desc" },
+   607→    });
+   608→    if (!stuck) return;
+   609→
+   610→    // آیا برنامه‌ای در این مدت ذخیره شده؟ (تولید ممکن است کامل شده باشد ولی
+   611→    // آپدیت status به‌خاطر مرگ پروسه نرسیده باشد)
+   612→    // ─── M2: فقط برنامه‌ای که «بعد از شروع همین چرخه تولید» ساخته شده دلیل
+   613→    // آماده‌بودن است — updatedAt همان لحظه‌ای است که وضعیت generating شده؛
+   614→    // برنامه دوره قبلی نباید تولید گیرکردهِ کاربر تمدیدی را ready کند.
+   615→    const hasPlan = await db.workoutPlan.findFirst({
+   616→      where: { userId, createdAt: { gte: stuck.updatedAt } },
+   617→      orderBy: { createdAt: "desc" },
+   618→      select: { id: true },
+   619→    });
+   620→    if (hasPlan) {
+   621→      // برنامه موجود است — وضعیت را ready کن (نه failed!)
+   622→      await db.programRequest.update({
+   623→        where: { id: stuck.id },
+   624→        data: { status: "ready" },
+   625→      });
+   626→      // v37: نوتیف همزمان (قبلاً فقط پیامک می‌رفت — درخواست مالک: پیامک ↔ نوتیف جفت باشند)
+   627→      // v63 — dedupe عنوان‌محورِ ۲۴ساعته (هم‌راستا با مسیرهای دیگر) + متنِ یکسان با
+   628→      // مسیر تولید عادی. قبلاً متنِ متفاوت بود و dedupeِ (عنوان+متن) آن را رد نمی‌کرد
+   629→      // → کاربر هم نوتیف «ساخته شد» و هم «آماده است» می‌گرفت (گزارش نوتیف ۵تایی).
+   630→      const alreadyNotified = await db.notification.findFirst({
+   631→        where: {
+   632→          userId,
+   633→          type: "achievement",
+   634→          title: "برنامه شما آماده شد! 🎯",
+   635→          createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+   636→        },
+   637→        select: { id: true },
+   638→      });
+   639→      if (!alreadyNotified) {
+   640→        await createNotification(
+   641→          userId,
+   642→          "achievement",
+   643→          "برنامه شما آماده شد! 🎯",
+   644→          "برنامه تمرینی و غذایی شخصی‌سازی‌شده شما توسط فیتاپ هوشمند ساخته شد. از بخش «تمرینات» و «تغذیه» مشاهده کنید.",
+   645→          "?tab=programs"
+   646→        );
+   647→      }
+   648→      // v32: پیامک «برنامه آماده شد» (قالب 663678)
+   649→      // v66: دداپ بر چرخهٔ بازیابی‌شده (stuck.id) — دورهٔ بعدی هم پیامک می‌گیرد
+   650→      notifyProgramReadySms(userId, stuck.id);
+   651→      console.log("[watchdog] recovered orphaned generating → ready (plan exists):", stuck.id);
+   652→      return;
+   653→    }
+   654→
+   655→    // برنامه‌ای نیست — اگر تابه‌حال خودترمیم نشده، یک‌بار دوباره شروع کن
+   656→    if (stuck.autoRetryCount < 1) {
+   657→      await db.programRequest.update({
+   658→        where: { id: stuck.id },
+   659→        data: { status: "failed", autoRetryCount: { increment: 1 } },
+   660→      });
+   661→      console.log("[watchdog] auto-retrying orphaned generation:", stuck.id);
+   662→      const result = await startProgramGenerationInBackground(userId);
+   663→      if (result.started) {
+   664→        console.log("[watchdog] auto-retry started for:", userId);
+   665→      } else {
+   666→        console.log("[watchdog] auto-retry not started:", result.reason);
+   667→      }
+   668→      return;
+   669→    }
+   670→
+   671→    // قبلاً یک‌بار خودترمیم شده و باز گیر کرده — failed بماند (کاربر دستی retry می‌کند)
+   672→    await db.programRequest.update({
+   673→      where: { id: stuck.id },
+   674→      data: { status: "failed" },
+   675→    });
+   676→    console.log("[watchdog] marked stuck generation as failed (retry budget exhausted):", stuck.id);
+   677→  } catch (e) {
+   678→    // watchdog هرگز نباید مسیر caller را بشکند
+   679→    console.error("[watchdog] recoverStuckGenerations error:", e);
+   680→  }
+   681→}
+   682→
+   683→/**
+   684→ * v38 — سوئیپ خودکار درخواست‌های «ناموفق» (درخواست مالک: «به هیچ وجه نباید
+   685→ * کاربر بدون برنامه بماند»).
+   686→ *
+   687→ * قبلاً درخواست failed برای همیشه failed می‌ماند مگر کاربر/ادمین دستی retry
+   688→ * می‌زد. حالا کرون رفتاری (هر ۳۰ دقیقه) این سوئیپ را صدا می‌زند:
+   689→ *   - درخواست‌های failed با attempts < FAILED_AUTO_RETRY_MAX (۳)
+   690→ *   - که حداقل FAILED_RETRY_GAP_MS (۱۵ دقیقه) از آخرین تلاش گذشته باشد
+   691→ *     (ضد حلقهٔ سریع روی خطای دائمی)
+   692→ * دوباره تولید شروع می‌شود (startProgramGenerationInBackground خودش claim
+   693→ * اتمیک انجام می‌دهد؛ درخواست failed قابل claim است).
+   694→ *
+   695→ * خروجی: تعداد درخواست‌هایی که دوباره صف شدند (برای summary کرون).
+   696→ */
+   697→const FAILED_AUTO_RETRY_MAX = 3;
+   698→const FAILED_RETRY_GAP_MS = 15 * 60 * 1000;
+   699→
+   700→// ─── 🩹 v46 — بودجهٔ روزانهٔ سوئیپ در سطح کل سیستم (لایهٔ آخر ضد نشتی AI) ───
+   701→// حتی با همهٔ گاردهای v45، اگر روزی دیتای خراب جدید یا مسیر دورزدنی پیدا شود،
+   702→// این بودجه در-حافظه حداکثر سوئیپ‌های مجاز در شبانه‌روز را محدود می‌کند.
+   703→// هر تولید برنامهٔ کامل ~۵۰هزار توکن گران است؛ سقف ۶ در ۲۴h یعنی بدترین-case
+   704→// نشتی از مسیر سوئیپ ≈ ۳۰۰K توکن/روز — محدود و قابل‌قبول، نه ابدی.
+   705→const SWEEP_DAILY_REQUEUE_MAX = 6;
+   706→const sweepBudget = { date: "", count: 0 };
+   707→
+   708→function tryConsumeSweepBudget(): boolean {
+   709→  const today = new Date().toISOString().slice(0, 10);
+   710→  if (sweepBudget.date !== today) {
+   711→    sweepBudget.date = today;
+   712→    sweepBudget.count = 0;
+   713→  }
+   714→  if (sweepBudget.count >= SWEEP_DAILY_REQUEUE_MAX) {
+   715→    console.warn(
+   716→      `[failed-recovery] daily sweep budget exhausted (${SWEEP_DAILY_REQUEUE_MAX}/24h) — skipping requeue`
+   717→    );
+   718→    return false;
+   719→  }
+   720→  sweepBudget.count++;
+   721→  return true;
+   722→}
+   723→
+   724→export async function recoverFailedGenerations(limit = 3): Promise<number> {
+   725→  try {
+   726→    const gapAgo = new Date(Date.now() - FAILED_RETRY_GAP_MS);
+   727→    const failedRequests = await db.programRequest.findMany({
+   728→      where: {
+   729→        status: "failed",
+   730→        attempts: { lt: FAILED_AUTO_RETRY_MAX },
+   731→        updatedAt: { lt: gapAgo },
+   732→      },
+   733→      orderBy: { updatedAt: "asc" },
+   734→      take: limit,
+   735→      select: { id: true, userId: true, plan: true, createdAt: true, updatedAt: true },
+   736→    });
+   737→
+   738→    let requeued = 0;
+   739→    for (const req of failedRequests) {
+   740→      // کاربر نبلاک و دارای پروفایل باشد (خطای دائمی ورودی را دور بزن)
+   741→      const user = await db.user.findUnique({
+   742→        where: { id: req.userId },
+   743→        select: { isBlocked: true },
+   744→      });
+   745→      if (!user || user.isBlocked) continue;
+   746→
+   747→      // ─── 🩹 v45 — ریشه باگ بحرانی مالک (نوتیف هر ۳۰ دقیقه + سوختن AI) ───
+   748→      // قبلاً این سوئیپ رکورد قدیمی failed را انتخاب می‌کرد ولی
+   749→      // startProgramGenerationInBackground روی «آخرین» درخواست کاربر عمل
+   750→      // می‌کرد (که معمولاً ready بود) → هر ۳۰ دقیقه: claim برنامهٔ سالم →
+   751→      // تولید کامل AI (۴ فراخوانی مدل گران) → نوتیف تکراری → رکورد قدیمی
+   752→      // همچنان failed/attempts=0 می‌ماند → حلقهٔ ابدی.
+   753→      // حالا:
+   754→      //   ① فقط اگر همین رکورد «آخرین» درخواست کاربر باشد صف‌مجدد می‌شود؛
+   755→      //   ② رکوردهای قدیمی‌تر terminal می‌شوند (attempts=MAX) تا دیگر
+   756→      //      هرگز انتخاب نشوند — دیتای خرابِ موجود هم خودترمیم می‌شود؛
+   757→      //   ③ اگر بعد از ساخت همین رکوردِ failed برنامهٔ فعال ذخیره شده
+   758→      //      باشد، کاربر برنامه را دارد → تولید تکرار ممنوع، terminal.
+   759→      const latest = await db.programRequest.findFirst({
+   760→        where: { userId: req.userId },
+   761→        orderBy: { createdAt: "desc" },
+   762→        select: { id: true },
+   763→      });
+   764→      if (!latest || latest.id !== req.id) {
+   765→        await db.programRequest
+   766→          .update({
+   767→            where: { id: req.id },
+   768→            data: {
+   769→              attempts: FAILED_AUTO_RETRY_MAX,
+   770→              lastError: "v45 sweep: superseded by a newer request — terminal",
+   771→            },
+   772→          })
+   773→          .catch(() => {});
+   774→        console.log(
+   775→          `[failed-recovery] ${req.id} is stale (latest=${latest?.id ?? "none"}) → terminalized, will not requeue`
+   776→        );
+   777→        continue;
+   778→      }
+   779→      const planAfterFailure = await db.workoutPlan.findFirst({
+   780→        where: {
+   781→          userId: req.userId,
+   782→          active: true,
+   783→          createdAt: { gte: req.createdAt },
+   784→        },
+   785→        select: { id: true },
+   786→      });
+   787→      if (planAfterFailure) {
+   788→        await db.programRequest
+   789→          .update({
+   790→            where: { id: req.id },
+   791→            data: {
+   792→              attempts: FAILED_AUTO_RETRY_MAX,
+   793→              status: "ready",
+   794→              lastError: null,
+   795→            },
+   796→          })
+   797→          .catch(() => {});
+   798→        console.log(
+   799→          `[failed-recovery] ${req.id} already has a plan created after it → marked ready (no duplicate AI generation)`
+   800→        );
+   801→        continue;
+   802→      }
+   803→
+   804→      const result: StartGenerationResult = tryConsumeSweepBudget()
+   805→        ? await startProgramGenerationInBackground(req.userId)
+   806→        : { started: false, reason: "daily_budget" };
+   807→      if (result.started) {
+   808→        requeued++;
+   809→        console.log(
+   810→          `[failed-recovery] requeued failed generation for user ${req.userId} (request ${req.id})`
+   811→        );
+   812→      } else {
+   813→        console.log(
+   814→          `[failed-recovery] could not requeue ${req.id}: ${result.reason}${result.blockingReason ? ` — ${result.blockingReason}` : ""}`
+   815→        );
+   816→      }
+   817→    }
+   818→    return requeued;
+   819→  } catch (e) {
+   820→    console.error("[failed-recovery] recoverFailedGenerations error:", e);
+   821→    return 0;
+   822→  }
+   823→}
+   824→

@@ -1,0 +1,832 @@
+     1→"use client";
+     2→
+     3→import { recoverPendingPayments } from "@/lib/fitness/recover-payments-client";
+     4→import { useState, useEffect, useRef } from "react";
+     5→import { motion, AnimatePresence } from "framer-motion";
+     6→import {
+     7→  Dumbbell,
+     8→  Phone,
+     9→  ShieldCheck,
+    10→  ChevronLeft,
+    11→  RefreshCw,
+    12→  MessageSquare,
+    13→  Timer,
+    14→} from "lucide-react";
+    15→import { Input } from "@/components/ui/input";
+    16→import { Label } from "@/components/ui/label";
+    17→// ⚠️ InputOTP (کتابخانه input-otp) عمداً استفاده نمی‌شود: input واقعی آن کتابخانه
+    18→// یک proxy نامرئی است و Android autofill/Gboard/WebOTP نمی‌توانند فیلد مخفی را
+    19→// هدف بگیرند → کد اتو-پر نمی‌شد و پیشنهاد کد بالای کیبورد هم نمی‌آمد.
+    20→// (فایل src/components/ui/input-otp.tsx دست‌نخورده ماند — فقط این import حذف شد.)
+    21→import { useAppStore } from "@/lib/fitness/store";
+    22→
+    23→import { toast } from "sonner";
+    24→import { replaceScreen } from "@/lib/fitness/navigation";
+    25→import { startNativeOtpRetriever } from "@/lib/fitness/app-bridge";
+    26→
+    27→type Step = "mobile" | "otp";
+    28→
+    29→const RESEND_COOLDOWN_SEC = 90;
+    30→// اعتبار پیش‌فرض کد (ثانیه) — سرور expiresIn می‌فرستد؛ این fallback است
+    31→const OTP_VALIDITY_FALLBACK_SEC = 600;
+    32→
+    33→// ۰۹:۵۹ → "۹:۵۹" فارسی — شمارش معکوس اعتبار کد
+    34→function formatCountdown(totalSec: number): string {
+    35→  const m = Math.floor(totalSec / 60);
+    36→  const s = totalSec % 60;
+    37→  return `${m}:${String(s).padStart(2, "0")}`;
+    38→}
+    39→
+    40→// FIX: تبدیل ارقام فارسی (۰-۹) و عربی (٠-٩) به لاتین قبل از فیلتر.
+    41→// regex \d فقط ارقام ASCII را می‌گیرد و قبلاً ارقام فارسی (کیبورد فارسی)
+    42→// بی‌صدا حذف می‌شدند — کاربر نمی‌توانست شماره/کد را تایپ کند.
+    43→function normalizeDigits(input: string): string {
+    44→  return input
+    45→    .replace(/[\u06F0-\u06F9]/g, (d) => String(d.charCodeAt(0) - 0x06f0)) // ۰-۹
+    46→    .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660)); // ٠-٩
+    47→}
+    48→
+    49→// استخراج کد OTP از هر ورودی خام (تایپ، پیست، WebOTP، autofill):
+    50→// ارقام فارسی/عربی → لاتین، حذف غیررقمی؛ اگر بیش از ۴ رقم بود «آخرین ۴ رقم» —
+    51→// چون در متن پیامک (فرمت @دامنه #کد) کد در انتهاست.
+    52→function extractOtpDigits(raw: string): string {
+    53→  const digits = normalizeDigits(String(raw ?? "")).replace(/\D/g, "");
+    54→  return digits.length > 4 ? digits.slice(-4) : digits;
+    55→}
+    56→
+    57→// Validate Iranian mobile format (09XXXXXXXXX)
+    58→function isValidIranMobile(mobile: string): boolean {
+    59→  return /^09\d{9}$/.test(mobile.replace(/\s/g, ""));
+    60→}
+    61→
+    62→export function AuthScreen() {
+    63→  const { setUser, setScreen, setOverlay } = useAppStore();
+    64→
+    65→  // ---- State ----
+    66→  const [step, setStep] = useState<Step>("mobile");
+    67→  const [mobile, setMobile] = useState("");
+    68→  const [code, setCode] = useState("");
+    69→  const [loading, setLoading] = useState(false);
+    70→  const [sending, setSending] = useState(false);
+    71→  const [error, setError] = useState("");
+    72→  const [resendIn, setResendIn] = useState(0);
+    73→  // ── شمارش معکوس «اعتبار کد» ──
+    74→  // مشکل گزارش‌شده کاربران: «پیامک بعد از تموم شدن زمان میاد» — تایمر قبلی فقط
+    75→  // مال «ارسال مجدد» بود (۶۰ ثانیه) و کاربر فکر می‌کرد کد بعدش بی‌اعتبار است؛
+    76→  // پیامک می‌رسید، کد را می‌زد و (قبل از این فیکس) چون ریسند کرده بود کد اول
+    77→  // باطل شده بود. حالا: اعتبار واقعی (۱۰ دقیقه) شمرده و نمایش داده می‌شود تا
+    78→  // کاربر بداند پیامک دیررسیده هم هنوز معتبر است و شتاب‌زده ریسند نکند.
+    79→  // null = هنوز کدی نفرستاده‌ایم/نمی‌دانیم → چیزی نمایش نده؛ ۰ = واقعاً منقضی.
+    80→  const [validityIn, setValidityIn] = useState<number | null>(null);
+    81→  // شمارندهٔ «دورِ ارسال کد» — بعد از هر ارسال/ارسال‌مجدد موفق +۱ می‌شود تا
+    82→  // listener وب‌OTP خاتمه یافته (abort) و برای پیامک جدید دوباره arm شود.
+    83→  const [otpNonce, setOtpNonce] = useState(0);
+    84→  // ref مستقیم روی input واقعی کد — هدف فوکوس بعد از ارسال/ریسند کد
+    85→  const otpInputRef = useRef<HTMLInputElement | null>(null);
+    86→
+    87→  // ⛔ کارت «ورود خودکار با پیامک» و پل requestSmsAutoRead حذف شدند.
+    88→  // علت ریشه‌ای: پرمیشن RECEIVE_SMS از اندروید ۱۳+ برای اپ‌های خارج از گوگل‌پلی
+    89→  // «محدود» است؛ سیستم اجازهٔ اعطا را می‌بندد و دیالوگ ترسناک
+    90→  // «App was denied access» نشان می‌داد (درخواست مالک برای حذف ریشه‌ای).
+    91→  // ورود خودکار کد حالا بدون هیچ پرمیشنی:
+    92→  // ۱) ورودی کد autoComplete="one-time-code" دارد → پیشنهاد سیستم/کیبورد
+    93→  // ۲) اپ در onResume کلیپ‌بورد را چک می‌کند و کد کپی‌شده را اتو-درج می‌کند
+    94→
+    95→  // NOTE: The "new terms" modal is rendered globally by `GlobalNewTermsModal`
+    96→  // (mounted in layout.tsx) whenever the `termsUpdateRequired` flag is set in
+    97→  // the store. The auth screen does NOT need to manage its own modal — the
+    98→  // global one overlays whatever screen the user is on (including this one).
+    99→
+   100→  // ---- Resend cooldown ticker ----
+   101→  useEffect(() => {
+   102→    if (resendIn <= 0) return;
+   103→    const t = setTimeout(() => setResendIn((v) => Math.max(0, v - 1)), 1000);
+   104→    return () => clearTimeout(t);
+   105→  }, [resendIn]);
+   106→
+   107→  // ---- Code validity countdown ticker ----
+   108→  useEffect(() => {
+   109→    if (validityIn == null || validityIn <= 0) return;
+   110→    const t = setTimeout(() => setValidityIn((v) => (v == null ? null : Math.max(0, v - 1))), 1000);
+   111→    return () => clearTimeout(t);
+   112→  }, [validityIn]);
+   113→
+   114→  // ---- Auto-focus OTP input when entering step 2 ----
+   115→  // بعد از ارسال کد (و ریسند) فوکوس روی خودِ فیلد کد می‌رود — کیبورد باز می‌شود
+   116→  // و پیشنهاد one-time-code بالای کیبورد ظاهر می‌شود.
+   117→  useEffect(() => {
+   118→    if (step === "otp") {
+   119→      // small delay to ensure DOM is ready
+   120→      const t = setTimeout(() => {
+   121→        otpInputRef.current?.focus();
+   122→      }, 80);
+   123→      return () => clearTimeout(t);
+   124→    }
+   125→  }, [step]);
+   126→
+   127→  // ---- FIX (v50): کیبورد موبایل نباید فرم/فیلد کد را بپوشاند ----
+   128→  // گزارش مالک: «وقتی سایت از اینستاگرام باز می‌شود و روی ورودی شماره موبایل
+   129→  // می‌زنی، با باز شدن کیبورد صفحه به بالا نمی‌رود و قسمت وارد کردن کد پشت
+   130→  // کیبورد می‌ماند.» ریشه: مرورگرهای موبایل/درون‌برنامه‌ای به‌طور پیش‌فرض
+   131→  // layout viewport را هنگام کیبورد تغییر نمی‌دهند (resizes-visual) و صفحهٔ
+   132→  // ثابت min-h-screen با overflow-hidden هیچ فضای اسکرولی برای بالا آمدن ندارد.
+   133→  // راه‌حل سه‌لایه (مکمل interactiveWidget در layout.tsx):
+   134→  //  ۱) ارتفاع ریشه = ارتفاع لحظه‌ای visualViewport (کیبورد باز → صفحه کوتاه)
+   135→  //  ۲) ناحیهٔ محتوایی overflow-y-auto (هدر جمع می‌شود، فرم در دسترس می‌ماند)
+   136→  //  ۳) در resize، ورودیِ فعال با scrollIntoView وسط ناحیهٔ دیدنی می‌آید
+   137→  const [vvHeight, setVvHeight] = useState<number | null>(null);
+   138→
+   139→  useEffect(() => {
+   140→    const vv = window.visualViewport;
+   141→    if (!vv) return;
+   142→    let timer = 0;
+   143→    const onResize = () => {
+   144→      setVvHeight(vv.height);
+   145→      // ورودی فعال را وسط ناحیهٔ دیدنی بیاور (تأخیر برای جاافتادن کیبورد)
+   146→      window.clearTimeout(timer);
+   147→      timer = window.setTimeout(() => {
+   148→        try {
+   149→          const el = document.activeElement;
+   150→          if (el instanceof HTMLElement && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
+   151→            el.scrollIntoView({ block: "center", behavior: "smooth" });
+   152→          }
+   153→        } catch {
+   154→          // ignore
+   155→        }
+   156→      }, 150);
+   157→    };
+   158→    setVvHeight(vv.height);
+   159→    vv.addEventListener("resize", onResize);
+   160→    return () => {
+   161→      window.clearTimeout(timer);
+   162→      vv.removeEventListener("resize", onResize);
+   163→    };
+   164→  }, []);
+   165→
+   166→  // ---- Auto-fill OTP via Web OTP API (Android Chrome) ----
+   167→  // و autocomplete="one-time-code" برای iOS/Android system autofill
+   168→  // چرخهٔ حیات listener (گاردهای abort):
+   169→  // • خروج از مرحلهٔ کد (step تغییر کند) → cleanup → abort ✓
+   170→  // • unmount کامپوننت → cleanup → abort ✓
+   171→  // • ارسال مجدد کد → otpNonce عوض می‌شود → cleanup قبلی + arm تازه ✓
+   172→  //   (listener قبلی یا هنوز منتظر است که abort می‌شود، یا resolve شده که
+   173→  //   abort دیگر اثری ندارد — در هر دو حالت promise معلق‌ای نمی‌ماند.)
+   174→  useEffect(() => {
+   175→    if (step !== "otp") return;
+   176→    if (typeof navigator === "undefined") return;
+   177→
+   178→    // Web OTP API — فقط در Android Chrome
+   179→    // بررسی دقیق‌تر: بعضی مرورگرها "credentials" دارند اما "OTPCredential" ندارند
+   180→    if ("credentials" in navigator && (window as any).OTPCredential) {
+   181→      const abortController = new AbortController();
+   182→      const timeout = setTimeout(() => abortController.abort(), 120000); // 2min timeout
+   183→
+   184→      (navigator as any).credentials
+   185→        .get({
+   186→          otp: { transport: ["sms"] },
+   187→          signal: abortController.signal,
+   188→        })
+   189→        .then((otp: any) => {
+   190→          clearTimeout(timeout);
+   191→          if (otp?.code) {
+   192→            // نرمال‌سازی ارقام (فارسی/عربی → لاتین)؛ اگر طولانی‌تر بود،
+   193→            // آخرین ۴ رقم (فرمت @origin #code — کد در انتهاست)
+   194→            const cleanedCode = extractOtpDigits(otp.code);
+   195→            if (cleanedCode.length === 4) {
+   196→              setCode(cleanedCode);
+   197→            }
+   198→          }
+   199→        })
+   200→        .catch(() => {
+   201→          clearTimeout(timeout);
+   202→          // User dismissed, timed out, or not supported — ignore
+   203→        });
+   204→
+   205→      return () => {
+   206→        clearTimeout(timeout);
+   207→        abortController.abort();
+   208→      };
+   209→    }
+   210→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   211→  }, [step, otpNonce]);
+   212→
+   213→  // ---- درج خودکار کد از اپ اندروید (SMS Retriever + کلیپ‌بورد — بدون پرمیشن) ----
+   214→  // اپ کد را از دو مسیر بدون پرمیشن می‌گیرد و از طریق window.__fitupNativeSmsCode
+   215→  // به سایت می‌دهد: ۱) SMS Retriever رسمی گوگل (پیامک با هش اپ امضا شده باشد —
+   216→  // ارسال خام sms.ir با SMSIR_LINE)، ۲) کلیپ‌بورد در onResume.
+   217→  // v55 — هندلر مقاوم‌تر شد: فقط کدِ خالص نیست؛ متن کامل پیامک هم پذیرفته
+   218→  // می‌شود (استخراج آخرین گروه مستقل ۴-رقمی) — بعد از درج، auto-verify
+   219→  // (اثر پایین) بلافاصله وارد پنل می‌کند. خواندن مستقیم پیامک (RECEIVE_SMS)
+   220→  // عمداً حذف شد — پرمیشن محدودِ اندروید ۱۳+ بود و دیالوگ ترسناک می‌آورد.
+   221→  useEffect(() => {
+   222→    if (step !== "otp") return;
+   223→    (window as any).__fitupNativeSmsCode = (raw: unknown) => {
+   224→      try {
+   225→        const text = normalizeDigits(String(raw ?? ""));
+   226→        // ۱) کد خالص ۴-رقمی
+   227→        if (/^\d{4}$/.test(text)) {
+   228→          setCode(text);
+   229→          setError("");
+   230→          return;
+   231→        }
+   232→        // ۲) گروه مستقل ۴-رقمی داخل متن کامل (متن پیامک/کپی کلیپ‌بورد)
+   233→        const matches = text.match(/(?<!\d)\d{4}(?!\d)/g);
+   234→        if (matches && matches.length >= 1) {
+   235→          setCode(matches[matches.length - 1]);
+   236→          setError("");
+   237→        }
+   238→      } catch {}
+   239→    };
+   240→    // v31: فعال‌سازی SMS Retriever نیتیو (بدون پرمیشن) — وقتی سرور پیامک را
+   241→    // با هش اپ امضا کند (ارسال خام sms.ir)، کد بدون کاربر اتو-درج می‌شود
+   242→    startNativeOtpRetriever();
+   243→    return () => {
+   244→      try {
+   245→        delete (window as any).__fitupNativeSmsCode;
+   246→      } catch {}
+   247→    };
+   248→  }, [step]);
+   249→
+   250→  // ---- v56: دکمهٔ «جای‌گذاری کد از کلیپ‌بورد» حذف شد (درخواست مالک) ----
+   251→  // گزارش مالک: «هیچ دکمهٔ اضافی نمی‌خوام — کد باید خودکار از پیامک خوانده بشه».
+   252→  // مسیرهای اتو-فیل بدون هیچ دکمه‌ای فعال‌اند: SMS Retriever نیتیو (اپ)،
+   253→  // WebOTP + Gboard (کروم) و autocomplete="one-time-code" (iOS). پیست دستی
+   254→  // داخل خود input هم همچنان کار می‌کند (onPaste زیر).
+   255→
+   256→  // ---- Auto-verify when code is complete (4 digits) ----
+   257→  useEffect(() => {
+   258→    if (step === "otp" && code.length === 4 && !loading) {
+   259→      // Small delay to ensure UI updates before verification
+   260→      const t = setTimeout(() => handleVerify(), 200);
+   261→      return () => clearTimeout(t);
+   262→    }
+   263→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   264→  }, [code, step]);
+   265→
+   266→  // ---- Send OTP ----
+   267→  async function handleSendOtp(e?: React.FormEvent) {
+   268→    e?.preventDefault();
+   269→    // گارد تک‌ارسال: Enter در فرم یا دابل‌کلیک نباید دو درخواست بفرستد
+   270→    if (sending) return;
+   271→    setError("");
+   272→
+   273→    if (!isValidIranMobile(mobile)) {
+   274→      setError("شماره موبایل نامعتبر است. مثال: 09123456789");
+   275→      toast.error("شماره موبایل نامعتبر است.");
+   276→      return;
+   277→    }
+   278→
+   279→    setSending(true);
+   280→    // 🩹 v45: timeout ۱۲ثانیه‌ای — سمت سرور حالا ≤ ~۹ثانیه جواب می‌دهد؛
+   281→    // اگر شبکه قطع شد به‌جای «failed to fetch» خام، پیام فارسی واضح
+   282→    const controller = new AbortController();
+   283→    const timer = setTimeout(() => controller.abort(), 12_000);
+   284→    try {
+   285→      const res = await fetch("/api/auth/send-otp", {
+   286→        method: "POST",
+   287→        headers: { "Content-Type": "application/json" },
+   288→        body: JSON.stringify({ mobile }),
+   289→        signal: controller.signal,
+   290→      });
+   291→      const data = await res.json().catch(() => ({}));
+   292→      if (!res.ok) {
+   293→        const msg = data?.error || "ارسال کد با خطا مواجه شد.";
+   294→        setError(msg);
+   295→        toast.error(msg);
+   296→        // If resend-too-soon, jump to OTP step anyway and apply the wait time
+   297→        if (data?.code === "RESEND_TOO_SOON" && typeof data.waitSeconds === "number") {
+   298→          setStep("otp");
+   299→          setResendIn(Math.min(RESEND_COOLDOWN_SEC, Math.max(1, data.waitSeconds)));
+   300→          // کد قبلی هنوز در راه است — تایمر اعتبارش را هم شروع کن
+   301→          setValidityIn(OTP_VALIDITY_FALLBACK_SEC);
+   302→        }
+   303→        return;
+   304→      }
+   305→      toast.success("کد ۴ رقمی به شماره شما ارسال شد.");
+   306→      setStep("otp");
+   307→      setCode("");
+   308→      setResendIn(RESEND_COOLDOWN_SEC);
+   309→      setValidityIn(
+   310→        typeof data?.expiresIn === "number" ? data.expiresIn : OTP_VALIDITY_FALLBACK_SEC
+   311→      );
+   312→      // دور تازهٔ پیامک → listener وب‌OTP برای کد جدید دوباره arm می‌شود
+   313→      setOtpNonce((n) => n + 1);
+   314→    } catch (err) {
+   315→      const msg =
+   316→        err instanceof DOMException && err.name === "AbortError"
+   317→          ? "ارسال کد بیش از حد طول کشید. لطفاً اتصال اینترنت را بررسی و دوباره تلاش کنید."
+   318→          : err instanceof TypeError
+   319→            ? "ارتباط با سرور برقرار نشد. لطفاً اتصال اینترنت را بررسی و دوباره تلاش کنید."
+   320→            : err instanceof Error
+   321→              ? err.message
+   322→              : "خطای ناشناخته";
+   323→      setError(msg);
+   324→      toast.error(msg);
+   325→    } finally {
+   326→      clearTimeout(timer);
+   327→      setSending(false);
+   328→    }
+   329→  }
+   330→
+   331→  // ─── باز کردن اسناد حقوقی (قوانین / حریم خصوصی) از لینک‌های پایین فرم ورود ───
+   332→  // الگوی ناوبری SPA: setScreen از store + به‌روزرسانی URL با پارامتر doc
+   333→  // (?screen=terms برای قوانین، ?screen=terms&doc=privacy برای حریم خصوصی) تا
+   334→  // رفرش صفحه هم همان سند را بالا بیاورد.
+   335→  function openLegalDoc(doc: "terms" | "privacy") {
+   336→    setScreen("terms");
+   337→    try {
+   338→      const url = new URL(window.location.href);
+   339→      url.searchParams.set("screen", "terms");
+   340→      if (doc === "privacy") {
+   341→        url.searchParams.set("doc", "privacy");
+   342→      } else {
+   343→        url.searchParams.delete("doc");
+   344→      }
+   345→      window.history.pushState({ screen: "terms", doc }, "", url.toString());
+   346→    } catch {
+   347→      // خطای URL بحرانی نیست — setScreen انجام شده و صفحه قوانین باز می‌شود
+   348→    }
+   349→  }
+   350→
+   351→  // ---- Resend OTP ----
+   352→  async function handleResend() {
+   353→    if (resendIn > 0) return;
+   354→    setError("");
+   355→    setSending(true);
+   356→    const controller = new AbortController();
+   357→    const timer = setTimeout(() => controller.abort(), 12_000);
+   358→    try {
+   359→      const res = await fetch("/api/auth/send-otp", {
+   360→        method: "POST",
+   361→        headers: { "Content-Type": "application/json" },
+   362→        body: JSON.stringify({ mobile }),
+   363→        signal: controller.signal,
+   364→      });
+   365→      const data = await res.json().catch(() => ({}));
+   366→      if (!res.ok) {
+   367→        const msg = data?.error || "ارسال مجدد با خطا مواجه شد.";
+   368→        if (data?.code === "RESEND_TOO_SOON" && typeof data.waitSeconds === "number") {
+   369→          setResendIn(Math.min(RESEND_COOLDOWN_SEC, Math.max(1, data.waitSeconds)));
+   370→          toast.error(msg);
+   371→          return;
+   372→        }
+   373→        setError(msg);
+   374→        toast.error(msg);
+   375→        return;
+   376→      }
+   377→      toast.success("کد جدید ارسال شد.");
+   378→      setCode("");
+   379→      setResendIn(RESEND_COOLDOWN_SEC);
+   380→      setValidityIn(
+   381→        typeof data?.expiresIn === "number" ? data.expiresIn : OTP_VALIDITY_FALLBACK_SEC
+   382→      );
+   383→      // دور تازهٔ پیامک → listener وب‌OTP برای کد جدید دوباره arm می‌شود
+   384→      setOtpNonce((n) => n + 1);
+   385→    } catch (err) {
+   386→      const msg =
+   387→        err instanceof DOMException && err.name === "AbortError"
+   388→          ? "ارسال کد بیش از حد طول کشید. لطفاً دوباره تلاش کنید."
+   389→          : err instanceof TypeError
+   390→            ? "ارتباط با سرور برقرار نشد. لطفاً دوباره تلاش کنید."
+   391→            : err instanceof Error
+   392→              ? err.message
+   393→              : "خطای ناشناخته";
+   394→      setError(msg);
+   395→      toast.error(msg);
+   396→    } finally {
+   397→      clearTimeout(timer);
+   398→      setSending(false);
+   399→    }
+   400→  }
+   401→
+   402→  // ---- Verify OTP ----
+   403→  async function handleVerify(e?: React.FormEvent) {
+   404→    e?.preventDefault();
+   405→    // گارد تک‌ارسال: Enter/دابل‌کلیک وقتی تأیید در جریان است دوباره نفرستد
+   406→    if (loading) return;
+   407→    setError("");
+   408→
+   409→    if (code.length !== 4) {
+   410→      setError("کد ۴ رقمی را وارد کنید.");
+   411→      return;
+   412→    }
+   413→
+   414→    setLoading(true);
+   415→    try {
+   416→      // --- ارسال کد معرفی ذخیره‌شده در localStorage (در صورت وجود) ---
+   417→      // این کد در زمان ورود با لینک ?ref=CODE ذخیره شده است.
+   418→      let referralCode: string | undefined;
+   419→      try {
+   420→        const stored = window.localStorage.getItem("fitap_referral_code");
+   421→        if (stored) referralCode = stored.trim().toUpperCase();
+   422→      } catch {
+   423→        // localStorage may be unavailable — silently ignore
+   424→      }
+   425→
+   426→      const res = await fetch("/api/auth/verify-otp", {
+   427→        method: "POST",
+   428→        headers: { "Content-Type": "application/json" },
+   429→        body: JSON.stringify({ mobile, code, referralCode }),
+   430→      });
+   431→      const data = await res.json().catch(() => ({}));
+   432→      if (!res.ok) {
+   433→        const msg = data?.error || "تأیید کد با خطا مواجه شد.";
+   434→        setError(msg);
+   435→        toast.error(msg);
+   436→        setCode(""); // clear OTP on error so user re-types
+   437→        return;
+   438→      }
+   439→
+   440→      setUser(data);
+   441→      toast.success("خوش آمدید! 💪");
+   442→      // ─── FIX (بازیابی پرداخت معلق در همان لحظه‌ی لاگین) ───
+   443→      // کاربری که در درگاه پرداخت کرده ولی پلنش فعال نشده، معمولاً دوباره
+   444→      // لاگین می‌کند «تا ببیند چرا فعال نشده» — همین‌جا استعلام و تحویل خودکار
+   445→      // انجام می‌شود (قبلاً این نقطه وجود نداشت و بازیابی به رفرش بعدی می‌افتاد).
+   446→      recoverPendingPayments();
+   447→      // پاک کردن کد معرفی از localStorage پس از ثبت‌نام موفق
+   448→      try {
+   449→        window.localStorage.removeItem("fitap_referral_code");
+   450→      } catch {}
+   451→      // پاک کردن query params (?screen=auth) پس از ورود موفق
+   452→      // تا هنگام رفرش، صفحه OTP نمایش داده نشود
+   453→      try {
+   454→        // URL را به ?screen=panel تغییر بده برای رفرش
+   455→        try {
+   456→          const url = new URL(window.location.href);
+   457→          url.searchParams.set("screen", "panel");
+   458→          window.history.replaceState({}, "", url.toString());
+   459→        } catch {}
+   460→      } catch {}
+   461→      // Admin users go directly to the admin panel (skip onboarding + main app)
+   462→      if (data.role === "ADMIN") {
+   463→        setScreen("admin");
+   464→      } else {
+   465→        setScreen(data.onboardingDone ? "main" : "onboarding");
+   466→        // ─── کاربر با لینک تمدید آمده بود → بعد از لاگین صفحه تمدید باز شود ───
+   467→        if (data.onboardingDone) {
+   468→          try {
+   469→            if (window.sessionStorage.getItem("fitap_open_renewal") === "1") {
+   470→              window.sessionStorage.removeItem("fitap_open_renewal");
+   471→              setOverlay("renewal");
+   472→            }
+   473→          } catch {}
+   474→        }
+   475→      }
+   476→    } catch (err) {
+   477→      const msg = err instanceof Error ? err.message : "خطای ناشناخته";
+   478→      setError(msg);
+   479→      toast.error(msg);
+   480→    } finally {
+   481→      setLoading(false);
+   482→    }
+   483→  }
+   484→
+   485→  return (
+   486→    // FIX (v50): ارتفاع ریشه = ارتفاع لحظه‌ای visualViewport — با باز شدن
+   487→    // کیبورد صفحه کوتاه می‌شود و فرم پشت کیبورد گم نمی‌شود (گزارش مالک:
+   488→    // ورود از اینستاگرام). در رندر اول ۱۰۰dvh و بعد از mount دقیق می‌شود.
+   489→    <div
+   490→      className="flex flex-col bg-white relative overflow-hidden"
+   491→      style={{ height: vvHeight ? `${vvHeight}px` : "100dvh" }}
+   492→    >
+   493→      {/* Subtle gold background accents */}
+   494→      <div className="absolute inset-0 -z-10 pointer-events-none">
+   495→        <div className="absolute -top-32 -right-24 w-80 h-80 rounded-full bg-amber-200/40 blur-3xl" />
+   496→        <div className="absolute top-1/3 -left-24 w-72 h-72 rounded-full bg-orange-200/30 blur-3xl" />
+   497→        <div className="absolute bottom-0 right-1/4 w-64 h-64 rounded-full bg-amber-100/40 blur-3xl" />
+   498→      </div>
+   499→
+   500→      {/* بازگشت — خارج از ناحیهٔ اسکرول تا همیشه بالای صفحه بماند */}
+   501→      <motion.button
+   502→        type="button"
+   503→        onClick={() => { setScreen("landing"); replaceScreen("landing"); }}
+   504→        initial={{ opacity: 0, x: 10 }}
+   505→        animate={{ opacity: 1, x: 0 }}
+   506→        className="absolute top-5 right-5 z-20 flex items-center gap-1 text-slate-500 hover:text-slate-900 transition text-sm"
+   507→      >
+   508→        بازگشت
+   509→        <ChevronLeft className="w-4 h-4" />
+   510→      </motion.button>
+   511→
+   512→      {/* FIX (v50): ناحیهٔ اسکرول داخلی — وقتی کیبورد باز می‌شود هدر جمع
+   513→          می‌شود و اگر باز هم جا نبود، محتوا اسکرول می‌شود تا ورودیِ فعال با
+   514→          scrollIntoView همیشه دیده شود */}
+   515→      <div className="flex-1 min-h-0 overflow-y-auto flex flex-col">
+   516→      {/* Brand header */}
+   517→      <div className="flex-1 min-h-0 overflow-hidden flex flex-col items-center justify-center px-6 pt-12 pb-6">
+   518→
+   519→        <motion.div
+   520→          initial={{ scale: 0, rotate: -30 }}
+   521→          animate={{ scale: 1, rotate: 0 }}
+   522→          transition={{ type: "spring", stiffness: 200, damping: 15 }}
+   523→          className="relative mb-5"
+   524→        >
+   525→          <div className="absolute inset-0 bg-amber-300/40 blur-2xl rounded-full" />
+   526→          <div
+   527→            className="relative w-20 h-20 rounded-3xl flex items-center justify-center shadow-xl overflow-hidden"
+   528→            style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   529→          >
+   530→            {/* eslint-disable-next-line @next/next/no-img-element */}
+   531→            <img src="/fitup-logo.png" alt="فیتاپ" className="w-full h-full object-cover" />
+   532→          </div>
+   533→        </motion.div>
+   534→
+   535→        <motion.h1
+   536→          initial={{ opacity: 0, y: 10 }}
+   537→          animate={{ opacity: 1, y: 0 }}
+   538→          transition={{ delay: 0.2 }}
+   539→          className="text-4xl font-black text-slate-900 text-center mb-2"
+   540→        >
+   541→          فیتاپ
+   542→        </motion.h1>
+   543→        <motion.p
+   544→          initial={{ opacity: 0 }}
+   545→          animate={{ opacity: 1 }}
+   546→          transition={{ delay: 0.3 }}
+   547→          className="text-slate-500 text-center text-sm max-w-xs"
+   548→        >
+   549→          هر بدنی فیتاپ میخواد
+   550→        </motion.p>
+   551→      </div>
+   552→
+   553→      {/* Form card */}
+   554→      <motion.div
+   555→        initial={{ opacity: 0, y: 30 }}
+   556→        animate={{ opacity: 1, y: 0 }}
+   557→        transition={{ delay: 0.4 }}
+   558→        className="shrink-0 bg-white rounded-t-[2rem] border-2 border-orange-200 shadow-2xl shadow-orange-500/10 px-6 pt-6 pb-10 mx-3 mb-3"
+   559→      >
+   560→        <AnimatePresence mode="wait">
+   561→          {step === "mobile" ? (
+   562→            <motion.form
+   563→              key="mobile-step"
+   564→              onSubmit={handleSendOtp}
+   565→              initial={{ opacity: 0, x: 20 }}
+   566→              animate={{ opacity: 1, x: 0 }}
+   567→              exit={{ opacity: 0, x: -20 }}
+   568→              transition={{ duration: 0.2 }}
+   569→              className="space-y-5"
+   570→            >
+   571→              {/* Step indicator */}
+   572→              <div className="flex items-center justify-center gap-2 text-xs font-bold text-slate-400 mb-2">
+   573→                <span className="w-6 h-6 rounded-full bg-orange-500 text-white flex items-center justify-center text-[11px]">
+   574→                  ۱
+   575→                </span>
+   576→                <span>شماره موبایل</span>
+   577→                <span className="w-8 h-px bg-slate-200" />
+   578→                <span className="w-6 h-6 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center text-[11px]">
+   579→                  ۲
+   580→                </span>
+   581→                <span>تأیید کد</span>
+   582→              </div>
+   583→
+   584→              <div className="space-y-2">
+   585→                <Label htmlFor="mobile" className="text-sm font-medium text-slate-700">
+   586→                  شماره موبایل
+   587→                </Label>
+   588→                <div className="relative">
+   589→                  <Phone className="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-orange-400" />
+   590→                  <Input
+   591→                    id="mobile"
+   592→                    value={mobile}
+   593→                    onChange={(e) =>
+   594→                      setMobile(normalizeDigits(e.target.value).replace(/[^\d]/g, "").slice(0, 11))
+   595→                    }
+   596→                    placeholder="09123456789"
+   597→                    inputMode="numeric"
+   598→                    dir="ltr"
+   599→                    className="pr-11 h-14 rounded-xl text-left bg-white border-2 border-orange-100 focus-visible:border-orange-400 focus-visible:ring-orange-300/40 text-slate-900 placeholder:text-slate-400 text-lg tracking-wider"
+   600→                    autoComplete="tel"
+   601→                    autoFocus
+   602→                    required
+   603→                  />
+   604→                </div>
+   605→              </div>
+   606→
+   607→              {error && (
+   608→                <motion.div
+   609→                  initial={{ opacity: 0, y: -5 }}
+   610→                  animate={{ opacity: 1, y: 0 }}
+   611→                  aria-live="polite"
+   612→                  className="text-red-600 text-sm bg-red-50 border border-red-200 rounded-xl px-4 py-2.5 text-center"
+   613→                >
+   614→                  {error}
+   615→                </motion.div>
+   616→              )}
+   617→
+   618→              <button
+   619→                type="submit"
+   620→                disabled={sending || !isValidIranMobile(mobile)}
+   621→                className="w-full h-14 rounded-2xl text-base font-bold text-white shadow-lg shadow-orange-500/30 transition-all hover:scale-[1.02] hover:shadow-xl hover:shadow-orange-500/40 disabled:opacity-60 disabled:hover:scale-100 disabled:hover:shadow-lg flex items-center justify-center gap-2"
+   622→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   623→              >
+   624→                {sending ? (
+   625→                  <span className="flex items-center gap-2">
+   626→                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+   627→                    در حال ارسال...
+   628→                  </span>
+   629→                ) : (
+   630→                  <>
+   631→                    <MessageSquare className="w-4 h-4" />
+   632→                    ارسال کد
+   633→                  </>
+   634→                )}
+   635→              </button>
+   636→
+   637→              <div className="flex items-center gap-2 justify-center text-xs text-slate-500 pt-1">
+   638→                <ShieldCheck className="w-3.5 h-3.5 text-orange-500" />
+   639→                <span>کد ۴ رقمی از طریق پیامک برای شما ارسال می‌شود</span>
+   640→              </div>
+   641→            </motion.form>
+   642→          ) : (
+   643→            <motion.form
+   644→              key="otp-step"
+   645→              onSubmit={handleVerify}
+   646→              initial={{ opacity: 0, x: 20 }}
+   647→              animate={{ opacity: 1, x: 0 }}
+   648→              exit={{ opacity: 0, x: -20 }}
+   649→              transition={{ duration: 0.2 }}
+   650→              className="space-y-5"
+   651→            >
+   652→              {/* Step indicator */}
+   653→              <div className="flex items-center justify-center gap-2 text-xs font-bold text-slate-400 mb-2">
+   654→                <button
+   655→                  type="button"
+   656→                  onClick={() => {
+   657→                    setStep("mobile");
+   658→                    setCode("");
+   659→                    setError("");
+   660→                    setResendIn(0);
+   661→                  }}
+   662→                  className="w-6 h-6 rounded-full bg-orange-500 text-white flex items-center justify-center text-[11px] hover:bg-orange-600 transition"
+   663→                  aria-label="بازگشت به مرحله شماره موبایل"
+   664→                >
+   665→                  ۱
+   666→                </button>
+   667→                <span>شماره موبایل</span>
+   668→                <span className="w-8 h-px bg-orange-200" />
+   669→                <span className="w-6 h-6 rounded-full bg-orange-500 text-white flex items-center justify-center text-[11px]">
+   670→                  ۲
+   671→                </span>
+   672→                <span className="text-slate-700">تأیید کد</span>
+   673→              </div>
+   674→
+   675→              <div className="space-y-3 text-center">
+   676→                <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-orange-50 border border-orange-200 text-orange-700 text-xs font-medium">
+   677→                  <Phone className="w-3.5 h-3.5" />
+   678→                  <span dir="ltr" className="tracking-wider">
+   679→                    {mobile}
+   680→                  </span>
+   681→                </div>
+   682→                <p className="text-sm text-slate-600">
+   683→                  کد ۴ رقمی ارسال‌شده به شماره بالا را وارد کنید
+   684→                </p>
+   685→              </div>
+   686→
+   687→              {/* ─── OTP: یک input واقعی، مرئی و مستقل ───
+   688→                  ریشهٔ «کد اتو-پر نمی‌شود و Gboard هم پیشنهاد نمی‌دهد» همین بود:
+   689→                  InputOTP (کتابخانه input-otp) چهار خانهٔ نمایشی می‌سازد ولی input
+   690→                  واقعی‌اش یک proxy نامرئی است — Android autofill/Gboard/WebOTP
+   691→                  نمی‌توانند فیلد مخفی را هدف بگیرند. حالا یک input استانداردِ
+   692→                  واقعی و مرئی است؛ با autoComplete="one-time-code" هر سه مسیر
+   693→                  بدون هیچ پرمیشنی فعال می‌شوند:
+   694→                  • Gboard/کیبورد سامسونگ: نوار پیشنهاد «کد» بالای کیبورد
+   695→                  • Android Chrome: WebOTP (اثر پایین) + autofill یک‌لمسی
+   696→                  • iOS: نوار QuickType «از پیام‌ها» */}
+   697→              <div className="flex justify-center py-2" dir="ltr">
+   698→                <label htmlFor="otp-input" className="sr-only">
+   699→                  کد پیامک‌شده
+   700→                </label>
+   701→                <input
+   702→                  ref={otpInputRef}
+   703→                  id="otp-input"
+   704→                  name="otp"
+   705→                  type="text"
+   706→                  dir="ltr"
+   707→                  inputMode="numeric"
+   708→                  pattern="[0-9]*"
+   709→                  autoComplete="one-time-code"
+   710→                  autoFocus
+   711→                  maxLength={4}
+   712→                  value={code}
+   713→                  onChange={(e) => setCode(extractOtpDigits(e.target.value))}
+   714→                  onPaste={(e) => {
+   715→                    // پیست کل متن پیامک هم کار می‌کند: ارقام استخراج و
+   716→                    // «آخرین ۴ رقم» برداشته می‌شود (کد در انتهای متن پیامک است)
+   717→                    e.preventDefault();
+   718→                    const digits = extractOtpDigits(e.clipboardData?.getData("text") ?? "");
+   719→                    if (digits) setCode(digits);
+   720→                  }}
+   721→                  disabled={loading}
+   722→                  placeholder="••••"
+   723→                  className="w-44 h-16 text-2xl font-black text-center tracking-[0.6em] indent-[0.6em] rounded-xl border-2 border-orange-100 bg-white text-slate-900 placeholder:text-slate-300 focus:border-orange-400 focus:outline-none focus:ring-4 focus:ring-orange-300/30 disabled:opacity-60 transition-colors"
+   724→                />
+   725→              </div>
+   726→
+   727→              {/* ── v56: دکمهٔ جای‌گذاری از کلیپ‌بورد حذف شد (درخواست مالک) —
+   728→                  اتو-فیل مسیرهای خودکار فعال است و پیست دستی داخل input کار می‌کند ── */}
+   729→
+   730→              {/* ── شمارش معکوس اعتبار کد (۱۰ دقیقه) ──
+   731→                  کاربر می‌بیند کد هنوز معتبر است حتی وقتی پیامک دیر رسید؛
+   732→                  و وقتی تمام شد پیام واضح «منقضی شد» + راهنمای ریسند. */}
+   733→              {step === "otp" && validityIn != null && validityIn > 0 && (
+   734→                <p className="text-center text-xs text-slate-500 flex items-center justify-center gap-1.5">
+   735→                  <Timer className="w-3.5 h-3.5 text-orange-500" />
+   736→                  کد تا
+   737→                  <span dir="ltr" className="font-black text-slate-700 tabular-nums">
+   738→                    {formatCountdown(validityIn)}
+   739→                  </span>
+   740→                  دیگر معتبر است
+   741→                </p>
+   742→              )}
+   743→              {step === "otp" && validityIn === 0 && (
+   744→                <p className="text-center text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5">
+   745→                  ⏰ اعتبار کد به پایان رسید — دکمه «ارسال مجدد کد» را بزنید
+   746→                </p>
+   747→              )}
+   748→
+   749→              {error && (
+   750→                <motion.div
+   751→                  initial={{ opacity: 0, y: -5 }}
+   752→                  animate={{ opacity: 1, y: 0 }}
+   753→                  aria-live="polite"
+   754→                  className="text-red-600 text-sm bg-red-50 border border-red-200 rounded-xl px-4 py-2.5 text-center"
+   755→                >
+   756→                  {error}
+   757→                </motion.div>
+   758→              )}
+   759→
+   760→              <button
+   761→                type="submit"
+   762→                disabled={loading || code.length !== 4}
+   763→                className="w-full h-14 rounded-2xl text-base font-bold text-white shadow-lg shadow-orange-500/30 transition-all hover:scale-[1.02] hover:shadow-xl hover:shadow-orange-500/40 disabled:opacity-60 disabled:hover:scale-100 disabled:hover:shadow-lg flex items-center justify-center gap-2"
+   764→                style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   765→              >
+   766→                {loading ? (
+   767→                  <span className="flex items-center gap-2">
+   768→                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+   769→                    در حال تأیید...
+   770→                  </span>
+   771→                ) : (
+   772→                  <>
+   773→                    <ShieldCheck className="w-4 h-4" />
+   774→                    تأیید و ورود
+   775→                  </>
+   776→                )}
+   777→              </button>
+   778→
+   779→              {/* Resend + change number */}
+   780→              <div className="flex flex-col items-center gap-2 pt-1">
+   781→                <button
+   782→                  type="button"
+   783→                  onClick={handleResend}
+   784→                  disabled={resendIn > 0 || sending}
+   785→                  className="inline-flex items-center gap-1.5 text-sm font-medium text-orange-600 hover:text-orange-700 disabled:text-slate-400 disabled:cursor-not-allowed transition"
+   786→                >
+   787→                  <RefreshCw className={`w-3.5 h-3.5 ${sending ? "animate-spin" : ""}`} />
+   788→                  {resendIn > 0
+   789→                    ? `ارسال مجدد کد (${resendIn} ثانیه)`
+   790→                    : "ارسال مجدد کد"}
+   791→                </button>
+   792→                <button
+   793→                  type="button"
+   794→                  onClick={() => {
+   795→                    setStep("mobile");
+   796→                    setCode("");
+   797→                    setError("");
+   798→                    setResendIn(0);
+   799→                    setValidityIn(null);
+   800→                  }}
+   801→                  className="text-xs text-slate-500 hover:text-slate-700 underline underline-offset-2 transition"
+   802→                >
+   803→                  تغییر شماره موبایل
+   804→                </button>
+   805→              </div>
+   806→            </motion.form>
+   807→          )}
+   808→        </AnimatePresence>
+   809→      </motion.div>
+   810→
+   811→      <div className="shrink-0 px-6 pb-6 text-center text-xs text-slate-400 leading-relaxed">
+   812→        ورود شما به معنای پذیرش{" "}
+   813→        <button
+   814→          onClick={() => openLegalDoc("terms")}
+   815→          className="font-bold text-orange-600 hover:text-orange-700 underline underline-offset-2 transition"
+   816→        >
+   817→          شرایط و قوانین
+   818→        </button>{" "}
+   819→        و{" "}
+   820→        <button
+   821→          onClick={() => openLegalDoc("privacy")}
+   822→          className="font-bold text-orange-600 hover:text-orange-700 underline underline-offset-2 transition"
+   823→        >
+   824→          سیاست حفظ حریم خصوصی
+   825→        </button>{" "}
+   826→        فیتاپ است.
+   827→      </div>
+   828→      </div>
+   829→    </div>
+   830→  );
+   831→}
+   832→

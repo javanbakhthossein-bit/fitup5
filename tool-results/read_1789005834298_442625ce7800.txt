@@ -1,0 +1,1177 @@
+     1→import { NextRequest } from "next/server";
+     2→import { db } from "@/lib/db";
+     3→import {
+     4→  createNotification,
+     5→  ensureRenewalDiscountCode,
+     6→  ensureOnboardingWinbackCode,
+     7→  ensureWelcomeOfferCode,
+     8→  getExpiryDiscountPercent,
+     9→  getOnboardingDiscountPercent,
+    10→  getWelcomeOfferDiscountPercent,
+    11→} from "@/lib/fitness/notifications";
+    12→import {
+    13→  sendCheckupReminderSms,
+    14→  sendExpiredWinbackSms,
+    15→  sendOnboardingNudgeSms,
+    16→  sendOnboardingWinbackSms,
+    17→  sendPlanExpiredSms,
+    18→  sendPlanExpiringSoonSms,
+    19→  sendRenewalBoostSms,
+    20→  sendWelcomeOfferSms,
+    21→} from "@/lib/fitness/sms-flows";
+    22→import { createSmsRenewLink } from "@/lib/fitness/sms-short-link";
+    23→import { runAbandonedCartScenario } from "@/lib/fitness/abandoned-cart-scenario";
+    24→import { recoverFailedGenerations } from "@/lib/fitness/program-generation";
+    25→import { rateLimit, getClientIp, rateLimitResponse } from "@/lib/fitness/rate-limit";
+    26→
+    27→/**
+    28→ * GET /api/cron/behavioral?secret=CRON_SECRET
+    29→ *
+    30→ * Behavioral marketing cron endpoint. Runs these scenarios:
+    31→ *  1) Basic plan users → upgrade notification
+    32→ *  2) Plan expires within 3 days → renewal reminder (+ auto per-user discount code)
+    33→ *  3) Inactive for 5+ days → re-engagement notification
+    34→ *  … (سناریوهای ۴ تا ۹.۵ — چکاپ/انقضا/وین‌بک/خوش‌آمدگویی — به‌همراه ۱۰: ترک درگاه)
+    35→ *  10) v53 — ترک درگاه پرداخت: پیامک «کد ۲۴۸۹۴۵» (درصد/قالب از SiteSetting) +
+    36→ *      کد تخفیف ۲ساعته + لینک کوتاه ?offer= به صفحهٔ پلن‌ها
+    37→ *
+    38→ * Each scenario creates notifications in the DB (deduped by a per-scenario window).
+    39→ * The endpoint is protected by CRON_SECRET — must match the secret in the query string
+    40→ * (fail-secure: اگر CRON_SECRET تنظیم نشده باشد، ۴۰۱ برمی‌گردد).
+    41→ *
+    42→ * Returns a JSON summary of how many notifications were created per scenario.
+    43→ */
+    44→export async function GET(req: NextRequest) {
+    45→  // ─── Rate limit (per-IP) — ضد brute-force روی secret ───
+    46→  const rl = rateLimit(`cron-behavioral:${getClientIp(req)}`, 30, 60 * 1000);
+    47→  if (!rl.ok) {
+    48→    return rateLimitResponse(rl.retryAfterSec);
+    49→  }
+    50→
+    51→  const url = new URL(req.url);
+    52→  const secret = url.searchParams.get("secret");
+    53→  const expected = process.env.CRON_SECRET;
+    54→
+    55→  if (!expected || secret !== expected) {
+    56→    return Response.json({ error: "Unauthorized" }, { status: 401 });
+    57→  }
+    58→
+    59→  const now = new Date();
+    60→  // خلاصه گزارش cron — تمام فیلدهای سناریوها به‌صورت اختیاری تعریف شده‌اند چون در طول
+    61→  // اجرا به‌صورت پویا ست می‌شوند (با `if (!summary.x) summary.x = 0;`).
+    62→  const summary: {
+    63→    upgrade: number;
+    64→    renewal: number;
+    65→    reengagement: number;
+    66→    total: number;
+    67→    runAt: string;
+    68→    checkup?: number;
+    69→    expired?: number;
+    70→    renewalLate?: number;
+    71→    pendingReminder?: number;
+    72→    pendingAutoActivated?: number;
+    73→    onboardingNudge?: number;
+    74→    onboardingWinback?: number;
+    75→    welcomeOffer?: number;
+    76→    renewalBoost?: number;
+    77→    planExpiring?: number;
+    78→    programRetry?: number;
+    79→    smsSent?: number;
+    80→    abandonedCart?: number;
+    81→    abandonedCartSkipped?: number;
+    82→  } = {
+    83→    upgrade: 0,
+    84→    renewal: 0,
+    85→    reengagement: 0,
+    86→    total: 0,
+    87→    welcomeOffer: 0,
+    88→    renewalBoost: 0,
+    89→    runAt: now.toISOString(),
+    90→  };
+    91→
+    92→  // -------------------------------------------------------------------
+    93→  // Scenario 1: Users on basic plan → upgrade notification
+    94→  // Dedupe: don't send if they already got an "upgrade" notification in last 14 days
+    95→  // (v48: ۷ روز → ۱۴ روز — ممیزی نوتیف‌ها به درخواست مالک: نویز تکراری کمتر)
+    96→  // -------------------------------------------------------------------
+    97→  try {
+    98→    const fourteenDaysAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+    99→    const basicUsers = await db.user.findMany({
+   100→      where: {
+   101→        planName: "basic",
+   102→        isBlocked: false,
+   103→      },
+   104→      select: { id: true },
+   105→    });
+   106→    for (const u of basicUsers) {
+   107→      const recent = await db.notification.findFirst({
+   108→        where: { userId: u.id, type: "upgrade", createdAt: { gt: fourteenDaysAgo } },
+   109→        select: { id: true },
+   110→      });
+   111→      if (recent) continue;
+   112→      await createNotification(
+   113→        u.id,
+   114→        "upgrade",
+   115→        "مسیرت می‌تونه سریع‌تر باشه 🚀",
+   116→        "چت بی‌نهایت با فیتاپ هوشمند، آنالیز عکس غذا و حالت باشگاه توی پلن پیشرفته منتظرته. هر وقت خواستی سریع‌تر به هدفت برسی، ارتقا بده.",
+   117→        "?tab=plans",
+   118→        { scenario: "upgrade", fromPlan: "basic" }
+   119→      );
+   120→      summary.upgrade++;
+   121→    }
+   122→  } catch (err) {
+   123→    console.error("[cron/behavioral] upgrade scenario failed:", err);
+   124→  }
+   125→
+   126→  // -------------------------------------------------------------------
+   127→  // v53 (درخواست مالک): نوتیف ارتقای داینامیک برای «پیشرفته به پایین» —
+   128→  // قبلاً فقط basic پیام ارتقا می‌گرفت؛ حالا استاندارد و پیشرفته هم بسته به
+   129→  // پلن جاری، پیام متناسب با پلن بعدی می‌گیرند (همان dedupe ۱۴ روزه).
+   130→  // -------------------------------------------------------------------
+   131→  try {
+   132→    const fourteenDaysAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+   133→    const upgradeTargets: { from: string; title: string; body: string }[] = [
+   134→      {
+   135→        from: "standard",
+   136→        title: "یک پله تا پلن پیشرفته 🚀",
+   137→        body: "با پلن پیشرفته، چت بی‌نهایت با فیتاپ هوشمند، آنالیز عکس غذا و حالت باشگاه فعال می‌شود — مسیر رسیدن به هدفت رو سریع‌تر کن.",
+   138→      },
+   139→      {
+   140→        from: "advanced",
+   141→        title: "سقفت رو جلو ببر 💪",
+   142→        body: "پلن حرفه‌ای: آنالیز ویدیو حرکات به تعداد حرکات برنامه‌ات، حالت باشگاه کامل و امکانات ویژهٔ حرفه‌ای‌ها — برای نتیجهٔ جدی‌تر، ارتقا بده.",
+   143→      },
+   144→    ];
+   145→    for (const t of upgradeTargets) {
+   146→      const users = await db.user.findMany({
+   147→        where: { planName: t.from, isBlocked: false },
+   148→        select: { id: true },
+   149→      });
+   150→      for (const u of users) {
+   151→        const recent = await db.notification.findFirst({
+   152→          where: { userId: u.id, type: "upgrade", createdAt: { gt: fourteenDaysAgo } },
+   153→          select: { id: true },
+   154→        });
+   155→        if (recent) continue;
+   156→        await createNotification(
+   157→          u.id,
+   158→          "upgrade",
+   159→          t.title,
+   160→          t.body,
+   161→          "?tab=plans",
+   162→          { scenario: "upgrade", fromPlan: t.from }
+   163→        );
+   164→        summary.upgrade++;
+   165→      }
+   166→    }
+   167→  } catch (err) {
+   168→    console.error("[cron/behavioral] upgrade scenario (standard/advanced) failed:", err);
+   169→  }
+   170→
+   171→  // -------------------------------------------------------------------
+   172→  // Scenario 2: Plan expires within 3 days → renewal reminder
+   173→  // ─── v38 (درخواست مالک): هیچ حرفی از کد تخفیف در این مرحله نیست —
+   174→  // کد تخفیف تمدید فقط در سناریوی ۷۲ ساعت بعد از انقضا (سناریو ۶) فعال و
+   175→  // ارسال می‌شود؛ قبل از آن نه ساخته می‌شود نه نمایش داده می‌شود.
+   176→  // Dedupe: don't send if they got a "renewal" notification in last 2 days.
+   177→  // -------------------------------------------------------------------
+   178→  try {
+   179→    const inThreeDays = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+   180→    const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
+   181→
+   182→    const expiringUsers = await db.user.findMany({
+   183→      where: {
+   184→        planExpiresAt: { gt: now, lt: inThreeDays },
+   185→        isBlocked: false,
+   186→      },
+   187→      select: { id: true, planName: true, mobile: true, planExpiresAt: true },
+   188→    });
+   189→
+   190→    for (const u of expiringUsers) {
+   191→      const recent = await db.notification.findFirst({
+   192→        where: { userId: u.id, type: "renewal", createdAt: { gt: twoDaysAgo } },
+   193→        select: { id: true },
+   194→      });
+   195→      if (recent) continue;
+   196→
+   197→      await createNotification(
+   198→        u.id,
+   199→        "renewal",
+   200→        `${toPersianDigitsFn(Math.max(1, Math.ceil((new Date(u.planExpiresAt ?? now).getTime() - now.getTime()) / (24 * 60 * 60 * 1000))))} روز تا پایان پلن ${PLAN_LABELS_FN[u.planName ?? ""] ?? ""} ⏳`,
+   201→        `اگه گل نزنی، روزهای باقی‌مانده‌ت موقع تمدید حفظ می‌شه. از صفحه تمدید، با یک کلیک کارت را تمام کن.`,
+   202→        "?renewal=1",
+   203→        { scenario: "renewal", planName: u.planName }
+   204→      );
+   205→      summary.renewal++;
+   206→    }
+   207→  } catch (err) {
+   208→    console.error("[cron/behavioral] renewal scenario failed:", err);
+   209→  }
+   210→
+   211→  // -------------------------------------------------------------------
+   212→  // Scenario 2b (v37): یک روز تا انقضا → پیامک 184777 + نوتیف + لینک تمدید مجزا
+   213→  // درخواست مالک: پیامک «پلن فعلی شما فردا منقضی میشود…» با لینک اختصاصی تمدید
+   214→  // (/renew?t=...) که کاربر بدون لاگین، پرداخت سریع را انجام دهد.
+   215→  // پنجره: اشتراک‌های فعال با endDate در (now, now+30h] — کرون هر ۳۰ دقیقه
+   216→  // اجرا می‌شود، پس پیامک وقتی می‌رسد که تقریباً «فردا» انقضا است.
+   217→  // دداپ پیامک: SmsLog ابدی با کلید plan_expiring_{subId} — هر چرخه یک بار.
+   218→  // دداپ نوتیف: نوع renewal در ۲۴ ساعت اخیر (مستقل از سناریوی ۳ روزهٔ بالا).
+   219→  // -------------------------------------------------------------------
+   220→  try {
+   221→    const in30h = new Date(now.getTime() + 30 * 60 * 60 * 1000);
+   222→    const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+   223→    const last3d = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+   224→
+   225→    const expiringSubs = await db.subscription.findMany({
+   226→      where: { status: "active", endDate: { gt: now, lt: in30h } },
+   227→      select: { id: true, userId: true, plan: true, endDate: true },
+   228→    });
+   229→
+   230→    for (const sub of expiringSubs) {
+   231→      const u = await db.user.findUnique({
+   232→        where: { id: sub.userId },
+   233→        select: { id: true, name: true, mobile: true, isBlocked: true },
+   234→      });
+   235→      if (!u || u.isBlocked || !u.mobile) continue;
+   236→
+   237→      // در میدیان ارتقا/خرید جدید؟ (اشتراک pending تازه یا پرداخت در جریان) → مزاحم نشو
+   238→      const midUpgrade = await db.subscription.findFirst({
+   239→        where: { userId: u.id, status: "pending", createdAt: { gt: last3d } },
+   240→        select: { id: true },
+   241→      });
+   242→      if (midUpgrade) continue;
+   243→      const pendingPayment = await db.payment.findFirst({
+   244→        where: {
+   245→          userId: u.id,
+   246→          status: { in: ["pending", "verifying"] },
+   247→          createdAt: { gt: last24h },
+   248→        },
+   249→        select: { id: true },
+   250→      });
+   251→      if (pendingPayment) continue;
+   252→
+   253→      // ─── پیامک 184777 با لینک تمدید مجزا ───
+   254→      // v48 — لینک کوتاه r/XXXXXXXX (≤۲۵ کاراکتر — فیکس خطای 114)؛ /r به go/renew
+   255→      // هدایت می‌کند → لینک هوشمند اپ حفظ است
+   256→      const renewLink = await createSmsRenewLink(u.id, sub.id);
+   257→      try {
+   258→        const smsRes = await sendPlanExpiringSoonSms(
+   259→          { id: u.id, name: u.name, mobile: u.mobile },
+   260→          renewLink,
+   261→          sub.id
+   262→        );
+   263→        if (smsRes.sent) {
+   264→          if (!summary.smsSent) summary.smsSent = 0;
+   265→          summary.smsSent++;
+   266→        }
+   267→      } catch (smsErr) {
+   268→        console.error("[cron/behavioral] plan_expiring_soon SMS failed:", smsErr);
+   269→      }
+   270→
+   271→      // ─── نوتیف همزمان (سایت + اپ اختصاصی + اپ بازار + وب‌اپ) ───
+   272→      const recentRenewNotif = await db.notification.findFirst({
+   273→        where: { userId: u.id, type: "renewal", createdAt: { gt: last24h } },
+   274→        select: { id: true },
+   275→      });
+   276→      if (!recentRenewNotif) {
+   277→        await createNotification(
+   278→          u.id,
+   279→          "renewal",
+   280→          "فردا پلنت تموم می‌شه ⏳",
+   281→          `پلن ${PLAN_LABELS_FN[sub.plan ?? ""] ?? ""} شما فردا منقضی می‌شود. با یک پرداخت از لینک تمدید، پلن جدیدت خودکار فعال می‌شود — روزهای باقی‌ماندهٔ فعلی هم حفظ می‌شود.`,
+   282→          "?renewal=1",
+   283→          { scenario: "renewal_tomorrow", planName: sub.plan }
+   284→        );
+   285→        if (!summary.planExpiring) summary.planExpiring = 0;
+   286→        summary.planExpiring++;
+   287→      }
+   288→    }
+   289→  } catch (err) {
+   290→    console.error("[cron/behavioral] plan expiring soon scenario failed:", err);
+   291→  }
+   292→
+   293→  // -------------------------------------------------------------------
+   294→  // Scenario 3: واقعاً غایب بوده → اعلان بازگشت
+   295→  // ─── FIX (گزارش کاربر): «با اینکه مداوم از اپ استفاده می‌کنم بازم میاد» ───
+   296→  // ریشه: قبلاً «آخرین فعالیت» فقط از ثبت وزن/چکاپ/چت/ساخت برنامه خوانده
+   297→  // می‌شد؛ کاربری که هر روز اپ را باز می‌کرد ولی چیزی ثبت نمی‌کرد «غایب»
+   298→  // تلقی می‌شد. حالا سیگنال اصلی = user.lastActiveAt است که در هر باز شدن
+   299→  // اپ/سایت (api/auth/me با throttle) و هر لاگین (verify-otp) به‌روز می‌شود.
+   300→  // سیگنال‌های مکمل (پرکار بودن واقعی): وزن، چکاپ، چت، برنامه، لاگ غذا،
+   301→  // وضعیت روز تمرین. آستانه هم ۵→۷ روز افزایش یافت و متن انسانی شد.
+   302→  // فقط وقتی پیام می‌رود که کاربر واقعاً ۷+ روز هیچ نسبتی با فیتاپ نداشته.
+   303→  // Dedupe: حداکثر یک re_engagement در هر ۷ روز.
+   304→  // -------------------------------------------------------------------
+   305→  try {
+   306→    const sevenDaysAgoMs = now.getTime() - 7 * 24 * 60 * 60 * 1000;
+   307→    const sevenDaysAgo = new Date(sevenDaysAgoMs);
+   308→
+   309→    const candidates = await db.user.findMany({
+   310→      where: {
+   311→        isBlocked: false,
+   312→        onboardingDone: true,
+   313→        // Has any active or expired plan (engaged users)
+   314→        NOT: [{ planName: null }],
+   315→      },
+   316→      select: { id: true, name: true, lastActiveAt: true },
+   317→    });
+   318→
+   319→    for (const u of candidates) {
+   320→      // Check for any recent notification to avoid spamming
+   321→      const recentNotif = await db.notification.findFirst({
+   322→        where: { userId: u.id, type: "re_engagement", createdAt: { gt: sevenDaysAgo } },
+   323→        select: { id: true },
+   324→      });
+   325→      if (recentNotif) continue;
+   326→
+   327→      // اگر کاربر این هفته اپ/سایت را باز کرده → قطعااً فعال است، رد شو
+   328→      if (u.lastActiveAt && new Date(u.lastActiveAt).getTime() >= sevenDaysAgoMs) {
+   329→        continue;
+   330→      }
+   331→
+   332→      // Pull the most recent activity across multiple tables (سیگنال‌های مکمل)
+   333→      const [lastWeight, lastCheckup, lastChat, lastWorkoutPlan, lastFoodLog, lastWorkoutDay] = await Promise.all([
+   334→        db.weightLog.findFirst({
+   335→          where: { userId: u.id },
+   336→          orderBy: { loggedAt: "desc" },
+   337→          select: { loggedAt: true },
+   338→        }),
+   339→        db.checkup.findFirst({
+   340→          where: { userId: u.id },
+   341→          orderBy: { createdAt: "desc" },
+   342→          select: { createdAt: true },
+   343→        }),
+   344→        db.chatMessage.findFirst({
+   345→          where: { userId: u.id },
+   346→          orderBy: { createdAt: "desc" },
+   347→          select: { createdAt: true },
+   348→        }),
+   349→        db.workoutPlan.findFirst({
+   350→          where: { userId: u.id },
+   351→          orderBy: { createdAt: "desc" },
+   352→          select: { createdAt: true },
+   353→        }),
+   354→        db.foodLog.findFirst({
+   355→          where: { userId: u.id },
+   356→          orderBy: { createdAt: "desc" },
+   357→          select: { createdAt: true },
+   358→        }),
+   359→        db.workoutDayStatus.findFirst({
+   360→          where: { userId: u.id },
+   361→          orderBy: { createdAt: "desc" },
+   362→          select: { createdAt: true },
+   363→        }),
+   364→      ]);
+   365→
+   366→      const timestamps = [
+   367→        u.lastActiveAt, // سیگنال اصلی — باز کردن اپ
+   368→        lastWeight?.loggedAt,
+   369→        lastCheckup?.createdAt,
+   370→        lastChat?.createdAt,
+   371→        lastWorkoutPlan?.createdAt,
+   372→        lastFoodLog?.createdAt,
+   373→        lastWorkoutDay?.createdAt,
+   374→      ]
+   375→        .filter(Boolean)
+   376→        .map((t) => new Date(t as Date).getTime());
+   377→
+   378→      const lastActivity = timestamps.length ? Math.max(...timestamps) : 0;
+   379→
+   380→      // اگر هیچ فعالیتی ثبت نشده (کاربر قدیمی قبل از lastActiveAt)، برای اولین
+   381→      // بار lastActiveAt را seed کن تا نوبت بعدی درست سنجیده شود؛ این دفعه
+   382→      // پیام نفرست (اطمینان از عدم اسپم برای داده‌ی قدیمی)
+   383→      if (lastActivity === 0) {
+   384→        try {
+   385→          await db.user.update({
+   386→            where: { id: u.id },
+   387→            data: { lastActiveAt: now },
+   388→          });
+   389→        } catch {}
+   390→        continue;
+   391→      }
+   392→
+   393→      // فقط وقتی پیام بفرست که واقعاً ۷+ روز از آخرین رابطه گذشته است
+   394→      if (lastActivity < sevenDaysAgoMs) {
+   395→        const days = Math.floor((now.getTime() - lastActivity) / (24 * 60 * 60 * 1000));
+   396→        const firstName = (u.name || "").trim().split(" ")[0];
+   397→        const who = firstName ? `${firstName}، ` : "";
+   398→        await createNotification(
+   399→          u.id,
+   400→          "re_engagement",
+   401→          // v36 — عنوان برندشده (رفع پرچم اسپم کروم): عبارت «دنبالت بودیم» شبیه
+   402→          // پیام شخصی/چت بود — الگوی کلاسیک اعلان گمراه‌کننده برای طبقه‌بند
+   403→          // «abusive notifications» گوگل. حالا صریحاً برند فیتاپ + لحن اعلانی.
+   404→          `${who}یادآوری فیتاپ: وقت برگشتنه 🧡`,
+   405→          days >= 10
+   406→            ? `حدود ${toPersianDigitsFn(days)} روزه فیتاپ رو باز نکردی. برنامه‌ات سر جاشه و جایی نمی‌ره؛ با یه جلسه‌ی سبکِ همین امروز، دقیقاً از همون‌جایی که رها کردی ادامه بده.`
+   407→            : `چند روزه غایبی. بدنت هنوز چیزی از دست نداده — فقط یه تمرین کوتاهِ امروز لازمه تا دوباره ببندیش رو مسیر.`,
+   408→          "?tab=programs",
+   409→          { scenario: "re_engagement", daysSinceLastActivity: days }
+   410→        );
+   411→        summary.reengagement++;
+   412→      }
+   413→    }
+   414→  } catch (err) {
+   415→    console.error("[cron/behavioral] re-engagement scenario failed:", err);
+   416→  }
+   417→
+   418→  // -------------------------------------------------------------------
+   419→  // Scenario 4: Checkup reminders — day 15, 30, 40 of the 45-day plan
+   420→  // Sends a notification reminding the user to do their periodic checkup.
+   421→  // Dedupe: don't send if they already got a "checkup_reminder" in last 5 days.
+   422→  // -------------------------------------------------------------------
+   423→  try {
+   424→    const fiveDaysAgoCheckup = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000);
+   425→    const activeUsers = await db.user.findMany({
+   426→      where: {
+   427→        planName: { not: null },
+   428→        planStartedAt: { not: null },
+   429→        isBlocked: false,
+   430→      },
+   431→      select: { id: true, planStartedAt: true, name: true },
+   432→    });
+   433→
+   434→    for (const u of activeUsers) {
+   435→      if (!u.planStartedAt) continue;
+   436→      const daysSinceStart = Math.floor((now.getTime() - new Date(u.planStartedAt).getTime()) / (24 * 60 * 60 * 1000));
+   437→
+   438→      // Checkup milestones: day 15, 30, 40 (±1 day tolerance)
+   439→      const isCheckupDay = [14, 15, 16, 29, 30, 31, 39, 40, 41].includes(daysSinceStart);
+   440→      if (!isCheckupDay) continue;
+   441→
+   442→      // Determine which phase
+   443→      let phase = 1;
+   444→      let phaseLabel = "اول";
+   445→      if (daysSinceStart >= 29 && daysSinceStart <= 31) { phase = 2; phaseLabel = "دوم"; }
+   446→      else if (daysSinceStart >= 39 && daysSinceStart <= 41) { phase = 3; phaseLabel = "سوم (نهایی)"; }
+   447→
+   448→      // Dedupe
+   449→      const recentCheckupNotif = await db.notification.findFirst({
+   450→        where: { userId: u.id, type: "checkup_reminder", createdAt: { gt: fiveDaysAgoCheckup } },
+   451→        select: { id: true },
+   452→      });
+   453→      if (recentCheckupNotif) continue;
+   454→
+   455→      await createNotification(
+   456→        u.id,
+   457→        "checkup_reminder",
+   458→        `زمان چکاپ ${phaseLabel} فرا رسید! 📊`,
+   459→        `${u.name ?? "ورزشکار"} عزیز، روز ${toPersianDigitsFn(daysSinceStart)} از دوره ۴۵ روزه شماست. اکنون زمان چکاپ ${phaseLabel} است: وزن، اندازه‌های بدن و درصد چربی را ثبت کنید تا فیتاپ هوشمند پیشرفت شما را تحلیل کند. با لمس این اعلان مستقیماً به بخش چکاپ می‌روید.`,
+   460→        // v15: لینک مستقیم به بخش چکاپ (اسکرول خودکار به کارت چکاپ در تب پیشرفت)
+   461→        "?tab=progress&section=checkup",
+   462→        { scenario: "checkup_reminder", phase, daysSinceStart }
+   463→      );
+   464→
+   465→      // ─── پیامک همزمان (قالب 761137 — متغیر NAME) — درخواست مالک v32 ───
+   466→      // همان لحظه که نوتیف چکاپ می‌رود، پیامک هم می‌رود (داپ ابدی با SmsLog).
+   467→      const smsUser = await db.user.findUnique({
+   468→        where: { id: u.id },
+   469→        select: { id: true, name: true, mobile: true },
+   470→      });
+   471→      if (smsUser) {
+   472→        const smsRes = await sendCheckupReminderSms(smsUser);
+   473→        if (smsRes.sent) {
+   474→          if (!summary.smsSent) summary.smsSent = 0;
+   475→          summary.smsSent++;
+   476→        }
+   477→      }
+   478→
+   479→      if (!summary.checkup) summary.checkup = 0;
+   480→      summary.checkup++;
+   481→    }
+   482→  } catch (err) {
+   483→    console.error("[cron/behavioral] checkup reminder scenario failed:", err);
+   484→  }
+   485→
+   486→  // -------------------------------------------------------------------
+   487→  // Scenario 5: Plan just expired — send expiry notification + survey link
+   488→  // Checks if plan expired within the last 24 hours (cron runs daily).
+   489→  // Also: extend renewal discount code generation to expired users so they
+   490→  // get an actual per-user code in the notification (no hardcoded "FITAP15").
+   491→  // Sends a separate survey notification inviting the user to rate their plan.
+   492→  // Dedupe: don't send if they already got an "expired" notification.
+   493→  // -------------------------------------------------------------------
+   494→  try {
+   495→    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+   496→    const recentlyExpired = await db.subscription.findMany({
+   497→      where: {
+   498→        status: "active",
+   499→        endDate: { lt: now, gt: oneDayAgo },
+   500→      },
+   501→      select: { id: true, userId: true, plan: true, endDate: true, durationDays: true },
+   502→    });
+   503→
+   504→    // Mark subscriptions as expired
+   505→    for (const sub of recentlyExpired) {
+   506→      await db.subscription.update({
+   507→        where: { id: sub.id },
+   508→        data: { status: "expired" },
+   509→      });
+   510→
+   511→      // Check if already notified
+   512→      // Dedupe فقط در پنجره‌ی ۶۰ روز اخیر — قبلاً برای «همیشه» دداپ می‌شد و
+   513→      // انقضای اشتراک دوم کاربر دیگر هرگز اطلاع‌رسانی نمی‌گرفت.
+   514→      const expiredDedupStart = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
+   515→      const alreadyNotified = await db.notification.findFirst({
+   516→        where: {
+   517→          userId: sub.userId,
+   518→          type: "expired",
+   519→          createdAt: { gt: expiredDedupStart },
+   520→        },
+   521→        select: { id: true },
+   522→      });
+   523→      if (alreadyNotified) continue;
+   524→
+   525→      // ─── v38 (درخواست مالک): در لحظهٔ انقضا هیچ کد تخفیفی ساخته/اعلام نمی‌شود —
+   526→      // کد تخفیف و پیامک آن فقط در سناریوی ۶ (۷۲ ساعت بعد از انقضا) فعال می‌شود.
+   527→      await createNotification(
+   528→        sub.userId,
+   529→        "expired",
+   530→        `پلن ${PLAN_LABELS_FN[sub.plan ?? ""] ?? ""} تمام شد ⏸`,
+   531→        "پیشرفتت از بین نرفته. برنامه‌ات آماده‌ست منتظرت بمونه — از صفحه تمدید با یک کلیک دوباره روشن‌ش کن.",
+   532→        "?renewal=1",
+   533→        { scenario: "expired", planName: sub.plan }
+   534→      );
+   535→
+   536→      // ─── پیامک همزمان انقضا (قالب 322780 — متغیر NAME + LINK) — درخواست مالک v32/v37 ───
+   537→      // دقیقاً همزمان با منقضی شدن پلن و نوتیف انقضا ارسال می‌شود (داپ با کلید
+   538→      // plan_expired_{subId} — هر چرخهٔ اشتراک یک بار). لینک = صفحهٔ تمدید مجزا.
+   539→      try {
+   540→        const smsUser = await db.user.findUnique({
+   541→          where: { id: sub.userId },
+   542→          select: { id: true, name: true, mobile: true },
+   543→        });
+   544→        if (smsUser) {
+   545→          // v48 — لینک کوتاه r/… (≤۲۵ کاراکتر) → /go/renew — اپ باز می‌شود، نه مرورگر
+   546→          const renewLink = await createSmsRenewLink(sub.userId, sub.id);
+   547→          const smsRes = await sendPlanExpiredSms(smsUser, renewLink, sub.id);
+   548→          if (smsRes.sent) {
+   549→            if (!summary.smsSent) summary.smsSent = 0;
+   550→            summary.smsSent++;
+   551→          }
+   552→        }
+   553→      } catch (smsErr) {
+   554→        console.error("[cron/behavioral] plan_expired SMS failed:", smsErr);
+   555→      }
+   556→
+   557→      // ─── نظرسنجی پایان پلن (وظیفه ۷-الف) ───
+   558→      // یک نوتیف جداگانه با لینک به نظرسنجی ارسال می‌شود.
+   559→      // dedupe: اگر قبلاً نظرسنجی برای این کاربر ارسال شده، دوباره نفرست
+   560→      const alreadySurveyNotified = await db.notification.findFirst({
+   561→        where: { userId: sub.userId, type: "system", meta: { contains: '"survey_invite"' } },
+   562→        select: { id: true },
+   563→      });
+   564→      if (!alreadySurveyNotified) {
+   565→        await createNotification(
+   566→          sub.userId,
+   567→          "system",
+   568→          "نظر شما درباره فیتاپ مهم است 📝",
+   569→          `پلن ${sub.plan ?? ""} شما به پایان رسید. لطفاً چند ثانیه وقت بگذارید و نظرسنجی پایان پلن را پر کنید تا بتوانیم خدمات بهتری ارائه دهیم.`,
+   570→          "?survey=open",
+   571→          { scenario: "survey_invite", planName: sub.plan }
+   572→        );
+   573→      }
+   574→
+   575→      if (!summary.expired) summary.expired = 0;
+   576→      summary.expired++;
+   577→    }
+   578→  } catch (err) {
+   579→    console.error("[cron/behavioral] expired scenario failed:", err);
+   580→  }
+   581→
+   582→  // -------------------------------------------------------------------
+   583→  // Scenario 6: کاربران منقضی ۷۲ ساعته — یادآوری تمدید + پیامک (قالب 604678)
+   584→  // ─── v32 (درخواست مالک): قبلاً این نوتیف ۱۰ روز بعد از انقضا می‌رفت؛
+   585→  // حالا دقیقاً ۷۲ ساعت (۳ روز) بعد از انقضا — هم‌زمان با پیامک 604678 —
+   586→  // هر دو با یک کد تخفیف اختصاصی (درصد قابل تغییر از پنل مدیر) سینک هستند.
+   587→  // Dedupe: نوتیف renewal_late (پنجرهٔ ۷ روزه) + پیامک (داپ ابدی SmsLog)
+   588→  // -------------------------------------------------------------------
+   589→  try {
+   590→    const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+   591→    const fourDaysAgo = new Date(now.getTime() - 4 * 24 * 60 * 60 * 1000);
+   592→    const sevenDaysAgoLate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+   593→
+   594→    // کاربرانی که planExpiresAt بین ۴ تا ۳ روز پیش بوده (یعنی امروز ۷۲ ساعت از انقضا می‌گذرد)
+   595→    const lateExpiredUsers = await db.user.findMany({
+   596→      where: {
+   597→        planExpiresAt: { lt: threeDaysAgo, gt: fourDaysAgo },
+   598→        isBlocked: false,
+   599→      },
+   600→      select: { id: true, name: true, mobile: true, planName: true, planExpiresAt: true },
+   601→    });
+   602→
+   603→    for (const u of lateExpiredUsers) {
+   604→      // چک کن آیا قبلاً نوتیف renewal_late گرفته
+   605→      const recent = await db.notification.findFirst({
+   606→        where: { userId: u.id, type: "renewal_late", createdAt: { gt: sevenDaysAgoLate } },
+   607→        select: { id: true },
+   608→      });
+   609→      if (recent) continue;
+   610→
+   611→      // چک کن آیا کاربر تمدید کرده (اشتراک فعال جدید دارد)
+   612→      const hasNewActive = await db.subscription.findFirst({
+   613→        where: { userId: u.id, status: "active", endDate: { gt: now } },
+   614→        select: { id: true },
+   615→      });
+   616→      if (hasNewActive) continue; // کاربر تمدید کرده — نوتیف/پیامک نفرست
+   617→
+   618→      // تولید کد تخفیف اختصاصی (درصد از پنل مدیر — پیش‌فرض ۳۰ v47)
+   619→      // v53 — اعتبار ۱۴ روز → ۲ روز (۴۸ ساعت) — دیریکتیو مالک
+   620→      const percent = await getExpiryDiscountPercent();
+   621→      const discount = await ensureRenewalDiscountCode(u.id, percent, 2);
+   622→      const percentFa = toPersianDigitsFn(percent);
+   623→
+   624→      await createNotification(
+   625→        u.id,
+   626→        "renewal_late",
+   627→        "هنوز می‌شه ادامه داد 🎁",
+   628→        discount
+   629→          ? `۷۲ ساعت از پایان پلن ${PLAN_LABELS_FN[u.planName ?? ""] ?? ""} می‌گذره؛ برنامه‌ات هنوز سر جاش است. با کد ${discount.code} (${percentFa}٪ تخفیف) دوباره روشن‌ش کن.`
+   630→          : `۷۲ ساعت از پایان پلن ${PLAN_LABELS_FN[u.planName ?? ""] ?? ""} می‌گذره؛ برنامه‌ات هنوز سر جاش است. دوباره روشن‌ش کن.`,
+   631→        "?renewal=1",
+   632→        { scenario: "renewal_late_72h", planName: u.planName, discountCode: discount?.code ?? null }
+   633→      );
+   634→
+   635→      // ─── پیامک همزمان (قالب 604678 — NAME + CODE + LINK) — دقیقاً ۷۲ ساعت بعد از انقضا ───
+   636→      // v37: لینک تمدید مجزا (/renew?t=...) + دداپ چرخه‌ای با شناسهٔ اشتراک منقضی
+   637→      if (discount) {
+   638→        try {
+   639→          const lastExpiredSub = await db.subscription.findFirst({
+   640→            where: { userId: u.id, status: "expired" },
+   641→            orderBy: { endDate: "desc" },
+   642→            select: { id: true },
+   643→          });
+   644→          const cycleId = lastExpiredSub?.id ?? u.id;
+   645→          // v48 — لینک کوتاه r/… (فیکس خطای 114) → /go/renew (لینک هوشمند اپ)
+   646→          const renewLink = await createSmsRenewLink(u.id, cycleId);
+   647→          const smsRes = await sendExpiredWinbackSms(
+   648→            { id: u.id, name: u.name, mobile: u.mobile },
+   649→            discount.code,
+   650→            renewLink,
+   651→            cycleId
+   652→          );
+   653→          if (smsRes.sent) {
+   654→            if (!summary.smsSent) summary.smsSent = 0;
+   655→            summary.smsSent++;
+   656→          }
+   657→        } catch (smsErr) {
+   658→          console.error("[cron/behavioral] expired_winback SMS failed:", smsErr);
+   659→        }
+   660→      }
+   661→
+   662→      if (!summary.renewalLate) summary.renewalLate = 0;
+   663→      summary.renewalLate++;
+   664→    }
+   665→  } catch (err) {
+   666→    console.error("[cron/behavioral] renewal_late scenario failed:", err);
+   667→  }
+   668→
+   669→  // -------------------------------------------------------------------
+   670→  // Scenario 6.5 (v47): پیامک تقویت تمدید — قالب 883325 (دیریکتیو مالک)
+   671→  // «۸ روز از زمان تمدید پلنت گذشته، با تغییر برنامه به بدنت شوک بده.»
+   672→  // دقیقاً ۸ روز بعد از انقضای پلن — نردبان دوم تمدید بعد از پیامک 604678
+   673→  // (۷۲ ساعت). همان کد تخفیف renewal_loyalty (ensure دوباره صداش می‌زند و
+   674→  // اگر کد قبلی استفاده نشده باشد همان را با درصدِ به‌روزِ پنل مدیر سینک
+   675→  // می‌کند) → درصد پیامک و صفحهٔ تمدید همیشه یکی است.
+   676→  // لینک = go/renew?t=... → لینک هوشمند (اپ باز می‌شود، نه مرورگر).
+   677→  // Dedupe ابدی: SmsLog (mobile, renewal_boost_{cycleId}).
+   678→  // -------------------------------------------------------------------
+   679→  try {
+   680→    const eightDaysAgoB = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
+   681→    const nineDaysAgoB = new Date(now.getTime() - 9 * 24 * 60 * 60 * 1000);
+   682→
+   683→    const boostUsers = await db.user.findMany({
+   684→      where: {
+   685→        planExpiresAt: { lt: eightDaysAgoB, gt: nineDaysAgoB },
+   686→        isBlocked: false,
+   687→      },
+   688→      select: { id: true, name: true, mobile: true, planName: true },
+   689→      take: 200,
+   690→    });
+   691→
+   692→    for (const u of boostUsers) {
+   693→      // کاربر تمدید کرده → هیچ پیامی نرو
+   694→      const hasNewActive = await db.subscription.findFirst({
+   695→        where: { userId: u.id, status: "active", endDate: { gt: now } },
+   696→        select: { id: true },
+   697→      });
+   698→      if (hasNewActive) continue;
+   699→
+   700→      const percent = await getExpiryDiscountPercent();
+   701→      // v53 — اعتبار ۱۴ روز → ۲ روز (۴۸ ساعت) — دیریکتیو مالک
+   702→      const discount = await ensureRenewalDiscountCode(u.id, percent, 2);
+   703→      if (!discount) continue; // کد قبلی استفاده شده یا کاربر خریدش را کرده
+   704→
+   705→      const lastExpiredSub = await db.subscription.findFirst({
+   706→        where: { userId: u.id, status: "expired" },
+   707→        orderBy: { endDate: "desc" },
+   708→        select: { id: true },
+   709→      });
+   710→      const cycleId = lastExpiredSub?.id ?? u.id;
+   711→      // v48 — لینک کوتاه r/… (فیکس خطای 114) → /go/renew (لینک هوشمند اپ)
+   712→      const renewLink = await createSmsRenewLink(u.id, cycleId);
+   713→
+   714→      const smsRes = await sendRenewalBoostSms(
+   715→        { id: u.id, name: u.name, mobile: u.mobile },
+   716→        discount.code,
+   717→        renewLink,
+   718→        cycleId
+   719→      );
+   720→
+   721→      // نوتیف هم‌خانواده (متن هماهنگ با پیامک 883325) — فقط وقتی پیامک رفت
+   722→      if (smsRes.sent) {
+   723→        try {
+   724→          await createNotification(
+   725→            u.id,
+   726→            "renewal_boost",
+   727→            "با تغییر برنامه به بدنت شوک بده ⚡",
+   728→            `با کد ${discount.code} (${toPersianDigitsFn(percent)}٪ تخفیف) پلنت رو دوباره روشن کن و برنامهٔ ورزشی جدیدت رو بگیر.`,
+   729→            "?renewal=1",
+   730→            { scenario: "renewal_boost_8d", planName: u.planName, discountCode: discount.code }
+   731→          );
+   732→        } catch (notifErr) {
+   733→          console.warn("[cron/behavioral] renewal_boost notif failed:", notifErr);
+   734→        }
+   735→        if (!summary.renewalBoost) summary.renewalBoost = 0;
+   736→        summary.renewalBoost++;
+   737→        if (!summary.smsSent) summary.smsSent = 0;
+   738→        summary.smsSent++;
+   739→      }
+   740→    }
+   741→  } catch (err) {
+   742→    console.error("[cron/behavioral] renewal_boost scenario failed:", err);
+   743→  }
+   744→
+   745→  // -------------------------------------------------------------------
+   746→  // Scenario 7: مدیریت اشتراک‌های pending (advanced/ultimate بدون پیش‌نیاز)
+   747→  // این اشتراک‌ها با status="pending" و startDate/endDate=null ساخته شده‌اند.
+   748→  // اگر کاربر هرگز عکس بدن را آپلود نکند، اشتراک همیشه pending می‌ماند.
+   749→  // منطق:
+   750→  //   • ۷ روز پس از خرید pending → یادآوری ارسال عکس بدن (dedupe 7-day window).
+   751→  //   • ۳۰ روز پس از خرید pending → auto-activate با durationDays (معمولاً ۴۵ روز).
+   752→  //     اشتراک از این لحظه فعال می‌شود تا کاربر حداقل به‌اندازه روزهای باقی‌مانده از
+   753→  //     پلن خود بهره‌مند شود. ProgramRequest همچنان pending_body_photo می‌ماند تا
+   754→  //     اگر کاربر بعداً عکس بدن را آپلود کرد، برنامه ساخته شود (از submit-body-analysis).
+   755→  // -------------------------------------------------------------------
+   756→  try {
+   757→    const sevenDaysAgoPending = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+   758→    const sevenDaysAgoDedupe = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+   759→    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+   760→
+   761→    // (الف) یادآوری برای اشتراک‌های pending که بین ۷ تا ۳۰ روز از خرید گذشته
+   762→    const pendingReminders = await db.subscription.findMany({
+   763→      where: {
+   764→        status: "pending",
+   765→        createdAt: { lt: sevenDaysAgoPending, gt: thirtyDaysAgo },
+   766→      },
+   767→      select: { id: true, userId: true, plan: true, durationDays: true, createdAt: true },
+   768→    });
+   769→
+   770→    for (const sub of pendingReminders) {
+   771→      // کاربر مسدود شده → skip
+   772→      const u = await db.user.findUnique({
+   773→        where: { id: sub.userId },
+   774→        select: { isBlocked: true },
+   775→      });
+   776→      if (u?.isBlocked) continue;
+   777→
+   778→      // dedupe: اگر در ۷ روز گذشته نوتیف pending_reminder گرفته، نفرست
+   779→      const recent = await db.notification.findFirst({
+   780→        where: {
+   781→          userId: sub.userId,
+   782→          type: "system",
+   783→          createdAt: { gt: sevenDaysAgoDedupe },
+   784→          meta: { contains: '"pending_reminder"' },
+   785→        },
+   786→        select: { id: true },
+   787→      });
+   788→      if (recent) continue;
+   789→
+   790→      const daysSincePurchase = Math.floor(
+   791→        (now.getTime() - new Date(sub.createdAt).getTime()) / (24 * 60 * 60 * 1000)
+   792→      );
+   793→
+   794→      await createNotification(
+   795→        sub.userId,
+   796→        "system",
+   797→        "یادآوری: عکس بدن خود را ارسال کنید 📸",
+   798→        `پلن ${sub.plan ?? ""} شما ${toPersianDigitsFn(
+   799→          daysSincePurchase
+   800→        )} روز پیش فعال شد اما هنوز عکس‌های بدن خود را ارسال نکرده‌اید. برای شروع دوره ${toPersianDigitsFn(
+   801→          sub.durationDays ?? 45
+   802→        )} روزه و ساخت برنامه اختصاصی، لطفاً از بخش داشبورد عکس‌های بدن (۴ زاویه) را آپلود کنید.`,
+   803→        "?tab=dashboard",
+   804→        {
+   805→          scenario: "pending_reminder",
+   806→          planName: sub.plan,
+   807→          daysSincePurchase,
+   808→          subscriptionId: sub.id,
+   809→        }
+   810→      );
+   811→      if (!summary.pendingReminder) summary.pendingReminder = 0;
+   812→      summary.pendingReminder++;
+   813→    }
+   814→
+   815→    // (ب) auto-activate برای اشتراک‌های pending که بیش از ۳۰ روز از خرید گذشته
+   816→    // ─── FIX (ممیزی 2-a باگ #2) ───
+   817→    // قبلاً: هر pending قدیمی‌تر از ۳۰ روز صرف‌نظر از endDate فعال می‌شد با مدت
+   818→    // کامل تازه + planName کاربر بی‌قیدوشرط بازنویسی می‌شد (می‌توانست پلن فعالِ
+   819→    // بالاتر را «داگرِید» کند). حالا:
+   820→    //  ۱) فقط pendings با endDate=null (هنوز پنجرهشان باز است) یا endDate>now
+   821→    //  ۲) اگر کاربر اشتراک active با تیر ≥ همین پلن دارد → فیلدهای User دست‌نخورده
+   822→    const stalePending = await db.subscription.findMany({
+   823→      where: {
+   824→        status: "pending",
+   825→        createdAt: { lt: thirtyDaysAgo },
+   826→        OR: [{ endDate: null }, { endDate: { gt: new Date() } }],
+   827→      },
+   828→      select: { id: true, userId: true, plan: true, durationDays: true, createdAt: true },
+   829→    });
+   830→
+   831→    // رتبه تیر پلن‌ها برای مقایسه برتری
+   832→    const PLAN_TIER: Record<string, number> = { basic: 1, standard: 2, advanced: 3, ultimate: 4 };
+   833→
+   834→    for (const sub of stalePending) {
+   835→      // اشتراک را به active تبدیل کن با startDate=now و endDate=now + durationDays
+   836→      // durationDays معمولاً ۴۵ روز است. اگر از مدت زمان گذشته باشیم، همچنان این مدت
+   837→      // به کاربر داده می‌شود تا از ارزش پلن خود بهره‌مند شود.
+   838→      const startNow = new Date();
+   839→      const endNow = new Date();
+   840→      endNow.setDate(endNow.getDate() + (sub.durationDays || 45));
+   841→
+   842→      await db.subscription.update({
+   843→        where: { id: sub.id },
+   844→        data: {
+   845→          status: "active",
+   846→          startDate: startNow,
+   847→          endDate: endNow,
+   848→        },
+   849→      });
+   850→
+   851→      // به‌روزرسانی فیلدهای پلن روی User — فقط اگر اشتراک فعالِ برتر ندارد
+   852→      try {
+   853→        const freshUser = await db.user.findUnique({
+   854→          where: { id: sub.userId },
+   855→          select: { planStartedAt: true, planExpiresAt: true, isBlocked: true },
+   856→        });
+   857→        if (freshUser && !freshUser.isBlocked) {
+   858→          const betterActive = await db.subscription.findFirst({
+   859→            where: {
+   860→              userId: sub.userId,
+   861→              status: "active",
+   862→              endDate: { gt: new Date() },
+   863→              id: { not: sub.id },
+   864→            },
+   865→            orderBy: { endDate: "desc" },
+   866→          });
+   867→          const newTier = PLAN_TIER[sub.plan] ?? 0;
+   868→          const activeTier = betterActive ? (PLAN_TIER[betterActive.plan] ?? 0) : 0;
+   869→          const hasBetter = !!betterActive && activeTier >= newTier;
+   870→          if (!hasBetter) {
+   871→            const updateData: { planStartedAt?: Date; planExpiresAt?: Date; planName?: string } = {};
+   872→            if (!freshUser.planStartedAt) updateData.planStartedAt = startNow;
+   873→            if (!freshUser.planExpiresAt || freshUser.planExpiresAt.getTime() < endNow.getTime()) {
+   874→              updateData.planExpiresAt = endNow;
+   875→            }
+   876→            updateData.planName = sub.plan;
+   877→            if (Object.keys(updateData).length > 0) {
+   878→              await db.user.update({
+   879→                where: { id: sub.userId },
+   880→                data: updateData,
+   881→              });
+   882→            }
+   883→          }
+   884→        }
+   885→      } catch (userErr) {
+   886→        console.error("[cron/behavioral] auto-activate user update failed:", userErr);
+   887→      }
+   888→
+   889→      // نوتیف به کاربر مبنی بر فعال‌سازی خودکار
+   890→      await createNotification(
+   891→        sub.userId,
+   892→        "subscription",
+   893→        "اشتراک شما فعال شد ⏰",
+   894→        `پلن ${sub.plan ?? ""} شما بیش از ۳۰ روز در حالت انتظار (pending) بود. برای اینکه از ارزش پلن خود بهره‌مند شوید، اشتراک از همین حالا برای ${toPersianDigitsFn(
+   895→          sub.durationDays ?? 45
+   896→        )} روز فعال شد. هنوز هم می‌توانید از بخش داشبورد عکس بدن خود را ارسال کنید تا برنامه اختصاصی شما ساخته شود.`,
+   897→        "?tab=dashboard",
+   898→        {
+   899→          scenario: "pending_auto_activated",
+   900→          planName: sub.plan,
+   901→          durationDays: sub.durationDays,
+   902→          endDate: endNow.toISOString(),
+   903→          subscriptionId: sub.id,
+   904→        }
+   905→      );
+   906→      if (!summary.pendingAutoActivated) summary.pendingAutoActivated = 0;
+   907→      summary.pendingAutoActivated++;
+   908→    }
+   909→  } catch (err) {
+   910→    console.error("[cron/behavioral] pending subscription scenario failed:", err);
+   911→  }
+   912→
+   913→  // -------------------------------------------------------------------
+   914→  // Scenario 8: پیامک آنبوردینگ ناتمام (قالب 669068 — متغیر NAME)
+   915→  // کاربری که موبایلش ثبت شده (و OTP گرفته) ولی آنبوردینگ را تکمیل نکرده —
+   916→  // ۳۰ دقیقه بعد از ثبت موبایل و خروج، یک پیامک دعوت به تکمیل می‌گیرد.
+   917→  // پنجره: ۳۰ دقیقه تا ۷ روز بعد از ثبت (کاربران قدیمی‌تر با backfill یک‌بار
+   918→  // پیامک می‌گیرند). Dedupe ابدی: SmsLog (mobile, onboarding_nudge).
+   919→  // v43 — دیریکتیو جدید مالک: کاربرِ بدونِ نام هم پیامک می‌گیرد و به‌جای NAME
+   920→  // «ورزشکار» نوشته می‌شود («بجای اینکه متغیر نیم رو خالی بذاری یا پیامک
+   921→  // نفرستی، پیامک بفرست و بنویس ورزشکار») — فیلتر نامِ v42 حذف شد. فال‌بک
+   922→  // در خود flow + گارد مرکزی sendTemplateSms لایهٔ دوم تضمین است.
+   923→  // -------------------------------------------------------------------
+   924→  try {
+   925→    const thirtyMinAgo = new Date(now.getTime() - 30 * 60 * 1000);
+   926→    // v48 — پنجره ۷ روز → ۹۰ روز: کاربرانِ ناتمامِ قدیمی‌تر هم (با دداپ ابدی،
+   927→    // فقط یک‌بار در عمرشان) پیامک دعوت به آنبوردینگ می‌گیرند — گزارش مالک
+   928→    const ninetyDaysAgoNudge = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+   929→
+   930→    const nudgeUsers = await db.user.findMany({
+   931→      where: {
+   932→        onboardingDone: false,
+   933→        isBlocked: false,
+   934→        createdAt: { lt: thirtyMinAgo, gt: ninetyDaysAgoNudge },
+   935→      },
+   936→      select: { id: true, name: true, mobile: true },
+   937→      take: 300,
+   938→    });
+   939→
+   940→    for (const u of nudgeUsers) {
+   941→      const smsRes = await sendOnboardingNudgeSms(u);
+   942→      if (smsRes.sent) {
+   943→        // v37: نوتیف همزمان با پیامک (فقط وقتی پیامک واقعاً می‌رود — ضد اسپم)
+   944→        try {
+   945→          await createNotification(
+   946→            u.id,
+   947→            "system",
+   948→            "هنوز شروع نکردی؟ 💪",
+   949→            "پروفایل فیتاپ تو منتظره — چند دقیقه وقت بذار و آنبوردینگ را تمام کن تا برنامه‌ی اختصاصی بدنت ساخته شود.",
+   950→            undefined
+   951→          );
+   952→        } catch (notifErr) {
+   953→          console.warn("[cron/behavioral] onboarding nudge notif failed:", notifErr);
+   954→        }
+   955→        if (!summary.onboardingNudge) summary.onboardingNudge = 0;
+   956→        summary.onboardingNudge++;
+   957→        if (!summary.smsSent) summary.smsSent = 0;
+   958→        summary.smsSent++;
+   959→      }
+   960→    }
+   961→  } catch (err) {
+   962→    console.error("[cron/behavioral] onboarding_nudge SMS scenario failed:", err);
+   963→  }
+   964→
+   965→  // -------------------------------------------------------------------
+   966→  // Scenario 9: پیامک بازگشت بعد از آنبوردینگ (قالب 461291 — NAME + CODE)
+   967→  // کاربری که آنبوردینگ را تکمیل کرده ولی ۲۴ ساعت بعد هنوز هیچ پلنی نخریده —
+   968→  // یک کد تخفیف اختصاصی (درصد از پنل مدیر، یک‌بارمصرفِ خرید اول) + پیامک می‌گیرد.
+   969→  // پنجره: ۲۴ تا ۴۸ ساعت بعد از onboardingCompletedAt (قدیمی‌ترها: backfill).
+   970→  // Dedupe ابدی: SmsLog (mobile, onboarding_winback).
+   971→  // -------------------------------------------------------------------
+   972→  try {
+   973→    const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+   974→    const fortyEightHoursAgo = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+   975→
+   976→    const winbackUsers = await db.user.findMany({
+   977→      where: {
+   978→        onboardingDone: true,
+   979→        onboardingCompletedAt: { lte: twentyFourHoursAgo, gt: fortyEightHoursAgo },
+   980→        isBlocked: false,
+   981→        planName: null,
+   982→      },
+   983→      select: { id: true, name: true, mobile: true },
+   984→      take: 200,
+   985→    });
+   986→
+   987→    for (const u of winbackUsers) {
+   988→      // فقط کسانی که هرگز اشتراکی نداشته‌اند (خرید اول)
+   989→      const subsCount = await db.subscription.count({ where: { userId: u.id } });
+   990→      if (subsCount > 0) continue;
+   991→
+   992→      const percent = await getOnboardingDiscountPercent();
+   993→      // v53 — اعتبار ۳۰ روز → ۲ روز (۴۸ ساعت) — دیریکتیو مالک
+   994→      const discount = await ensureOnboardingWinbackCode(u.id, percent, 2);
+   995→      if (!discount) continue;
+   996→
+   997→      const smsRes = await sendOnboardingWinbackSms(u, discount.code);
+   998→      if (smsRes.sent) {
+   999→        // v37: نوتیف همزمان با پیامک (فقط وقتی پیامک واقعاً می‌رود — ضد اسپم)
+  1000→        try {
+  1001→          await createNotification(
+  1002→            u.id,
+  1003→            "system",
+  1004→            "هدیه‌ی شروع در انتظارته 🎁",
+  1005→            `کد تخفیف یک‌بارمصرف ${discount.code} (${toPersianDigitsFn(percent)}٪) برای اولین خرید پلن فیتاپ فعال است — تا ۴۸ ساعت اعتبار دارد.`,
+  1006→            "?tab=plans",
+  1007→            { scenario: "onboarding_winback", discountCode: discount.code }
+  1008→          );
+  1009→        } catch (notifErr) {
+  1010→          console.warn("[cron/behavioral] onboarding winback notif failed:", notifErr);
+  1011→        }
+  1012→        if (!summary.onboardingWinback) summary.onboardingWinback = 0;
+  1013→        summary.onboardingWinback++;
+  1014→        if (!summary.smsSent) summary.smsSent = 0;
+  1015→        summary.smsSent++;
+  1016→      }
+  1017→    }
+  1018→  } catch (err) {
+  1019→    console.error("[cron/behavioral] onboarding_winback SMS scenario failed:", err);
+  1020→  }
+  1021→
+  1022→  // -------------------------------------------------------------------
+  1023→  // Scenario 9.5 (v47): پیامک خوش‌آمدگویی خرید — قالب 612964 (دیریکتیو مالک)
+  1024→  // «یک پیام با تمپلیت 612964 بساز برای دقیقا ۸ روز بعد از ثبت شماره موبایل»
+  1025→  //
+  1026→  // پنجره: دقیقاً ۸ روز بعد از User.createdAt (ثبت موبایل) — نه وابسته به
+  1027→  // آنبوردینگ (چون ممکن است هنوز تکمیل نکرده باشد).
+  1028→  //
+  1029→  // NAME — دیریکتیو صریح مالک:
+  1030→  //   «اگر کاربر آنبوردینگ رو تکمیل نکرده بود بجای متغیر نیم باید بنویسی
+  1031→  //    ورزشکار و در صورت تکمیل اسمش رو.»
+  1032→  //
+  1033→  // CODE: کد اختصاصی reason=welcome_offer با درصد welcome_offer_discount_percent
+  1034→  // (پیش‌فرض ۳۰٪ — قابل تغییر در پنل مدیر). لینک ثابت قالب به صفحهٔ پلن‌ها
+  1035→  // می‌رود (در متن قالب پنل: https://fittup.ir/go/plans — لینک هوشمند اپ).
+  1036→  //
+  1037→  // گزینش: کاربرانی که تا امروز ۸ روزه هیچ خریدی نکرده‌اند (هیچ اشتراکی
+  1038→  // ندارند) — چون لینک به خرید ختم می‌شود، خریدارها مستثنا هستند.
+  1039→  // Dedupe ابدی: SmsLog (mobile, welcome_offer) — یک بار در عمر کاربر.
+  1040→  // -------------------------------------------------------------------
+  1041→  try {
+  1042→    const eightDaysAgo = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
+  1043→    const nineDaysAgo = new Date(now.getTime() - 9 * 24 * 60 * 60 * 1000);
+  1044→
+  1045→    const welcomeUsers = await db.user.findMany({
+  1046→      where: {
+  1047→        createdAt: { lt: eightDaysAgo, gt: nineDaysAgo },
+  1048→        isBlocked: false,
+  1049→      },
+  1050→      select: { id: true, name: true, mobile: true, onboardingDone: true },
+  1051→      take: 200,
+  1052→    });
+  1053→
+  1054→    for (const u of welcomeUsers) {
+  1055→      if (!u.mobile) continue;
+  1056→      // فقط کاربرانی که هرگز چیزی نخریده‌اند
+  1057→      const subsCount = await db.subscription.count({ where: { userId: u.id } });
+  1058→      if (subsCount > 0) continue;
+  1059→
+  1060→      const percent = await getWelcomeOfferDiscountPercent();
+  1061→      // v53 — اعتبار ۳۰ روز → ۲ روز (۴۸ ساعت) — دیریکتیو مالک
+  1062→      const discount = await ensureWelcomeOfferCode(u.id, percent, 2);
+  1063→      if (!discount) continue; // کد قبلی همین کمپین استفاده شده → خرید/استفاده
+  1064→
+  1065→      // دیریکتیو مالک: آنبوردینگ ناتمام → «ورزشکار»، تکمیل → نام خودش
+  1066→      const displayName = u.onboardingDone ? smsFirstNameFn(u.name) : "ورزشکار";
+  1067→
+  1068→      const smsRes = await sendWelcomeOfferSms(
+  1069→        { id: u.id, name: u.name, mobile: u.mobile },
+  1070→        discount.code,
+  1071→        displayName
+  1072→      );
+  1073→
+  1074→      if (smsRes.sent) {
+  1075→        try {
+  1076→          await createNotification(
+  1077→            u.id,
+  1078→            "system",
+  1079→            "هدیهٔ ۸ روزهٔ تو آماده‌ست 🎁",
+  1080→            `کد تخفیف ${discount.code} (${toPersianDigitsFn(percent)}٪) برای خرید پلن فیتاپ فعال شد — تا ۴۸ ساعت اعتبار دارد. زندگی ورزشی‌تو متحول کن!`,
+  1081→            "?tab=plans",
+  1082→            { scenario: "welcome_offer_8d", discountCode: discount.code }
+  1083→          );
+  1084→        } catch (notifErr) {
+  1085→          console.warn("[cron/behavioral] welcome_offer notif failed:", notifErr);
+  1086→        }
+  1087→        if (!summary.welcomeOffer) summary.welcomeOffer = 0;
+  1088→        summary.welcomeOffer++;
+  1089→        if (!summary.smsSent) summary.smsSent = 0;
+  1090→        summary.smsSent++;
+  1091→      }
+  1092→    }
+  1093→  } catch (err) {
+  1094→    console.error("[cron/behavioral] welcome_offer SMS scenario failed:", err);
+  1095→  }
+  1096→
+  1097→  // -------------------------------------------------------------------
+  1098→  // Scenario 10 (v53): ترک درگاه پرداخت — پیامک «کد ۲۴۸۹۴۵» + کد تخفیف ۲ساعته
+  1099→  // درخواست مالک: کاربری که پرداخت درگاه (زرین‌پال) را شروع کرده و رها کرده،
+  1100→  // ۵۵ دقیقه تا ۲۴ ساعت بعد با پیامک «با ۱۰ درصد تخفیف تا دو ساعت آینده…»
+  1101→  // برمی‌گردد. کد نمایشی همیشه «248945» است (کد داخلی یکتا 248945-XXXXX —
+  1102→  // ensureAbandonedCartCode) و لینک، صفحهٔ پلن‌ها را با ?offer= باز می‌کند.
+  1103→  //
+  1104→  // منطق کامل (نامزدها، ۷ شرط ارسال، تنظیمات SiteSetting و ارسال قالب→bulk)
+  1105→  // در src/lib/fitness/abandoned-cart-scenario.ts جدا شده است — هم از همین
+  1106→  // sweep اجرا می‌شود و هم مستقیماً قابل تست است.
+  1107→  // -------------------------------------------------------------------
+  1108→  try {
+  1109→    const acRes = await runAbandonedCartScenario(now);
+  1110→    if (acRes.sent > 0) {
+  1111→      summary.abandonedCart = acRes.sent;
+  1112→      if (!summary.smsSent) summary.smsSent = 0;
+  1113→      summary.smsSent += acRes.sent;
+  1114→    }
+  1115→    if (acRes.skippedOutsideWindow > 0) {
+  1116→      summary.abandonedCartSkipped = acRes.skippedOutsideWindow;
+  1117→    }
+  1118→  } catch (err) {
+  1119→    console.error("[cron/behavioral] abandoned_cart scenario failed:", err);
+  1120→  }
+  1121→
+  1122→  // -------------------------------------------------------------------
+  1123→  // Scenario 11 (v38): سوئیپ خودکار تولیدهای ناموفق — درخواست مالک:
+  1124→  // «به هیچ وجه نباید کاربر بدون برنامه بماند». درخواست‌های failed با
+  1125→  // attempts < ۳ و ۱۵ دقیقه سکوت → دوباره صف تولید (سقف ۳ در هر سوئیپ).
+  1126→  // -------------------------------------------------------------------
+  1127→  try {
+  1128→    const requeued = await recoverFailedGenerations(3);
+  1129→    if (requeued > 0) {
+  1130→      summary.programRetry = requeued;
+  1131→      console.log(`[cron/behavioral] auto-requeued ${requeued} failed program generation(s)`);
+  1132→    }
+  1133→  } catch (err) {
+  1134→    console.error("[cron/behavioral] failed-generation sweep error:", err);
+  1135→  }
+  1136→
+  1137→  summary.total =
+  1138→    summary.upgrade +
+  1139→    summary.renewal +
+  1140→    summary.reengagement +
+  1141→    (summary.checkup || 0) +
+  1142→    (summary.expired || 0) +
+  1143→    (summary.renewalLate || 0) +
+  1144→    (summary.pendingReminder || 0) +
+  1145→    (summary.pendingAutoActivated || 0) +
+  1146→    (summary.planExpiring || 0) +
+  1147→    (summary.onboardingNudge || 0) +
+  1148→    (summary.onboardingWinback || 0) +
+  1149→    (summary.welcomeOffer || 0) +
+  1150→    (summary.renewalBoost || 0) +
+  1151→    (summary.abandonedCart || 0);
+  1152→  return Response.json({ ok: true, ...summary });
+  1153→}
+  1154→
+  1155→// برچسب فارسی پلن‌ها (محلی — بدون import سنگین از types)
+  1156→const PLAN_LABELS_FN: Record<string, string> = {
+  1157→  basic: "اقتصادی",
+  1158→  standard: "استاندارد",
+  1159→  advanced: "پیشرفته",
+  1160→  ultimate: "حرفه‌ای",
+  1161→};
+  1162→
+  1163→// Simple Persian digit converter (to avoid importing from types in cron)
+  1164→function toPersianDigitsFn(n: number | string): string {
+  1165→  const persianDigits = ["۰", "۱", "۲", "۳", "۴", "۵", "۶", "۷", "۸", "۹"];
+  1166→  return String(n).replace(/[0-9]/g, (d) => persianDigits[parseInt(d)]);
+  1167→}
+  1168→
+  1169→// نام کوچک امن برای پارامتر NAME پیامک (محلی — همان منطق sms-flows.smsFirstName، سقف ۲۵ v48)
+  1170→function smsFirstNameFn(name: string | null | undefined): string {
+  1171→  const first = String(name || "")
+  1172→    .replace(/[\r\n\t]/g, " ")
+  1173→    .trim()
+  1174→    .split(/\s+/)[0] || "";
+  1175→  return first.slice(0, 25);
+  1176→}
+  1177→

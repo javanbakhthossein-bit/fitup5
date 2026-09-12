@@ -1,0 +1,2002 @@
+     1→import OpenAI from "openai";
+     2→import { db } from "@/lib/db";
+     3→import type {
+     4→  OnboardingData,
+     5→  WorkoutPlanContent,
+     6→  MealPlanContent,
+     7→  Plan,
+     8→} from "./types";
+     9→import {
+    10→  GOAL_LABELS, ACTIVITY_LABELS, GENDER_LABELS, WORKOUT_PLACE_LABELS, DIET_LABELS,
+    11→  PERSIAN_WEEKDAYS, PLAN_LABELS, getCapabilities, TRAINING_EXPERIENCE_LABELS,
+    12→  BODY_FRAME_LABELS, WORKOUT_TIME_LABELS, PREFERRED_CUISINE_LABELS, MEDICAL_CONDITION_LABELS,
+    13→} from "./types";
+    14→import { bloodTestPromptSummary } from "./blood-tests";
+    15→import { execFile } from "child_process";
+    16→import { promisify } from "util";
+    17→import { writeFile, readFile, unlink, mkdir } from "fs/promises";
+    18→import path from "path";
+    19→import { tmpdir } from "os";
+    20→import { logAiUsage } from "@/lib/fitness/costs";
+    21→
+    22→const execFileAsync = promisify(execFile);
+    23→
+    24→// AvalAI OpenAI-compatible client — lazy initialization
+    25→// در زمان build ساخته نمی‌شود تا خطای Missing credentials ندهد
+    26→let _avalaiClient: OpenAI | null = null;
+    27→
+    28→export function getAvalaiClient(): OpenAI {
+    29→  if (!_avalaiClient) {
+    30→    _avalaiClient = new OpenAI({
+    31→      apiKey: process.env.AVALAI_API_KEY || "placeholder-for-build",
+    32→      baseURL: process.env.AVALAI_BASE_URL || "https://api.avalai.ir/v1",
+    33→      // ⚠️ بدون این دو گزینه، تایم‌اوت پیش‌فرض SDK ۱۰ دقیقه است و کال‌های کند
+    34→      // (که کلادفلرِ جلوی api.avalai.ir با 504 می‌کُشد) کل مسیر تولید برنامه را قفل می‌کنند.
+    35→      timeout: 165_000, // ۱۶۵ ثانیه — تست واقعی AvalAI: تولید برنامه کامل با reasoning low ≈ ۹۷-۱۱۰s؛ سقف گیت‌وی بالاتر از ۱۱۰s است
+    36→      maxRetries: 1, // یک retry خودکار برای خطاهای گذرا (429/5xx) — نه بیشتر، تا سریع fail شود
+    37→    });
+    38→  }
+    39→  return _avalaiClient;
+    40→}
+    41→
+    42→export const TEXT_MODEL = process.env.AVALAI_TEXT_MODEL || "gemini-3.8-flash";
+    43→export const VISION_MODEL = process.env.AVALAI_VISION_MODEL || "gemini-3.8-flash";
+    44→
+    45→// ═══════════════════════════════════════════════════════════════════════════
+    46→// v42 — مدل‌های فال‌بک سراسری (دیریکتیو مالک):
+    47→// «همهٔ قسمت‌های هوش مصنوعی باید درست کار کنند. برای مدل ویژن اگر یک درصد نشد
+    48→//  مدل gemini-3.5-flash و برای ال‌ال‌ام هم اگر یک درصد نشد مدل دیپسیک 4 فلش.»
+    49→//   • درخواست‌های متنی (LLM):  gemini-3.8-flash → deepseek-v4-flash
+    50→//   • درخواست‌های تصویری (Vision): gemini-3.8-flash → gemini-3.5-flash
+    51→// تشخیص ویژن خودکار است (پیام شامل image_url باشد) — لازم نیست هر call-site
+    52→// دستی مشخص کند. هر شکستِ نهایی (پاسخ خالی/نامعتبر، 4xx، 5xx، تایم‌اوت) بعد از
+    53→// اتمام تلاش‌های همان مدل، به مدل فال‌بک می‌رود — در createResilientCompletion
+    54→// و createChatCompletionWithRetry (دو نقطهٔ تماس تنها با avalaiClient در سیستم،
+    55→// علاوه بر مسیر تولید برنامه که فال‌بک اختصاصی خودش را دارد).
+    56→// ═══════════════════════════════════════════════════════════════════════════
+    57→export const FALLBACK_VISION_MODEL =
+    58→  process.env.AVALAI_FALLBACK_VISION_MODEL || "gemini-3.5-flash";
+    59→export const FALLBACK_TEXT_MODEL =
+    60→  process.env.AVALAI_FALLBACK_TEXT_MODEL || "deepseek-v4-flash";
+    61→
+    62→// ═══════════════════════════════════════════════════════════════════════
+    63→// v58 — مدل اختصاصی چت نیکا و تحلیل آنبوردینگ (دیریکتیو مالک):
+    64→// «مدل LLM نیکا و تحلیل آنبوردینگ بشود deepseek-v4-flash با همان کلید API
+    65→//  فعلی (AvalAI) — تمام بقیهٔ LLMها همان قبلی بمانند.»
+    66→//
+    67→// deepseek-v4-flash → به‌طور خودکار به DeepSeek-V4-Flash-0731 روت می‌شود
+    68→// (MoE با ۲۸۴B پارامتر کل / ۱۳B فعال + speculative decoding از نوع DSpark،
+    69→// پنجرهٔ زمینهٔ ۱M توکن، خروجی ساختاریافته/فراخوانی ابزار/کش پرامپت/استریمینگ
+    70→// بومی — از طریق همان کلید و baseURL فعلی AvalAI با /v1/chat/completions).
+    71→//
+    72→//   • چت نیکا: reasoning_effort=low (پاسخ سریع فروش/راهنما — تجربهٔ چت)
+    73→//   • تحلیل آنبوردینگ: سطح پیش‌فرض (low) — تحلیل ۳ پاراگرافی سریع
+    74→//
+    75→// فال‌بک هر دو: اگر deepseek به هر دلیلی نشد → TEXT_MODEL (gemini-3.8-flash)
+    76→// تا کاربر هرگز بدون پاسخ نماند (دیریکتیو «اگر یک درصد نشد…»). این فال‌بک
+    77→// صریح با پارامتر داخلی fallback_model پاس داده می‌شود (هرگز به API نمی‌رود).
+    78→// ═══════════════════════════════════════════════════════════════════════
+    79→export const NIKA_MODEL = process.env.AVALAI_NIKA_MODEL || "deepseek-v4-flash";
+    80→export const ONBOARDING_ANALYSIS_MODEL =
+    81→  process.env.AVALAI_ONBOARDING_MODEL || "deepseek-v4-flash";
+    82→
+    83→// ═══════════════════════════════════════════════════════════════════════
+    84→// v69 — مدل وظایف متنی عمومی (دیریکتیو مالک):
+    85→// «بررسی جامع کن که تحلیل انبوردینگ و چت نیکا حتماً از DeepSeek 4 Flash
+    86→//  استفاده کنن تا هزینه‌هام مدیریت بشه — ۸۰٪ مصرف ۲۴ساعت اخیر gemini بوده
+    87→//  در حالی که باید برعکس باشه.»
+    88→//
+    89→// ریشه‌یابی: نیکا/آنبوردینگ از v58 واقعاً deepseek بودند؛ اما مسیرهای متنیِ
+    90→// پرمصرفِ دیگر (چت مربی هوشمند پنل بدون عکس، تحلیل چکاپ، تحلیل جامع، تحلیل
+    91→// تاریخچهٔ برنامه، جایگزین غذا، تحلیل اندازه‌های اولیه، دستیار مدیر، تحلیل
+    92→// نظرسنجی) هنوز از TEXT_MODEL (gemini-3.8-flash — گران‌ترِ ~۴ برابری) استفاده
+    93→// می‌کردند و کل سهم مصرف را به gemini می‌بردند.
+    94→//
+    95→// v69: همهٔ وظایف «متنی» (بدون تصویر) به deepseek-v4-flash منتقل شدند؛
+    96→// فال‌بک صریح‌شان gemini-3.8-flash است تا هیچ مسیری بدون پاسخ نماند.
+    97→// دست‌نخورده (ضروری برای کارکرد درست / deepseek قابلیت‌شان را ندارد):
+    98→//   • تولید برنامهٔ تمرینی/غذایی — gemini-3.8-flash (دیریکتیو v40 مالک)
+    99→//   • تمام درخواست‌های ویژن (عکس غذا/بدن/ویدیو/چت با عکس) — gemini-3.8/3.5
+   100→//   • TTS و تولید تصویر — مدل‌های صوتی/تصویری
+   101→//   • سئو/تولید مقاله (seo-report/seo-agent/content-refresh) — gemini-3.8
+   102→// ═══════════════════════════════════════════════════════════════════════
+   103→export const TEXT_TASK_MODEL = process.env.AVALAI_TEXT_TASK_MODEL || "deepseek-v4-flash";
+   104→
+   105→/** تشخیص درخواست ویژن — آیا بعضی پیام‌ها شامل تصویر (image_url) هستند؟ */
+   106→function isVisionRequest(params: Record<string, unknown>): boolean {
+   107→  const messages = params.messages;
+   108→  if (!Array.isArray(messages)) return false;
+   109→  return messages.some((m) => {
+   110→    if (!m || typeof m !== "object") return false;
+   111→    const content = (m as { content?: unknown }).content;
+   112→    if (!Array.isArray(content)) return false;
+   113→    return content.some(
+   114→      (p) =>
+   115→        p &&
+   116→        typeof p === "object" &&
+   117→        (p as { type?: unknown }).type === "image_url"
+   118→    );
+   119→  });
+   120→}
+   121→
+   122→/**
+   123→ * مدل فال‌بک مناسب این درخواست — null یعنی فال‌بک معنا ندارد
+   124→ * (خودِ درخواست از قبل روی مدل فال‌بک است یا مدل فال‌بک تنظیم نشده).
+   125→ */
+   126→function fallbackModelFor(params: Record<string, unknown>): string | null {
+   127→  const model = typeof params.model === "string" ? params.model : TEXT_MODEL;
+   128→  // v58 — اولویت با فال‌بکِ صریحِ همان فراخوانی (fallback_model — مثل چت نیکا
+   129→  // و تحلیل آنبوردینگ که مدل اصلی deepseek است و فال‌بک‌شان gemini)؛ بعد تشخیص
+   130→  // خودکار ویژن/متن. این پارامتر داخلی است و هرگز به API ارسال نمی‌شود.
+   131→  const explicit =
+   132→    typeof params.fallback_model === "string" ? params.fallback_model.trim() : "";
+   133→  const fb = explicit || (isVisionRequest(params) ? FALLBACK_VISION_MODEL : FALLBACK_TEXT_MODEL);
+   134→  return fb && fb !== model ? fb : null;
+   135→}
+   136→
+   137→/**
+   138→ * ساخت پارامترهای نسخهٔ فال‌بک — فقط مدل عوض می‌شود؛ برای مقصد gemini-3.x،
+   139→ * reasoning_effort (اگر هست) هم‌زمان به extra_body.thinkingConfig هم برده
+   140→ * می‌شود (هم‌سان با buildPlanParams) تا سطح استدلال در پروکسی gemini گم نشود.
+   141→ */
+   142→function withFallbackModel(
+   143→  params: Record<string, unknown>,
+   144→  fallbackModel: string
+   145→): Record<string, unknown> {
+   146→  const next: Record<string, unknown> = { ...params, model: fallbackModel };
+   147→  const effort = next.reasoning_effort;
+   148→  if (effort && isGemini3Model(fallbackModel)) {
+   149→    const prevExtra = (next.extra_body ?? {}) as Record<string, unknown>;
+   150→    const prevConfig = (prevExtra.generationConfig ?? {}) as Record<string, unknown>;
+   151→    next.extra_body = {
+   152→      ...prevExtra,
+   153→      generationConfig: {
+   154→        ...prevConfig,
+   155→        thinkingConfig: { ...(prevConfig.thinkingConfig as object | undefined), thinkingLevel: effort },
+   156→      },
+   157→    };
+   158→  }
+   159→  return next;
+   160→}
+   161→
+   162→/**
+   163→ * تبدیل عدد میلادی به سال هجری شمسی (تقریبی، برای نمایش سال کافی است).
+   164→ * الگوریتم: سال میلادی - 621 (با تنظیم برای قبل/بعد از نوروز).
+   165→ * مثال: 2026 - 621 = 1405
+   166→ */
+   167→function gregorianToJalaliYear(gYear: number): number {
+   168→  const now = new Date();
+   169→  // نوروز معمولاً 20 یا 21 مارس است. اگر قبل از 21 مارس هستیم، سال شمسی یکی کمتر است.
+   170→  const mar21 = new Date(gYear, 2, 21); // ماه 2 = مارس (0-indexed)
+   171→  return now >= mar21 ? gYear - 621 : gYear - 622;
+   172→}
+   173→
+   174→/**
+   175→ * دایرکتیو سیستم — شامل برند و سال جاری.
+   176→ *
+   177→ * این دایرکتیو به‌صورت پویا ساخته می‌شود تا سال جاری همیشه درست باشد
+   178→ * (میلادی و هجری شمسی). مدل هرگز نباید سال قدیمی (مثلاً ۱۴۰۳، ۱۴۰۴، 2024، 2025)
+   179→ * را در محتوای مقالات، پاسخ‌ها یا هر جای سیستم استفاده کند.
+   180→ *
+   181→ * قوانین:
+   182→ *  - برند: «فیتاپ» (فارسی) یا «FitUp» (انگلیسی) — ممنوع: fitup، fittap، ...
+   183→ *  - سال جاری: همیشه به‌صورت پویا محاسبه می‌شود (میلادی + شمسی).
+   184→ */
+   185→export function getSystemDirectives(): string {
+   186→  const now = new Date();
+   187→  const gYear = now.getFullYear();
+   188→  const jYear = gregorianToJalaliYear(gYear);
+   189→  // تبدیل به اعداد فارسی
+   190→  const faGYear = String(gYear).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+   191→  const faJYear = String(jYear).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+   192→
+   193→  return `قوانین مهم سیستم:
+   194→
+   195→۱) برند: نام این پلتفرم در متن فارسی همیشه و فقط «فیتاپ» نوشته می‌شود و در متن انگلیسی همیشه «FitUp» (با F و U بزرگ). هرگز نام برند را به‌صورت fitup، Fitup، fittup، Fittup، fittap یا Fittap ننویس.
+   196→
+   197→۲) سال جاری: ${faJYear} هجری شمسی و ${faGYear} میلادی است. سال را فقط جایی به کار ببر که واقعاً لازم است:
+   198→- ❌ هرگز سال را به تایتل (عنوان) مقالات، عناوین سئو (seoTitle) یا هدینگ‌ها اضافه نکن، مگر اینکه کلمه کلیدی اصلی خودش شامل سال باشد (مثلاً «بهترین اپلیکیشن بدنسازی ۲۰۲۶»).
+   199→- ❌ سال را به عنوان یک پسوند خودکار به هر موضوعی اضافه نکن (مثلاً «راهنمای کامل پرس سینه در سال ۱۴۰۵» اشتباه است).
+   200→- ✅ فقط وقتی در متن بدنه به یک رویداد، آمار یا تاریخ مشخص اشاره می‌کنی و سال برای درک آن ضروری است، از سال جاری استفاده کن.
+   201→- ✅ اگر کاربر مستقیماً درباره سال می‌پرسد یا مقاله درباره یک موضوع time-sensitive (مثل «بهترین اپلیکیشن‌های ${faGYear}») است، سال جاری را ذکر کن.
+   202→- ⚠️ هرگز از سال‌های قدیمی (۱۴۰۳، ۱۴۰۴، 1403، 1404، 2024، 2025) استفاده نکن.
+   203→
+   204→`;
+   205→}
+   206→
+   207→/**
+   208→ * @deprecated از `withSystemDirectives` استفاده کنید.
+   209→ * برای backward compatibility نگه داشته شده است.
+   210→ */
+   211→export const BRAND_DIRECTIVE = getSystemDirectives();
+   212→
+   213→/**
+   214→ * تزریق دایرکتیو سیستم (برند + سال جاری) به ابتدای یک system prompt.
+   215→ * اگر prompt قبلاً تزریق شده باشد، دوباره تزریق نمی‌کند.
+   216→ *
+   217→ * @deprecated از `withSystemDirectives` استفاده کنید.
+   218→ * برای backward compatibility نگه داشته شده است.
+   219→ */
+   220→export function withBrandDirective(systemPrompt: string): string {
+   221→  return withSystemDirectives(systemPrompt);
+   222→}
+   223→
+   224→/**
+   225→ * تزریق دایرکتیو سیستم (برند + سال جاری) به ابتدای یک system prompt.
+   226→ * اگر prompt قبلاً تزریق شده باشد، دوباره تزریق نمی‌کند.
+   227→ *
+   228→ * این تابع تمام دایرکتیوهای سیستمی را شامل می‌شود:
+   229→ *  - قانون برند (فیتاپ / FitUp)
+   230→ *  - قانون سال جاری (میلادی و شمسی)
+   231→ */
+   232→export function withSystemDirectives(systemPrompt: string): string {
+   233→  const directives = getSystemDirectives();
+   234→  if (!systemPrompt) return directives;
+   235→  // چک کردن idempotency: اگر prompt با "قوانین مهم سیستم:" شروع می‌شود، یعنی قبلاً تزریق شده.
+   236→  if (systemPrompt.startsWith("قوانین مهم سیستم:")) return systemPrompt;
+   237→  // backward compatibility: اگر با دایرکتیو قدیمی برند شروع شده، کل دایرکتیو جدید را جایگزین می‌کنیم
+   238→  if (systemPrompt.startsWith("قانون مهم برند:")) {
+   239→    // حذف دایرکتیو قدیمی و تزریق جدید
+   240→    const withoutOldDirective = systemPrompt.replace(/^قانون مهم برند:[^\n]*\n\n/, "");
+   241→    return directives + withoutOldDirective;
+   242→  }
+   243→  return directives + systemPrompt;
+   244→}
+   245→
+   246→/**
+   247→ * آیا مدل از خانواده gemini-3.x است؟
+   248→ * این مدل‌ها نیاز به پارامترهای مخصوص دارند (thinkingConfig، maxOutputTokens).
+   249→ * شامل gemini-3.0، gemini-3.5، gemini-3.6، gemini-3.7 و غیره.
+   250→ */
+   251→export function isGemini3Model(model: string): boolean {
+   252→  const m = model.toLowerCase();
+   253→  return m.startsWith("gemini-3") || m.includes("gemini-3.5") || m.includes("gemini-3.0") || m.includes("gemini-3.6") || m.includes("gemini-3.7");
+   254→}
+   255→
+   256→/**
+   257→ * آیا مدل از خانواده deepseek-v4 است؟
+   258→ * این مدل‌ها از پارامتر reasoning_effort (low | high | max) پشتیبانی می‌کنند.
+   259→ * deepseek-v4-flash (DeepSeek-V4-Flash-0731) نمونه‌ای از این خانواده است.
+   260→ */
+   261→export function isDeepseekV4Model(model: string): boolean {
+   262→  const m = model.toLowerCase();
+   263→  return m.startsWith("deepseek-v4") || m.includes("deepseek-v4");
+   264→}
+   265→
+   266→/**
+   267→ * Proxy هوشمند برای avalaiClient.
+   268→ *
+   269→ * این Proxy تمام کال‌های `chat.completions.create` را intercept می‌کند و به‌صورت
+   270→ * خودکار پارامترهای مخصوص هر مدل را اضافه می‌کند:
+   271→ *
+   272→ *  - مدل‌های gemini-3.x (gemini-3.8-flash، gemini-3.5-flash و ...):
+   273→ *    max_tokens و temperature را به generationConfig منتقل می‌کند و
+   274→ *    thinkingConfig.thinkingLevel = "low" اضافه می‌کند (دیریکتیو: تفکر LOW — سرعت).
+   275→ *
+   276→ *  - مدل‌های deepseek-v4 (deepseek-v4-flash / DeepSeek-V4-Flash-0731):
+   277→ *    reasoning_effort = "low" اضافه می‌کند (دیریکتیو: تفکر LOW — سرعت).
+   278→ *    این مدل از reasoning_effort با مقادیر low | high | max پشتیبانی می‌کند، اما
+   279→ *    "max" باعث تفکر بیش از ~۱۰۰ ثانیه و 504 کلادفلر/تایم‌اوت می‌شد.
+   280→ *
+   281→ *  - برای مدل‌های دیگر: رفتار استاندارد OpenAI حفظ می‌شود.
+   282→ *
+   283→ * مهم: تابع `create` در OpenAI SDK به `this._client` وابسته است. اگر آن را bind
+   284→ * نکنیم، خطای "Cannot read properties of undefined (reading '_client')" رخ می‌دهد.
+   285→ * بنابراین `originalCreate` را قبل از wrap کردن به `completionsObj` bind می‌کنیم.
+   286→ */
+   287→function wrapCreateWithGemini3Support<T extends (...args: any[]) => any>(
+   288→  originalCreate: T,
+   289→  thisArg: any
+   290→): T {
+   291→  // bind کردن به thisArg (completions object) تا this._client در دسترس باشد
+   292→  const boundCreate = originalCreate.bind(thisArg) as T;
+   293→  return ((async (params: any, options?: any) => {
+   294→    const model: string = params?.model || TEXT_MODEL;
+   295→    const isGemini3 = isGemini3Model(model);
+   296→    const isDeepseekV4 = isDeepseekV4Model(model);
+   297→
+   298→    if (isGemini3) {
+   299→      // برای gemini-3.x: پارامترها به generationConfig منتقل شوند
+   300→      // thinkingLevel پیش‌فرض "low" است (دیریکتیو کاربر: تفکر LOW — سرعت)،
+   301→      // اما اگر caller مقدار دیگری (مثلاً "high" برای تولید برنامه) داده باشد،
+   302→      // آن مقدار محترم شمرده می‌شود و override نمی‌شود.
+   303→      const callerThinkingLevel = (params as any)?.extra_body?.generationConfig?.thinkingConfig?.thinkingLevel;
+   304→      const thinkingLevel = typeof callerThinkingLevel === "string" && callerThinkingLevel
+   305→        ? callerThinkingLevel
+   306→        : "low";
+   307→      const generationConfig: Record<string, unknown> = {
+   308→        thinkingConfig: { thinkingLevel },
+   309→      };
+   310→      if (params?.max_tokens != null) {
+   311→        generationConfig.maxOutputTokens = params.max_tokens;
+   312→      }
+   313→      if (params?.temperature != null) {
+   314→        generationConfig.temperature = params.temperature;
+   315→      }
+   316→      if (params?.top_p != null) {
+   317→        generationConfig.topP = params.top_p;
+   318→      }
+   319→
+   320→      // حذف پارامترهای top-level که gemini-3.x نمی‌پذیرد
+   321→      const { max_tokens, temperature, top_p, ...rest } = params;
+   322→
+   323→      // ادغام با extra_body موجود (اگر کاربر قبلاً چیزی فرستاده)
+   324→      const existingExtraBody = (params as any).extra_body || {};
+   325→      const mergedParams = {
+   326→        ...rest,
+   327→        extra_body: {
+   328→          ...existingExtraBody,
+   329→          generationConfig: {
+   330→            ...(existingExtraBody.generationConfig || {}),
+   331→            ...generationConfig,
+   332→          },
+   333→        },
+   334→      };
+   335→
+   336→      return boundCreate(mergedParams, options);
+   337→    }
+   338→
+   339→    if (isDeepseekV4) {
+   340→      // برای deepseek-v4-flash: reasoning_effort = "low" اضافه کن (تفکر سبک — دیریکتیو کاربر: LOW).
+   341→      // ⚠️ مقدار قبلی "max" باعث تفکر بیش از ~۱۰۰ ثانیه و 504 کلادفلر/تایم‌اوت ۱۰ دقیقه‌ای می‌شد.
+   342→      // اگر کاربر قبلاً reasoning_effort تنظیم کرده، آن را override نمی‌کنیم.
+   343→      if (params?.reasoning_effort == null) {
+   344→        return boundCreate({ ...params, reasoning_effort: "low" }, options);
+   345→      }
+   346→      return boundCreate(params, options);
+   347→    }
+   348→
+   349→    // برای مدل‌های دیگر: بدون تغییر
+   350→    return boundCreate(params, options);
+   351→  }) as unknown as T);
+   352→}
+   353→
+   354→/**
+   355→ * فراخوانی LLM با retry دستی برای تولید برنامه‌های تمرینی/غذایی.
+   356→ *
+   357→ * چرا: گیت‌وی api.avalai.ir (کلادفلر) برای پاسخ‌های طولانیِ تولید برنامه
+   358→ * (خروجی JSON بزرگ ≈ ۳۰KB) به‌صورت ناپایدار 504 Gateway Timeout می‌دهد
+   359→ * (تست واقعی: پاسخ‌های ۹۷-۱۱۰ ثانیه‌ای گاهی رد می‌شوند، گاهی در ۶۳s قطع).
+   360→ * SDK خودش maxRetries دارد ولی خطاهای HTML-دار 504 را همیشه retry نمی‌کند؛
+   361→ * اینجا تا ۳ تلاش با backoff کوتاه انجام می‌شود (فقط برای خطاهای گذرا).
+   362→ *
+   363→ * planTimeoutMs: تولید برنامه در پس‌زمینه انجام می‌شود (نه داخل request کاربر)
+   364→ * پس می‌توانیم timeout بلندتری گذاشت — تفکر high ممکن است ۲-۴ دقیقه طول بکشد.
+   365→ *
+   366→ * fallbackParams: اگر همه تلاش‌ها با پارامتر اصلی (مثلاً تفکر high) شکست خوردند،
+   367→ * یک تلاش نهایی با پارامتر جایگزین (تفکر low) انجام می‌شود — کیفیت در اولویت
+   368→ * است ولی کاربر هرگز بدون برنامه نمی‌ماند.
+   369→ */
+   370→/**
+   371→ * اعتبارسنج محتوای پاسخ — null/رشتهٔ خالی یعنی OK، رشتهٔ فارسی یعنی توضیح خطا.
+   372→ * v39: زنجیرهٔ تفکر فقط روی «پاسخِ واقعاً قابل‌استفاده» توقف می‌کند، نه هر پاسخ 200.
+   373→ */
+   374→export type PlanContentValidator = (text: string) => string | null;
+   375→
+   376→export async function createPlanCompletionWithRetry(
+   377→  params: Record<string, unknown>,
+   378→  logTag: string,
+   379→  maxAttempts = 3,
+   380→  opts?: {
+   381→    timeoutMs?: number;
+   382→    fallbackParams?: Record<string, unknown>;
+   383→    validateContent?: PlanContentValidator;
+   384→  }
+   385→): Promise<string> {
+   386→  let lastErr: unknown = null;
+   387→  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+   388→    try {
+   389→      const completion = await avalaiClient.chat.completions.create(params as any, {
+   390→        maxRetries: 0, // retry دستی اینجا — دوباره‌کاری نکن
+   391→        ...(opts?.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+   392→      });
+   393→      // ─── v39-fix: پاسخ «خالی» دیگر موفقیت حساب نمی‌شود ───
+   394→      // باگ ریشه‌ای تولید برنامه: AvalAI با 200 و content:null برمی‌گشت
+   395→      // (مدل تفکری gemini-3.8، کل بودجهٔ خروجی را با reasoning می‌خورد و
+   396→      // صفر توکن متن تولید می‌کرد → finish_reason=length) و کد قدیمی
+   397→      // `content || ""` آن را «موفق» می‌گرفت → زنجیره همان لحظه متوقف،
+   398→      // بدون سقوط به سطح تفکر بعدی و بدون فال‌بک مدل → «برنامه خالی».
+   399→      const choice: any = (completion as any)?.choices?.[0];
+   400→      const rawContent = choice?.message?.content;
+   401→      const text = typeof rawContent === "string" ? rawContent : "";
+   402→      if (!text.trim()) {
+   403→        const usage: any = (completion as any)?.usage || {};
+   404→        const cd = usage.completion_tokens_details || {};
+   405→        const diag = `finish_reason=${choice?.finish_reason || "?"} completion_tokens=${usage.completion_tokens ?? "?"} reasoning=${cd.reasoning_tokens ?? "?"} text=${cd.text_tokens ?? "?"}`;
+   406→        console.error(`[${logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (${diag})`);
+   407→        // قطعی است؛ تلاش دوباره با همین پارامترها بی‌فایده → سطح بعدی زنجیره
+   408→        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (${diag})`);
+   409→        break;
+   410→      }
+   411→      if (choice?.finish_reason === "length") {
+   412→        // متن هست ولی سقف خروجی خورده — احتمالاً JSON بریده؛ هنوز برمی‌گردانیم
+   413→        // چون ممکن است JSON کامل باشد و فقط توضیح انتهایی بریده شده باشد.
+   414→        console.warn(`[${logTag}] attempt ${attempt}: finish_reason=length (len=${text.length}) — may be truncated`);
+   415→      }
+   416→      if (opts?.validateContent) {
+   417→        const vErr = opts.validateContent(text);
+   418→        if (vErr) {
+   419→          console.error(
+   420→            `[${logTag}] attempt ${attempt}/${maxAttempts}: validation failed — ${vErr} (len=${text.length}, finish_reason=${choice?.finish_reason || "?"}, head=${text.slice(0, 160).replace(/\s+/g, " ")})`
+   421→          );
+   422→          lastErr = new Error(vErr);
+   423→          if (attempt === maxAttempts) break;
+   424→          await new Promise((r) => setTimeout(r, 2000));
+   425→          continue; // پاسخ نامعتبر می‌تواند تصادفی باشد → retry همان سطح
+   426→        }
+   427→      }
+   428→      return text;
+   429→    } catch (err) {
+   430→      lastErr = err;
+   431→      const msg = String((err as Error)?.message || err);
+   432→      const retriable = /50[234]|429|timed out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up/i.test(msg);
+   433→      console.error(`[${logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}):`, msg.slice(0, 200));
+   434→      if (!retriable || attempt === maxAttempts) break;
+   435→      await new Promise((r) => setTimeout(r, 3000)); // backoff کوتاه
+   436→    }
+   437→  }
+   438→
+   439→  // تلاش نهایی با پارامتر جایگزین (مثلاً تفکر low) — بهتر از هیچ برنامه‌ای نیست
+   440→  if (opts?.fallbackParams) {
+   441→    console.warn(`[${logTag}] falling back to alternate params (e.g. low thinking)...`);
+   442→    try {
+   443→      const completion = await avalaiClient.chat.completions.create(opts.fallbackParams as any, {
+   444→        maxRetries: 0,
+   445→        ...(opts?.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+   446→      });
+   447→      const choice: any = (completion as any)?.choices?.[0];
+   448→      const rawContent = choice?.message?.content;
+   449→      const text = typeof rawContent === "string" ? rawContent : "";
+   450→      if (text.trim() && (!opts.validateContent || !opts.validateContent(text))) {
+   451→        return text;
+   452→      }
+   453→      console.error(`[${logTag}] fallback attempt returned empty/invalid content (finish_reason=${choice?.finish_reason || "?"})`);
+   454→      lastErr = new Error("پاسخ خالی/نامعتبر از مدل (fallbackParams)");
+   455→    } catch (err) {
+   456→      lastErr = err;
+   457→      console.error(`[${logTag}] fallback attempt failed:`, String((err as Error)?.message || err).slice(0, 200));
+   458→    }
+   459→  }
+   460→
+   461→  console.error(`[${logTag}] all attempts failed:`, lastErr);
+   462→  throw lastErr instanceof Error
+   463→    ? lastErr
+   464→    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+   465→}
+   466→
+   467→// ═══════════════════════════════════════════════════════════════════════════
+   468→// زنجیرهٔ تولید برنامه‌های تمرینی/تغذیه/مکمل — دیریکتیو مالک (v40):
+   469→// «با gemini-3.8-flash ساخته بشه؛ در بدترین حالت با میزان تفکر high.
+   470→//  اولویت رو بذار رو اون و اگر یک درصد نشد از DeepSeek 4 Flash استفاده کن»
+   471→// مدل gemini-3.8-flash از تلاش استدلالی قابل‌تنظیم پشتیبانی می‌کند. زنجیره:
+   472→//   گام ۱ — gemini-3.8-flash با thinkingLevel=high (۲ تلاش برای خطاهای گذرای گیت‌وی)
+   473→//   گام ۲ — deepseek-v4-flash با reasoning_effort=high (۲ تلاش) — فقط اگر
+   474→//           گام ۱ به‌هرشکلی شکست خورد (پاسخ خالی/نامعتبر، 400 دائمی، 504/تایم‌اوت پایدار)
+   475→//
+   476→// بودجه‌بندی زمان: watchdog تولید برنامه STUCK_GENERATION_WINDOW_MS=۵۰ دقیقه است؛
+   477→// سقف هر تلاش ۲۷۰ ثانیه → بدترین حالت (۲×gemini + ۲×deepseek) ≈ ۱۸ دقیقه < ۵۰ ✓
+   478→// (تمرینی و غذایی موازی اجرا می‌شوند و هر دو از همین بودجه استفاده می‌کنند.)
+   479→//
+   480→// چرا max حذف شد؟ تست واقعی v39: تفکر max بودجهٔ خروجی را با reasoning می‌بلعید
+   481→// (finish_reason=length، متن خالی/بریده) — همان ریشهٔ «برنامه خالی»؛ تفکر high
+   482→// کیفیت نزدیک max می‌دهد بدون آن مشکل (curl واقعی: finish=stop + JSON کامل).
+   483→// چرا low حذف شد؟ دیریکتیو مالک: بدترین حالتِ تفکر باید high بماند — به‌جای
+   484→// پایین‌آوردن سطح، مدل عوض می‌شود (deepseek-v4-flash با high تست‌شده ✓).
+   485→const PLAN_ATTEMPT_TIMEOUT_MS = 270_000; // ۴.۵ دقیقه برای هر تلاش
+   486→
+   487→// v39-fix: بودجهٔ صریح خروجی برای تولید برنامه.
+   488→// بدون این، AvalAI برای gemini-3.8 یک بودجهٔ پیش‌فرض کوچک اعمال می‌کند که
+   489→// reasoning (تفکر max/high) به‌تنهایی آن را می‌بلعد → content:null → «برنامه خالی».
+   490→// تست واقعی (سپتامبر ۲۰۲۶): maxOutputTokens=65536 پذیرفته می‌شود و reasoning+JSON
+   491→// بزرگ (~۲۵هزار توکن) را با هم جا می‌دهد. برای gemini-3.x پروکسیِ پایین‌تر این
+   492→// مقدار را به generationConfig.maxOutputTokens منتقل می‌کند.
+   493→const PLAN_MAX_OUTPUT_TOKENS = 65536;
+   494→
+   495→/**
+   496→ * ساخت پارامترهای chat.completions برای تولید برنامه با سطح تفکر مشخص.
+   497→ * v40: پارامتر model اضافه شد — فال‌بک deepseek-v4-flash هم با همین سازنده
+   498→ * ساخته می‌شود تا reasoning_effort=high بگیرد (پروکسیِ پایین‌تر مقدار non-null
+   499→ * را override نمی‌کند) و extra_bodyِ تفکرِ gemini فقط برای gemini-3.x ست شود.
+   500→ */
+   501→function buildPlanParams(
+   502→  systemPrompt: string,
+   503→  userPrompt: string,
+   504→  thinkingLevel: string,
+   505→  model: string = TEXT_MODEL
+   506→): Record<string, unknown> {
+   507→  return {
+   508→    model,
+   509→    messages: [
+   510→      { role: "system", content: systemPrompt },
+   511→      { role: "user", content: userPrompt },
+   512→    ],
+   513→    // v39-fix: بودجهٔ صریح خروجی (جلوگیری از بلعیده‌شدن بودجه توسط reasoning)
+   514→    max_tokens: PLAN_MAX_OUTPUT_TOKENS,
+   515→    // برای مدل‌های deepseek-v4 (reasoning_effort پشتیبانی می‌کنند)
+   516→    reasoning_effort: thinkingLevel,
+   517→    // برای مدل‌های gemini-3.x (thinkingLevel از طریق generationConfig)
+   518→    ...(isGemini3Model(model)
+   519→      ? { extra_body: { generationConfig: { thinkingConfig: { thinkingLevel } } } }
+   520→      : {}),
+   521→  };
+   522→}
+   523→
+   524→/**
+   525→ * فراخوانی LLM برای تولید برنامه — دیریکتیو مالک (v40):
+   526→ * «برنامه با gemini-3.8-flash ساخته بشه؛ در بدترین حالت با میزان تفکر high؛
+   527→ *  اگر یک درصد نشد، از DeepSeek 4 Flash استفاده کن.»
+   528→ *
+   529→ * گام ۱: gemini-3.8-flash با thinkingLevel=high — ۲ تلاش برای خطاهای گذرای
+   530→ *        گیت‌وی (504/429/timeout)؛ خطای دائمی (400) و پاسخ خالی/نامعتبر
+   531→ *        بلافاصله به گام ۲ می‌روند.
+   532→ * گام ۲: deepseek-v4-flash با reasoning_effort=high — ۲ تلاش (تست واقعی curl:
+   533→ *        finish=stop + JSON کامل در ~۶.۵ ثانیه). AVALAI_FALLBACK_TEXT_MODEL
+   534→ *        اگر ست شده باشد جایگزین deepseek پیش‌فرض می‌شود.
+   535→ *
+   536→ * v39→v40: زنجیرهٔ قدیمی max→high→low حذف شد — max بودجهٔ خروجی را می‌بلعید
+   537→ * (ریشهٔ «برنامه خالی») و low کیفیت را پایین می‌آورد؛ حالا سطح تفکر هرگز از
+   538→ * high پایین نمی‌آید و به‌جای آن مدل تعویض می‌شود.
+   539→ */
+   540→export async function generatePlanContent(
+   541→  systemPrompt: string,
+   542→  userPrompt: string,
+   543→  logTag: string,
+   544→  validateContent?: PlanContentValidator
+   545→): Promise<string> {
+   546→  const chain: Array<{ level: string; attempts: number }> = [
+   547→    { level: "high", attempts: 2 }, // دیریکتیو مالک: تفکر high — پایین‌تر نمی‌آییم
+   548→  ];
+   549→  let lastErr: unknown = null;
+   550→  for (const step of chain) {
+   551→    try {
+   552→      return await createPlanCompletionWithRetry(
+   553→        buildPlanParams(systemPrompt, userPrompt, step.level),
+   554→        logTag,
+   555→        step.attempts,
+   556→        // پاسخ فقط وقتی «موفق» است که واقعاً قابل‌استفاده باشد —
+   557→        // وگرنه زنجیره به مدل فال‌بک می‌رود
+   558→        { timeoutMs: PLAN_ATTEMPT_TIMEOUT_MS, validateContent }
+   559→      );
+   560→    } catch (err) {
+   561→      lastErr = err;
+   562→      console.warn(
+   563→        `[${logTag}] gemini-3.8-flash (thinking=${step.level}) failed — switching to fallback model:`,
+   564→        String((err as Error)?.message || err).slice(0, 180)
+   565→      );
+   566→    }
+   567→  }
+   568→
+   569→  // ─── گام ۲: فال‌بک مدل — DeepSeek 4 Flash (دیریکتیو مالک v40) ───
+   570→  // با همان سطح تفکر high (reasoning_effort=high) — آخرین خط دفاعی قبل از
+   571→  // «ناموفق»؛ پرامپت‌ها و اعتبارسنج دست‌نخورده می‌مانند، فقط موتور عوض می‌شود.
+   572→  const fallbackModel = process.env.AVALAI_FALLBACK_TEXT_MODEL || "deepseek-v4-flash";
+   573→  if (fallbackModel && fallbackModel !== TEXT_MODEL) {
+   574→    console.warn(
+   575→      `[${logTag}] primary model exhausted — trying fallback model "${fallbackModel}" (thinking=high)...`
+   576→    );
+   577→    try {
+   578→      return await createPlanCompletionWithRetry(
+   579→        buildPlanParams(systemPrompt, userPrompt, "high", fallbackModel),
+   580→        `${logTag}(fallback:${fallbackModel})`,
+   581→        2,
+   582→        { timeoutMs: PLAN_ATTEMPT_TIMEOUT_MS, validateContent }
+   583→      );
+   584→    } catch (err) {
+   585→      lastErr = err;
+   586→      console.error(`[${logTag}] fallback model also failed:`, String((err as Error)?.message || err).slice(0, 200));
+   587→    }
+   588→  }
+   589→
+   590→  throw lastErr instanceof Error
+   591→    ? lastErr
+   592→    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+   593→}
+   594→
+   595→/**
+   596→ * فراخوانی چت با retry سبک برای خطاهای گذرا — برای چت‌ها و تحلیل‌های سریع.
+   597→ *
+   598→ * چرا: گیت‌وی api.avalai.ir (ArvanCloud) به‌صورت ناپایدار درخواست‌ها را بعد از
+   599→ * ~۳۰ ثانیه با 504 (صفحه HTML کلادفلر) می‌کُشد. تست واقعی: چت نیکا/مربی گاهی
+   600→ * در اولین تلاش 504 می‌خورد و در تلاش دوم همان لحظه جواب می‌دهد. بدون retry،
+   601→ * کاربر خطای «ارتباط برقرار نشد» می‌بیند در حالی که یک تلاش دیگر کافی بود.
+   602→ *
+   603→ * فقط خطاهای گذرا (502/503/504/429/timeout/شبکه) retry می‌شوند؛
+   604→ * خطاهای دائمی (401 کلید غلط، 400 پارامتر غلط) بلافاصله fail می‌شوند.
+   605→ *
+   606→ * v42: بعد از اتمام همهٔ تلاش‌های مدل اول، درخواست با مدل فال‌بک تکرار می‌شود
+   607→ * (ویژن → gemini-3.5-flash، متن → deepseek-v4-flash — دیریکتیو مالک).
+   608→ * چت نیکا/مربی، تحلیل عکس غذا/بدن و تحلیل ویدیو از این تابع استفاده می‌کنند.
+   609→ */
+   610→export async function createChatCompletionWithRetry(
+   611→  params: Record<string, unknown>,
+   612→  logTag: string,
+   613→  maxAttempts = 3
+   614→): Promise<string> {
+   615→  try {
+   616→    return await chatCompletionWithRetryAttempt(params, logTag, maxAttempts);
+   617→  } catch (primaryErr) {
+   618→    // ─── v42 دیریکتیو مالک: هر شکستِ نهایی مدل اول → مدل فال‌بک ───
+   619→    // ویژن → gemini-3.5-flash | متن → deepseek-v4-flash (خودکار)
+   620→    const fb = fallbackModelFor(params);
+   621→    if (!fb) throw primaryErr;
+   622→    console.warn(
+   623→      `[${logTag}] primary model exhausted — falling back to "${fb}" (v42 directive)...`
+   624→    );
+   625→    return await chatCompletionWithRetryAttempt(
+   626→      withFallbackModel(params, fb),
+   627→      `${logTag}(fallback:${fb})`,
+   628→      maxAttempts
+   629→    );
+   630→  }
+   631→}
+   632→
+   633→async function chatCompletionWithRetryAttempt(
+   634→  params: Record<string, unknown>,
+   635→  logTag: string,
+   636→  maxAttempts: number
+   637→): Promise<string> {
+   638→  let lastErr: unknown = null;
+   639→  // v58 — پارامتر داخلی fallback_model قبل از ارسال حذف می‌شود (هرگز به API نمی‌رود)
+   640→  const apiParams: Record<string, unknown> = { ...params };
+   641→  delete apiParams.fallback_model;
+   642→  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+   643→    try {
+   644→      const completion = await avalaiClient.chat.completions.create(apiParams as any, {
+   645→        maxRetries: 0, // retry دستی اینجا
+   646→      });
+   647→      // v39: پاسخ خالی (content:null — مدل تفکری بودجه را با reasoning می‌خورد)
+   648→      // دیگر موفقیت نیست؛ مثل خطای گذرا retry می‌شود (چت سریع است)
+   649→      const choice: any = (completion as any)?.choices?.[0];
+   650→      const rawContent = choice?.message?.content;
+   651→      const text = typeof rawContent === "string" ? rawContent : "";
+   652→      if (!text.trim()) {
+   653→        const usage: any = (completion as any)?.usage || {};
+   654→        const cd = usage.completion_tokens_details || {};
+   655→        console.error(
+   656→          `[${logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (finish_reason=${choice?.finish_reason || "?"}, reasoning=${cd.reasoning_tokens ?? "?"}, text=${cd.text_tokens ?? "?"})`
+   657→        );
+   658→        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (finish_reason=${choice?.finish_reason || "?"})`);
+   659→        if (attempt === maxAttempts) break;
+   660→        await new Promise((r) => setTimeout(r, 2500));
+   661→        continue;
+   662→      }
+   663→      return text;
+   664→    } catch (err) {
+   665→      lastErr = err;
+   666→      const msg = String((err as Error)?.message || err);
+   667→      const retriable = /50[234]|429|timed out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up/i.test(msg);
+   668→      console.error(`[${logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}):`, msg.slice(0, 200));
+   669→      if (!retriable || attempt === maxAttempts) break;
+   670→      await new Promise((r) => setTimeout(r, 2500)); // backoff کوتاه
+   671→    }
+   672→  }
+   673→  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+   674→}
+   675→
+   676→/* ═══════════════════════════════════════════════════════════════════════════
+   677→ * v41 — سپر سراسری فراخوانی AI برای «همهٔ» امکانات سیستم
+   678→ * ═══════════════════════════════════════════════════════════════════════════
+   679→ * درس v39/v40: gemini-3.8-flash مدل تفکری است — بدون بودجهٔ خروجیِ صریح،
+   680→ * reasoning بودجهٔ پیش‌فرض AvalAI را می‌خورد و با 200 و content:null برمی‌گردد.
+   681→ * تولید برنامه این سپر را گرفت؛ اما ۱۲ نقطهٔ دیگر (سئوی هوشمند، تحلیل‌ها،
+   682→ * دستیار مدیر و…) مستقیم avalaiClient را صدا می‌زدند — همه به این تابع
+   683→ * منتقل شدند: بودجهٔ صریح + retry خطاهای گذرا + تشخیص پاسخ خالی + اعتبارسنج.
+   684→ */
+   685→
+   686→export interface ResilientCompletionOptions {
+   687→  /** برچسب لاگ — مثل "content-refresh" */
+   688→  logTag: string;
+   689→  /**
+   690→   * بودجهٔ صریح خروجی (max_tokens). برای gemini-3.x پروکسی آن را به
+   691→   * generationConfig.maxOutputTokens می‌برد. پیش‌فرض ۸۱۹۲ — برای خروجی‌های بزرگ
+   692→   * (بازنویسی مقالهٔ کامل) مقدار بالاتر بدهید (مثل 65536).
+   693→   */
+   694→  maxTokens?: number;
+   695→  temperature?: number;
+   696→  /** سقف زمانی هر تلاش (میلی‌ثانیه) — پیش‌فرض بدون سقف SDK */
+   697→  timeoutMs?: number;
+   698→  /** تعداد تلاش‌ها برای خطای گذرا/پاسخ خالی (پیش‌فرض ۳) */
+   699→  maxAttempts?: number;
+   700→  /** اعتبارسنج محتوا — رشتهٔ فارسی = توضیح خطا → retry؛ null = پذیرفتن */
+   701→  validateContent?: PlanContentValidator;
+   702→  /** مدل — پیش‌فرض TEXT_MODEL؛ برای تحلیل تصویر VISION_MODEL بدهید */
+   703→  model?: string;
+   704→  /** استدلال صریح (برای deepseek: reasoning_effort؛ اگر ست نشود پروکسی پیش‌فرض را می‌گذارد) */
+   705→  reasoningEffort?: string;
+   706→  /**
+   707→   * v52 حسابداری — شناسهٔ مسیر برای لاگ مصرف AiUsageLog (پیش‌فرض: همان logTag).
+   708→   * اختیاری — فراخوانی‌های فعلی بدون تغییر کار می‌کنند.
+   709→   */
+   710→  routeTag?: string;
+   711→  /** v52 حسابداری — کاربر مرتبط با این فراخوانی (اختیاری — برای لاگ مصرف) */
+   712→  userId?: string;
+   713→}
+   714→
+   715→/**
+   716→ * فراخوانی محافظت‌شدهٔ chat.completions — همهٔ نقاط AI باید از این استفاده کنند
+   717→ * نه از avalaiClient مستقیم. رفتار: retry خطاهای گذرا (502/503/504/429/timeout)،
+   718→ * retry پاسخ خالی (content:null)، اعتبارسنجی اختیاری محتوا، لاگ تشخیصی کامل.
+   719→ * v42: بعد از اتمام تلاش‌های مدل اول، مدل فال‌بک (ویژن → gemini-3.5-flash،
+   720→ * متن → deepseek-v4-flash) امتحان می‌شود — دیریکتیو مالک «اگر یک درصد نشد…».
+   721→ */
+   722→export async function createResilientCompletion(
+   723→  params: Record<string, unknown>,
+   724→  opts: ResilientCompletionOptions
+   725→): Promise<string> {
+   726→  try {
+   727→    return await resilientCompletionAttempt(params, opts);
+   728→  } catch (primaryErr) {
+   729→    // ─── v42 دیریکتیو مالک: هر شکستِ نهایی مدل اول → مدل فال‌بک ───
+   730→    // ویژن → gemini-3.5-flash | متن → deepseek-v4-flash (تشخیص خودکار با image_url)
+   731→    const fb = fallbackModelFor(params);
+   732→    if (!fb) throw primaryErr;
+   733→    console.warn(
+   734→      `[${opts.logTag}] primary model exhausted — falling back to "${fb}" (v42 directive)...`
+   735→    );
+   736→    return await resilientCompletionAttempt(withFallbackModel(params, fb), {
+   737→      ...opts,
+   738→      logTag: `${opts.logTag}(fallback:${fb})`,
+   739→    });
+   740→  }
+   741→}
+   742→
+   743→async function resilientCompletionAttempt(
+   744→  params: Record<string, unknown>,
+   745→  opts: ResilientCompletionOptions
+   746→): Promise<string> {
+   747→  const maxAttempts = opts.maxAttempts ?? 3;
+   748→  const body: Record<string, unknown> = {
+   749→    ...(opts.model ? { model: opts.model } : {}),
+   750→    ...params,
+   751→  };
+   752→  if (body.model == null) body.model = TEXT_MODEL;
+   753→  // v58 — پارامتر داخلی مسیر فال‌بک؛ هرگز نباید به API برسد
+   754→  delete body.fallback_model;
+   755→  if (opts.maxTokens != null && body.max_tokens == null) body.max_tokens = opts.maxTokens;
+   756→  if (opts.temperature != null && body.temperature == null) body.temperature = opts.temperature;
+   757→  if (opts.reasoningEffort != null && body.reasoning_effort == null) body.reasoning_effort = opts.reasoningEffort;
+   758→
+   759→  let lastErr: unknown = null;
+   760→  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+   761→    const attemptStartedAt = Date.now(); // v52 حسابداری — اندازه‌گیری تأخیر برای لاگ مصرف
+   762→    try {
+   763→      const completion = await avalaiClient.chat.completions.create(body as any, {
+   764→        maxRetries: 0, // retry دستی اینجا — دوباره‌کاری نکن
+   765→        ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+   766→      });
+   767→      const choice: any = (completion as any)?.choices?.[0];
+   768→      const rawContent = choice?.message?.content;
+   769→      const text = typeof rawContent === "string" ? rawContent : "";
+   770→      if (!text.trim()) {
+   771→        // v39-lesson: 200 با content:null = شکست، نه موفقیت
+   772→        const usage: any = (completion as any)?.usage || {};
+   773→        const cd = usage.completion_tokens_details || {};
+   774→        const diag = `finish_reason=${choice?.finish_reason || "?"} completion_tokens=${usage.completion_tokens ?? "?"} reasoning=${cd.reasoning_tokens ?? "?"} text=${cd.text_tokens ?? "?"}`;
+   775→        console.error(`[${opts.logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (${diag})`);
+   776→        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (${diag})`);
+   777→        if (attempt === maxAttempts) break;
+   778→        await new Promise((r) => setTimeout(r, 2000));
+   779→        continue;
+   780→      }
+   781→      if (choice?.finish_reason === "length") {
+   782→        console.warn(`[${opts.logTag}] attempt ${attempt}: finish_reason=length (len=${text.length}) — خروجی ممکن است بریده باشد`);
+   783→      }
+   784→      if (opts.validateContent) {
+   785→        const vErr = opts.validateContent(text);
+   786→        if (vErr) {
+   787→          console.error(
+   788→            `[${opts.logTag}] attempt ${attempt}/${maxAttempts}: validation failed — ${vErr} (len=${text.length}, finish_reason=${choice?.finish_reason || "?"}, head=${text.slice(0, 160).replace(/\s+/g, " ")})`
+   789→          );
+   790→          lastErr = new Error(vErr);
+   791→          if (attempt === maxAttempts) break;
+   792→          await new Promise((r) => setTimeout(r, 2000));
+   793→          continue;
+   794→        }
+   795→      }
+   796→      // ─── v52 حسابداری — لاگ مصرف AI (best-effort؛ بعد از اعتبارسنجیِ موفق) ───
+   797→      // هیچ تغییری در منطق retry/فال‌بک/اعتبارسنجی ایجاد نمی‌کند — فقط ثبت هزینه.
+   798→      try {
+   799→        const usage: any = (completion as any)?.usage;
+   800→        if (usage && typeof usage === "object") {
+   801→          const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+   802→          const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+   803→          const totalTokens = Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens;
+   804→          await logAiUsage({
+   805→            route: opts.routeTag ?? opts.logTag ?? "unknown",
+   806→            model: String(body.model ?? TEXT_MODEL), // مدل واقعی همین تلاشِ موفق (بعد از fallback هم درست است)
+   807→            promptTokens,
+   808→            completionTokens,
+   809→            totalTokens,
+   810→            latencyMs: Date.now() - attemptStartedAt,
+   811→            userId: opts.userId ?? null,
+   812→          });
+   813→        }
+   814→      } catch {
+   815→        // هرگز جریان اصلی را نمی‌شکند
+   816→      }
+   817→      return text;
+   818→    } catch (err) {
+   819→      lastErr = err;
+   820→      const msg = String((err as Error)?.message || err);
+   821→      const retriable = /50[234]|429|timed out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up|Request was aborted/i.test(msg);
+   822→      console.error(`[${opts.logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}):`, msg.slice(0, 200));
+   823→      if (!retriable || attempt === maxAttempts) break;
+   824→      await new Promise((r) => setTimeout(r, 2500));
+   825→    }
+   826→  }
+   827→  throw lastErr instanceof Error
+   828→    ? lastErr
+   829→    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+   830→}
+   831→
+   832→// ساخت Proxy عمیق که chat.completions.create را intercept می‌کند
+   833→export const avalaiClient = new Proxy({} as OpenAI, {
+   834→  get(_, prop) {
+   835→    const client = getAvalaiClient();
+   836→    const value = (client as any)[prop];
+   837→
+   838→    if (prop === "chat") {
+   839→      // Proxy برای chat
+   840→      return new Proxy(value, {
+   841→        get(__, chatProp) {
+   842→          const chatValue = (value as any)[chatProp];
+   843→          if (chatProp === "completions") {
+   844→            // Proxy برای completions
+   845→            return new Proxy(chatValue, {
+   846→              get(___, compProp) {
+   847→                const compValue = (chatValue as any)[compProp];
+   848→                if (compProp === "create" && typeof compValue === "function") {
+   849→                  // wrap create با مدیریت gemini-3.x — bind به chatValue (completions object)
+   850→                  return wrapCreateWithGemini3Support(compValue, chatValue);
+   851→                }
+   852→                return typeof compValue === "function" ? compValue.bind(chatValue) : compValue;
+   853→              },
+   854→            });
+   855→          }
+   856→          return typeof chatValue === "function" ? chatValue.bind(value) : chatValue;
+   857→        },
+   858→      });
+   859→    }
+   860→
+   861→    return typeof value === "function" ? value.bind(client) : value;
+   862→  },
+   863→});
+   864→
+   865→// ─────────────────────────────────────────────────────────────────────────────
+   866→// WORKOUT-PLAN-PRO — تایپ‌های توسعه‌یافته برای برنامه‌های حرفه‌ای
+   867→// این فیلدها به صورت اختیاری به WorkoutPlanContent / MealPlanContent اضافه می‌شوند
+   868→// تا برنامه‌ها در سطح مربیان بزرگ دنیا (هانی رامبد، هادی چوپان، کریس بامستد) تولید شوند.
+   869→// ─────────────────────────────────────────────────────────────────────────────
+   870→
+   871→/** تایپ توسعه‌یافته برنامه تمرینی — شامل فیلدهای حرفه‌ای جدید */
+   872→export type ProWorkoutPlanContent = WorkoutPlanContent & {
+   873→  /** تکنیک‌های پیشرفته استفاده‌شده در برنامه (FST-7، سوپرست آنتاگونیست، تری‌ست، دراپ‌ست، رست پاز، و ...) */
+   874→  advancedTechniques?: string[];
+   875→  /** تقسیم عضلات هفته (push/pull/legs، upper/lower، body part split، push/pull/legs/rest، و ...) */
+   876→  muscleGroupSplit?: string;
+   877→  /** جزئیات FST-7 (Fascia Stretch Training) در حرکت آخر هر گروه عضلانی — ویژه پلن ultimate */
+   878→  fst7Details?: {
+   879→    exerciseName: string;
+   880→    sets: number;
+   881→    reps: string;
+   882→    restSec: number;
+   883→    note?: string;
+   884→  };
+   885→  /** نوع دوره‌بندی (Periodization) */
+   886→  periodizationType?: "linear" | "undulating" | "block" | "wave" | "daily_undulating";
+   887→  /** فرکانس تمرین هر گروه عضلانی در هفته (۱-۳) */
+   888→  muscleFrequencyPerWeek?: number;
+   889→  /** الهام‌گرفته از کدام مربی بزرگ */
+   890→  inspiredByCoach?: "hany_rambod" | "hadi_chupan" | "chris_bumstead" | "mixed";
+   891→};
+   892→
+   893→/** تایپ توسعه‌یافته برنامه غذایی — شامل فیلدهای حرفه‌ای جدید */
+   894→export type ProMealPlanContent = MealPlanContent & {
+   895→  /** تفکیک دقیق محاسبه TDEE و مازاد/نقصان کالری */
+   896→  tdeeBreakdown?: {
+   897→    bmr: number;
+   898→    tdee: number;
+   899→    targetCalories: number;
+   900→    /** مازاد کالری (مثبت) یا نقصان (منفی) */
+   901→    calorieAdjustment: number;
+   902→    proteinG: number;
+   903→    carbsG: number;
+   904→    fatG: number;
+   905→    /** پروتئین به ازای هر کیلوگرم وزن بدن */
+   906→    proteinPerKg: number;
+   907→    /** کربوهیدرات به ازای هر کیلوگرم وزن بدن */
+   908→    carbsPerKg: number;
+   909→    /** چربی به ازای هر کیلوگرم وزن بدن */
+   910→    fatPerKg: number;
+   911→  };
+   912→  /** جایگزین‌های رژیمی (وگان، کتو، کم‌کربوهیدرات، بدون گلوتن، و ...) برای هر وعده */
+   913→  dietAlternatives?: {
+   914→    diet: string;
+   915→    description: string;
+   916→    sampleMeals: string[];
+   917→  }[];
+   918→  /** استک مکمل پیشرفته — دسته‌بندی‌شده به پایه/پیشرفته/هدفمند */
+   919→  supplementStack?: {
+   920→    category: "base" | "advanced" | "targeted";
+   921→    name: string;
+   922→    dose: string;
+   923→    timing: string;
+   924→    note?: string;
+   925→    /** افراد منع‌شده از مصرف این مکمل (بیماران قلبی، دیابتی، و ...) */
+   926→    contraindicatedFor?: string[];
+   927→  }[];
+   928→};
+   929→
+   930→// ─── ضریب فعالیت برای محاسبه دقیق TDEE ───
+   931→// بر اساس فرمول‌های استاندارد Harris-Benedict و Mifflin-St Jeor
+   932→function getActivityMultiplier(activityLevel?: OnboardingData["activityLevel"]): number {
+   933→  switch (activityLevel) {
+   934→    case "sedentary":
+   935→      return 1.2;   // بی‌تحرک (کار پشت میز، بدون تمرین)
+   936→    case "light":
+   937→      return 1.375; // کم‌تحرک (تمرین ۱-۳ روز در هفته)
+   938→    case "moderate":
+   939→      return 1.55;  // متوسط (تمرین ۳-۵ روز در هفته)
+   940→    case "active":
+   941→      return 1.725; // فعال (تمرین ۶-۷ روز در هفته)
+   942→    case "very_active":
+   943→      return 1.9;   // خیلی فعال (تمرین سنگین روزانه + کار فیزیکی)
+   944→    default:
+   945→      return 1.4;   // پیش‌فرض محافظه‌کارانه
+   946→  }
+   947→}
+   948→
+   949→// ─── راهنمای تکنیک‌های پیشرفته بر اساس سطح پلن ───
+   950→// این تابع تعیین می‌کند کاربر بر اساس پلن اشتراکش به چه تکنیک‌های حرفه‌ای دسترسی دارد.
+   951→// - ultimate (حرفه‌ای): FST-7 هانی رامبد + دوره‌بندی موجی + ۸-۱۰ حرکت
+   952→// - advanced (پیشرفته): سوپرست‌های آنتاگونیست + دراپ‌ست + ۷-۸ حرکت
+   953→// - standard (استاندارد): تمرینات پایه با رعایت فرم + ۶-۷ حرکت
+   954→// - basic (اقتصادی): تمرینات ساده و مؤثر + ۵-۶ حرکت
+   955→// ─── تکنیک‌های تمرینی بر اساس سابقه ورزشکار (نه پلن) ───
+   956→// ⚠️ مهم: کیفیت برنامه تمرینی بر اساس سابقه کاربر تعیین می‌شود، نه پلن خریداری‌شده.
+   957→// یک ورزشکار حرفه‌ای که پلن اقتصادی می‌خرد باید همان کیفیت برنامه حرفه‌ای را دریافت کند.
+   958→// پلن فقط قابلیت‌ها (مکمل، آنالیز ویدیو و غیره) را کنترل می‌کند، نه کیفیت برنامه را.
+   959→function getExperienceBasedTechniqueGuidance(experience?: string): {
+   960→  level: "beginner" | "intermediate" | "advanced" | "pro";
+   961→  allowedTechniques: string[];
+   962→  forbiddenTechniques: string[];
+   963→  proCoachInspiration: string;
+   964→  exerciseCountHint: string;
+   965→  periodization: string;
+   966→} {
+   967→  switch (experience) {
+   968→    case "pro":
+   969→      return {
+   970→        level: "pro",
+   971→        allowedTechniques: [
+   972→          "FST-7 (Fascia Stretch Training) در حرکت آخر هر گروه عضلانی",
+   973→          "دوره‌بندی موجی (Undulating Periodization) — تغییرات حجم/شدت در روزهای مختلف",
+   974→          "سوپرست آنتاگونیست (push/pull)",
+   975→          "تری‌ست همان گروه عضلانی",
+   976→          "جاینت‌ست برای چربی‌سوزی",
+   977→          "دراپ‌ست در ست آخر",
+   978→          "رست پاز (pause reps)",
+   979→          "تدریجی اضافه بار (Progressive Overload)",
+   980→          "تکنیک ۱.۵ تکراری (1.5 reps)",
+   981→          "Negative-accentuated reps",
+   982→          "Blood Flow Restriction (BFR)",
+   983→          "Rest-Pause extended sets",
+   984→        ],
+   985→        forbiddenTechniques: [],
+   986→        proCoachInspiration:
+   987→          "هانی رامبد (FST-7) + هادی چوپان (فرکانس بالا) + کریس بامستد (ارتباط ذهن-عضله)",
+   988→        exerciseCountHint: "۸ تا ۱۰ حرکت در هر روز",
+   989→        periodization: "undulating",
+   990→      };
+   991→    case "advanced":
+   992→      return {
+   993→        level: "advanced",
+   994→        allowedTechniques: [
+   995→          "FST-7 (Fascia Stretch Training) در حرکت آخر گروه‌های عضلانی بزرگ",
+   996→          "دوره‌بندی موجی (Undulating Periodization)",
+   997→          "سوپرست آنتاگونیست (push/pull)",
+   998→          "تری‌ست همان گروه عضلانی",
+   999→          "جاینت‌ست برای چربی‌سوزی",
+  1000→          "دراپ‌ست در ست آخر",
+  1001→          "رست پاز (pause reps)",
+  1002→          "تدریجی اضافه بار (Progressive Overload)",
+  1003→          "تکنیک ۱.۵ تکراری (1.5 reps)",
+  1004→        ],
+  1005→        forbiddenTechniques: [],
+  1006→        proCoachInspiration:
+  1007→          "هانی رامبد (FST-7) + هادی چوپان (فرکانس بالا) + کریس بامستد (ارتباط ذهن-عضله)",
+  1008→        exerciseCountHint: "۷ تا ۸ حرکت در هر روز",
+  1009→        periodization: "undulating",
+  1010→      };
+  1011→    case "intermediate":
+  1012→      return {
+  1013→        level: "intermediate",
+  1014→        allowedTechniques: [
+  1015→          "سوپرست آنتاگونیست (push/pull)",
+  1016→          "تری‌ست همان گروه عضلانی",
+  1017→          "دراپ‌ست در ست آخر حرکات کمکی",
+  1018→          "رست پاز (pause reps)",
+  1019→          "تدریجی اضافه بار (Progressive Overload)",
+  1020→          "تکنیک ۱.۵ تکراری (1.5 reps)",
+  1021→        ],
+  1022→        forbiddenTechniques: [
+  1023→          "FST-7 (نیازمند سابقه پیشرفته)",
+  1024→        ],
+  1025→        proCoachInspiration: "کریس بامستد (فرم + ارتباط ذهن-عضله) + هادی چوپان (حجم بالا)",
+  1026→        exerciseCountHint: "۶ تا ۷ حرکت در هر روز",
+  1027→        periodization: "linear",
+  1028→      };
+  1029→    case "beginner":
+  1030→    default:
+  1031→      return {
+  1032→        level: "beginner",
+  1033→        allowedTechniques: [
+  1034→          "تدریجی اضافه بار (Progressive Overload) — ملایم",
+  1035→          "رست پاز ساده (pause reps)",
+  1036→          "سوپرست آنتاگونیست ساده (push/pull) — حداکثر ۱ در هر روز",
+  1037→        ],
+  1038→        forbiddenTechniques: [
+  1039→          "FST-7",
+  1040→          "دوره‌بندی موجی",
+  1041→          "تری‌ست و جاینت‌ست",
+  1042→          "دراپ‌ست",
+  1043→          "BFR",
+  1044→        ],
+  1045→        proCoachInspiration: "یادگیری الگوهای حرکتی پایه و تثبیت فرم صحیح — کریس بامستد (ارتباط ذهن-عضله)",
+  1046→        exerciseCountHint: "۵ تا ۶ حرکت در هر روز",
+  1047→        periodization: "linear",
+  1048→      };
+  1049→  }
+  1050→}
+  1051→
+  1052→// backward compat — نگه داشتن نام قدیمی برای جلوگیری از خطا
+  1053→function getPlanTierTechniqueGuidance(planName?: Plan | null, experience?: string) {
+  1054→  return getExperienceBasedTechniqueGuidance(experience);
+  1055→}
+  1056→
+  1057→// ─── محاسبه دقیق TDEE و کالری هدف بر اساس هدف و فعالیت ───
+  1058→function computeTDEEAndTarget(data: OnboardingData): {
+  1059→  bmr: number;
+  1060→  tdee: number;
+  1061→  targetCalories: number;
+  1062→  calorieAdjustment: number;
+  1063→  proteinG: number;
+  1064→  carbsG: number;
+  1065→  fatG: number;
+  1066→  proteinPerKg: number;
+  1067→  carbsPerKg: number;
+  1068→  fatPerKg: number;
+  1069→} {
+  1070→  // فرمول Mifflin-St Jeor (دقیق‌ترین فرمول BMR)
+  1071→  const bmr =
+  1072→    data.gender === "male"
+  1073→      ? 10 * data.weight + 6.25 * data.height - 5 * data.age + 5
+  1074→      : 10 * data.weight + 6.25 * data.height - 5 * data.age - 161;
+  1075→  const activityMultiplier = getActivityMultiplier(data.activityLevel);
+  1076→  const tdee = bmr * activityMultiplier;
+  1077→
+  1078→  // تنظیم کالری بر اساس هدف — مازاد/نقصان هوشمند
+  1079→  let calorieAdjustment = 0;
+  1080→  switch (data.goal) {
+  1081→    case "fat_loss":
+  1082→      // نقصان ۴۰۰-۵۰۰ کالری برای چربی‌سوزی ایمن (۰.۵ کیلو در هفته)
+  1083→      calorieAdjustment = -Math.min(500, Math.round(tdee * 0.2));
+  1084→      break;
+  1085→    case "cut":
+  1086→      // v60 — کات: نقصان ملایم‌تر (حدود ۱۵٪) برای حفظ حداکثری عضله
+  1087→      calorieAdjustment = -Math.min(400, Math.round(tdee * 0.15));
+  1088→      break;
+  1089→    case "muscle_gain":
+  1090→      // مازاد ۲۵۰-۴۰۰ کالری برای حجم‌گیری تمیز (به حداقل رساندن چربی‌سازی)
+  1091→      calorieAdjustment = 300;
+  1092→      break;
+  1093→    case "bulk":
+  1094→      // v60 — افزایش حجم: مازاد بزرگ‌تر (حدود ۴۰۰) برای رشد سریع‌تر با کنترل چربی
+  1095→      calorieAdjustment = 400;
+  1096→      break;
+  1097→    case "strength":
+  1098→      // مازاد ملایم ۲۰۰ کالری برای قدرت
+  1099→      calorieAdjustment = 200;
+  1100→      break;
+  1101→    case "endurance":
+  1102→      // تعادل با کمی مازاد برای ریکاوری
+  1103→      calorieAdjustment = 100;
+  1104→      break;
+  1105→    case "fitness":
+  1106→    default:
+  1107→      calorieAdjustment = 0;
+  1108→      break;
+  1109→  }
+  1110→  const targetCalories = Math.round(tdee + calorieAdjustment);
+  1111→
+  1112→  // محاسبه درشت‌مغذی‌ها — پروتئین بر اساس هدف، چربی ۲۵٪، کربوهیدرات باقی‌مانده
+  1113→  // v60 — کات: بالاترین پروتئین (۲.۴g/kg) برای حفظ عضله در نقصان؛ bulk مثل muscle_gain
+  1114→  const proteinPerKg =
+  1115→    data.goal === "cut"
+  1116→      ? 2.4
+  1117→      : data.goal === "fat_loss"
+  1118→        ? 2.2
+  1119→        : data.goal === "muscle_gain" || data.goal === "bulk"
+  1120→          ? 2.0
+  1121→          : 1.8;
+  1122→  const proteinG = Math.round(data.weight * proteinPerKg);
+  1123→  const fatG = Math.round((targetCalories * 0.25) / 9); // ۲۵٪ کالری از چربی
+  1124→  const carbsG = Math.max(0, Math.round((targetCalories - proteinG * 4 - fatG * 9) / 4));
+  1125→  const carbsPerKg = Math.round((carbsG / data.weight) * 10) / 10;
+  1126→  const fatPerKg = Math.round((fatG / data.weight) * 10) / 10;
+  1127→
+  1128→  return {
+  1129→    bmr: Math.round(bmr),
+  1130→    tdee: Math.round(tdee),
+  1131→    targetCalories,
+  1132→    calorieAdjustment,
+  1133→    proteinG,
+  1134→    carbsG,
+  1135→    fatG,
+  1136→    proteinPerKg,
+  1137→    carbsPerKg,
+  1138→    fatPerKg,
+  1139→  };
+  1140→}
+  1141→
+  1142→// Get AI config from DB (admin-configurable system prompts)
+  1143→// ─── M5: کش درون‌حافظه‌ای با TTL ۳۰ ثانیه ───
+  1144→// قبلاً برای هر پیام چت/نیکا یک کوئری DB اضافه زده می‌شد؛ حالا نتیجه ۳۰ ثانیه کش
+  1145→// می‌شود. تغییرات ادمین حداکثر با ۳۰ ثانیه تأخیر اعمال می‌شود.
+  1146→const AI_CONFIG_CACHE_TTL_MS = 30_000;
+  1147→const _aiConfigCache = new Map<string, { value: string; at: number }>();
+  1148→
+  1149→export async function getAiConfig(key: string, fallback: string): Promise<string> {
+  1150→  const now = Date.now();
+  1151→  const hit = _aiConfigCache.get(key);
+  1152→  if (hit && now - hit.at < AI_CONFIG_CACHE_TTL_MS) {
+  1153→    return hit.value || fallback;
+  1154→  }
+  1155→  const cfg = await db.aiConfig.findUnique({ where: { key } });
+  1156→  const value = cfg?.value || fallback;
+  1157→  _aiConfigCache.set(key, { value, at: now });
+  1158→  return value;
+  1159→}
+  1160→
+  1161→// قوانین زبان فارسی — در پرامپت‌های مربی و چت برای جلوگیری از استفاده کلمات انگلیسی تزریق می‌شود.
+  1162→// این بلوک به DEFAULT_COACH_PROMPT و DEFAULT_CHAT_PROMPT اضافه می‌شود.
+  1163→const PERSIAN_LANGUAGE_RULES = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1164→قوانین زبان (بسیار مهم):
+  1165→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1166→- همیشه فقط فارسی بنویس. استفاده از کلمات انگلیسی ممنوع است.
+  1167→- به جای کلمات انگلیسی، معادل فارسی آن‌ها را استفاده کن:
+  1168→  • Gym Mode → حالت باشگاه
+  1169→  • TDEE → نیاز کالری روزانه
+  1170→  • PWA → برنامه نصب‌شده
+  1171→  • cardio → هوازی
+  1172→  • superset → سوپرست (به فارسی)
+  1173→  • triset → تری‌ست (به فارسی)
+  1174→  • warmup → گرم‌کردن
+  1175→  • cooldown → سردکردن
+  1176→  • set → ست
+  1177→  • rep → تکرار
+  1178→  • rest → استراحت
+  1179→  • workout → تمرین
+  1180→  • body fat → چربی بدن
+  1181→  • metabolism → متابولیسم
+  1182→  • plateau → ثبات/سکون
+  1183→  • bulk → حجم‌گیری
+  1184→  • cut → کات/چربی‌سوزی
+  1185→  • cheat meal → وعده آزاد
+  1186→  • RPE → شدت درک‌شده
+  1187→  • RIR → تکرار ذخیره
+  1188→  • DOMS → درد عضلانی تاخیری
+  1189→- فقط نام حرکات ورزشی و اصطلاحات تخصصی که معادل فارسی ندارند را می‌توانی به انگلیسی بنویسی (مثل squat, deadlift, bench press) اما بلافاصله معادل فارسی یا توضیح آن را در پرانتز اضافه کن.`;
+  1190→
+  1191→// Default system prompts (used if admin hasn't configured)
+  1192→export const DEFAULT_COACH_PROMPT = `تو مربی هوشمند فیتاپ هستی — یک مربی متخصص و تمام‌عیار ورزشی، رژیدرمانی و مکمل‌ها. کاملاً به زبان فارسی و با لحنی حرفه‌ای، علمی، جدی و انگیزشی پاسخ می‌دهی. تو به تمام داده‌های آنبوردینگ ورزشکار (سن، قد، وزن، هدف، سطح فعالیت، آسیب‌دیدگی‌ها، رژیم غذایی، آلرژی‌ها، آزمایش خون) دسترسی کامل داری و بر اساس آن‌ها صحبت می‌کنی. قابلیت‌های تو: ارائه برنامه‌های تمرینی هفتگی، تجویز دقیق کالری و درشت‌مغذی‌ها، معرفی مکمل‌ها با دوز مصرف، و پاسخ به سوالات فنی تمرینات. همیشه نکات ایمنی را رعایت کن و در صورت نیاز هشدار پزشکی بده.
+  1193→
+  1194→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1195→آشنایی کامل با پلتفرم فیتاپ (بسیار مهم):
+  1196→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1197→تو باید با تمام قابلیت‌های فیتاپ آشنا باشی تا کاربران را دقیق راهنمایی کنی:
+  1198→
+  1199→۱. برنامه تمرینی هوشمند:
+  1200→- برنامه‌ها ۴۵ روزه با فازهای مختلف هستند
+  1201→- پشتیبانی از سوپرست و تریست
+  1202→- تایمر استراحت هوشمند بین ست‌ها
+  1203→- ثبت وزنه و تعداد تکرار
+  1204→- پیشرفت تدریجی وزنه‌ها
+  1205→- امکان جایگزینی حرکت برای آسیب‌دیدگی
+  1206→
+  1207→۲. برنامه غذایی و مکمل:
+  1208→- برنامه غذایی شخصی‌سازی‌شده با کالری هدف
+  1209→- غذاهای جایگزین ایرانی و در دسترس
+  1210→- برنامه مکمل ایمن و علمی
+  1211→- ترکیب وعده‌های غذایی
+  1212→
+  1213→۳. چت با مربی هوشمند (همین چت):
+  1214→- ارسال متن، عکس و ویدیو
+  1215→- تحلیل هوشمند عکس غذا (کالری، درشت‌مغذی‌ها)
+  1216→- تحلیل عکس بدن و فرم ورزشی
+  1217→- پاسخ به سوالات فنی
+  1218→
+  1219→۴. آنالیز هوشمند:
+  1220→- آنالیز وعده غذایی با عکس (برای پلن پیشرفته+)
+  1221→- آنالیز بدن با عکس (برای پلن پیشرفته+)
+  1222→- آنالیز ویدیویی بدن (برای پلن حرفه‌ای)
+  1223→- تحلیل آزمایش خون ۴۷ ماده (برای پلن حرفه‌ای)
+  1224→- اصلاح تکنیک حرکات با ویدیو (برای پلن حرفه‌ای)
+  1225→
+  1226→۵. پیگیری پیشرفت:
+  1227→- ثبت وزن روزانه با نمودار
+  1228→- ثبت اندازه‌های بدن (کمر، بازو، سینه، باسن)
+  1229→- گالری تصاویر پیشرفت (Before/After)
+  1230→- چکاپ‌های دوره‌ای (برای پلن استاندارد+)
+  1231→
+  1232→۶. حالت باشگاه (Gym Mode):
+  1233→- نمایش برنامه تمرین روز
+  1234→- تایمر استراحت
+  1235→- ثبت وزنه و ست‌ها
+  1236→- فقط برای پلن پیشرفته+
+  1237→
+  1238→۷. ابزارهای رایگان (بدون اشتراک):
+  1239→- محاسبه‌گر کالری (TDEE)
+  1240→- بانک حرکات ورزشی (۲۵۰+ حرکت با آموزش)
+  1241→- جدول کالری غذاها (۱۰۰۰+ غذای سالم)
+  1242→
+  1243→۸. پلن‌های اشتراک (قیمت‌ها ممکن است تغییر کند):
+  1244→- اقتصادی: برنامه تمرین + تغذیه (۴۵ روزه)
+  1245→- استاندارد: + مکمل + چکاپ دوره‌ای
+  1246→- پیشرفته: + چت بی‌نهایت + آنالیز عکس + Gym Mode
+  1247→- حرفه‌ای: + آنالیز ویدیو + آزمایش خون + پشتیبانی اختصاصی
+  1248→
+  1249→۹. سایر قابلیت‌ها:
+  1250→- کیف پول (شارژ و استفاده برای خرید)
+  1251→- کدهای تخفیف عمومی و اختصاصی
+  1252→- سیستم معرفی دوستان (رفرال) با کد اختصاصی
+  1253→- نوتیفیکیشن‌های هوشمند (یادآوری تمرین، آب، تغذیه)
+  1254→- نصب روی گوشی (PWA) — حتی با بسته بودن اپ نوتیف می‌آید
+  1255→- پرداخت امن زرین‌پال
+  1256→- مقالات تخصصی بدنسازی و تغذیه
+  1257→
+  1258→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1259→قوانین پاسخ‌گویی:
+  1260→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1261→- اگر کاربر درباره قابلیتی سوال کرد، دقیق توضیح بده و در کدام پلن موجود است
+  1262→- اگر کاربر می‌خواهد برنامه‌اش را تغییر دهد، راهنمایی‌اش کن
+  1263→- اگر کاربر از آسیب‌دیدگی می‌گوید، حرکات جایگزین پیشنهاد بده
+  1264→- برای سوالات تغذیه، از غذاهای ایرانی و در دسترس استفاده کن
+  1265→- همیشه نکات ایمنی را رعایت کن
+  1266→- در صورت نیاز هشدار پزشکی بده
+  1267→- شعار ما: هر بدنی فیتاپ میخواد!
+  1268→
+  1269→قوانین علمی مکمل‌ها (بسیار مهم):
+  1270→- مکمل‌ها باید بر اساس آخرین تحقیقات علمی و ایمن باشند.
+  1271→- دوز مکمل‌ها باید در محدوده ایمن و توصیه‌شده باشد. هرگز دوز بالا تجویز نکن.
+  1272→- ⚠️ اول غذا، بعد مکمل: مکمل جای غذا نیست. تجویزِ تو باید داینامیک و بر اساس نیازِ واقعیِ همین کاربر باشد (هدف، رژیم، شرایط پزشکی، پروتئینِ روزانه از غذا) — نه یک فهرستِ ثابت. معمولاً ۱ تا ۴ قلم کافی است؛ اگر غذا پوشش می‌دهد، صریح بگو «مکمل لازم نیست».
+  1273→- BCAA/EAA، بتاآلانین، سیترین مالات و گلوتامین را توصیه نکن — با پروتئین کافی بی‌اثرند و هزینه‌ی اضافه می‌سازند.
+  1274→- پروتئین وی را فقط وقتی پیشنهاد بده که کاربر پروتئین روزانه‌اش را از غذا (تخم‌مرغ، مرغ، حبوبات، ماست) نمی‌تواند تأمین کند.
+  1275→- ویتامین D: حداکثر ۱۰۰۰-۲۰۰۰ واحد بین‌المللی در روز (نه ۲۰۰۰ واحد ۳ بار در روز!). دوز بالای ویتامین D سم‌زا است.
+  1276→- ویتامین D soluble در چربی است و در بدن ذخیره می‌شود — نیازی به دوز بالا نیست.
+  1277→- کراتین مونوهیدرات: ۳-۵ گرم در روز (بدون فاز بارگیری ضروری نیست) — فقط برای هدفِ عضله‌سازی/قدرت.
+  1278→- پروتئین وی: ۲۵-۳۰ گرم در وعده (نه بیشتر از ۵۰ گرم).
+  1279→- امگا ۳: ۱-۲ گرم در روز.
+  1280→- مولتی‌ویتامین: فقط برای رژیم‌های واقعاً محدود — وگرنه به‌عنوان اختیاری معرفی کن.
+  1281→- از تجویز مکمل‌های خطرناک یا هورمونی به‌شدت پرهیز کن.
+  1282→- همیشه در بخش note بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."
+  1283→
+  1284→قوانین نکات هفته (notes):
+  1285→- نکات هفته باید انگیزشی، علمی و کاربردی باشند.
+  1286→- شامل ۳-۴ نکته کوتاه و جذاب درباره پیشرفت، تغذیه، استراحت و انگیزه باشد.
+  1287→- از ایموجی‌های مرتبط استفاده کن (🔥💪🎯⚡).
+  1288→- لحن مثبت و تشویق‌کننده داشته باش.
+  1289→
+  1290→${PERSIAN_LANGUAGE_RULES}`;
+  1291→
+  1292→export const DEFAULT_CHAT_PROMPT = `تو مربی هوشمند فیتاپ هستی — یک مربی متخصص و حرفه‌ای ورزشی، تغذیه و مکمل‌ها. به زبان فارسی و با لحن علمی، جدی و انگیزشی پاسخ می‌دهی.
+  1293→
+  1294→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1295→آشنایی کامل با پلتفرم فیتاپ:
+  1296→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1297→تو باید با تمام قابلیت‌های فیتاپ آشنا باشی:
+  1298→
+  1299→۱. برنامه تمرینی: ۴۵ روزه، سوپرست/تریست، تایمر استراحت، ثبت وزنه، پیشرفت تدریجی
+  1300→۲. برنامه غذایی: شخصی‌سازی‌شده با کالری هدف، غذاهای ایرانی، برنامه مکمل ایمن
+  1301→۳. چت با مربی (همینجا): ارسال متن/عکس/ویدیو، تحلیل غذا و بدن با عکس
+  1302→۴. آنالیز هوشمند: عکس غذا (پیشرفته+)، عکس بدن (پیشرفته+)، ویدیو بدن (حرفه‌ای)، آزمایش خون (حرفه‌ای)
+  1303→۵. پیگیری پیشرفت: ثبت وزن، اندازه‌ها، گالری تصاویر، چکاپ دوره‌ای
+  1304→۶. حالت باشگاه (Gym Mode): برنامه روز، تایمر، ثبت ست (پیشرفته+)
+  1305→۷. ابزارهای رایگان: محاسبه‌گر TDEE، بانک ۲۵۰+ حرکت، جدول ۱۰۰۰+ غذای سالم
+  1306→۸. پلن‌ها: اقتصادی، استاندارد، پیشرفته، حرفه‌ای (قیمت‌ها در سایت قابل تغییر است)
+  1307→۹. سایر: کیف پول، کد تخفیف، معرفی دوستان، نوتیف هوشمند، PWA، پرداخت زرین‌پال، مقالات
+  1308→
+  1309→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1310→قوانین پاسخ‌گویی:
+  1311→━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1312→- به تمام داده‌های آنبوردینگ ورزشکار (سن، قد، وزن، هدف، سطح فعالیت، آسیب‌دیدگی‌ها، رژیم غذایی، آلرژی‌ها) دسترسی داری
+  1313→- اگر کاربر درباره قابلیتی سوال کرد، دقیق توضیح بده و در کدام پلن موجود است
+  1314→- برای آسیب‌دیدگی، حرکات جایگزین پیشنهاد بده
+  1315→- از غذاهای ایرانی و در دسترس استفاده کن
+  1316→- همیشه نکات ایمنی را رعایت کن
+  1317→- شعار ما: هر بدنی فیتاپ میخواد!
+  1318→
+  1319→قوانین علمی مکمل‌ها:
+  1320→- ⚠️ اول غذا، بعد مکمل: مکمل جای غذا نیست. تجویزِ تو باید داینامیک و بر اساس نیازِ همین کاربر باشد (هدف، رژیم، شرایط پزشکی، پروتئینِ روزانه از غذا) — نه یک فهرستِ ثابت. معمولاً ۱ تا ۴ قلم کافی است؛ اگر غذا پوشش می‌دهد، صریح بگو «مکمل لازم نیست».
+  1321→- BCAA/EAA، بتاآلانین، سیترین مالات و گلوتامین را توصیه نکن — با پروتئین کافی بی‌اثرند.
+  1322→- پروتئین وی فقط اگر پروتئین روزانه از غذا تأمین نمی‌شود — اول غذای واقعی (تخم‌مرغ، مرغ، حبوبات).
+  1323→- ویتامین D: ۱۰۰۰-۲۰۰۰ واحد در روز (دوز بالا سم‌زا است)
+  1324→- کراتین مونوهیدرات: ۳-۵ گرم در روز (فقط هدفِ عضله‌سازی/قدرت)
+  1325→- پروتئین وی: ۲۵-۳۰ گرم در وعده
+  1326→- امگا ۳: ۱-۲ گرم در روز
+  1327→- مولتی‌ویتامین: فقط برای رژیم‌های محدود (وگرنه اختیاری)
+  1328→- از مکمل‌های خطرناک یا هورمونی پرهیز کن
+  1329→- همیشه بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."
+  1330→
+  1331→${PERSIAN_LANGUAGE_RULES}`;
+  1332→
+  1333→export const DEFAULT_NUTRITION_PROMPT = `تو متخصص تغذیه و مربی هوشمند فیتاپ هستی. برنامه غذایی کاملاً شخصی‌سازی‌شده به زبان فارسی ارائه بده و درشت‌مغذی‌ها را دقیق محاسبه کن.
+  1334→
+  1335→قوانین علمی مکمل‌ها (بسیار مهم):
+  1336→- مکمل‌ها باید بر اساس آخرین تحقیقات علمی و ایمن باشند.
+  1337→- دوز مکمل‌ها باید در محدوده ایمن و توصیه‌شده باشد. هرگز دوز بالا تجویز نکن.
+  1338→- ⚠️ اول غذا، بعد مکمل: مکمل جای غذا نیست. تجویزِ تو باید داینامیک و بر اساس نیازِ همین کاربر باشد (هدف، رژیم، شرایط پزشکی، پروتئینِ روزانه از غذا) — نه یک فهرستِ ثابت. معمولاً ۱ تا ۴ قلم کافی است؛ اگر غذا پوشش می‌دهد، صریح بگو «مکمل لازم نیست».
+  1339→- BCAA/EAA، بتاآلانین، سیترین مالات و گلوتامین را توصیه نکن — با پروتئین کافی بی‌اثرند.
+  1340→- پروتئین وی فقط اگر پروتئین روزانه از غذا تأمین نمی‌شود — اول غذای واقعی (تخم‌مرغ، مرغ، حبوبات، ماست).
+  1341→- ویتامین D: حداکثر ۱۰۰۰-۲۰۰۰ واحد بین‌المللی در روز. دوز بالای ویتامین D سم‌زا است.
+  1342→- کراتین مونوهیدرات: ۳-۵ گرم در روز — فقط برای هدفِ عضله‌سازی/قدرت.
+  1343→- پروتئین وی: ۲۵-۳۰ گرم در وعده.
+  1344→- امگا ۳: ۱-۲ گرم در روز.
+  1345→- مولتی‌ویتامین: فقط برای رژیم‌های واقعاً محدود (وگرنه اختیاری).
+  1346→- از تجویز مکمل‌های خطرناک یا هورمونی به‌شدت پرهیز کن.
+  1347→- همیشه در بخش note بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."`;
+  1348→
+  1349→/** پرامپت نیکا — کارشناس فروش فوق‌حرفه‌ای و راهنمای کامل پلتفرم فیتاپ */
+  1350→export const DEFAULT_NIKA_PROMPT = `تو «نیکا» هستی — کارشناس تخصصی فروش و راهنمای کامل پلتفرم فیتاپ. نام پلتفرم همیشه و فقط «فیتاپ» به فارسی نوشته می‌شود. هرگز کلمه FitUp یا fitup به انگلیسی ننویس.
+  1351→
+  1352→شخصیت تو:
+  1353→- صمیمی، دوستانه، خوش‌برخورد و مشکل‌گشا
+  1354→- حرفه‌ای و تخصصی — به تمام امکانات فیتاپ کاملاً مسلطی و دانش دقیق داری
+  1355→- همیشه مشتاق کمک و انگیزه‌بخش
+  1356→- از ایموجی‌های مناسب استفاده کن (🌟💡✨💪🔥)
+  1357→- پاسخ‌هایت را کوتاه، دقیق و مفید نگه دار — حداکثر ۳-۴ پاراگراف، مستقیم به نقطه برس
+  1358→
+  1359→قوانین طلایی:
+  1360→۱. تو به هیچ عنوان برنامه تمرینی یا رژیم غذایی شخصی تجویز نمی‌کنی. این کار مخصوص «فیتاپ هوشمند» (مربی هوشمند داخل پنل کاربر) است. اگر کاربر برنامه اختصاصی خواست، او را به خرید پلن پیشرفته یا حرفه‌ای راهنمایی کن.
+  1361→۲. هرگز هیچ کد تخفیفی به کاربر ارائه نده. اگر کاربر درباره تخفیف پرسید، بگو: «تخفیف‌های ویژه به صورت خودکار در حساب کاربری شما اعمال می‌شوند، نیازی به کد ندارید.»
+  1362→۳. هرگز قابلیت یا امکانی که در فیتاپ وجود ندارد را نساز. فقط درباره امکانات واقعی زیر صحبت کن.
+  1363→۴. درباره هر پلن، قیمت و امکانات دقیق را بگو — از کلی‌گویی و حرف بازاریابی خالی پرهیز کن. تفاوت‌ها را مشخص کن.
+  1364→۵. هرگز URL یا آدرس اینترنتی به کاربر نده — به جای آن از فرمت لینک درون‌برنامه‌ای زیر استفاده کن.
+  1365→
+  1366→📌 لینک‌دهی درون‌برنامه‌ای (بسیار مهم — همیشه این کار را بکن):
+  1367→وقتی می‌خواهی کاربر را به بخشی از فیتاپ راهنمایی کنی، حتماً و فقط از این فرمت استفاده کن:
+  1368→[متن لینک](action:screen_name)
+  1369→screen_name فقط و فقط یکی از این مقادیر مجاز است:
+  1370→- landing → صفحه اصلی فیتاپ
+  1371→- auth → ثبت‌نام یا ورود کاربر
+  1372→- tool-tdee → محاسبه‌گر کالری و TDEE
+  1373→- tool-exercises → بانک حرکات ورزشی
+  1374→- tool-foods → جدول کالری غذاها
+  1375→- articles → مقالات ورزشی فیتاپ
+  1376→- plans → مشاهده و خرید پلن‌ها (Overlay اشتراک)
+  1377→
+  1378→مثال درست: «می‌تونی [محاسبه کالری روزانه](action:tool-tdee) رو امتحان کنی.»
+  1379→مثال درست: «برای دیدن پلن‌ها روی [مشاهده پلن‌ها](action:plans) کلیک کن.»
+  1380→مثال غلط: «برو به آدرس fitap.ir/plans» (هیچ URL خارجی نده!)
+  1381→مثال غلط: «برو به صفحه محاسبه کالری» (بدون فرمت لینک، کلیک نمی‌شود!)
+  1382→
+  1383→━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1384→دانش کامل تو درباره پلتفرم فیتاپ
+  1385→━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1386→
+  1387→🔹 ۴ پلن اشتراک (همه ۴۵ روزه، شامل ۱ فاز تمرینی کامل):
+  1388→
+  1389→۱) پلن اقتصادی — ۳۵۰,۰۰۰ تومان
+  1390→   ✓ آنالیز پروفایل ورزشکار
+  1391→   ✓ برنامه تمرینی هفتگی شخصی‌سازی‌شده
+  1392→   ✓ برنامه تغذیه روزانه با ترکیب وعده و جایگزین‌ها
+  1393→   ✓ پیگیری وزن
+  1394→   ✗ بدون چت با مربی هوشمند
+  1395→   ✗ بدون برنامه مکمل
+  1396→   مناسب: کسی که برنامه پایه می‌خواهد و خودش مدیریت می‌کند.
+  1397→
+  1398→۲) پلن استاندارد — ۸۰۰,۰۰۰ تومان
+  1399→   ✓ همه امکانات پلن اقتصادی
+  1400→   ✓ برنامه مکمل ورزشی با دوز ایمن و علمی
+  1401→   ✓ ۳ چکاپ دوره‌ای (هر ۱۵ روز)
+  1402→   ✓ داشبورد پیشرفته با نمودار
+  1403→   ✗ بدون چت با مربی هوشمند
+  1404→   مناسب: ورزشکار جدی که مکمل و چکاپ دوره‌ای هم می‌خواهد.
+  1405→
+  1406→۳) پلن پیشرفته — ۱,۲۰۰,۰۰۰ تومان (پیشنهاد ویژه 🔥)
+  1407→   ✓ همه امکانات پلن استاندارد
+  1408→   ✓ چت بی‌نهایت با «فیتاپ هوشمند» (مربی AI ۲۴/۷)
+  1409→   ✓ آنالیز عکس غذا (عکس بگیر، کالری و درشت‌مغذی‌ها را بگو)
+  1410→   ✓ آنالیز عکس بدن (پیگیری پیشرفت ظاهری)
+  1411→   ✓ حالت باشگاه (Gym Mode) با تایمر استراحت و ثبت ست
+  1412→   ✓ دستیار تغذیه با ترکیب وعده و غذاهای جایگزین
+  1413→   ✓ کتابخانه ویدیو حرکات
+  1414→   مناسب: کسی که مربی همیشه در دسترس می‌خواهد.
+  1415→
+  1416→۴) پلن حرفه‌ای — ۱,۸۰۰,۰۰۰ تومان (کامل‌ترین 🏆)
+  1417→   ✓ همه امکانات پلن پیشرفته
+  1418→   ✓ ارسال ویدیو تمرین + آنالیز ویدیویی بدن توسط AI
+  1419→   ✓ اصلاح تکنیک حرکات
+  1420→   ✓ تحلیل آزمایش خون (عکس آزمایش بگیر، تحلیل کن)
+  1421→   ✓ پشتیبانی اختصاصی و کامل‌ترین همراهی
+  1422→   مناسب: ورزشکار حرفه‌ای که کامل‌ترین همراهی می‌خواهد.
+  1423→
+  1424→→ برای مشاهده و خرید پلن‌ها همیشه از: [مشاهده پلن‌ها](action:plans)
+  1425→→ برای ثبت‌نام کاربر جدید: [ورود/ثبت‌نام](action:auth)
+  1426→
+  1427→🔹 سیاست پیشنهاد پلن (مهم — طبق درخواست مالک):
+  1428→• در پیشنهاد، همیشه پلن استاندارد (۸۰۰ هزار) به بالا را معرفی کن.
+  1429→• پلن پیشرفته برای اهداف چربی‌سوزی/عضله‌سازی و ورزشکاران جدی بهترین پیشنهاد است.
+  1430→• پلن حرفه‌ای را برای ورزشکاران حرفه‌ای، نگرانی پزشکی یا نیاز به آنالیز ویدیو/آزمایش خون پیشنهاد بده.
+  1431→• پلن اقتصادی (۳۵۰ هزار) را فقط وقتی معرفی کن که کاربر صریحاً بگوید بودجه‌اش محدود است. هرگز خودت پلن اقتصادی را پیشنهاد اول نکن.
+  1432→
+  1433→🔹 ابزارهای رایگان فیتاپ (بدون نیاز به اشتراک):
+  1434→• [محاسبه‌گر کالری و TDEE](action:tool-tdee) — محاسبه دقیق BMR، TDEE و کالری هدف بر اساس سن، جنسیت، وزن، قد و سطح فعالیت.
+  1435→• [بانک حرکات ورزشی](action:tool-exercises) — لیست کامل حرکات با توضیح نحوه انجام، نکات ایمنی، عضله هدف و سطح دشواری.
+  1436→• [جدول کالری غذاها](action:tool-foods) — شاخص کالری، پروتئین، کربوهیدرات و چربی صدها غذا ایرانی و بین‌المللی.
+  1437→
+  1438→🔹 بخش مقالات ورزشی:
+  1439→کاربران می‌توانند [مقالات تخصصی فیتاپ](action:articles) را بخوانند — راهنماهای جامع درباره برنامه بدنسازی، برنامه تغذیه، مکمل‌های ورزشی، کاهش وزن و عضله‌سازی. کاملاً رایگان و بدون نیاز به ثبت‌نام.
+  1440→
+  1441→🔹 قابلیت‌های پیشرفته داخل پنل کاربر (نیازمند پلن پیشرفته یا حرفه‌ای):
+  1442→• مربی هوشمند: چت ۲۴/۷ با AI که به داده‌های آنبوردینگ شما دسترسی دارد و به سوالات تخصصی تمرین و تغذیه پاسخ می‌دهد.
+  1443→• حالت باشگاه (Gym Mode): تایمر استراحت بین ست‌ها، ثبت وزنه و تکرار، و موسیقی انگیزشی.
+  1444→• تحلیل عکس غذا: عکس غذای خود را بگیرید، هوش مصنوعی کالری و درشت‌مغذی‌ها را محاسبه می‌کند.
+  1445→• تحلیل عکس بدن: عکس پیشرفت بگیرید و تغییرات ظاهری را پیگیری کنید.
+  1446→• تحلیل ویدیویی بدن (مخصوص پلن حرفه‌ای): ویدیو تمرین بفرستید، فرم حرکت اصلاح می‌شود.
+  1447→• تحلیل آزمایش خون (مخصوص پلن حرفه‌ای): عکس آزمایش خون بگیرید، تحلیل تخصصی دریافت کنید.
+  1448→
+  1449→وقتی کاربر سوال تخصصی تمرین یا تغذیه می‌پرسد، تو فقط اطلاعات کلی و علمی می‌دهی و او را به [مشاهده پلن‌ها](action:plans) دعوت می‌کنی تا از مربی هوشمند استفاده کند.
+  1450→
+  1451→شعار ما: هر بدنی فیتاپ میخواد! 🌟`;
+  1452→
+  1453→
+  1454→// Build user context string from onboarding + plan tier
+  1455→export function buildUserContext(data: OnboardingData, planName?: Plan | null): string {
+  1456→  const bmr =
+  1457→    data.gender === "male"
+  1458→      ? 10 * data.weight + 6.25 * data.height - 5 * data.age + 5
+  1459→      : 10 * data.weight + 6.25 * data.height - 5 * data.age - 161;
+  1460→  const caps = getCapabilities(planName ?? null);
+  1461→  const planLabel = planName ? PLAN_LABELS[planName] : "بدون پلن (Basic)";
+  1462→
+  1463→  // --- NEW: Comprehensive professional context lines ---
+  1464→  const medicalConditionsList = Array.isArray(data.medicalConditions) && data.medicalConditions.length > 0
+  1465→    ? data.medicalConditions.map((c) => MEDICAL_CONDITION_LABELS[c] || c).join("، ")
+  1466→    : "";
+  1467→
+  1468→  const hasMedicalConditions = !!medicalConditionsList;
+  1469→  const hasInjuries = !!data.injuries && data.injuries.trim().length > 0;
+  1470→  const hasLowSleep = typeof data.sleepHours === "number" && data.sleepHours < 7;
+  1471→  const hasHighStress = typeof data.stressLevel === "number" && data.stressLevel >= 4;
+  1472→
+  1473→  // Target date context (timeline planning)
+  1474→  let targetDateContext = "";
+  1475→  if (data.targetDate) {
+  1476→    try {
+  1477→      const d = new Date(data.targetDate);
+  1478→      if (!isNaN(d.getTime())) {
+  1479→        const now = new Date();
+  1480→        const daysLeft = Math.max(1, Math.ceil((d.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+  1481→        targetDateContext = `\n- تاریخ هدف: ${data.targetDate} (حدود ${daysLeft} روز مانده)`;
+  1482→      }
+  1483→    } catch {
+  1484→      targetDateContext = `\n- تاریخ هدف: ${data.targetDate}`;
+  1485→    }
+  1486→  }
+  1487→
+  1488→  return `اطلاعات کاربر:
+  1489→- جنسیت: ${GENDER_LABELS[data.gender]}
+  1490→- سن: ${data.age} سال
+  1491→- قد: ${data.height} سانتی‌متر
+  1492→- وزن: ${data.weight} کیلوگرم
+  1493→- وزن هدف: ${data.targetWeight ?? "نامشخص"} کیلوگرم${targetDateContext}
+  1494→- هدف اصلی: ${GOAL_LABELS[data.goal]}
+  1495→- سطح فعالیت: ${ACTIVITY_LABELS[data.activityLevel]}
+  1496→- روزهای تمرین در هفته: ${data.workoutDays} روز${data.workoutDaysList && data.workoutDaysList.length > 0 ? ` (${data.workoutDaysList.join("، ")})` : ""}
+  1497→- مکان تمرین: ${WORKOUT_PLACE_LABELS[data.workoutPlace]}
+  1498→- تجهیزات: ${data.equipment.length ? data.equipment.join("، ") : "بدون تجهیزات خاص"}
+  1499→- سوابق بیماری: ${data.diseases || "ندارد"}
+  1500→- آسیب‌دیدگی مفصلی/عضلانی: ${data.injuries || "ندارد"}
+  1501→- حساسیت غذایی: ${data.allergies || "ندارد"}
+  1502→- نوع رژیم غذایی: ${DIET_LABELS[data.dietType]}
+  1503→${data.trainingExperience ? `- سابقه ورزشی: ${TRAINING_EXPERIENCE_LABELS[data.trainingExperience]}` : ""}
+  1504→${data.previousTrainingType ? `- نوع تمرین قبلی: ${data.previousTrainingType}` : ""}
+  1505→${data.drugAllergies ? `- آلرژی‌های دارویی: ${data.drugAllergies}` : ""}
+  1506→${data.currentMedications ? `- داروهای مصرفی: ${data.currentMedications}` : ""}
+  1507→${data.maxLifts ? `- حداکثر وزنه‌ها: ${data.maxLifts}` : ""}
+  1508→${data.bodyFrame ? `- اندازه استخوان بدن (Body Frame): ${BODY_FRAME_LABELS[data.bodyFrame]}` : ""}
+  1509→${typeof data.sleepHours === "number" ? `- میانگین خواب شبانه: ${data.sleepHours} ساعت${hasLowSleep ? " ⚠️ کمتر از حد مطلوب" : ""}` : ""}
+  1510→${typeof data.stressLevel === "number" ? `- سطح استرس روزانه: ${data.stressLevel} از ۵${hasHighStress ? " ⚠️ بالا — روی ریکاوری اثر منفی" : ""}` : ""}
+  1511→${typeof data.waterHabit === "number" ? `- عادت فعلی نوشیدن آب: ${data.waterHabit} لیوان در روز` : ""}
+  1512→${data.workoutTime ? `- ساعت ترجیحی تمرین: ${WORKOUT_TIME_LABELS[data.workoutTime]}` : ""}
+  1513→${medicalConditionsList ? `- شرایط پزشکی خاص: ${medicalConditionsList}` : ""}
+  1514→${data.currentSupplements ? `- مکمل‌های فعلی مصرفی: ${data.currentSupplements}` : ""}
+  1515→${data.dislikedFoods ? `- غذاهای دوست‌نداشته/حذفی: ${data.dislikedFoods}` : ""}
+  1516→${data.preferredCuisine ? `- سبک آشپزی ترجیحی: ${PREFERRED_CUISINE_LABELS[data.preferredCuisine]}` : ""}
+  1517→${data.specialConditions ? `- ⚠️ شرایط/نیاز/هدف خاص که خود کاربر نوشته (بسیار مهم — کل برنامه باید دقیقاً با این شرایط سازگار باشد):
+  1518→«${data.specialConditions}»` : ""}
+  1519→${typeof data.waterGoalMl === "number" ? `- هدف هیدراتاسیون روزانه: ${Math.round(data.waterGoalMl / 10) / 100} لیتر (محاسبه خودکار)` : ""}
+  1520→- BMR تخمینی: ${Math.round(bmr)} کالری
+  1521→- پلن اشتراک کاربر: ${planLabel}
+  1522→- قابلیت‌های فعال: ${[
+  1523→    caps.workoutAndNutritionPlan ? "برنامه تمرین+تغذیه" : null,
+  1524→    "برنامه مکمل (استک کامل — یکسان برای همه پلن‌ها)",
+  1525→    caps.periodicCheckups ? "چکاپ دوره‌ای" : null,
+  1526→    caps.aiChatQuestions !== 0 ? "چت هوشمند" : null,
+  1527→    caps.mealPhotoAnalysis ? "آنالیز عکس غذا" : null,
+  1528→    caps.bodyPhotoAnalysis ? "آنالیز عکس بدن" : null,
+  1529→    caps.videoBodyAnalysis ? "آنالیز ویدیوی فرم بدن" : null,
+  1530→    caps.techniqueCorrection ? "اصلاح تکنیک" : null,
+  1531→    caps.bloodTestAnalysis ? "تحلیل آزمایش خون" : null,
+  1532→  ].filter(Boolean).join("، ")}`.trim() + `
+  1533→
+  1534→⚠️ نکات ایمنی مهم ورزشکار:
+  1535→${hasMedicalConditions ? `- شرایط پزشکی حساس دارد (${medicalConditionsList}) — حتماً برنامه ایمن و سازگار با شرایط طراحی کن و هشدار پزشکی لازم را بده.\n` : ""}${hasInjuries ? `- آسیب‌دیدگی دارد (${data.injuries}) — حرکات آسیب‌زا را حذف کن و جایگزین ایمن پیشنهاد بده.\n` : ""}${hasLowSleep ? `- خواب ناکافی (کمتر از ۷ ساعت) — شدت حجم تمرین را ملایم نگه دار و توصیه‌های ریکاوری بده.\n` : ""}${hasHighStress ? `- استرس بالا — برنامه باید فشار کورتیزولی بیش‌ازحد ایجاد نکند؛ شدت ملایم‌تر و ریکاوری کافی.\n` : ""}${data.currentSupplements ? `- مکمل مصرف می‌کند (${data.currentSupplements}) — تداخل مکمل پیشنهادی با مصرفی فعلی را بررسی کن.\n` : ""}`;
+  1536→}
+  1537→
+  1538→/**
+  1539→ * ساخت بلوک پرامپت مخصوص پلن کاربر.
+  1540→ * بر اساس سطح پلن، سطح جزئیات و دامنه برنامه را تعیین می‌کند.
+  1541→ * - Basic: فقط برنامه تمرین + تغذیه
+  1542→ * - Standard+: اضافه‌کردن برنامه مکمل‌ها
+  1543→ * - Ultimate: تزریق متغیرهای آزمایش خون و آنالیز ویدیویی
+  1544→ */
+  1545→export function buildPlanAwareInstructions(planName?: Plan | null, extras?: { bloodTestReport?: string; videoAnalysisResult?: string; bodyPhotoAnalysis?: string; renewalContext?: string; trainingExperience?: string }): string {
+  1546→  const caps = getCapabilities(planName ?? null);
+  1547→  // ─── تکنیک‌های تمرینی بر اساس سابقه ورزشکار (نه پلن) ───
+  1548→  const tier = getExperienceBasedTechniqueGuidance(extras?.trainingExperience);
+  1549→  const instructions: string[] = [];
+  1550→
+  1551→  // ─── ۱. تکنیک‌های تمرینی پیشرفته بر اساس سطح پلن (WORKOUT-PLAN-PRO) ───
+  1552→  // این بخش برنامه تمرینی را به سطح مربیان بزرگ (هانی رامبد، هادی چوپان، کریس بامستد) ارتقا می‌دهد.
+  1553→  if (tier.level === "pro") {
+  1554→    instructions.push(
+  1555→      "🔥 تکنیک‌های تمرینی ویژه پلن حرفه‌ای (الزاماً اعمال کن):\n" +
+  1556→      "• FST-7 (Fascia Stretch Training — هانی رامبد): در حرکت آخر هر گروه عضلانی، ۷ ست با ۸-۱۲ تکرار و فقط ۳۰-۴۵ ثانیه استراحت بزن. فیلد fst7Details را با نام حرکت، تعداد ست (۷)، تکرارها و استراحت پر کن. هدف: پمپ حداکثری و کشش فاسیا برای رشد عضلانی.\n" +
+  1557→      "• دوره‌بندی موجی (Undulating Periodization): در طول هفته، حجم/شدت را متغیر بده — یک روز هایپرتروفی (۸-۱۲ تکرار، RPE 7-8)، یک روز قدرت (۴-۶ تکرار، RPE 8-9)، یک روز استقامت (۱۵-۲۰ تکرار، RPE 6-7). فیلد periodizationType را \"undulating\" بگذار.\n" +
+  1558→      "• فرکانس بالا (هادی چوپان): هر گروه عضلانی را ۲ بار در هفته تمرین بده. فیلد muscleFrequencyPerWeek را ۲ بگذار.\n" +
+  1559→      "• ارتباط ذهن-عضله (کریس بامستد): در توضیح هر حرکت، روی کنترل تمپو و فاز اکسنتریک ۳-۴ ثانیه‌ای تأکید کن. فیلد inspiredByCoach را \"mixed\" بگذار.\n" +
+  1560→      "• فیلد advancedTechniques (آرایه): حداقل ۳ تکنیک پیشرفته استفاده‌شده در برنامه را لیست کن.\n" +
+  1561→      "• فیلد muscleGroupSplit: تقسیم عضلات هفته را مشخص کن (مثلاً push/pull/legs یا upper/lower/push/pull/legs)."
+  1562→    );
+  1563→  } else if (tier.level === "advanced") {
+  1564→    instructions.push(
+  1565→      "💪 تکنیک‌های تمرینی ویژه پلن پیشرفته:\n" +
+  1566→      "• سوپرست آنتاگونیست (push/pull): حداقل در ۲ روز از هفته از سوپرست متضاد استفاده کن (پرس سینه + بارفیکس، پرس بالاسینه + زیرسینه، پرس بالاسرشانه + زیربغل سیم‌کش).\n" +
+  1567→      "• تری‌ست همان گروه عضلانی: در روزهای حجمی می‌توانی ۱ تری‌ست برای پمپ نهایی عضله استفاده کنی.\n" +
+  1568→      "• دراپ‌ست: در ست آخر حرکات کمکی، یک دراپ‌ست ۲۰٪ کاهش وزنه + ناتمام تا شکست بزن.\n" +
+  1569→      "• رست پاز (pause reps): در نقطه میانی حرکات اصلی (پرس، اسکوات) ۲ ثانیه مکث کن.\n" +
+  1570→      "• فیلد advancedTechniques (آرایه): حداقل ۲ تکنیک پیشرفته استفاده‌شده را لیست کن.\n" +
+  1571→      "• فیلد muscleGroupSplit: تقسیم عضلات هفته را مشخص کن (مثلاً push/pull/legs یا upper/lower).\n" +
+  1572→      "• فیلد inspiredByCoach را \"chris_bumstead\" بگذار — تمرکز روی فرم و ارتباط ذهن-عضله.\n" +
+  1573→      "• ⚠️ از FST-7 و دوره‌بندی موجی استفاده نکن (مخصوص پلن حرفه‌ای)."
+  1574→    );
+  1575→  } else if (tier.level === "intermediate") {
+  1576→    instructions.push(
+  1577→      "⚡ راهنمای پلن استاندارد:\n" +
+  1578→      "• تمرکز روی فرم صحیح حرکات و اتصال ذهن-عضله.\n" +
+  1579→      "• تدریجی اضافه بار (Progressive Overload): هر هفته وزنه را ۲.۵-۵٪ افزایش بده.\n" +
+  1580→      "• فیلد advancedTechniques: می‌توانی خالی بگذاری یا فقط [\"Progressive Overload\"] بنویسی.\n" +
+  1581→      "• فیلد muscleGroupSplit: تقسیم ساده عضلات هفته را مشخص کن (مثلاً \"full body 3x\" یا \"upper/lower\").\n" +
+  1582→      "• ⚠️ از سوپرست‌های پیچیده، تری‌ست، جاینت‌ست، FST-7 و دراپ‌ست استفاده نکن."
+  1583→    );
+  1584→  } else {
+  1585→    // basic
+  1586→    instructions.push(
+  1587→      "🌱 راهنمای پلن اقتصادی:\n" +
+  1588→      "• تمرکز روی یادگیری الگوهای حرکتی پایه (پرس، اسکوات، ددلیفت، بارفیکس).\n" +
+  1589→      "• فرم صحیح مهم‌تر از وزنه است — کنترل کامل تمپو (۳-۱-۲-۰).\n" +
+  1590→      "• تدریجی اضافه بار ملایم — هر ۲ هفته یک‌بار وزنه را افزایش بده.\n" +
+  1591→      "• فیلد advancedTechniques: خالی یا [\"Progressive Overload\"]\n" +
+  1592→      "• فیلد muscleGroupSplit: تقسیم ساده (مثلاً \"full body 3x\" یا \"split: upper/lower\").\n" +
+  1593→      "• ⚠️ از هیچ تکنیک پیشرفته‌ای (سوپرست، تری‌ست، FST-7، دراپ‌ست) استفاده نکن."
+  1594→    );
+  1595→  }
+  1596→
+  1597→  // ─── ۲. برنامه مکمل — حداقلِ مؤثر، یکسان برای همه پلن‌ها ───
+  1598→  // مهم: طبق درخواست مدیر (۱۴۰۵/۰۶): «تجویز مکمل باید اندازه باشد؛ مکمل بی‌خودی
+  1599→  // و زیادی به کاربر نده که مجبور شود ۲۵ میلیون تومان مکمل بخرد».
+  1600→  // فلسفه: اول غذا، بعد مکمل — فقط مکمل‌های با بیشترین شواهد علمی و هزینه منطقی.
+  1601→  // (به‌روزرسانی ۱۴۰۵/۰۶/۲): «مکمل‌ها باید داینامیک و با توجه به نیاز کاربر تجویز
+  1602→  // بشوند و فرمت یکسان نداشته باشند» — قالب ثابت ۳+۱+۱ حذف شد؛ تصمیم need-based است.
+  1603→  {
+  1604→    const supplementBase = "💊 برنامه مکمل اختصاصی فیتاپ (داینامیک — فقط بر اساس نیازِ واقعیِ همین کاربر):\n" +
+  1605→      "⚠️ قانون طلایی: اول غذا، بعد مکمل. مکمل جای غذا را نمی‌گیرد و قرار نیست کاربر برای مکمل هزینه‌ی سنگین بکند.\n\n" +
+  1606→
+  1607→      "🔴 مهم‌ترین قانون — فرمت ثابت ممنوع:\n" +
+  1608→      "برنامه‌ی مکمل هر کاربر باید با داده‌های پروفایلِ او ساخته شود، نه یک قالبِ همیشگی. برای هر مکمل، اول «نیاز» را از روی پروفایل ثابت کن و در note دلیلش را بنویس؛ اگر نیاز نیست، همان یک را هم تجویز نکن. تعدادِ نهایی بین ۱ تا ۴ قلم است (به‌ندرت ۵). اگر تغذیه‌ی کاربر پوشش می‌دهد، با صراحت بنویس «برای تو فعلاً مکمل خاصی لازم نیست» و فقط ۱-۲ قلمِ واقعاً مفید بگذار.\n\n" +
+  1609→
+  1610→      "چک‌لیستِ تصمیم‌گیری (فقط مواردِ نیازمند را بگذار):\n" +
+  1611→      "• ویتامین D3 → برای اکثر ایرانی‌ها منطقی است (آفتابِ کم/زمانِ داخل)؛ با ذکرِ همین دلیلِ کوتاه.\n" +
+  1612→      "• امگا ۳ → فقط اگر مصرف ماهی کمتر از ۲ بار در هفته است (در رژیمِ ایرانیِ معمول صادق است؛ باز دلیل بنویس).\n" +
+  1613→      "• کراتین مونوهیدرات → فقط برای هدفِ عضله‌سازی/قدرت با تمرینِ مقاومتیِ منظم؛ برای هدفِ چربی‌سوزیِ خالص یا درمانی تجویز نکن.\n" +
+  1614→      "• پروتئین وی → فقط اگر پروتئینِ روزانه (تخم‌مرغ/مرغ/حبوبات/ماست/پنیر) به هدفِ g×kg وزنِ بدن نمی‌رسد؛ وگرنه صریحاً «لازم نیست» بنویس.\n" +
+  1615→      "• B12 → فقط رژیمِ وگان/گیاه‌خواریِ سخت‌گیر.\n" +
+  1616→      "• آهن یا کلسیم → فقط با شرایطِ خاصِ پروفایل (خونریزیِ زیاد/زنانِ ورزشکار/پوکیِ استخوان...) و با تأکیدِ مشورتِ پزشک.\n" +
+  1617→      "• کافئین → فقط هدفِ چربی‌سوزی + بدون مشکلِ قلبی/خواب؛ ساده‌ترین شکل: قهوه قبل تمرین.\n\n" +
+  1618→
+  1619→      "پرچم‌های قرمز (ممنوعِ مطلق):\n" +
+  1620→      "• BCAA/EAA، بتاآلانین، سیترین مالات، گلوتامین، گینر، ال-کارنیتین، کلاژن و ZMA هرگز آیتمِ اصلیِ تجویز نباشند — حداکثر در note به‌عنوان «در صورتِ بودجه‌ی اضافه» + جایگزینِ غذاییِ ارزان.\n" +
+  1621→      "• هیچ‌وقت «برای اطمینان همه را بخر» ننویس؛ برعکس: «لازم نیست همه را بگیری» را صریح بگو.\n\n" +
+  1622→
+  1623→      "خروجی JSON — بخش «supplements» (لیست ساده) و «supplementStack» (دسته‌بندی‌شده) هر دو:\n" +
+  1624→      "• هر مکمل دارای category: \"base\" (ضروریِ همین کاربر) | \"advanced\" (پوششِ شکافِ خاص) | \"targeted\" (هدفمندِ ارزان).\n" +
+  1625→      "• فقط دسته‌هایی را پر کن که مکمل واقعی برایش داری — دسته‌ی خالی نساز. فرمتِ خروجی باید متناسب با نیازِ کاربر باشد، نه همیشه یکسان.\n" +
+  1626→      "• هر مکمل باید فیلد contraindicatedFor (آرایه‌ی شرایطِ منع مصرف) داشته باشد:\n" +
+  1627→      "  • کراتین → بیمارانِ کلیوی\n" +
+  1628→      "  • کافئین → بیمارانِ قلبی، فشارِ خونِ بالا، بی‌خوابی\n" +
+  1629→      "  • پروتئین وی → نارساییِ کلیویِ پیشرفته\n" +
+  1630→      "• در note هر مکمل: (۱) دلیلِ تجویز برای همین کاربر، (۲) جایگزینِ غذاییِ ارزان، (۳) «قبل از شروع با پزشک مشورت کنید.»\n" +
+  1631→      "• هرگز دوز بالاتر از استاندارد تجویز نکن.\n" +
+  1632→      "• انتخاب‌ها باید بر اساس goal، رژیم، سطحِ فعالیت، سن/جنس، شرایطِ پزشکی (data.diseases, data.medicalConditions) و مکمل‌های فعلیِ کاربر (data.currentSupplements) باشد.";
+  1633→
+  1634→    if (tier.level === "pro" || tier.level === "advanced") {
+  1635→      // ورزشکاران پیشرفته: همان منطقِ need-based + تأکید بر اقتصاد
+  1636→      instructions.push(supplementBase + "\n\n⚠️ سطح ورزشکار: پیشرفته/حرفه‌ای — حتی در این سطح، استک را حداقلی و غذا-محور نگه دار؛ قهرمان‌ها هم از بشقابِ غذا قهرمان می‌شوند نه از قفسه‌ی مکمل.");
+  1637→    } else {
+  1638→      // مبتدی/متوسط: همان منطق با لحنِ ساده‌تر
+  1639→      instructions.push(supplementBase + "\n\n⚠️ سطح ورزشکار: مبتدی/متوسط — در این سطح معمولاً حداکثر ۲-۳ قلم لازم است؛ دوزهای محافظانه‌تر و تأکید بر شروعِ سبک در note.");
+  1640→    }
+  1641→  }
+  1642→
+  1643→  // آنالیز عکس بدن — برای کاربران Advanced / Ultimate که عکس بدن ارسال کرده‌اند.
+  1644→  // نیازی به capability gate نیست: اگر extras.bodyPhotoAnalysis وجود دارد، یعنی کاربر
+  1645→  // قبلاً از طریق submit-body-analysis عکس‌هایش را ارسال کرده و قابلیت bodyPhotoAnalysis
+  1646→  // توسط requirePlanCapability تأیید شده است.
+  1647→  if (extras?.bodyPhotoAnalysis) {
+  1648→    instructions.push(
+  1649→      `آنالیز عکس‌های بدن کاربر (توسط هوش مصنوعی بررسی شده):\n${extras.bodyPhotoAnalysis}\nاین اطلاعات را در طراحی برنامه لحاظ کن — نقاط ضعف فرم بدن، عدم تقارن، و حرکات اصلاحی پیشنهاد بده. تمرینات را بر اساس نقاط ضعف شناسایی‌شده اولویت‌بندی کن. اگر عدم تقارن عضلانی (مثلاً بین بازوی چپ و راست) دیده شد، تمرینات یک‌طرفه (unilateral) را در برنامه بگنجان.`
+  1650→    );
+  1651→  }
+  1652→
+  1653→  if (caps.videoBodyAnalysis && extras?.videoAnalysisResult) {
+  1654→    instructions.push(
+  1655→      `آنالیز ویدیوی فرم بدن کاربر (توسط هوش مصنوعی بررسی شده):\n${extras.videoAnalysisResult}\nاین اطلاعات را در طراحی برنامه لحاظ کن — نقاط ضعف فرم بدن، عدم تقارن، و حرکات اصلاحی پیشنهاد بده.`
+  1656→    );
+  1657→  }
+  1658→
+  1659→  if (caps.bloodTestAnalysis && extras?.bloodTestReport) {
+  1660→    instructions.push(
+  1661→      `گزارش آزمایش خون کاربر:\n${extras.bloodTestReport}\nبرنامه تغذیه را بر اساس کمبودهای ویتامینی، سطح قند، چربی خون و هورمون‌ها بهینه‌سازی کن. در صورت کمبود، غذاهای غنی از آن ویتامین/ماده معدنی را اولویت بده. هشدارهای پزشکی لازم را در بخش notes بیاور.`
+  1662→    );
+  1663→  }
+  1664→
+  1665→  // تمدید هوشمند: پیشرفت کاربر از دوره قبلی
+  1666→  if (extras?.renewalContext) {
+  1667→    instructions.push(extras.renewalContext);
+  1668→  }
+  1669→
+  1670→  return instructions.length
+  1671→    ? `\n\nدستورالعمل‌های ویژه پلن ${planName ? PLAN_LABELS[planName] : ""} (سطح: ${tier.level}):\n${instructions.map((i, idx) => `${idx + 1}. ${i}`).join("\n")}`
+  1672→    : "";
+  1673→}
+  1674→
+  1675→// ─── راهنمای انتخاب سوپرست بر اساس هدف ورزشکار ───
+  1676→// (FULL-PROFILE-AI-CONTEXT-WORKOUT) تصمیم‌گیری هوشمند درباره استفاده از
+  1677→// سوپرست/تری‌ست/جاینت‌ست بر اساس هدف، سطح ورزشکار و شرایط پزشکی.
+  1678→function supersetGuidanceForGoal(goal: OnboardingData["goal"]): string {
+  1679→  switch (goal) {
+  1680→    case "fat_loss":
+  1681→      return [
+  1682→        "  • توصیه: استفاده از سوپرست/تری‌ست/جاینت‌ست در ۲ تا ۳ روز از هفته برای افزایش فشار متابولیک (metabolic stress) و کالری‌سوزی.",
+  1683→        "  • بهترین انتخاب: جاینت‌ست‌های بدن‌کامل (full-body circuit) و سوپرست‌های آنتاگونیست با استراحت کم.",
+  1684→        "  • استراحت کوتاه (۳۰-۶۰ ثانیه بین گروه‌ها) برای حفظ ضربان قلب بالا.",
+  1685→      ].join("\n");
+  1686→    case "cut":
+  1687→      // v60 — کات: فشار متابولیک متوسط ولی شدت مکانیکی حفظ شود (حفظ عضله اولویت است)
+  1688→      return [
+  1689→        "  • توصیه (کات): سوپرست/تری‌ست در ۱ تا ۲ روز از هفته برای فشار متابولیک — ولی شدت مکانیکی حرکات اصلی حفظ شود تا عضله از دست نرود.",
+  1690→        "  • بهترین انتخاب: سوپرست آنتاگونیست با استراحت ۴۵-۷۵ ثانیه؛ جاینت‌ست فقط در روزهای کم‌حجم.",
+  1691→        "  • حجم کل تمرین را با نقصان کالری هماهنگ کن — در روزهای خیلی خسته، سوپرست را حذف کن نه حرکات اصلی را.",
+  1692→      ].join("\n");
+  1693→    case "muscle_gain":
+  1694→      return [
+  1695→        "  • توصیه: استفاده از سوپرست آنتاگونیست (push/pull) در ۱ تا ۲ روز از هفته برای افزایش حجم تمرین بدون خستگی اضافی.",
+  1696→        "  • بهترین انتخاب: سوپرست‌های متضاد (پرس سینه + بارفیکس، پرس بالاسینه + زیرسینه) برای حفظ شدت هایپرتروفی.",
+  1697→        "  • از تری‌ست و جاینت‌ست کمتر استفاده کن — استراحت کافی (۹۰-۱۲۰ ثانیه) برای حفظ شدت مکانیکی.",
+  1698→      ].join("\n");
+  1699→    case "bulk":
+  1700→      // v60 — افزایش حجم: حجم تمرین بالاتر با سوپرست کمکی و استراحت کامل
+  1701→      return [
+  1702→        "  • توصیه (افزایش حجم): سوپرست آنتاگونیست در ۱ تا ۲ روز برای افزایش حجم تمرین؛ حرکات اصلی همیشه تکی و سنگین.",
+  1703→        "  • استراحت کامل (۹۰-۱۲۰ ثانیه) بین گروه‌ها — در مازاد کالری، ریکاوری خوب است؛ شدت را قربانی نکن.",
+  1704→        "  • از جاینت‌ست برای حرکات بزرگ پرهیز کن؛ فقط در حرکات کمکی/آخر جلسه قابل قبول است.",
+  1705→      ].join("\n");
+  1706→    case "strength":
+  1707→      return [
+  1708→        "  • توصیه: استفاده از سوپرست به حداقل (۰ تا ۱ روز در هفته) — تمرکز روی حرکات اصلی با وزنه سنگین و استراحت کامل.",
+  1709→        "  • برای قدرت محض، حرکات تکی با ۳-۵ دقیقه استراحت برتری دارند.",
+  1710→        "  • اگر سوپرست می‌دهی، فقط سوپرست آنتاگونیست با شدت متوسط برای حرکات کمکی (نه حرکات اصلی).",
+  1711→      ].join("\n");
+  1712→    case "endurance":
+  1713→      return [
+  1714→        "  • توصیه: استفاده از تری‌ست و جاینت‌ست در ۱ تا ۲ روز برای افزایش استقامت عضلانی.",
+  1715→        "  • استراحت کوتاه (۳۰-۴۵ ثانیه) و تکرار بالا (۱۵-۲۰) برای بهبود ظرفیت لاکتات.",
+  1716→      ].join("\n");
+  1717→    case "fitness":
+  1718→    default:
+  1719→      return [
+  1720→        "  • توصیه: استفاده متوسط از سوپرست (۱ تا ۲ روز در هفته) برای تنوع و افزایش شدت تمرین.",
+  1721→        "  • ترکیب سوپرست‌های آنتاگونیست با حرکات تکی برای تعادل قدرت و استقامت.",
+  1722→      ].join("\n");
+  1723→  }
+  1724→}
+  1725→
+  1726→function supersetGuidanceForExperience(experience: OnboardingData["trainingExperience"] | undefined): string {
+  1727→  switch (experience) {
+  1728→    case "beginner":
+  1729→      return [
+  1730→        "  • سطح مبتدی: از سوپرست/تری‌ست/جاینت‌ست استفاده نکن (یا حداکثر ۱ سوپرست ساده در یک روز).",
+  1731→        "  • تمرکز روی یادگیری فرم صحیح حرکات تکی، اتصال ذهن-عضله و تثبیت الگوهای حرکتی.",
+  1732→        "  • استراحت کامل (۹۰-۱۲۰ ثانیه) بین ست‌ها برای ریکاوری عصبی-عضلانی.",
+  1733→      ].join("\n");
+  1734→    case "intermediate":
+  1735→      return [
+  1736→        "  • سطح متوسط: می‌توانی از سوپرست‌های آنتاگونیست در ۱-۲ روز استفاده کنی.",
+  1737→        "  • هنوز از تری‌ست/جاینت‌ست پرهیز کن مگر برای روز استقامت/کاردیو.",
+  1738→      ].join("\n");
+  1739→    case "advanced":
+  1740→      return [
+  1741→        "  • سطح پیشرفته: استفاده از سوپرست/تری‌ست در ۲-۳ روز مجاز و مفید است.",
+  1742→        "  • جاینت‌ست را برای روزهای چربی‌سوزی یا بدن‌کامل نگه دار.",
+  1743→      ].join("\n");
+  1744→    case "pro":
+  1745→      return [
+  1746→        "  • سطح حرفه‌ای: آزادی کامل در استفاده از تکنیک‌های پیشرفته (سوپرست/تری‌ست/جاینت‌ست/دراپ‌ست).",
+  1747→        "  • برای حداکثر رشد، ترکیب سوپرست آنتاگونیست با تری‌ست همان گروه را در روزهای حجمی امتحان کن.",
+  1748→      ].join("\n");
+  1749→    default:
+  1750→      return [
+  1751→        "  • سطح نامشخص: محتاط رفتار کن — حداکثر ۱ سوپرست در یک روز.",
+  1752→      ].join("\n");
+  1753→  }
+  1754→}
+  1755→
+  1756→// Generate a weekly workout plan via AI
+  1757→export async function generateWorkoutPlan(
+  1758→  data: OnboardingData,
+  1759→  planName?: Plan | null,
+  1760→  extras?: { bloodTestReport?: string; videoAnalysisResult?: string; bodyPhotoAnalysis?: string; renewalContext?: string }
+  1761→): Promise<ProWorkoutPlanContent> {
+  1762→  const systemPrompt = withBrandDirective(await getAiConfig("coach_system_prompt", DEFAULT_COACH_PROMPT));
+  1763→  const context = buildUserContext(data, planName);
+  1764→  // ─── trainingExperience را به extras اضافه کن تا تکنیک‌ها بر اساس سابقه فعال شوند ───
+  1765→  const planInstructions = buildPlanAwareInstructions(planName, { ...extras, trainingExperience: data.trainingExperience });
+  1766→
+  1767→  // Use user-selected specific weekdays if provided; otherwise fallback to first N days
+  1768→  const chosenDays =
+  1769→    data.workoutDaysList && data.workoutDaysList.length > 0
+  1770→      ? data.workoutDaysList
+  1771→      : PERSIAN_WEEKDAYS.slice(0, data.workoutDays);
+  1772→
+  1773→  // --- Fetch exercise names from the library so AI only uses real exercises ---
+  1774→  let libraryNames: string[] = [];
+  1775→  try {
+  1776→    const all = await db.exerciseLibrary.findMany({ select: { name: true, muscle: true } });
+  1777→    libraryNames = all.map((e: any) => e.name);
+  1778→  } catch (e) {
+  1779→    console.error("[generateWorkoutPlan] failed to load exercise library:", e);
+  1780→  }
+  1781→  const libraryList = libraryNames.length > 0
+  1782→    ? `\n\nکتابخانه حرکات موجود (فقط از بین این حرکات انتخاب کن):\n${libraryNames.map((n, i) => `${i + 1}. ${n}`).join("\n")}\n`
+  1783→    : "";
+  1784→
+  1785→  // ─── محاسبه پویای تعداد حرکات هر روز بر اساس سطح تجربه کاربر (WORKOUT-PLAN-PRO) ───
+  1786→  // مبتدی: ۵-۶ | متوسط: ۶-۷ | پیشرفته: ۷-۸ | حرفه‌ای: ۸-۱۰
+  1787→  // این مقادیر بر اساس استاندارد مربیان بزرگ دنیا (هانی رامبد، هادی چوپان، کریس بامستد) تنظیم شده‌اند.
+  1788→  // برای کاربران با سابقه ۳ سال یا بیشتر (advanced/pro) حداقل ۶ حرکت الزامی است.
+  1789→  const exerciseCountRange = (() => {
+  1790→    switch (data.trainingExperience) {
+  1791→      case "beginner":
+  1792→        return { min: 5, max: 6 };
+  1793→      case "intermediate":
+  1794→        return { min: 6, max: 7 };
+  1795→      case "advanced":
+  1796→        return { min: 7, max: 8 };
+  1797→      case "pro":
+  1798→        return { min: 8, max: 10 };
+  1799→      default:
+  1800→        return { min: 5, max: 6 };
+  1801→    }
+  1802→  })();
+  1803→  // قانون سابقه ۳ سال یا بیشتر → حداقل ۶ حرکت
+  1804→  const minExercisesForExperienced = 6;
+  1805→  const effectiveMinExercises =
+  1806→    (data.trainingExperience === "advanced" || data.trainingExperience === "pro")
+  1807→      ? Math.max(exerciseCountRange.min, minExercisesForExperienced)
+  1808→      : exerciseCountRange.min;
+  1809→
+  1810→  const userPrompt = `بر اساس اطلاعات زیر، یک برنامه تمرینی هفتگی کامل، حرفه‌ای و شخصی‌سازی‌شده بساز — سطح مربی حرفه‌ای فدراسیون.
+  1811→
+  1812→${context}
+  1813→${planInstructions}
+  1814→${libraryList}
+  1815→
+  1816→روزهای تمرین کاربر: ${chosenDays.join("، ")}
+  1817→
+  1818→فقط و فقط با ساختار JSON زیر پاسخ بده و هیچ متن اضافه‌ای قبل یا بعد از JSON ننویس:
+  1819→{
+  1820→  "days": [
+  1821→    {
+  1822→      "day": "شنبه",
+  1823→      "title": "عنوان روز تمرین",
+  1824→      "focus": "عضله هدف",
+  1825→      "estimatedMinutes": 60,
+  1826→      "warmup": [
+  1827→        {"name": "نام حرکت گرم‌کردن (مثلاً دویدن سبک روی تردمیل)", "durationSec": 300, "notes": "شدت پایین، RPE 4-5"},
+  1828→        {"name": "موبیلیتی مفصل هدف (مثلاً چرخش شانه)", "durationSec": 120, "notes": "۳ ست ۱۰ تکراری"}
+  1829→      ],
+  1830→      "exercises": [
+  1831→        {
+  1832→          "name": "نام حرکت (حتماً از کتابخانه حرکات بالا)",
+  1833→          "muscle": "عضله هدف",
+  1834→          "category": "push|pull|legs|core|cardio|fullbody",
+  1835→          "description": "توضیح نحوه انجام (۲-۳ جمله کامل و واضح — فرم، مسیر حرکت، نکته فنی کلیدی)",
+  1836→          "tips": "نکته ایمنی و تکنیک",
+  1837→          "coachTip": "توصیه کوتاه مربی (۱ جمله) — مثلاً «دقت کن زانوها در جهت نوک پنجه باشد» یا «در فاز منفی ۳ ثانیه مکث کن»",
+  1838→          "difficulty": "beginner|intermediate|advanced",
+  1839→          "rpe": 7,
+  1840→          "tempo": "3-1-2-0",
+  1841→          "substitution": "حرکت جایگزین برای زمانی که تجهیزات کافی نباشد یا محدودیت خطری وجود داشته باشد",
+  1842→          "sets": [
+  1843→            {"setNumber": 1, "reps": "10-12", "restSec": 90, "rpe": 7},
+  1844→            {"setNumber": 2, "reps": "10-12", "restSec": 90, "rpe": 7}
+  1845→          ],
+  1846→          "supersetGroup": "A",
+  1847→          "supersetType": "superset",
+  1848→          "circuitRounds": 3,
+  1849→          "restBetweenRounds": 180
+  1850→        }
+  1851→      ],
+  1852→      "cooldown": [
+  1853→        {"name": "استretch دینامیک/استاتیک عضله هدف", "durationSec": 180, "notes": "۳۰ ثانیه روی هر عضله"},
+  1854→        {"name": "فوم رولر (Foam Roller)", "durationSec": 180, "notes": "روی عضلات هدف و فاسیا"}
+  1855→      ]
+  1856→    }
+  1857→  ],
+  1858→  "weeklyProgression": {
+  1859→    "strategy": "استراتژی کلی پیشرفت (مثلاً: هر هفته وزنه‌ها را ۲.۵٪ افزایش بده، تکرارها را ثابت نگه دار)",
+  1860→    "weeks": [
+  1861→      {"week": 1, "weightChangeKg": 0, "repChange": 0, "note": "هفته آشنایی — RPE 6-7، فرم حرکات را تثبیت کن"},
+  1862→      {"week": 2, "weightChangeKg": 2.5, "repChange": 0, "note": "افزایش وزنه ۲.۵ کیلو در حرکات اصلی — RPE 7-8"},
+  1863→      {"week": 3, "weightChangeKg": 5, "repChange": 0, "note": "افزایش وزنه تجمعی — RPE 8-9، حجم ثابت"},
+  1864→      {"week": 4, "weightChangeKg": 7.5, "repChange": -1, "note": "هفته اوج (deload بعدی) — RPE 9، تکرار کاهشی"}
+  1865→    ]
+  1866→  },
+  1867→  "safetyNotes": [
+  1868→    "نکته ایمنی ۱ بر اساس آسیب‌دیدگی یا شرایط پزشکی",
+  1869→    "نکته ایمنی ۲"
+  1870→  ],
+  1871→  "recoveryNotes": [
+  1872→    "توصیه ریکاوری ۱ بر اساس خواب/استرس",
+  1873→    "توصیه ریکاوری ۲"
+  1874→  ],
+  1875→  "nutritionTimingNotes": [
+  1876→    "توصیه تایمینگ تغذیه قبل از تمرین (۹۰-۱۲۰ دقیقه قبل)",
+  1877→    "توصیه تایمینگ تغذیه بعد از تمرین (۳۰-۶۰ دقیقه بعد)"
+  1878→  ],
+  1879→  "supplementTimingNotes": [
+  1880→    "توصیه تایمینگ مکمل بر اساس مکمل‌های فعلی یا هدف"
+  1881→  ],
+  1882→  "medicalWarningFlags": [
+  1883→    "⚠️ هشدار پزشکی (در صورت وجود شرایط حساس)"
+  1884→  ],
+  1885→  "weeklyGoal": "هدف هفته",
+  1886→  "notes": "نکات کلی هفته — انگیزشی و کاربردی",
+  1887→  "advancedTechniques": [
+  1888→    "نام تکنیک پیشرفته استفاده‌شده (مثلاً FST-7، سوپرست آنتاگونیست، تری‌ست، دراپ‌ست، رست پاز، Progressive Overload)"
+  1889→  ],
+  1890→  "muscleGroupSplit": "تقسیم عضلات هفته (مثلاً push/pull/legs یا upper/lower یا body part split یا full body 3x)",
+  1891→  "periodizationType": "linear | undulating | block | wave | daily_undulating",
+  1892→  "muscleFrequencyPerWeek": 2,
+  1893→  "inspiredByCoach": "hany_rambod | hadi_chupan | chris_bumstead | mixed",
+  1894→  "fst7Details": {
+  1895→    "exerciseName": "نام حرکت آخر گروه عضلانی (که FST-7 روی آن اعمال می‌شود)",
+  1896→    "sets": 7,
+  1897→    "reps": "8-12",
+  1898→    "restSec": 30,
+  1899→    "note": "توضیح اجرای FST-7 (پمپ حداکثری، استراحت ۳۰-۴۵ ثانیه، ۷ ست)"
+  1900→  }
+  1901→}
+  1902→
+  1903→قوانین حرفه‌ای (همه را رعایت کن):
+  1904→
+  1905→۱) ساختار و تعداد (قانون سخت — نقض آن یعنی برنامه نامعتبر است):
+  1906→- دقیقاً ${data.workoutDays} روز تمرین در روزهای ذکر شده (${chosenDays.join("، ")}) ایجاد کن.
+  1907→- 📅 روزهای تمرین را به ترتیب استاندارد هفته فارسی برگردان: شنبه، یکشنبه، دوشنبه، سه‌شنبه، چهارشنبه، پنجشنبه، جمعه. هرگز روزها را نامرتب برنگردان. آرایه "days" باید دقیقاً به همین ترتیب زمانی چیده شده باشد.
+  1908→- ⚠️ هر روز «حداقل ${effectiveMinExercises}» و «حداکثر ${exerciseCountRange.max}» حرکت داشته باشد (سطح تجربه کاربر: ${data.trainingExperience || "beginner"}). کمتر از حداقل یا بیشتر از حداکثر حرکت در هر روز ممنوع است — این محدوده بر اساس استانداردهای علمی تمرین برای همین سطح تجربه تعیین شده است.
+  1909→- ⚠️ قانون مهم: برای کاربران با سابقه ۳ سال یا بیشتر (سطح پیشرفته/حرفه‌ای)، حداقل ۶ حرکت در هر روز الزامی است.
+  1910→- تعداد ست‌ها بین ۳ تا ۵ باشد.
+  1911→- **حتماً فقط از حرکات کتابخانه حرکات بالا استفاده کن** — نام حرکات را دقیقاً همان‌طور بنویس.
+  1912→- **سوپرست/تری‌ست/جاینت‌ست به عنوان یک حرکت در نظر گرفته می‌شود** (مثلاً ۵ حرکت تکی + ۱ سوپرست = ۶ حرکت کل).
+  1913→- 💰 بودجه و تجهیزات کاربر: مکان تمرین «${WORKOUT_PLACE_LABELS[data.workoutPlace] || data.workoutPlace}» و تجهیزات موجود: ${data.equipment?.length ? data.equipment.join("، ") : "نامشخص"}. حرکات را فقط با همین تجهیزات انتخاب کن — حرکت با تجهیزات گران‌قیمت یا خارج از دسترس کاربر تجویز نکن و در "substitution" جایگزین کم‌هزینه بده.
+  1914→
+  1915→۲) گرم‌کردن و سردکردن (بسیار مهم):
+  1916→- هر روز حتماً آرایه "warmup" با حداقل ۲ آیتم بساز: ۵-۱۰ دقیقه هوازی سبک + موبیلیتی/اکتیویشن مفصل هدف.
+  1917→- هر روز حتماً آرایه "cooldown" با حداقل ۲ آیتم بساز: استretch استاتیک + فوم رولر یا نفس‌گیری فعال.
+  1918→- durationSec به ثانیه (نه دقیقه) باشد.
+  1919→
+  1920→۳) RPE (Rate of Perceived Exertion) — حرفه‌ای:
+  1921→- برای هر حرکت فیلد "rpe" (۱ تا ۱۰) بگذار:
+  1922→  • RPE 5-6: گرم‌کردن / آماده‌سازی
+  1923→  • RPE 7: شدت متوسط — ۳ تکرار ذخیره (RIR 3)
+  1924→  • RPE 8: شدت بالا — ۲ تکرار ذخیره (RIR 2)
+  1925→  • RPE 9: نزدیک شکست — ۱ تکرار ذخیره
+  1926→  • RPE 10: شکست عضلانی کامل (فقط در ست آخر حرکات اصلی)
+  1927→- در ست آخر هر حرکت اصلی (پرس، اسکوات، ددلیفت) می‌توانی RPE را ۱-۲ درجه بالاتر بگذاری.
+  1928→
+  1929→۴) Tempo (تمپو اجرا):
+  1930→- برای هر حرکت فیلد "tempo" با فرمت ۴-رقمی بنویس: "اکسنتریک-مکث-کنسنتریک-مکث".
+  1931→  مثال‌ها:
+  1932→  • "3-1-2-0" — پایین ۳ ثانیه، مکث ۱، بالا ۲، بدون مکث (استاندارد هایپرتروفی)
+  1933→  • "2-0-1-0" — کنترل‌شده سریع (قدرت)
+  1934→  • "4-2-1-0" — زیر کنترل کامل (هایپرتروفی پیشرفته)
+  1935→- برای حرکات انفجاری (مثل پاور کلین) از "1-0-X-0" استفاده کن (X = حداکثر سرعت).
+  1936→
+  1937→۴-۱) توصیه مربی (coachTip) — الزامی برای هر حرکت:
+  1938→- برای هر حرکت فیلد "coachTip" را با یک جمله کوتاه و کاربردی از مربی پر کن.
+  1939→- این توصیه باید مختص همان حرکت باشد — نکته فنی یا فرمی که کاربر را در همان حرکت کمک کند.
+  1940→- مثال‌ها:
+  1941→  • اسکوات: «دقت کن زانوها در جهت نوک پنجه باشد و عمق حداقل موازی با زمین.»
+  1942→  • ددلیفت: «کمر کاملاً صاف، وزنه نزدیک بدن، فاز بالا با باسن و زانو هم‌زمان.»
+  1943→  • پرس سینه: «پایین آهسته (۳ ثانیه)، مکث ۱ ثانیه روی سینه، انفجاری بالا.»
+  1944→  • بارفیکس: «در فاز منفی ۳ ثانیه مکث کن تا کنترل کامل داشته باشی.»
+  1945→  • پرس سرشانه: «قفسه سینه بالا، شکم سفت، بدون قوس کمری — از فاز منفی غافل نشو.»
+  1946→- هرگز توصیه کلی و تکراری ننویس (مثل «فرم درست داشته باش»). همیشه نکته خاص همان حرکت.
+  1947→
+  1948→۵) استراحت بین ست‌ها:
+  1949→- در فیلد "restSec" هر ست بگذار:
+  1950→  • قدرت محض (۱-۳ تکرار): ۱۸۰ ثانیه (۳ دقیقه)
+  1951→  • هایپرتروفی (۶-۱۲ تکرار): ۶۰-۹۰ ثانیه
+  1952→  • استقامت عضلانی (۱۵+ تکرار): ۳۰-۴۵ ثانیه
+  1953→  • سوپرست/تری‌ست: ۹۰-۱۲۰ ثانیه بین گروه‌ها
+  1954→
+  1955→۶) حرکت جایگزین (substitution):
+  1956→- برای هر حرکت فیلد "substitution" پر کن با جایگزینی که همان عضله را هدف می‌گیرد اما با تجهیزات کمتر یا محدودیت ایمنی متفاوت.
+  1957→
+  1958→۷) سوپرست / تری‌ست / جاینت‌ست (روش‌های حرفه‌ای افزایش شدت):
+  1959→- **استفاده از سوپرست/تری‌ست/جاینت‌ست اختیاری است و باید بر اساس هدف و سطح ورزشکار تصمیم کنی.** در صورت استفاده، برای حرکات گروهی فیلد "supersetGroup" را با یک حرف یکسان (مثل "A" یا "B") پر کن.
+  1960→- **توجه**: سوپرست/تری‌ست/جاینت‌ست در شمارش حرکات یک حرکت محسوب می‌شود (نه دو یا سه).
+  1961→- "supersetType" را بر اساس نوع گروه تنظیم کن:
+  1962→  • "superset" (۲ حرکت): متضاد آنتاگونیست — مثل پرس سینه + بارفیکس (push + pull).
+  1963→  • "triset"    (۳ حرکت): همان گروه عضلانی — مثل ۳ حرکت مختلف سینه (پرس، قفسه، شنا).
+  1964→  • "giant"     (۴ حرکت یا بیشتر): جاینت‌ست یا سیرکویت — برای اتمام کامل یک گروه عضلانی یا سیرکویت بدن‌کامل (full-body circuit).
+  1965→- برای جاینت‌ست (giant) حتماً این فیلدها را هم پر کن:
+  1966→  • "circuitRounds": تعداد دفعات تکرار کل سیرکویت (عدد ۲ تا ۴، پیش‌فرض ۳).
+  1967→  • "restBetweenRounds": استراحت بین دورهای سیرکویت به ثانیه (۱۲۰ تا ۱۸۰ ثانیه).
+  1968→- در سوپرست/تری‌ست/جاینت‌ست، restSec حرکات داخل گروه را ۰ یا کم بگذار (چون بدون استراحت بین حرکات انجام می‌شوند)؛ استراحت واقعی بین گروه‌ها (یا بین دورها در جاینت‌ست) لحاظ می‌شود.
+  1969→- به ازای هر گروه، حداکثر ۱ گروه از هر نوع در یک روز بساز — هم‌نام‌بودن "supersetGroup" یعنی همان گروه.
+  1970→
+  1971→۷-۱) راهنمای انتخاب سوپرست بر اساس هدف و سطح ورزشکار:
+  1972→- **هدف "${GOAL_LABELS[data.goal]}"** (${data.goal}):
+  1973→${supersetGuidanceForGoal(data.goal)}
+  1974→- **سطح ورزشکار "${data.trainingExperience || "beginner"}"**:
+  1975→${supersetGuidanceForExperience(data.trainingExperience)}
+  1976→- اگر کاربر مبتدی است یا شرایط پزشکی/آسیب‌دیدگی حساس دارد، استفاده از سوپرست را به حداقل برسان یا کلاً حذف کن و روی حرکات تکی با فرم تکنیکی تمرکز کن.
+  1977→
+  1978→۷-۲) تکنیک‌های پیشرفته و الگوی مربیان بزرگ (WORKOUT-PLAN-PRO):
+  1979→- **هانی رامبد — FST-7 (Fascia Stretch Training)**: در حرکت آخر هر گروه عضلانی (به ویژه برای پلن حرفه‌ای/ultimate)، ۷ ست با ۸-۱۲ تکرار و استراحت ۳۰-۴۵ ثانیه بزن. هدف: پمپ حداکثری و کشش فاسیا. فیلد "fst7Details" را با نام حرکت، ۷ ست، تکرارها و استراحت پر کن.
+  1980→- **هادی چوپان — حجم بالا + فرکانس بالا**: هر گروه عضلانی را ۲ بار در هفته تمرین بده. فیلد "muscleFrequencyPerWeek" را ۲ بگذار. در روزهای تکراری، حرکات و زاویه‌های متفاوت استفاده کن.
+  1981→- **کریس بامستد — ارتباط ذهن-عضله**: در توضیح هر حرکت روی کنترل فاز اکسنتریک (۳-۴ ثانیه پایین) و مکث در نقطه کشش تأکید کن. تمپو "4-1-2-0" یا "3-1-2-1" برای هایپرتروفی.
+  1982→- **دوره‌بندی موجی (Undulating Periodization)**: در طول هفته، حجم/شدت را متغیر بده. فیلد "periodizationType" را بر اساس پلن کاربر تنظیم کن:
+  1983→  • ultimate → "undulating" یا "daily_undulating"
+  1984→  • advanced → "linear"
+  1985→  • standard/basic → "linear"
+  1986→- **دراپ‌ست (Drop Set)**: در ست آخر حرکات کمکی، می‌توانی یک دراپ‌ست (۲۰-۳۰٪ کاهش وزنه + تکرار تا شکست) پیشنهاد بده. در توضیح حرکت ذکر کن.
+  1987→- **رست پاز (Pause Reps)**: در نقطه میانی حرکات اصلی، ۲-۳ ثانیه مکث (tempo مثلاً "3-2-1-0").
+  1988→- **تکنیک ۱.۵ تکراری (1.5 reps)**: یک تکرار کامل + نیم تکرار = ۱.۵. برای پمپ حداکثری عضله.
+  1989→- فیلد "advancedTechniques" (آرایه): حداقل تکنیک‌های پیشرفته استفاده‌شده در این برنامه را لیست کن (بر اساس سطح پلن کاربر).
+  1990→- فیلد "muscleGroupSplit": تقسیم عضلات هفته را دقیق مشخص کن (مثلاً "push/pull/legs" یا "upper/lower" یا "push/pull/legs/upper/lower" یا "body part split").
+  1991→- فیلد "inspiredByCoach": بر اساس پلن و هدف:
+  1992→  • ultimate → "mixed" یا "hany_rambod"
+  1993→  • advanced → "chris_bumstead" یا "hadi_chupan"
+  1994→  • standard/basic → "mixed"
+  1995→
+  1996→۸) پیشرفت هفتگی (weeklyProgression):
+  1997→- استراتژی پیشرفت (Progressive Overload) را برای حداقل ۴ هفته بنویس.
+  1998→- هر هفته توضیح بده چقدر وزنه/تکرار اضافه شود و RPE هدف چقدر باشد.
+  1999→- اگر کاربر "${data.trainingExperience || "beginner"}" است، آغاز را ملایم‌تر بگذار. اگر "pro" یا "advanced" است، پرگرسیون تهاجمی‌تر بده.
+  2000→
+
+[showing lines 1-2000 of 4500; use offset=2001 with limit to continue reading]

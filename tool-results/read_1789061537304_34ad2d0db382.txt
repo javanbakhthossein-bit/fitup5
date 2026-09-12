@@ -1,0 +1,592 @@
+     1→#!/bin/bash
+     2→set -e
+     3→
+     4→echo "🚀 شروع دیپلوی..."
+     5→cd /var/www/fitup
+     6→
+     7→# ۰. خودترمیمی (v22): استخراج idempotent جدیدترین زیپ + جایگزینی امن deploy.sh
+     8→# درس باگ v21 روی سرور: unzip دستی ناقص/قطع‌شده فقط بخشی از فایل‌ها را باز کرد
+     9→# و .deploy-manifest.txt قدیمی روی دیسک ماند → پاک‌سازی stale دو فایلِ «جدیدِ»
+    10→# v21 را قدیمی پنداشت و حذف کرد → خطای build «Module not found».
+    11→# v22: همیشه (نه فقط وقتی src غایب است) جدیدترین زیپ کامل extract می‌شود تا
+    12→# دیسک دقیقاً با زیپ همگام بماند — شامل مانیفست.
+    13→LATEST_ZIP=$(ls -t fitup-deploy-*.zip 2>/dev/null | head -1 || true)
+    14→if [ -n "$LATEST_ZIP" ]; then
+    15→  echo "📦 زیپ دیپلوی: $LATEST_ZIP — استخراج idempotent همهٔ فایل‌ها (به‌جز deploy.sh)..."
+    16→  if ! unzip -oq "$LATEST_ZIP" -x deploy.sh; then
+    17→    echo "❌ استخراج زیپ شکست خورد (احتمال کمبود فضا؟) — دیپلوی متوقف شد."
+    18→    df -h /var/www/fitup 2>/dev/null || true
+    19→    exit 1
+    20→  fi
+    21→  # deploy.sh خودش از unzip مستثنی است: بازنویسی اسکریپتِ در حالِ اجرا باعث
+    22→  # خرابی bash می‌شود. اگر نسخهٔ زیپ جدیدتر است → جایگزین + exec مجدد خودکار.
+    23→  unzip -p "$LATEST_ZIP" deploy.sh > deploy.sh.zipnew 2>/dev/null || true
+    24→  if [ -s deploy.sh.zipnew ] && ! cmp -s deploy.sh.zipnew deploy.sh; then
+    25→    if [ "$DEPLOY_REEXEC" = "1" ]; then
+    26→      echo "  ⚠ deploy.sh زیپ با نسخهٔ در حال اجرا فرق دارد ولی قبلاً exec شده — ادامه با نسخهٔ فعلی"
+    27→    else
+    28→      echo "  🔄 deploy داخل زیپ جدیدتر از نسخهٔ در حال اجراست — جایگزینی و اجرای مجدد..."
+    29→      cp deploy.sh.zipnew deploy.sh && rm -f deploy.sh.zipnew
+    30→      export DEPLOY_REEXEC=1
+    31→      exec bash deploy.sh
+    32→    fi
+    33→  fi
+    34→  rm -f deploy.sh.zipnew 2>/dev/null || true
+    35→fi
+    36→if [ ! -f "prisma/schema.prisma" ] || [ ! -d "src" ]; then
+    37→  if [ -z "$LATEST_ZIP" ]; then
+    38→    echo "❌ خطا: کد پروژه (prisma/schema.prisma / src) یافت نشد و هیچ fitup-deploy-*.zip در /var/www/fitup نیست."
+    39→    echo ""
+    40→    echo "   راه حل: زیپ دیپلوی را در همین مسیر آپلود کنید، بعد:"
+    41→    echo "     cd /var/www/fitup && bash deploy.sh   (خودش زیپ را باز می‌کند)"
+    42→    echo "   یا دستی:"
+    43→    echo "     unzip -o fitup-deploy-2026-09-05-v22.zip && bash deploy.sh"
+    44→    exit 1
+    45→  else
+    46→    echo "❌ زیپ $LATEST_ZIP کامل نیست (prisma/schema.prisma / src همچنان غایب است)!"
+    47→    echo "   زیپ احتمالاً ناقص آپلود شده — دوباره آپلود کنید و bash deploy.sh را دوباره بزنید."
+    48→    exit 1
+    49→  fi
+    50→fi
+    51→
+    52→# ۰-ب. گارد هویت PWA (v29 — باگ دیالوگ «مرور به‌روزرسانی» کروم)
+    53→# کروم برای WebAPKهای نصب‌شده هر بار که «نام یا آیکون» وب‌اپ تغییر کند یک
+    54→# دیالوگ تأیید هویت (با دکمهٔ حذف نصب!) نشان می‌دهد — حتی اگر تغییر عمدی نباشد
+    55→# (مثلاً re-export تصادفی لوگو با بایت‌های متفاوت). این گارد هویت PWA را هش
+    56→# می‌کند و اگر بین دیپلوی‌ها تغییر کرده باشد با هشدار بزرگ اطلاع می‌دهد تا
+    57→# «هیچ‌وقت» تصادفی تغییر نکند. دیپلوی fail نمی‌شود — فقط هشدار صادقانه.
+    58→PWA_IDENTITY_FILES="public/manifest.json public/icon-192.png public/icon-512.png public/icon-192-maskable.png public/icon-512-maskable.png"
+    59→PWA_IDENTITY_FILE=".pwa-identity.sha256"
+    60→PWA_IDENTITY_NOW=$(cat $PWA_IDENTITY_FILES 2>/dev/null | sha256sum | awk '{print $1}')
+    61→if [ -z "$PWA_IDENTITY_NOW" ]; then
+    62→  echo "Ⓦ PWA identity: فایل‌های manifest/آیکون پیدا نشدند — گارد skip شد"
+    63→else
+    64→  PWA_IDENTITY_PREV=$(cat "$PWA_IDENTITY_FILE" 2>/dev/null || true)
+    65→  if [ -n "$PWA_IDENTITY_PREV" ] && [ "$PWA_IDENTITY_NOW" != "$PWA_IDENTITY_PREV" ]; then
+    66→    echo ""
+    67→    echo "⚠⚠ هویت PWA تغییر کرده است (manifest.json یا فایل‌های آیکون) ⚠⚠"
+    68→    echo "   کروم به «همه» کاربرانی که وب‌اپ را نصب دارند، دیالوگ تأیید هویت"
+    69→    echo "   (مرور به‌روزرسانی + گزینهٔ «حذف نصب برنامه») نشان می‌دهد."
+    70→    echo "   اگر این تغییر عمدی نیست، فایل‌های زیر را به نسخهٔ قبلی برگردانید:"
+    71→    echo "     $PWA_IDENTITY_FILES"
+    72→    echo "   (هویت قبلی: $PWA_IDENTITY_PREV — هویت جدید: $PWA_IDENTITY_NOW)"
+    73→    echo ""
+    74→  else
+    75→    echo "  ✓ هویت PWA پایدار است (بدون دیالوگ تأیید کروم برای کاربران فعلی)"
+    76→  fi
+    77→  echo "$PWA_IDENTITY_NOW" > "$PWA_IDENTITY_FILE"
+    78→fi
+    79→
+    80→# ۱. پشتیبان‌گیری از دیتابیس
+    81→echo "📦 پشتیبان‌گیری از دیتابیس..."
+    82→BACKUP_DIR="/var/www/fitup/backups"
+    83→mkdir -p $BACKUP_DIR
+    84→DATE=$(date +"%Y-%m-%d_%H-%M-%S")
+    85→cp db/custom.db "$BACKUP_DIR/db_backup_$DATE.db" 2>/dev/null || echo "  (دیتابیس در دسترس نیست)"
+    86→ls -t $BACKUP_DIR/db_backup_*.db 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null
+    87→echo "  ✓ پشتیبان ذخیره شد"
+    88→
+    89→# ۱-ب. پشتیبان‌گیری از «همه» رسانه‌های کاربران (v15 — قبلاً فقط articles!)
+    90→# مهم: رسانه‌های خصوصی کاربران (عکس پیشرفت/بدن، چت، ویدیو، آزمایش خون) هم
+    91→# مثل مقالات مقدس‌اند. اگر دیپلوی/rollback اتفاقی uploads را خالی کند، این
+    92→# پشتیبان نجات‌دهنده است (ریشه‌ی باگ «عکس‌های شکسته گالری پیشرفت»).
+    93→if [ -d "uploads" ]; then
+    94→  echo "🖼 پشتیبان‌گیری از کل رسانه‌ها (uploads)..."
+    95→  UPLOADS_COUNT_BEFORE=$(find uploads -type f 2>/dev/null | wc -l)
+    96→  ARTICLES_COUNT_BEFORE=$(find uploads/articles -type f 2>/dev/null | wc -l)
+    97→  mkdir -p "$BACKUP_DIR/uploads_full_backup"
+    98→  rsync -a uploads/ "$BACKUP_DIR/uploads_full_backup/" 2>/dev/null \
+    99→    || cp -rn uploads/* "$BACKUP_DIR/uploads_full_backup/" 2>/dev/null || true
+   100→  echo "  ✓ $UPLOADS_COUNT_BEFORE فایل پشتیبان شد ($ARTICLES_COUNT_BEFORE تصویر مقالات + رسانه‌های خصوصی کاربران)"
+   101→else
+   102→  UPLOADS_COUNT_BEFORE=0
+   103→  ARTICLES_COUNT_BEFORE=0
+   104→  echo "  (پوشه uploads موجود نیست)"
+   105→fi
+   106→
+   107→# ۲. نصب وابستگی‌ها
+   108→echo "📦 نصب وابستگی‌ها..."
+   109→bun install
+   110→
+   111→# ۲-ب. خودترمیمی DATABASE_URL در .env (v22)
+   112→# باگ واقعی سرور: DATABASE_URL به مسیر سندباکس (file:/home/z/...) اشاره می‌کرد
+   113→# → prisma دیتابیسِ خالی در آن مسیر ساخت، repair-media «۰ رفرنس رسانه» دید و
+   114→# سایت عملاً دیتابیس غلط می‌خواند؛ دیتای واقعی در /var/www/fitup/db/custom.db بود.
+   115→# این قدم فقط وقتی .env را اصلاح می‌کند که دیتابیس فعلی «خالی/گمشده» باشد و
+   116→# دیتابیس استاندارد سرور «پر از دیتا» — هیچ‌وقت دیتای واقعی را جابه‌جا نمی‌کند.
+   117→echo "🗄 بررسی سلامت DATABASE_URL..."
+   118→if bun run scripts/fix-database-url.ts; then
+   119→  echo "  ✓ بررسی DATABASE_URL انجام شد"
+   120→else
+   121→  echo "  ⚠ بررسی DATABASE_URL ناموفق بود — بعد از دیپلوی دستی چک کنید: grep DATABASE_URL .env"
+   122→fi
+   123→
+   124→# ۲-ج. نصب ffmpeg — لازم برای تحلیل ویدیو در چت و آنالیز ویدیویی
+   125→# (استخراج فریم‌های ویدیو با ffmpeg انجام می‌شود؛ نبود آن باعث می‌شود مربی
+   126→#  هوشمند به کاربر «نمی‌توانم ویدیو را تحلیل کنم» بگوید!)
+   127→echo "🎬 بررسی ffmpeg..."
+   128→if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+   129→  echo "  ✓ ffmpeg از قبل نصب است"
+   130→else
+   131→  echo "  ⚠ ffmpeg نصب نیست — در حال نصب..."
+   132→  if command -v apt-get >/dev/null 2>&1; then
+   133→    apt-get update -qq 2>/dev/null || true
+   134→    apt-get install -y -qq ffmpeg 2>/dev/null && echo "  ✓ ffmpeg نصب شد" || echo "  ✗ نصب ffmpeg ناموفق بود — تحلیل ویدیو کار نمی‌کند! دستی: apt-get install -y ffmpeg"
+   135→  else
+   136→    echo "  ✗ apt-get در دسترس نیست — ffmpeg را دستی نصب کنید (الزامی برای تحلیل ویدیو):"
+   137→    echo "     Ubuntu/Debian: apt-get install -y ffmpeg"
+   138→    echo "     CentOS/RHEL:   yum install -y ffmpeg (repo EPEL/RPMFusion)"
+   139→  fi
+   140→fi
+   141→
+   142→# ۳. تولید Prisma client
+   143→echo "🔧 تولید Prisma client..."
+   144→bun run db:generate
+   145→
+   146→# ═══════════════════════════════════════════════════════════════════════
+   147→# v56 — دیپلوی بدون قطعی (build قبل از توقف سرور — درخواست مالک:
+   148→# «موقع دیپلوی ۵۰۲ نشون نده») 
+   149→# قبلاً: pm2 stop → build چند دقیقه‌ای → restart ⇒ کاربر کل مدت ۵۰۲ می‌دید.
+   150→# حالا: build در پوشهٔ مجزا (.next.new — با NEXT_DIST_DIR در next.config.ts)
+   151→# روی سرورِ زنده انجام می‌شود؛ فقط تعویض نهایی چند ثانیه طول می‌کشد و
+   152→# شکست build هم دیگر سایت را خاموش نمی‌کند (نسخهٔ قدیمی دست‌نخورده می‌ماند).
+   153→# ═══════════════════════════════════════════════════════════════════════
+   154→
+   155→# ۴. پاک‌سازی فایل‌های stale — منبع حقیقت: خودِ زیپ (v22)
+   156→# [منتقل‌شده به قبل از build] مهم: unzip فایل‌های حذف‌شده را پاک نمی‌کند! اگر
+   157→# کد قدیمی روی سرور بماند، next build هنگام TypeScript با خطای تایپ شکست می‌خورد.
+   158→# (db/uploads/public دست نمی‌خورند — دیتای کاربر و رسانه‌ها مقدس‌اند. اجرای این
+   159→# مرحله روی سرورِ زنده بی‌خطر است چون نسخهٔ در حال سرو از کپی standalone اجرا می‌شود.)
+   160→# ۶-ب. پاک‌سازی فایل‌های stale — منبع حقیقت: خودِ زیپ (v22)
+   161→# مهم: unzip فایل‌های حذف‌شده را پاک نمی‌کند! اگر کد قدیمی روی سرور بماند،
+   162→# next build هنگام TypeScript با خطای تایپ شکست می‌خورد (مثل smart-nav.ts).
+   163→# ⚠️ باگ v21 روی سرور: مانیفست روی دیسک قدیمی مانده بود (unzip ناقص) → دو
+   164→# فایل جدیدِ v21 «stale» پنداشته شدند، حذف شدند و build با Module not found مرد!
+   165→# v22: فهرست فایل‌های مجاز = محتوای جدیدترین زیپ (unzip -Z1) ∪ مانیفست.
+   166→# هیچ فایلی که در زیپ هست حذف نمی‌شود — حتی اگر مانیفست غلط/قدیمی باشد.
+   167→# (db/uploads/public دست نمی‌خورند — دیتای کاربر و رسانه‌ها مقدس‌اند.)
+   168→if [ -n "$LATEST_ZIP" ] || [ -f ".deploy-manifest.txt" ]; then
+   169→  echo "🧹 پاک‌سازی فایل‌های قدیمی (stale)..."
+   170→  ALLOWED_FILES=$(
+   171→    {
+   172→      if [ -n "$LATEST_ZIP" ]; then
+   173→        unzip -Z1 "$LATEST_ZIP" 2>/dev/null | grep -v '/$' || true
+   174→      fi
+   175→      if [ -f ".deploy-manifest.txt" ]; then
+   176→        tr ' ' '\n' < .deploy-manifest.txt || true
+   177→      fi
+   178→    } | grep -v '^$' | LC_ALL=C sort -u
+   179→  )
+   180→  STALE_COUNT=0
+   181→  if [ -n "$ALLOWED_FILES" ]; then
+   182→    while IFS= read -r stale_file; do
+   183→      case "$stale_file" in
+   184→        src/*|prisma/*|scripts/*)
+   185→          if [ -f "$stale_file" ]; then
+   186→            rm -f "$stale_file"
+   187→            STALE_COUNT=$((STALE_COUNT + 1))
+   188→            echo "  🗑 حذف stale: $stale_file"
+   189→          fi
+   190→          ;;
+   191→      esac
+   192→    done < <(LC_ALL=C comm -23 <(find src prisma scripts -type f 2>/dev/null | LC_ALL=C sort) <(printf '%s\n' "$ALLOWED_FILES" | LC_ALL=C sort -u))
+   193→  fi
+   194→  if [ "$STALE_COUNT" -eq 0 ]; then
+   195→    echo "  ✓ فایل stale ای وجود ندارد"
+   196→  else
+   197→    echo "  ✓ $STALE_COUNT فایل قدیمی حذف شد"
+   198→  fi
+   199→else
+   200→  echo "ℹ زیپ و مانیفست موجود نیستند — پاک‌سازی stale رد شد (امن است)"
+   201→fi
+   202→
+   203→# ۶-ج. فایل‌های کد قدیمی در upload/ — از نسخه‌های خیلی قدیمی مانده‌اند
+   204→# (tsconfig جدید فقط src/scripts را تایپ‌چک می‌کند، ولی این فایل‌ها زباله‌اند و پاک می‌شوند.
+   205→#  فقط *.ts/*.tsx حذف می‌شود — دیتابیس یا فایل‌های دیگر upload/ دست نمی‌خورند.)
+   206→if [ -d "upload" ]; then
+   207→  STRAY_CODE=$(find upload -type f \( -name "*.ts" -o -name "*.tsx" \) 2>/dev/null | wc -l)
+   208→  if [ "$STRAY_CODE" -gt 0 ]; then
+   209→    find upload -type f \( -name "*.ts" -o -name "*.tsx" \) -delete
+   210→    echo "  🗑 $STRAY_CODE فایل کد قدیمی از upload/ حذف شد (کپی stale از نسخه‌های قبلی)"
+   211→  else
+   212→    echo "  ✓ فایل کد قدیمی در upload/ نیست"
+   213→  fi
+   214→fi
+   215→
+   216→
+   217→# ۵. build جدید در .next.new — نسخهٔ قدیمی از .next همچنان در حال سرو است
+   218→# ⚠️ v25: build صریحاً با **webpack** اجرا می‌شود (باگ پنیک Turbopack v24).
+   219→# مستقیم باینری محلی next صدا زده می‌شود؛ دستورهای کپی static/public در قدم ۶ هست.
+   220→# ═══════════════════════════════════════════════════════════════════════
+   221→# v62 — فیکس قطعی «بیلد به .next.new نمی‌رود» + EISDIR (لاگ‌های v48→v61 مالک)
+   222→# ریشه‌یابی با خواندن سورس Next 16 (dist/build/collect-build-traces.js و utils.js):
+   223→#  ۱) مسیرهای خطای EISDIR (/var/www/fitup/.next/...) ثابت می‌کردند بیلد با وجود
+   224→#     NEXT_DIST_DIR=.next.new داخل «.next» درجا انجام می‌شود ⇒ کانفیگ فعال next
+   225→#     روی سرور env را نمی‌گیرد (عامل شایع: next.config.js/.mjs سایه‌دار قدیمی که
+   226→#     next.config.ts را پس می‌زند؛ پاک‌سازی stale فقط src/prisma/scripts را
+   227→#     پاک می‌کرد و ریشه را هرگز).
+   228→#  ۲) بیلد درجا فاجعه‌بار است: Next در شروع مرحلهٔ standalone کل
+   229→#     .next/standalone را rm -rf می‌کند — یعنی فایل‌های سرورِ زنده!
+   230→#  ۳) گاردهای این بخش:
+   231→#     الف) حذف کانفیگ‌های سایه‌دار قبل از build
+   232→#     ب) بکاپ hardlink از .next/standalone (لحظه‌ای — بدون کپی دیتا) برای ترمیم
+   233→#     ج) بعد از build: وِریفای BUILD_ID داخل .next.new؛ اگر نبود و .next تازه
+   234→#        شده بود ⇒ یک‌بار build دوباره؛ باز نشد ⇒ ترمیم standalone و توقف امن
+   235→# ═══════════════════════════════════════════════════════════════════════
+   236→DEPLOY_BUILD_START_TS=$(date +%s)
+   237→echo "🔨 Build جدید (webpack — بدون قطعی سرویس)…"
+   238→
+   239→# ۵-الف. کانفیگ‌های سایه‌دار — next.config.ts منبع حقیقت است (v62)
+   240→for SHADOW_CFG in next.config.js next.config.mjs next.config.cjs next.config.mts; do
+   241→  if [ -f "$SHADOW_CFG" ]; then
+   242→    echo "  🗑 کانفیگ سایه‌دار «$SHADOW_CFG» حذف شد — باعث می‌شد NEXT_DIST_DIR نادیده گرفته شود و بیلد درجا داخل .next برود (ریشهٔ خرابی دیپلوی‌های اخیر)"
+   243→    rm -f "$SHADOW_CFG"
+   244→  fi
+   245→done
+   246→
+   247→# ۵-ب. بکاپ hardlink از standalone زنده — اگر بیلد درجا رخ دهد فوراً ترمیم می‌شود
+   248→# (cp -al همان inodeها را لینک می‌کند: لحظه‌ای و بدون مصرف دیسک اضافه)
+   249→STANDALONE_BACKUP=""
+   250→if [ -d ".next/standalone" ]; then
+   251→  rm -rf .next/standalone.prebuild 2>/dev/null || true
+   252→  if cp -al .next/standalone .next/standalone.prebuild 2>/dev/null; then
+   253→    STANDALONE_BACKUP=".next/standalone.prebuild"
+   254→    echo "  ✓ بکاپ hardlink از standalone زنده گرفته شد (حتی در بدترین حالت سایت قابل ترمیم فوری است)"
+   255→  else
+   256→    echo "  ⚠ بکاپ hardlink ناموفق — ادامه می‌دهیم (نبود بکاپ بهتر از توقف دیپلوی است)"
+   257→  fi
+   258→fi
+   259→
+   260→restore_standalone() {
+   261→  if [ -n "$STANDALONE_BACKUP" ] && [ -d "$STANDALONE_BACKUP" ]; then
+   262→    echo "  ↩ ترمیم standalone زنده از بکاپ hardlink..."
+   263→    rm -rf .next/standalone 2>/dev/null || true
+   264→    mv "$STANDALONE_BACKUP" .next/standalone 2>/dev/null || true
+   265→    pm2 restart fitup 2>/dev/null || true
+   266→    echo "  ✓ standalone ترمیم شد و سایت دوباره بالا آمد"
+   267→  fi
+   268→}
+   269→
+   270→run_deploy_build() {
+   271→  rm -rf .next.new 2>/dev/null || true
+   272→  NEXT_DIST_DIR=.next.new NODE_ENV=production ./node_modules/.bin/next build --webpack
+   273→}
+   274→
+   275→if ! run_deploy_build; then
+   276→  echo "❌ Build شکست خورد — سایت با build قبلی همچنان بالاست (بدون قطعی)."
+   277→  echo "   خطای بالا را ریشه‌یابی کنید و دوباره دیپلوی بزنید."
+   278→  rm -rf .next.new 2>/dev/null || true
+   279→  restore_standalone
+   280→  exit 1
+   281→fi
+   282→echo "  ✓ build موفق"
+   283→
+   284→# ۵-ج. وِریفای محل خروجی بیلد — BUILD_ID باید داخل .next.new باشد (v62)
+   285→verify_build_output() {
+   286→  [ -f ".next.new/BUILD_ID" ] && [ -d ".next.new/server" ]
+   287→}
+   288→if ! verify_build_output; then
+   289→  if [ -f ".next/BUILD_ID" ] && [ "$(stat -c %Y .next/BUILD_ID 2>/dev/null || echo 0)" -ge "$DEPLOY_BUILD_START_TS" ]; then
+   290→    echo "  ⚠ بیلد به‌جای .next.new داخل .next رفت — یعنی NEXT_DIST_DIR اعمال نشده بود"
+   291→    echo "    (عامل شایع: کانفیگ سایه‌دار/قدیمی next.config — بالا حذف شد). build دوباره..."
+   292→    # بیلد درجا فایل‌های سرور زنده (.next/standalone) را پاک کرده — فوراً از
+   293→    # بکاپ برگردان تا در طول build دوم سایت سالم بماند (v62)
+   294→    restore_standalone
+   295→    STANDALONE_BACKUP=""
+   296→    if ! run_deploy_build; then
+   297→      echo "❌ build دوم هم شکست خورد — دیپلوی متوقف شد (سایت با نسخهٔ قبلی بالا می‌ماند)."
+   298→      rm -rf .next.new 2>/dev/null || true
+   299→      restore_standalone
+   300→      exit 1
+   301→    fi
+   302→    if ! verify_build_output; then
+   303→      echo "❌ بعد از build دوم هم .next.new/BUILD_ID نیست — distDir هنوز اعمال نمی‌شود."
+   304→      echo "   دیپلوی متوقف شد (سایت با نسخهٔ قبلی بالا می‌ماند). next.config.ts داخل زیپ را بررسی کنید."
+   305→      rm -rf .next.new 2>/dev/null || true
+   306→      restore_standalone
+   307→      exit 1
+   308→    fi
+   309→    echo "  ✓ build دوم موفق — این‌بار خروجی درست داخل .next.new است"
+   310→  else
+   311→    echo "❌ بیلد «موفق» اعلام شد ولی .next.new/BUILD_ID وجود ندارد — بیلد ناقص بوده."
+   312→    echo "   دیپلوی متوقف شد (سایت با نسخهٔ قبلی بالا می‌ماند)."
+   313→    rm -rf .next.new 2>/dev/null || true
+   314→    restore_standalone
+   315→    exit 1
+   316→  fi
+   317→fi
+   318→rm -rf .next/standalone.prebuild 2>/dev/null || true
+   319→STANDALONE_BACKUP=""
+   320→echo "  ✓ build موفق و خروجی کامل است (.next.new/BUILD_ID ✓)"
+   321→
+   322→# ۶. آماده‌سازی standalone بیلد جدید — همهٔ کپی‌ها «قبل از» توقف سرور انجام
+   323→# می‌شود تا پنجرهٔ قطعی واقعاً چند ثانیه باشد.
+   324→# ─── v61 فیکس «cp: cannot stat '.next.new/static'» (لاگ بیلد مالک) ───
+   325→# کپی static حالا گارد دارد: اگر static در مسیر منتظره نبود، کل بیلد جستجو
+   326→# می‌شود؛ اگر Next خودش داخل standalone کپی کرده باشد پذیرفته می‌شود؛ و اگر
+   327→# واقعاً هیچ static ای نباشد، دیپلوی «قبل از توقف سرور» متوقف می‌شود تا سایت
+   328→# زنده هرگز بدون CSS/JS نماند. (بعد از موفقیت: هم standalone/.next.new و هم
+   329→# standalone/.next پر می‌شود تا هر دو حالت runtime پوشش داده شود.)
+   330→echo "📁 کپی static و public داخل بیلد جدید..."
+   331→STATIC_SRC=".next.new/static"
+   332→if [ ! -d "$STATIC_SRC" ]; then
+   333→  if [ -d ".next.new/standalone/.next.new/static" ] || [ -d ".next.new/standalone/.next/static" ]; then
+   334→    echo "  ✓ Next خودش static را داخل standalone کپی کرده است"
+   335→    STATIC_SRC=""
+   336→  else
+   337→    echo "  ⚠ static در .next.new/static نبود — جستجوی کل بیلد..."
+   338→    STATIC_SRC=$(find .next.new -maxdepth 4 -type d -name static -not -path "*/standalone/*" 2>/dev/null | head -1)
+   339→    if [ -n "$STATIC_SRC" ]; then
+   340→      echo "  ✓ static پیدا شد: $STATIC_SRC"
+   341→    else
+   342→      echo "  ❌ هیچ پوشهٔ static در بیلد جدید نیست! دیپلوی متوقف شد (سایت قبلی دست‌نخورده و سالم می‌ماند)."
+   343→      echo "     این یعنی بیلد ناقص بوده — لاگ بیلد بالا را ببینید و دوباره تلاش کنید."
+   344→      exit 1
+   345→    fi
+   346→  fi
+   347→fi
+   348→mkdir -p .next.new/standalone/.next.new .next.new/standalone/.next
+   349→if [ -n "$STATIC_SRC" ]; then
+   350→  cp -r "$STATIC_SRC" .next.new/standalone/.next.new/
+   351→  cp -r "$STATIC_SRC" .next.new/standalone/.next/
+   352→  echo "  ✓ static کپی شد (standalone/.next.new + standalone/.next)"
+   353→fi
+   354→cp -r public .next.new/standalone/
+   355→
+   356→# ۶-پ. (v65) حفظ چانک‌های نسخهٔ قبلی — ریشه‌یابی خطای «Loading chunk N failed»
+   357→# کاربرانی که صفحه را قبل از دیپلوی باز کرده‌اند (مخصوصاً IAB اینستاگرام که
+   358→# HTML را کش می‌کند) هنوز به فایل‌های chunk با hash نسخهٔ قبلی اشاره می‌کنند؛
+   359→# اگر آن فایل‌ها حذف شوند، هر کلیک/اسکرول بعدی‌شان ChunkLoadError می‌شود و
+   360→# تب «لاگ خطاها» پنل پر از «Loading chunk N failed (timeout)» می‌شود.
+   361→# FIX: همهٔ فایل‌های static نسخهٔ قبلی به بیلد جدید «بدون بازنویسی» اضافه
+   362→# می‌شوند (cp -n): فایل‌های هم‌نام = نسخهٔ جدید می‌ماند؛ بقیه فقط برای
+   363→# صفحات قدیمیِ باز سرو می‌شوند و با آپدیت بعدی HTML تازه، خودبه‌خود بی‌استفاده.
+   364→for OLD_STATIC in ".next/standalone/.next/static" ".next/standalone/.next.new/static"; do
+   365→  if [ -d "$OLD_STATIC" ]; then
+   366→    for DEST in ".next.new/standalone/.next/static" ".next.new/standalone/.next.new/static"; do
+   367→      if [ -d "$DEST" ]; then
+   368→        cp -rn "$OLD_STATIC"/. "$DEST"/ 2>/dev/null || true
+   369→      fi
+   370→    done
+   371→    echo "  ✓ چانک‌های نسخهٔ قبلی برای سازگاری صفحاتِ باز اضافه شد (از $OLD_STATIC)"
+   372→    break
+   373→  fi
+   374→done
+   375→
+   376→# ۶-ب. رسانه‌های مقالات در خروجی build (v21 — لایه دوم امنیت سرو عکس‌ها)
+   377→# ⚠️ امنیت: فقط articles/ کپی می‌شود — رسانه‌های خصوصی کاربران هرگز static سرو نمی‌شوند.
+   378→rm -rf .next.new/standalone/public/uploads 2>/dev/null || true
+   379→if [ -d "uploads/articles" ]; then
+   380→  ARTICLES_TO_STATIC=$(find uploads/articles -type f 2>/dev/null | wc -l)
+   381→  mkdir -p .next.new/standalone/public/uploads
+   382→  cp -rn uploads/articles .next.new/standalone/public/uploads/ 2>/dev/null || true
+   383→  echo "  ✓ $ARTICLES_TO_STATIC تصویر مقاله به static public بیلد جدید اضافه شد"
+   384→fi
+   385→
+   386→# ۶-ج. کپی فایل‌های پیکربندی
+   387→echo "📁 کپی فایل‌های پیکربندی..."
+   388→cp .env .next.new/standalone/.env 2>/dev/null || echo "  (.env وجود ندارد)"
+   389→mkdir -p .next.new/standalone/db
+   390→cp db/custom.db .next.new/standalone/db/custom.db 2>/dev/null || echo "  (دیتابیس وجود ندارد)"
+   391→# حفظ کلید سشن بین دیپلوی‌ها — کاربران بعد از دیپلوی لاگین می‌مانند.
+   392→cp db/.session-secret .next.new/standalone/db/.session-secret 2>/dev/null || true
+   393→# symlink uploads (عکس‌ها مستقل از build باقی می‌مانند)
+   394→rm -rf .next.new/standalone/uploads 2>/dev/null || true
+   395→ln -sfn /var/www/fitup/uploads .next.new/standalone/uploads
+   396→echo "  ✓ بیلد جدید کاملاً آماده است"
+   397→
+   398→# ۷. توقف اپلیکیشن — از این لحظه به بعد فقط چند ثانیه طول می‌کشد
+   399→echo "⏹ توقف اپلیکیشن (پنجرهٔ کوتاه تعویض)..."
+   400→pm2 stop fitup 2>/dev/null || true
+   401→
+   402→# ۸. اعمال تغییرات schema — بعد از توقف تا schema روی SQLite قفل نشود
+   403→# اگر db:push شکست بخورد صدای آن را پنهان نمی‌کنیم (باگ v9)
+   404→echo "📊 اعمال تغییرات schema..."
+   405→if bun run db:push 2>&1; then
+   406→  echo "  ✓ schema اعمال شد"
+   407→else
+   408→  echo "  ⚠ db:push با خطا مواجه شد — ادامه می‌دهیم (جایگزین: خودترمیمی DB بعد از boot ستون‌های ضروری را اضافه می‌کند)"
+   409→fi
+   410→
+   411→# ۸-ب. مهاجرت/ترمیم رسانه‌ها (همان مرحله‌های قبلی — بعد از توقف، سریع)
+   412→# ۶. انتقال رسانه‌های قدیمی از public/uploads (فقط یک‌بار — مهاجرت امن)
+   413→# مهم: رسانه‌های خصوصی کاربران (عکس بدن، چت، ویدیو، آزمایش خون و…) از
+   414→# نسخه‌های قدیمی در public/uploads بودند. این قدم همه دسته‌ها را به‌صورت
+   415→# امن به uploads/ منتقل می‌کند و فقط وقتی public/uploads را حذف می‌کند که
+   416→# هیچ فایل جامانده‌ای داخلش نباشد (بدون از دست رفتن حتی یک فایل کاربر).
+   417→if [ -d "public/uploads" ] && [ ! -L "public/uploads" ]; then
+   418→  echo "📁 مهاجرت رسانه‌های قدیمی از public/uploads به uploads/..."
+   419→  for category in articles body-analysis body-photos blood-tests chat meal-analysis progress videos; do
+   420→    if [ -d "public/uploads/$category" ]; then
+   421→      mkdir -p "uploads/$category"
+   422→      # -n: فایل موجود را بازنویسی نکن (نسخه جدیدتر در uploads برنده است)
+   423→      cp -rn "public/uploads/$category/." "uploads/$category/" 2>/dev/null || true
+   424→      echo "  ✓ $category منتقل شد ($(find "public/uploads/$category" -type f 2>/dev/null | wc -l) فایل)"
+   425→    fi
+   426→  done
+   427→  # زیرپوشه TTS چت (chat/tts)
+   428→  if [ -d "public/uploads/chat/tts" ]; then
+   429→    mkdir -p "uploads/chat/tts"
+   430→    cp -rn "public/uploads/chat/tts/." "uploads/chat/tts/" 2>/dev/null || true
+   431→  fi
+   432→  # فقط وقتی حذف کن که هیچ فایلی در هیچ زیرپوشه‌ای باقی نمانده باشد
+   433→  REMAINING=$(find public/uploads -type f 2>/dev/null | wc -l)
+   434→  if [ "$REMAINING" -eq 0 ]; then
+   435→    rm -rf public/uploads
+   436→    echo "  ✓ مهاجرت کامل شد و public/uploads حذف شد"
+   437→  else
+   438→    echo "  ⚠ $REMAINING فایل شناسایی‌نشده در public/uploads باقی مانده — پوشه حفظ شد (حذف نشد)"
+   439→  fi
+   440→fi
+   441→
+   442→
+   443→# ۶-ب-۲. ترمیم رسانه‌های گم‌شده کاربران (v15 — ریشه‌ی باگ «عکس شکسته گالری»)
+   444→# رکوردهایی که فایلشان یا در public/uploads مانده یا در پشتیبان backup است
+   445→# بازیابی می‌شوند؛ گزارش دقیق چاپ می‌شود. اسکریپت فقط فایل کپی می‌کند —
+   446→# هیچ رکورد DB حذف نمی‌شود.
+   447→echo "🔧 ترمیم رسانه‌های کاربران..."
+   448→bun run scripts/repair-user-media.ts 2>&1 | tail -8 || echo "  (skip — ترمیم ناموفق ولی دیپلوی ادامه می‌یابد)"
+   449→
+   450→
+   451→# ۹. تعویض build — اتمیک و چندثانیه‌ای (rollback با .next.old ممکن است)
+   452→rm -rf .next.old 2>/dev/null || true
+   453→if [ -d ".next" ]; then
+   454→  mv .next .next.old
+   455→  echo "🗑 build قدیمی کنار گذاشته شد (.next.old — برای rollback فوری)"
+   456→fi
+   457→mv .next.new .next
+   458→echo "✓ build جدید جایگزین شد"
+   459→
+   460→# ۱۰. ری‌استارت اپلیکیشن
+   461→# اگر فرآیند fitup در pm2 ثبت نشده باشد (اولین دیپلوی) اسکریپت نباید قطع شود؛
+   462→# health check پایانی وضعیت را مشخص می‌کند.
+   463→echo "▶ ری‌استارت اپلیکیشن..."
+   464→pm2 restart fitup 2>/dev/null || echo "  ⚠ فرآیند fitup در pm2 موجود نیست — با pm2 start/ecosystem راه‌اندازی کنید"
+   465→
+   466→# ۱۰-ب. ذخیره تنظیمات pm2
+   467→echo "💾 ذخیره تنظیمات pm2..."
+   468→pm2 save
+   469→
+   470→# ۱۰-ج. تعویض خودکار به صفحهٔ نگهداری در صورت بروز خطا (v56)
+   471→# اگر build قدیمی موجود باشد rollback می‌کنیم؛ صفحهٔ نگهداری (public/maintenance.html)
+   472→# هم برای پروکسی جلویی در دسترس است تا به‌جای ۵۰۲ خام، پیام زیبا دیده شود.
+   473→rollback_build() {
+   474→  echo "↩ بازگردانی build قبلی..."
+   475→  if [ -d ".next.old" ]; then
+   476→    rm -rf .next.failed 2>/dev/null || true
+   477→    mv .next .next.failed 2>/dev/null || true
+   478→    mv .next.old .next
+   479→    pm2 restart fitup 2>/dev/null || true
+   480→    echo "  ✓ build قبلی بازگردانی و سایت دوباره بالا آمد"
+   481→  fi
+   482→}
+   483→
+   484→# ۱۲. اصلاح URL‌های عکس در دیتابیس
+   485→echo "🔧 اصلاح URL‌های عکس..."
+   486→bun run src/lib/fitness/fix-article-image-urls.ts 2>&1 | tail -3 || echo "  (skip)"
+   487→
+   488→# ۱۲-ب. بازگرداندن inline images گم شده
+   489→echo "🔄 بازگرداندن inline images گم شده..."
+   490→bun run src/lib/fitness/restore-missing-inlines.ts 2>&1 | tail -3 || echo "  (skip)"
+   491→
+   492→# ۱۲-ج. به‌روزرسانی سال‌های مقالات (2024/1403 → 2026/1405)
+   493→echo "📅 به‌روزرسانی سال‌های مقالات..."
+   494→bun run src/lib/fitness/update-article-years.ts 2>&1 | tail -3 || echo "  (skip)"
+   495→
+   496→# ۱۲-ج۲. تعمیر ویدیوهای خراب بانک حرکات (v28 — idempotent؛ درخواست مالک:
+   497→# «هیچ حرکتی بدون ویدیوی آموزشی نباشد» — ۲۱۲ حرکت ID ساختگی داشتند)
+   498→echo "🎬 تعمیر ویدیوهای بانک حرکات..."
+   499→bun run scripts/fix-exercise-videos.ts --apply 2>&1 | tail -4 || echo "  (skip — فایل مپینگ نیست)"
+   500→
+   501→# ۱۲-د. انتشار اپ اندروید اختصاصی (v16 — idempotent)
+   502→# فایل public/downloads/fitup-own-version.txt دقیقاً «versionName versionCode» را
+   503→# مشخص می‌کند (همان اعدادی که در build.gradle.kts ساخته شده) — فرمول حدس‌زدن
+   504→# ندارد. اگر نسخه از قبل فعال باشد، اسکریپت هیچ کاری نمی‌کند (اجرای دوباره امن).
+   505→echo "📱 انتشار اپ اندروید اختصاصی..."
+   506→if [ -f "public/downloads/fitup-own-version.txt" ] && ls public/downloads/fitup-own-v*.apk >/dev/null 2>&1; then
+   507→  OWN_VER=$(awk '{print $1}' public/downloads/fitup-own-version.txt | tr -d '[:space:]')
+   508→  OWN_CODE=$(awk '{print $2}' public/downloads/fitup-own-version.txt | tr -d '[:space:]')
+   509→  if [ -n "$OWN_VER" ] && [ -n "$OWN_CODE" ]; then
+   510→    if bun run scripts/publish-own-app.ts "$OWN_VER" "$OWN_CODE" 2>&1 | tail -2; then
+   511→      echo "  ✓ اپ اختصاصی بررسی/منتشر شد ($OWN_VER / code $OWN_CODE)"
+   512→    else
+   513→      echo "  ⚠ انتشار اپ اختصاصی ناموفق — بعداً دستی: bun run scripts/publish-own-app.ts $OWN_VER $OWN_CODE"
+   514→    fi
+   515→  fi
+   516→else
+   517→  echo "  (APK/نسخهٔ اپ اختصاصی در public/downloads نیست — skip)"
+   518→fi
+   519→
+   520→# ۱۳/۱۴: ری‌استارت و pm2 save در قدم ۱۰ انجام شد (v56 — بدون تکرار)
+   521→
+   522→# ۱۵. تست — بررسی واقعی کد HTTP (قبلاً فقط چاپ می‌شد و خطا نادیده گرفته می‌شد)
+   523→echo "🔍 تست سلامت اپلیکیشن..."
+   524→sleep 3
+   525→HTTP_CODE=000
+   526→for i in 1 2 3 4 5; do
+   527→  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
+   528→  if [ "$HTTP_CODE" = "200" ]; then
+   529→    break
+   530→  fi
+   531→  echo "  تلاش $i: HTTP $HTTP_CODE — ۵ ثانیه صبر و تلاش مجدد..."
+   532→  sleep 5
+   533→done
+   534→if [ "$HTTP_CODE" != "200" ]; then
+   535→  echo "❌ دیپلوی ناموفق: اپلیکیشن با کد HTTP $HTTP_CODE پاسخ داد (انتظار ۲۰۰)"
+   536→  echo "  آخرین خطاهای pm2:"
+   537→  pm2 logs fitup --err --lines 20 --nostream 2>/dev/null || true
+   538→  rollback_build
+   539→  exit 1
+   540→fi
+   541→echo "  ✓ HTTP Status: $HTTP_CODE"
+   542→
+   543→# ۱۵.۵. بررسی سلامت sitemap — باید ۱۳۰۰+ URL داشته باشد نه فقط ۷ صفحات ثابت
+   544→# (باگ پروداکشن: یک خطای DB → sitemap فقط صفحات ثابت برمی‌گرداند. حالا sitemap
+   545→# خودترمیم‌شو per-section است؛ این چک صادقانه هشدار می‌دهد اگر باز هم بخشی شکست خورده باشد.)
+   546→echo "🗺 بررسی sitemap.xml..."
+   547→SITEMAP_URL_COUNT=$( (curl -s --max-time 90 http://localhost:3000/sitemap.xml || true) | (grep -o '<loc>' || true) | wc -l )
+   548→if [ "$SITEMAP_URL_COUNT" -lt 20 ]; then
+   549→  echo ""
+   550→  echo "Ⓦ SITEMAP PROBLEM: sitemap.xml فقط $SITEMAP_URL_COUNT URL دارد (انتظار: ۱۳۰۰+) — بخش‌های دیتابیس (مقالات/حرکات/غذاها) احتمالاً شکست خورده‌اند!"
+   551→  echo "   برای ریشه‌یابی، لاگ‌های pm2 را برای خطاهای [sitemap] بررسی کنید:"
+   552→  echo "     pm2 logs fitup --lines 100 --nostream 2>/dev/null | grep '\\[sitemap\\]'"
+   553→  echo "   (دیپلوی fail نمی‌شود — sitemap بعد از رفع مشکل DB با کش ۱ ساعته خودش ترمیم می‌شود)"
+   554→  echo ""
+   555→else
+   556→  echo "  ✓ sitemap.xml: $SITEMAP_URL_COUNT URL"
+   557→fi
+   558→
+   559→# ۱۶. بازگردانی خودکار تصاویر اگر در دیپلوی گم شده‌اند
+   560→# (مقایسه فقط روی uploads/articles — قبلاً کل uploads با articles مقایسه می‌شد و
+   561→#  همیشه هشدار کاذب می‌داد؛ مسیر پشتیبان هم اشتباه بود: uploads_backup → uploads_full_backup)
+   562→ARTICLES_COUNT_AFTER=$(find uploads/articles -type f 2>/dev/null | wc -l)
+   563→if [ "$ARTICLES_COUNT_BEFORE" -gt 0 ] && [ "$ARTICLES_COUNT_AFTER" -lt "$ARTICLES_COUNT_BEFORE" ]; then
+   564→  echo "⚠ تعداد تصاویر مقالات کاهش یافته ($ARTICLES_COUNT_BEFORE → $ARTICLES_COUNT_AFTER) — بازگردانی از پشتیبان..."
+   565→  mkdir -p uploads/articles
+   566→  if [ -d "$BACKUP_DIR/uploads_full_backup/articles" ]; then
+   567→    cp -rn "$BACKUP_DIR/uploads_full_backup/articles/." uploads/articles/ 2>/dev/null || true
+   568→  fi
+   569→  ARTICLES_COUNT_RECOVERED=$(find uploads/articles -type f 2>/dev/null | wc -l)
+   570→  echo "  ✓ بازگردانی شد: $ARTICLES_COUNT_RECOVERED فایل"
+   571→fi
+   572→
+   573→# ۱۶-ب. هشدار جدی اگر تصاویر مقالات کلاً غایب است (v18)
+   574→# اگر DB مقاله با کاور دارد ولی uploads/articles خالی است، همه عکس‌ها ۴۰۴ می‌شوند.
+   575→# سرویس خودترمیم در بوت بعدی با کش/تولید AI ترمیم می‌کند ولی ادمین باید بداند.
+   576→FINAL_ARTICLES_COUNT=$(find uploads/articles -type f 2>/dev/null | wc -l)
+   577→if [ "$FINAL_ARTICLES_COUNT" -lt 20 ]; then
+   578→  echo ""
+   579→  echo "Ⓦ WARNING: فقط $FINAL_ARTICLES_COUNT فایل تصویر مقاله در uploads/articles است!"
+   580→  echo "   اگر مقالات سایت بدون عکس نمایش داده می‌شوند، زیپ v18+ را unzip -o کنید که uploads/articles کامل را دارد"
+   581→  echo "   (سرویس خودترمیم رسانه در بوت هم کاورها/inline های باقی‌مانده را ترمیم/تولید می‌کند)"
+   582→  echo ""
+   583→fi
+   584→# نکته: سرویس خودترمیم رسانه (article-media-selfheal) هنگام boot سرور هم همه
+   585→# کاورها/inline های مفقود را به‌صورت خودکار ترمیم می‌کند (با کش آینه‌ای بدون هزینه).
+   586→
+   587→echo ""
+   588→echo "🎉 دیپلوی کامل شد!"
+   589→echo "  - دیتابیس: $(ls -lh db/custom.db 2>/dev/null | awk '{print $5}')"
+   590→echo "  - پشتیبان‌ها: $(ls backups/*.db 2>/dev/null | wc -l) فایل"
+   591→echo "  - تصاویر مقالات: $(find uploads -type f 2>/dev/null | wc -l) فایل"
+   592→

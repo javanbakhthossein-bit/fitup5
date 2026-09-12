@@ -1,0 +1,715 @@
+     1→"use client";
+     2→
+     3→import { recoverPendingPayments, shouldRecoverNow } from "@/lib/fitness/recover-payments-client";
+     4→import { useEffect, useState, useRef } from "react";
+     5→import { toast } from "sonner";
+     6→import { useAppStore } from "@/lib/fitness/store";
+     7→import { isFitUpNativeApp, isFitUpOwnApp, requestBatteryOptimizationExemption, requestNativeNotificationPermission, syncNativeNotificationsNow } from "@/lib/fitness/app-bridge";
+     8→import { isFitUpBazaarApp } from "@/lib/fitness/bazaar-bridge";
+     9→import { installBazaarScrollGuard } from "@/lib/fitness/bazaar-scroll-guard";
+    10→import { installGalleryGate, showPermissionGate } from "@/lib/fitness/permission-gate";
+    11→import { PermissionGateModal } from "@/components/fitness/permission-gate-modal";
+    12→import { BlockedScreen } from "@/components/fitness/blocked-screen";
+    13→import { AuthScreen } from "@/components/fitness/auth-screen";
+    14→import { AppUpdateModal } from "@/components/fitness/app-update-modal";
+    15→import { OnboardingScreen } from "@/components/fitness/onboarding-screen";
+    16→import { MainApp } from "@/components/fitness/main-app";
+    17→import { SplashLoader } from "@/components/fitness/splash-loader";
+    18→import { LandingPage } from "@/components/fitness/landing/landing-page";
+    19→import { NikaWidget } from "@/components/fitness/nika-widget";
+    20→import { getScreenFromUrl } from "@/lib/fitness/navigation";
+    21→import { TdeeCalculator } from "@/components/fitness/tools/tdee-calculator";
+    22→import { ExercisesDatabase } from "@/components/fitness/tools/exercises-database";
+    23→import { FoodCalorieIndex } from "@/components/fitness/tools/food-calorie-index";
+    24→import { ToolsNav } from "@/components/fitness/tools/tools-nav";
+    25→import { TermsPage } from "@/components/fitness/terms-page";
+    26→import { ContactPage } from "@/components/fitness/contact-page";
+    27→import { AboutPage } from "@/components/fitness/about-page";
+    28→import { PaymentVerifyHandler } from "@/components/fitness/payment-verify-handler";
+    29→import { AnalysisScreen } from "@/components/fitness/analysis-screen";
+    30→import { AdminOverlay } from "@/components/fitness/views/admin-overlay";
+    31→import { ArticlesPage } from "@/components/fitness/articles/articles-page";
+    32→import { ArticlePage } from "@/components/fitness/articles/article-page";
+    33→import { ExerciseDetailPage } from "@/components/fitness/tools/exercise-detail-page";
+    34→import { FoodDetailPage } from "@/components/fitness/tools/food-detail-page";
+    35→import { ReferralLanding } from "@/components/fitness/landing/referral-landing";
+    36→import type { InitialScreen } from "@/lib/fitness/ssr-screen";
+    37→import {
+    38→  AlertDialog,
+    39→  AlertDialogAction,
+    40→  AlertDialogCancel,
+    41→  AlertDialogContent,
+    42→  AlertDialogDescription,
+    43→  AlertDialogFooter,
+    44→  AlertDialogHeader,
+    45→  AlertDialogTitle,
+    46→} from "@/components/ui/alert-dialog";
+    47→
+    48→// ─── تایتل‌های پویا برای هر صفحه ───
+    49→const PAGE_TITLES: Record<string, string> = {
+    50→  landing: "برنامه بدنسازی آنلاین | فیتاپ — برنامه تمرینی و تغذیه",
+    51→  auth: "ورود به فیتاپ | ثبت‌نام با شماره موبایل",
+    52→  onboarding: "تکمیل اطلاعات | فیتاپ",
+    53→  main: "پنل ورزشکار | فیتاپ",
+    54→  admin: "پنل مدیریت | فیتاپ",
+    55→  loading: "فیتاپ",
+    56→  "referral-landing": "دعوت دوستان | فیتاپ",
+    57→  articles: "مقالات بدنسازی و تناسب اندام | فیتاپ",
+    58→  article: "مقاله | فیتاپ",
+    59→  "tool-tdee": "محاسبه کالری روزانه و TDEE | محاسبه‌گر کالری، BMR و BMI | فیتاپ",
+    60→  "tool-exercises": "بانک حرکات بدنسازی | فیتاپ",
+    61→  "exercise-detail": "آموزش حرکت | فیتاپ",
+    62→  "tool-foods": "جدول کالری غذاها | فیتاپ",
+    63→  "food-detail": "کالری غذا | فیتاپ",
+    64→  terms: "قوانین و مقررات | فیتاپ",
+    65→  contact: "تماس با ما | فیتاپ",
+    66→  about: "درباره ما | فیتاپ",
+    67→};
+    68→
+    69→// ─── تزریق screen اولیهٔ محاسبه‌شده در سرور (SSR) ───
+    70→// منطق کامل: src/lib/fitness/ssr-screen.ts
+    71→// این تابع فقط یک‌بار در هر بارگذاری صفحه اجرا می‌شود — قبل از اولین useAppStore()
+    72→// تا snapshot اولیه همان screen سرور باشد (خروجی سرور = خروجی کلاینت، بدون mismatch).
+    73→let ssrBootstrapped = false;
+    74→function bootstrapStoreFromServer(initial: InitialScreen) {
+    75→  if (ssrBootstrapped) return;
+    76→  ssrBootstrapped = true;
+    77→  const s = useAppStore.getState();
+    78→  if (s.screen !== "loading") return;
+    79→  useAppStore.setState({
+    80→    screen: initial.screen as typeof s.screen,
+    81→    ...(initial.articleSlug ? { articleSlug: initial.articleSlug } : {}),
+    82→    ...(initial.exerciseId ? { exerciseId: initial.exerciseId } : {}),
+    83→    ...(initial.foodId ? { foodId: initial.foodId } : {}),
+    84→    ...(initial.mainTab ? { mainTab: initial.mainTab as typeof s.mainTab } : {}),
+    85→  });
+    86→}
+    87→
+    88→// ─── تأیید خروج از PWA با دکمه back (اندروید) ───
+    89→// confirm() مرورگر در WebView/iframe محدود همیشه false برمی‌گرداند و کاربر
+    90→// عملاً با دکمه back در PWA گیر می‌کرد — دیالوگ درون‌برنامه‌ای جایگزین شد.
+    91→function PwaExitConfirmDialog({ open, onStay, onExit }: { open: boolean; onStay: () => void; onExit: () => void }) {
+    92→  return (
+    93→    <AlertDialog open={open} onOpenChange={(o) => !o && onStay()}>
+    94→      <AlertDialogContent dir="rtl" className="max-w-sm">
+    95→        <AlertDialogHeader>
+    96→          <AlertDialogTitle>خروج از فیتاپ</AlertDialogTitle>
+    97→          <AlertDialogDescription>آیا از برنامه فیتاپ خارج می‌شوید؟</AlertDialogDescription>
+    98→        </AlertDialogHeader>
+    99→        <AlertDialogFooter className="flex-row">
+   100→          <AlertDialogCancel onClick={onStay}>ماندن</AlertDialogCancel>
+   101→          <AlertDialogAction
+   102→            className="bg-red-500 text-white hover:bg-red-600"
+   103→            onClick={onExit}
+   104→          >
+   105→            خروج
+   106→          </AlertDialogAction>
+   107→        </AlertDialogFooter>
+   108→      </AlertDialogContent>
+   109→    </AlertDialog>
+   110→  );
+   111→}
+   112→
+   113→export default function HomeClient({ initial }: { initial: InitialScreen }) {
+   114→  // ⚠️ باید قبل از فراخوانی useAppStore اجرا شود تا snapshot اولیه درست باشد
+   115→  bootstrapStoreFromServer(initial);
+   116→  const { screen, setScreen, setUser, setArticleSlug, setExerciseId, setFoodId, setMainTab, setTermsUpdateRequired, setOverlay, user } = useAppStore();
+   117→
+   118→  // ─── مقادیر اولیه از سرور (SSR) ───
+   119→  // این مقادیر حالا از props سرور مقداردهی اولیه می‌شوند (متناسب با SSR)
+   120→  // و بعداً applyUrlToScreen در mount دوباره آن‌ها را از URL اعمال می‌کند.
+   121→  const [paymentVerify, setPaymentVerify] = useState(initial.paymentVerify === true);
+   122→  const [refCode, setRefCode] = useState<string | null>(initial.refCode ?? null);
+   123→  // دیالوگ تأیید خروج از PWA (دکمه back در حالت standalone) — جایگزین confirm()
+   124→  const [showExitConfirm, setShowExitConfirm] = useState(false);
+   125→
+   126→  // ═══════════════════════════════════════════════════════════════
+   127→  //  منطق اصلی: URL → screen
+   128→  //  اصل: URL همیشه منبع حقیقت است. هیچ state پیچیده‌ای نیست.
+   129→  // ═══════════════════════════════════════════════════════════════
+   130→
+   131→  // ─── تابع اعمال screen از URL ───
+   132→  // این تابع در mount و popstate صدا زده می‌شود
+   133→  const applyUrlToScreen = async () => {
+   134→    if (typeof window === "undefined") return;
+   135→
+   136→    // ذخیره کد معرفی
+   137→    const params = new URLSearchParams(window.location.search);
+   138→    const ref = params.get("ref");
+   139→    if (ref) {
+   140→      try { window.localStorage.setItem("fitap_referral_code", ref.trim().toUpperCase()); } catch {}
+   141→    }
+   142→
+   143→    // tab از URL
+   144→    const tab = params.get("tab");
+   145→    if (tab) {
+   146→      // v51 (قانون بازار): تب mobileapp در اپ کافه‌بازار معتبر نیست — از هر
+   147→      // مسیری (لینک نوتیف قدیمی/URL دستی) بیاید به داشبورد برمی‌گردد.
+   148→      const validTabs = ["dashboard", "programs", "workouts", "nutrition", "progress", "chat", "plans", "referral", "support", "mobileapp"];
+   149→      const bazaar = isFitUpBazaarApp();
+   150→      const allowed = bazaar ? validTabs.filter((t) => t !== "mobileapp") : validTabs;
+   151→      if (allowed.includes(tab)) setMainTab(tab as any);
+   152→      else if (bazaar && tab === "mobileapp") setMainTab("dashboard");
+   153→    }
+   154→
+   155→    // ─── ?renewal=1 → صفحه تمدید بعد از auth ───
+   156→    // لینک نوتیف‌های تمدید/انقضا (cron رفتاری) مستقیم به تجربه تمدید می‌رود:
+   157→    // رینگ روزها + آمار دوره + کد تخفیف + CTA. اگر کاربر لاگین نباشد، اول
+   158→    // auth و بعد صفحه تمدید باز می‌شود.
+   159→    const wantsRenewal = params.get("renewal") === "1";
+   160→    if (wantsRenewal) {
+   161→      // اگر همین الان در پنل است، مستقیم بازش کن
+   162→      if (useAppStore.getState().user && useAppStore.getState().screen === "main") {
+   163→        setOverlay("renewal");
+   164→      }
+   165→      // در غیر این صورت doAuthCheck بعد از ورود موفق بازش می‌کند
+   166→    }
+   167→
+   168→    const urlScreen = getScreenFromUrl();
+   169→    // ─── حالت «برنامه»: PWA standalone یا اپ‌های نیتیو فیتاپ (بازار/اختصاصی) ───
+   170→    // اپ‌های نیتیو WebView هستند و display-mode:standalone ندارند — اما رفتارشان
+   171→    // باید مثل PWA باشد: URL خالی → auth check (نه لندینگ)، بک → خروج با تأیید.
+   172→    const isStandalone =
+   173→      window.matchMedia("(display-mode: standalone)").matches ||
+   174→      (window.navigator as any).standalone === true ||
+   175→      isFitUpNativeApp();
+   176→    const forceLanding = params.get("view") === "landing";
+   177→
+   178→    // ─── set payment_verify و refCode از URL (hydration-safe) ───
+   179→    // این مقادیر در useState با false/null شروع می‌شوند و اینجا set می‌شوند.
+   180→    const pv = params.get("payment_verify") === "1";
+   181→    setPaymentVerify(pv);
+   182→    const rawRef = params.get("ref");
+   183→    setRefCode(rawRef ? rawRef.trim().toUpperCase() : null);
+   184→
+   185→    // ─── ۱. صفحات عمومی (مقالات، ابزارها، جزئیات) ───
+   186→    // این صفحات همیشه از URL خوانده می‌شوند — مهم نیست کاربر لاگین است یا نه
+   187→    if (urlScreen.screen === "article" && urlScreen.articleSlug) {
+   188→      setArticleSlug(urlScreen.articleSlug);
+   189→      setScreen("article");
+   190→      // auth check در background
+   191→      fetchAuthInBackground();
+   192→      return;
+   193→    }
+   194→    if (urlScreen.screen === "articles") {
+   195→      setScreen("articles");
+   196→      fetchAuthInBackground();
+   197→      return;
+   198→    }
+   199→    if (urlScreen.screen?.startsWith("tool-")) {
+   200→      setScreen(urlScreen.screen as any);
+   201→      fetchAuthInBackground();
+   202→      return;
+   203→    }
+   204→    if (urlScreen.screen === "exercise-detail" && urlScreen.exerciseId) {
+   205→      setExerciseId(urlScreen.exerciseId);
+   206→      setScreen("exercise-detail");
+   207→      fetchAuthInBackground();
+   208→      return;
+   209→    }
+   210→    if (urlScreen.screen === "food-detail" && urlScreen.foodId) {
+   211→      setFoodId(urlScreen.foodId);
+   212→      setScreen("food-detail");
+   213→      fetchAuthInBackground();
+   214→      return;
+   215→    }
+   216→    if (urlScreen.screen === "terms") {
+   217→      setScreen("terms");
+   218→      fetchAuthInBackground();
+   219→      return;
+   220→    }
+   221→    if (urlScreen.screen === "contact") {
+   222→      setScreen("contact");
+   223→      fetchAuthInBackground();
+   224→      return;
+   225→    }
+   226→    if (urlScreen.screen === "about") {
+   227→      setScreen("about");
+   228→      fetchAuthInBackground();
+   229→      return;
+   230→    }
+   231→
+   232→    // ─── ۲. صفحات احتیاج به auth check ───
+   233→    // ?screen=panel → auth check → panel یا auth
+   234→    // ?screen=auth → auth check → panel یا auth
+   235→    // URL خالی → landing (مرورگر) یا auth check (PWA)
+   236→    const wantsPanel = urlScreen.screen === "main"; // ?screen=panel → getScreenFromUrl returns "main"
+   237→    const wantsAuth = urlScreen.screen === "auth";
+   238→    // v32: ?screen=admin → auth check → پنل مدیریت (رفع باگ «رفرش در تب ادمین می‌برد به داشبورد/لندینگ»)
+   239→    const wantsAdmin = urlScreen.screen === "admin";
+   240→
+   241→    // در مرورگر معمولی:
+   242→    // - URL خالی → همیشه landing (حتی اگر لاگین است)
+   243→    // - ?screen=panel یا ?screen=auth → auth check
+   244→    // - ?view=landing → همیشه landing
+   245→    // - ادمین همیشه → پنل مدیریت
+   246→    if (!isStandalone || forceLanding) {
+   247→      if (!wantsPanel && !wantsAuth && !wantsAdmin && !wantsRenewal) {
+   248→        // URL خالی → landing
+   249→        showLanding();
+   250→        // auth check در background برای نمایش نام کاربر
+   251→        fetchAuthInBackground();
+   252→        return;
+   253→      }
+   254→      // ?screen=panel یا ?screen=auth یا ?screen=admin یا ?renewal=1 → auth check
+   255→      await doAuthCheck(wantsAuth);
+   256→      return;
+   257→    }
+   258→
+   259→    // ─── PWA (standalone) ───
+   260→    // URL خالی → auth check → panel یا auth
+   261→    // ?screen=terms یا ?screen=contact → همان صفحه
+   262→    // ?view=landing → landing
+   263→    await doAuthCheck(false);
+   264→
+   265→    // ─── توابع کمکی ───
+   266→    function showLanding() {
+   267→      if (ref) setScreen("referral-landing");
+   268→      else setScreen("landing");
+   269→    }
+   270→
+   271→    /**
+   272→     * FIX (بازگشت درگاه بدون verify): بازیابی با throttle ۱۰ دقیقه‌ای.
+   273→     * قبلاً recover فقط در doAuthCheck (?screen=panel / PWA) صدا زده می‌شد —
+   274→     * کاربری که از بانک برنمی‌گشت و بعداً صرفاً صفحه اصلی را باز می‌کرد، هرگز
+   275→     * بازیابی نمی‌شد! حالا هر بازدید لاگین‌شده (حتی لندینگ) چک می‌شود.
+   276→     * (پیاده‌سازی مشترک: src/lib/fitness/recover-payments-client.ts)
+   277→     */
+   278→
+   279→    async function fetchAuthInBackground() {
+   280→      // 🩹 v45: epoch در شروع — اگر وسط fetch کاربر logout کرد، پاسخ کهنه را نپذیر
+   281→      const epochAtStart = useAppStore.getState().sessionEpoch;
+   282→      try {
+   283→        const res = await fetch("/api/auth/me", { cache: "no-store" });
+   284→        if (!res.ok) return;
+   285→        if (useAppStore.getState().sessionEpoch !== epochAtStart) return;
+   286→        const data = await res.json();
+   287→        if (data?.user) {
+   288→          if (useAppStore.getState().sessionEpoch !== epochAtStart) return;
+   289→          setUser(data.user);
+   290→          // ─── FIX (مسابقهٔ verify/recover — باگ «پرداخت معلق یافت نشد») ───
+   291→          // اگر همین حالا از درگاه برگشته‌ایم (payment_verify=1)،
+   292→          // PaymentVerifyHandler مالک verify است؛ recover پس‌زمینه نباید همزمان
+   293→          // پرداخت را claim کند و صفحهٔ رسید را با ۴۰۴ مواجه کند.
+   294→          if (!pv && shouldRecoverNow()) recoverPendingPayments();
+   295→        }
+   296→        if (data?.termsUpdateRequired) setTermsUpdateRequired(true);
+   297→      } catch {}
+   298→    }
+   299→
+   300→    async function doAuthCheck(fallbackToAuth: boolean, attempt = 0) {
+   301→      try {
+   302→        const res = await fetch("/api/auth/me", { cache: "no-store" });
+   303→        // 🩹 v49 (باگ «تغییر VPN → رفرش → لاگ‌اوت»): خطای HTTP (۵۰۰ و…) هم مثل
+   304→        // خطای شبکه گذرا است — نه «لاگین‌نبودن». قبلاً res.ok چک نمی‌شد و بدنهٔ
+   305→        // خطا به‌جای user می‌خواند و کاربر به‌زور به لندینگ/auth پرت می‌شد.
+   306→        if (!res.ok) throw new Error(`auth/me HTTP ${res.status}`);
+   307→        const data = await res.json();
+   308→        if (data?.termsUpdateRequired) setTermsUpdateRequired(true);
+   309→        // v51 (مسدودسازی): کاربر مسدود → صفحهٔ زیبای «مسدود» — نه لندینگ نه لاگ‌اوت
+   310→        if (data?.blocked && !data?.user) {
+   311→          setUser(null);
+   312→          setScreen("blocked");
+   313→          return;
+   314→        }
+   315→        if (data?.user) {
+   316→          setUser(data.user);
+   317→          // ─── بازیابی خودکار پرداخت‌های معلق (باگ «در انتظار») ───
+   318→          // کاربری که در درگاه پرداخت کرده ولی به سایت برنگشته/سرور نیمه‌کاره مانده:
+   319→          // همینجا استعلام می‌کنیم؛ اگر پرداخت موفق بوده، پلن تحویل و کاربر به‌روز می‌شود.
+   320→          // FIX (مسابقهٔ verify/recover): در بازگشت از درگاه (pv) recover صدا زده
+   321→          // نمی‌شود — PaymentVerifyHandler مالک است؛ وگرنه claim همزمان باعث
+   322→          // «پرداخت معلق یافت نشد» روی صفحهٔ رسید می‌شد.
+   323→          if (!pv) recoverPendingPayments();
+   324→          if (data.user.role === "ADMIN") {
+   325→            setScreen("admin");
+   326→          } else {
+   327→            setScreen(data.user.onboardingDone ? "main" : "onboarding");
+   328→            // کاربر با لینک ?renewal=1 آمده و وارد پنل شد → صفحه تمدید
+   329→            if (wantsRenewal && data.user.onboardingDone) {
+   330→              setOverlay("renewal");
+   331→            }
+   332→          }
+   333→        } else {
+   334→          // کاربر لاگین نیست (پاسخ قطعی ۲۰۰ — رفرش هم مشکلی ندارد)
+   335→          if (wantsRenewal) {
+   336→            // با لینک تمدید آمده — اول وارد شو؛ بعد از لاگین صفحه تمدید باز می‌شود
+   337→            try { window.sessionStorage.setItem("fitap_open_renewal", "1"); } catch {}
+   338→            setScreen("auth");
+   339→          } else if (isStandalone && !forceLanding) {
+   340→            setScreen("auth");
+   341→          } else if (fallbackToAuth) {
+   342→            setScreen("auth");
+   343→          } else {
+   344→            showLanding();
+   345→          }
+   346→        }
+   347→      } catch {
+   348→        // 🩹 v49: خطای شبکه/سرور ≠ خروج از حساب. وسط سوئیچ VPN چند ثانیه
+   349→        // قطعی/timeout طبیعی است — قبلاً همینجا کاربر لاگ‌اوت دیده می‌شد.
+   350→        // تا ۳ بار با فاصلهٔ فزاینده تلاش می‌کنیم (۸۰۰ms/۱۶۰۰ms/۲۴۰۰ms).
+   351→        if (attempt < 2) {
+   352→          window.setTimeout(() => { void doAuthCheck(fallbackToAuth, attempt + 1); }, 800 * (attempt + 1));
+   353→          return;
+   354→        }
+   355→        // بعد از اتمام تلاش‌ها: رفتار قبلی (صفحهٔ مقصد بر اساس محیط)
+   356→        if (isStandalone && !forceLanding) {
+   357→          setScreen("auth");
+   358→        } else if (fallbackToAuth) {
+   359→          setScreen("auth");
+   360→        } else {
+   361→          showLanding();
+   362→        }
+   363→      }
+   364→    }
+   365→  };
+   366→
+   367→  // ─── mount: فقط auth check برای صفحات که نیاز دارند ───
+   368→  // صفحات عمومی از store اولیه نمایش داده می‌شوند (بدون صبر برای auth)
+   369→  useEffect(() => {
+   370→    if (typeof window === "undefined") return;
+   371→    // ─── گارد اسکرول اپ‌های نیتیو (بازار + اختصاصی — فیکس باگ رفرش با اسکرول به بالا) ───
+   372→    // داخل WebView های اندروید نصب می‌شود؛ در مرورگر/PWA بی‌اثر است.
+   373→    try {
+   374→      if (isFitUpNativeApp()) installBazaarScrollGuard();
+   375→    } catch {}
+   376→    // ─── دروازهٔ گالری در اپ اختصاصی (درخواست مالک): اولین انتخاب فایل →
+   377→    // مودال زیبای توضیح → بعد باز شدن گالری. فقط داخل اپ اختصاصی فعال است. ───
+   378→    try {
+   379→      if (isFitUpOwnApp()) installGalleryGate();
+   380→    } catch {}
+   381→    applyUrlToScreen();
+   382→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   383→  }, []);
+   384→
+   385→  // ─── بازیابی خریدهای بازار (فقط داخل اپ اندروید) ───
+   386→  // اپ بعد از اتصال پولکی، خریدهای consume-نشده را از طریق
+   387→  // window.__fitupBazaarRestore(purchases) به سایت می‌دهد. هر خرید به
+   388→  // /api/payment/bazaar/purchase فرستاده می‌شود (idempotent — توکن مصرف‌شده
+   389→  // دوباره فعال نمی‌کند) و بعد از فعال‌سازی موفق consume می‌شود تا تمدید
+   390→  // بعدی ممکن باشد. سناریو: کرش اپ بین پرداخت و فعال‌سازی سرور.
+   391→  useEffect(() => {
+   392→    if (typeof window === "undefined") return;
+   393→    (window as any).__fitupBazaarRestore = async (purchases: any[]) => {
+   394→      if (!Array.isArray(purchases) || purchases.length === 0) return;
+   395→      for (const p of purchases) {
+   396→        try {
+   397→          const productId = String(p?.productId || "");
+   398→          const planId = String(p?.planId || productId.replace(/^fitup_/, ""));
+   399→          const purchaseToken = String(p?.purchaseToken || "");
+   400→          if (!productId || !purchaseToken || !planId) continue;
+   401→          const res = await fetch("/api/payment/bazaar/purchase", {
+   402→            method: "POST",
+   403→            headers: { "Content-Type": "application/json" },
+   404→            body: JSON.stringify({
+   405→              planId,
+   406→              productId,
+   407→              purchaseToken,
+   408→              orderId: p?.orderId || null,
+   409→              // v55 — امضای خرید برای مسیر پشتیبان RSA (وقتی API بازار در دسترس نیست)
+   410→              dataJson: p?.dataJson || undefined,
+   411→              signature: p?.signature || undefined,
+   412→            }),
+   413→          });
+   414→          if (res.ok) {
+   415→            try {
+   416→              (window as any).FitUpNative?.consumePurchase?.(purchaseToken);
+   417→            } catch {}
+   418→          }
+   419→        } catch {}
+   420→      }
+   421→    };
+   422→    return () => {
+   423→      try {
+   424→        delete (window as any).__fitupBazaarRestore;
+   425→      } catch {}
+   426→    };
+   427→  }, []);
+   428→
+   429→  // ─── اپ اندروید نیتیو (اختصاصی + بازار): مودال زیبای «فعال‌سازی اعلان‌ها» بعد از ورود ───
+   430→  // مجوز نوتیف (POST_NOTIFICATIONS اندروید ۱۳+) «در زمان خودش» گرفته می‌شود:
+   431→  // بعد از ورود موفق کاربر به پنل — نه در استارتاپ (درخواست مالک).
+   432→  // فقط یک‌بار در عمر نصب پرسیده می‌شود؛ تأیید → پل نیتیو + ثبت، رد → دیگر پرسیده نمی‌شود.
+   433→  // v31: بازار هم شامل شد (قبلاً فقط اپ اختصاصی بود → کاربران بازار هرگز پرسیده
+   434→  // نمی‌شدند و نوتیف‌ها روی اندروید ۱۳+ بی‌صدا no-op بود) + بعد از رضایت،
+   435→  // گارد بهینه‌سازی باتری + همگام‌سازی فوری اعلان‌های از-دست-رفته.
+   436→  useEffect(() => {
+   437→    if (typeof window === "undefined") return;
+   438→    if (!user || screen !== "main") return;
+   439→    if (!isFitUpNativeApp()) return;
+   440→    try {
+   441→      if (window.localStorage.getItem("fitup_perm_notifications_asked") === "1") return;
+   442→    } catch {}
+   443→    let cancelled = false;
+   444→    const t = setTimeout(async () => {
+   445→      if (cancelled) return;
+   446→      try { window.localStorage.setItem("fitup_perm_notifications_asked", "1"); } catch {}
+   447→      const ok = await showPermissionGate("notifications");
+   448→      if (!cancelled && ok) {
+   449→        requestNativeNotificationPermission();
+   450→        // گارد باتری — فقط بعد از رضایت اعلان‌ها (دیالوگ نیتیو خودش یک‌بار-محور است)
+   451→        requestBatteryOptimizationExemption();
+   452→      }
+   453→      // همگام‌سازی فوری — هر ورود به پنل، اعلان‌های زمانِ بسته‌بودن را جبران می‌کند
+   454→      syncNativeNotificationsNow();
+   455→    }, 2600);
+   456→    return () => {
+   457→      cancelled = true;
+   458→      clearTimeout(t);
+   459→    };
+   460→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   461→  }, [user?.id, screen]);
+   462→
+   463→  // ─── popstate: ساده! فقط URL را دوباره بخوان ───
+   464→  useEffect(() => {
+   465→    if (typeof window === "undefined") return;
+   466→
+   467→    const handlePopState = () => {
+   468→      const store = useAppStore.getState();
+   469→      const currentScreen = store.screen;
+   470→
+   471→      // ─── در پنل ورزشکار: بک اول → داشبورد، بک دوم → خروج از پنل ───
+   472→      if (currentScreen === "main") {
+   473→        const currentTab = store.mainTab;
+   474→        if (currentTab && currentTab !== "dashboard") {
+   475→          // بک اول: برگرد به داشبورد (URL هم همان لحظه تمیز می‌شود)
+   476→          store.setMainTab("dashboard");
+   477→          try {
+   478→            const url = new URL(window.location.origin + window.location.pathname);
+   479→            url.searchParams.set("screen", "panel");
+   480→            url.searchParams.set("tab", "dashboard");
+   481→            window.history.pushState(null, "", url.toString());
+   482→          } catch {
+   483→            window.history.pushState(null, "", window.location.href);
+   484→          }
+   485→          return;
+   486→        }
+   487→        // در dashboard — بک دوم: خروج از پنل
+   488→        // (PWA standalone یا اپ نیتیو — در مرورگر معمولی → لندینگ)
+   489→        const inAppShell =
+   490→          window.matchMedia("(display-mode: standalone)").matches ||
+   491→          (window.navigator as any).standalone === true ||
+   492→          isFitUpNativeApp();
+   493→        if (inAppShell) {
+   494→          // PWA: دیالوگ درون‌برنامه‌ای به‌جای confirm() — در WebView محدود confirm
+   495→          // همیشه false برمی‌گرداند و کاربر با دکمه back گیر می‌کرد
+   496→          setShowExitConfirm(true);
+   497→          // یک entry دوباره push می‌کنیم تا back بعدی (وقتی دیالوگ باز است)
+   498→          // مستقیماً از برنامه خارج نکند
+   499→          window.history.pushState(null, "", window.location.href);
+   500→        } else {
+   501→          // مرورگر معمولی: به landing برگرد — با URL تمیز (بدون ?screen=panel
+   502→          // تا رفرش/بک بعدی دوباره وارد پنل نشود)
+   503→          store.setScreen("landing");
+   504→          try { window.history.replaceState(null, "", "/"); } catch {}
+   505→        }
+   506→        return;
+   507→      }
+   508→
+   509→      // ─── ادمین: در PWA/اپ نیتیو اعلان خروج ───
+   510→      if (currentScreen === "admin") {
+   511→        const inAppShell =
+   512→          window.matchMedia("(display-mode: standalone)").matches ||
+   513→          (window.navigator as any).standalone === true ||
+   514→          isFitUpNativeApp();
+   515→        if (inAppShell) {
+   516→          // دیالوگ درون‌برنامه‌ای به‌جای confirm() (همان مشکل WebView محدود)
+   517→          setShowExitConfirm(true);
+   518→          window.history.pushState(null, "", window.location.href);
+   519→        }
+   520→        return;
+   521→      }
+   522→
+   523→      // ─── صفحات عمومی: URL را دوباره بخوان ───
+   524→      // مرورگر URL را تغییر داده، ما فقط آن را می‌خوانیم
+   525→      applyUrlToScreen();
+   526→    };
+   527→
+   528→    window.addEventListener("popstate", handlePopState);
+   529→    return () => window.removeEventListener("popstate", handlePopState);
+   530→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   531→  }, []);
+   532→
+   533→  // ─── پل back اپ نیتیو (درخواست مالک): بک اول از هر قسمت به جز داشبورد → داشبورد؛
+   534→  // بک روی داشبورد → مودال تأیید خروج native (در MainActivity.kt).
+   535→  // MainActivity با evaluateJavascript این تابع را صدا می‌زند و بر اساس خروجی
+   536→  // ('overlay' | 'dashboard' | 'home') تصمیم می‌گیرد. ترتیب منطق:
+   537→  //   ۱) اورلی باز → فقط بستن اورلی
+   538→  //   ۲) تب/صفحه دیگر (تمرین/غذا/مقاله/ابزار/…) → پرش SPA به داشبورد (بدون رفرش)
+   539→  //   ۳) روی داشبورد → 'home' → native مودال خروج نشان می‌دهد
+   540→  useEffect(() => {
+   541→    (window as any).__fitupNativeBack = () => {
+   542→      try {
+   543→        const st = useAppStore.getState();
+   544→        // 🩹 v49 (باگ «بک در صفحهٔ نتیجهٔ پرداخت از برنامه خارج می‌کند»):
+   545→        // در بازگشت از درگاه (?payment_verify=1) بک باید به پنل/خانهٔ خود
+   546→        // سایت برگردد — نه دیالوگ خروج نیتیو. رویداد داخلی برای
+   547→        // PaymentVerifyHandler فرستاده می‌شود تا همان منطق finish/backHome را اجرا کند.
+   548→        if (new URLSearchParams(window.location.search).get("payment_verify") === "1") {
+   549→          window.dispatchEvent(new CustomEvent("fitup:payment-verify-back"));
+   550→          try { window.history.pushState(null, "", window.location.href); } catch {}
+   551→          return "overlay"; // هندل شد — نیتیو هیچ کاری نکند
+   552→        }
+   553→        // کاربر لاگین‌نکرده (auth/لندینگ) — داشبوردی وجود ندارد → مودال خروج
+   554→        if (!st.user) return "home";
+   555→        if (st.screen === "main" && st.overlay) {
+   556→          st.setOverlay(null);
+   557→          try { window.history.pushState(null, "", window.location.href); } catch {}
+   558→          return "overlay";
+   559→        }
+   560→        const atDashboard = st.screen === "main" && st.mainTab === "dashboard";
+   561→        if (!atDashboard) {
+   562→          st.setOverlay(null);
+   563→          st.setScreen("main");
+   564→          st.setMainTab("dashboard");
+   565→          try {
+   566→            const u = new URL(window.location.origin + window.location.pathname);
+   567→            u.searchParams.set("screen", "panel");
+   568→            u.searchParams.set("tab", "dashboard");
+   569→            window.history.pushState(null, "", u.toString());
+   570→          } catch {
+   571→            try { window.history.pushState(null, "", window.location.href); } catch {}
+   572→          }
+   573→          return "dashboard";
+   574→        }
+   575→        return "home";
+   576→      } catch {
+   577→        return "unknown";
+   578→      }
+   579→    };
+   580→    return () => {
+   581→      try { delete (window as any).__fitupNativeBack; } catch {}
+   582→    };
+   583→  }, []);
+   584→
+   585→  // ─── خروج از PWA (تأییدشده با دیالوگ) ───
+   586→  // بستن پنجره در PWA نصب‌شده معمولاً توسط مرورگر مجاز نیست → تلاش می‌کنیم
+   587→  // و همیشه به لندینگ برمی‌گردیم (اگر close موفق باشد صفحه unload می‌شود و
+   588→  // setScreen عملاً اجرا نمی‌شود).
+   589→  function exitPwaApp() {
+   590→    setShowExitConfirm(false);
+   591→    try {
+   592→      window.close();
+   593→    } catch {}
+   594→    setScreen("landing");
+   595→  }
+   596→
+   597→  // ─── تایتل پویا ───
+   598→  useEffect(() => {
+   599→    if (typeof window === "undefined") return;
+   600→    document.title = PAGE_TITLES[screen] || "برنامه بدنسازی آنلاین | فیتاپ — برنامه تمرینی و تغذیه";
+   601→  }, [screen]);
+   602→
+   603→  // ─── اسکرول: هر بار که screen تغییر می‌کند، به بالا برو ───
+   604→  // استثنا: landing — اسکرول حفظ می‌شود (مرورگر خودش مدیریت می‌کند)
+   605→  // این مشکل «لینک از وسط صفحه → صفحه جدید از وسط باز می‌شود» را حل می‌کند
+   606→  const prevScreenRef = useRef(screen);
+   607→  useEffect(() => {
+   608→    if (typeof window === "undefined") return;
+   609→    // همه صفحات به‌جز landing — وقتی screen تغییر می‌کند، اسکرول به بالا
+   610→    // ⚠️ instant (نه auto): html دارای scroll-behavior:smooth است و auto به
+   611→    // انیمیشن تبدیل می‌شود که با تغییر layout می‌تواند وسط راه لغو شود.
+   612→    if (screen !== "loading" && screen !== prevScreenRef.current && screen !== "landing") {
+   613→      window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+   614→    }
+   615→    prevScreenRef.current = screen;
+   616→  }, [screen]);
+   617→
+   618→  // ═══════════════════════════════════════════════════════════════
+   619→  //  رندر صفحه بر اساس screen
+   620→  // ═══════════════════════════════════════════════════════════════
+   621→
+   622→  // FE-C1: onDone فلگ paymentVerify را ریست می‌کند تا کاربر بعد از خروج از
+   623→  // صفحهٔ نتیجهٔ پرداخت (موفق/ناموفق) در آن گیر نکند — قبلاً این فلگ فقط در
+   624→  // mount ست می‌شد و هیچ مسیری false‌اش نمی‌کرد (نجات فقط با reload).
+   625→  if (paymentVerify)
+   626→    return <PaymentVerifyHandler onDone={() => setPaymentVerify(false)} />;
+   627→  if (screen === "loading") return <SplashLoader />;
+   628→  if (screen === "blocked") return <BlockedScreen />;
+   629→  if (screen === "referral-landing" && refCode) return <ReferralLanding refCode={refCode} />;
+   630→  if (screen === "landing") return (
+   631→    <>
+   632→      <LandingPage />
+   633→      <NikaWidget />
+   634→      <AppUpdateModal />
+   635→      <PermissionGateModal />
+   636→    </>
+   637→  );
+   638→  if (screen === "auth") return (
+   639→    <>
+   640→      <AuthScreen />
+   641→      <NikaWidget />
+   642→      <AppUpdateModal />
+   643→      <PermissionGateModal />
+   644→    </>
+   645→  );
+   646→  if (screen === "onboarding") return (
+   647→    <>
+   648→      <OnboardingScreen />
+   649→      <NikaWidget />
+   650→      <AppUpdateModal />
+   651→      <PermissionGateModal />
+   652→    </>
+   653→  );
+   654→  if (screen === "analysis") return <AnalysisScreen />;
+   655→  if (screen === "admin") {
+   656→    return (
+   657→      <div className="fixed inset-0 bg-white">
+   658→        <AdminOverlay standalone />
+   659→        <PwaExitConfirmDialog
+   660→          open={showExitConfirm}
+   661→          onStay={() => setShowExitConfirm(false)}
+   662→          onExit={exitPwaApp}
+   663→        />
+   664→      </div>
+   665→    );
+   666→  }
+   667→  if (screen === "tool-tdee" || screen === "tool-exercises" || screen === "tool-foods") {
+   668→    return (
+   669→      <>
+   670→        <ToolsNav />
+   671→        {screen === "tool-tdee" && <TdeeCalculator />}
+   672→        {screen === "tool-exercises" && <ExercisesDatabase />}
+   673→        {screen === "tool-foods" && <FoodCalorieIndex />}
+   674→        <NikaWidget />
+   675→      </>
+   676→    );
+   677→  }
+   678→  if (screen === "terms") return (
+   679→    <>
+   680→      <TermsPage />
+   681→      <NikaWidget />
+   682→    </>
+   683→  );
+   684→  if (screen === "contact") return (
+   685→    <>
+   686→      <ContactPage />
+   687→      <NikaWidget />
+   688→    </>
+   689→  );
+   690→  if (screen === "about") return (
+   691→    <>
+   692→      <AboutPage />
+   693→      <NikaWidget />
+   694→    </>
+   695→  );
+   696→  if (screen === "articles") return <ArticlesPage />;
+   697→  if (screen === "article") return <ArticlePage />;
+   698→  if (screen === "exercise-detail") return <ExerciseDetailPage />;
+   699→  if (screen === "food-detail") return <FoodDetailPage />;
+   700→  return (
+   701→    <>
+   702→      {/* 🩹 v45: گارد کاربر شبح — MainApp هرگز بدون user مونت نمی‌شود
+   703→          (باگ «بعد از خروج دکمه‌ها تا رفرش کار نمی‌کنند») */}
+   704→      {useAppStore.getState().user ? <MainApp /> : null}
+   705→      <PwaExitConfirmDialog
+   706→        open={showExitConfirm}
+   707→        onStay={() => setShowExitConfirm(false)}
+   708→        onExit={exitPwaApp}
+   709→      />
+   710→      <AppUpdateModal />
+   711→      <PermissionGateModal />
+   712→    </>
+   713→  );
+   714→}
+   715→

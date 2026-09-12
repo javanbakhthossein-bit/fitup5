@@ -1,0 +1,1052 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState, useCallback } from "react";
+     4→import { useScrollLock } from "@/hooks/use-scroll-lock";
+     5→import { motion } from "framer-motion";
+     6→import {
+     7→  X,
+     8→  Dumbbell,
+     9→  Activity,
+    10→  Target,
+    11→  Salad,
+    12→  HeartPulse,
+    13→  Moon,
+    14→  Trophy,
+    15→  Calendar,
+    16→  Pill,
+    17→  Ruler,
+    18→  Camera,
+    19→  TestTube,
+    20→  Video,
+    21→  Loader2,
+    22→  Save,
+    23→  Pencil,
+    24→  Sparkles,
+    25→  CalendarDays,
+    26→} from "lucide-react";
+    27→import { useAppStore } from "@/lib/fitness/store";
+    28→import { Button } from "@/components/ui/button";
+    29→import { Card } from "@/components/ui/card";
+    30→import { Skeleton } from "@/components/ui/skeleton";
+    31→import { InlineVideoPreview } from "@/components/fitness/inline-video-preview";
+    32→import { Input } from "@/components/ui/input";
+    33→import { Label } from "@/components/ui/label";
+    34→import { Textarea } from "@/components/ui/textarea";
+    35→import { MediaImage } from "@/components/fitness/media-image";
+    36→import {
+    37→  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+    38→} from "@/components/ui/select";
+    39→import {
+    40→  toPersianDigits,
+    41→  GOAL_LABELS, ACTIVITY_LABELS,
+    42→  WORKOUT_PLACE_LABELS, DIET_LABELS, TRAINING_EXPERIENCE_LABELS,
+    43→  BODY_FRAME_LABELS, WORKOUT_TIME_LABELS, PREFERRED_CUISINE_LABELS,
+    44→  MEDICAL_CONDITION_LABELS,
+    45→  PERSIAN_WEEKDAYS,
+    46→  type Goal, type ActivityLevel, type WorkoutPlace, type DietType,
+    47→  type TrainingExperience, type BodyFrame, type WorkoutTime,
+    48→  type PreferredCuisine, type MedicalConditionKey,
+    49→} from "@/lib/fitness/types";
+    50→import { toast } from "sonner";
+    51→
+    52→/**
+    53→ * ─── مودال «پرونده ورزشی» (Sports Profile Modal) ───
+    54→ *
+    55→ * درخواست مالک: «نیازی نیست تمام اطلاعات پرونده ورزشی کاربر رو در منوی
+    56→ * پروفایل نشون بدی — اطلاعات پایه رو در منوی پروفایل بیار و یک دکمه بذار
+    57→ * با عنوان "مشاهده پرونده ورزشی" که همه‌چیز به‌صورت یک مدال جذاب با قابلیت
+    58→ * ویرایش در اونجا وجود داشته باشه».
+    59→ *
+    60→ * این مودال از پروفایل (منوی بازشو) جدا است و داده‌ی خودش را مستقل می‌گیرد:
+    61→ *   • ۹ سکشن پرونده با ویرایش آیتم‌به‌آیتم (PUT /api/onboarding/profile)
+    62→ *   • اندازه‌های اولیه بدن (baseline چکاپ فاز ۰)
+    63→ *   • تحلیل فیتاپ هوشمند
+    64→ *   • عکس‌های پیشرفت + تحلیل‌های عکس بدن / آزمایش خون / ویدیو
+    65→ */
+    66→
+    67→interface OnboardingProfileDto {
+    68→  genderLabel?: string;
+    69→  age: number;
+    70→  height: number;
+    71→  weight: number;
+    72→  targetWeight?: number | null;
+    73→  goalLabel: string;
+    74→  activityLabel: string;
+    75→  workoutDays: number;
+    76→  workoutDaysList?: string[];
+    77→  workoutPlaceLabel: string;
+    78→  workoutTimeLabel?: string;
+    79→  equipment?: string[];
+    80→  dietLabel: string;
+    81→  allergies?: string;
+    82→  dislikedFoods?: string;
+    83→  preferredCuisineLabel?: string;
+    84→  waterHabit?: number | null;
+    85→  injuries?: string;
+    86→  diseases?: string;
+    87→  drugAllergies?: string;
+    88→  currentMedications?: string;
+    89→  medicalConditionsLabel?: string;
+    90→  sleepHours?: number | null;
+    91→  stressLevel?: number | null;
+    92→  bodyFrameLabel?: string;
+    93→  trainingExperienceLabel?: string;
+    94→  previousTrainingType?: string;
+    95→  maxLifts?: string;
+    96→  targetDate?: string;
+    97→  currentSupplements?: string;
+    98→  gender?: string;
+    99→  goal?: string;
+   100→  activityLevel?: string;
+   101→  workoutPlace?: string;
+   102→  workoutTime?: string;
+   103→  dietType?: string;
+   104→  preferredCuisine?: string;
+   105→  trainingExperience?: string;
+   106→  bodyFrame?: string;
+   107→  medicalConditions?: string[];
+   108→}
+   109→
+   110→interface BaselineDto {
+   111→  weight: number;
+   112→  chestMeasurement?: number | null;
+   113→  armMeasurement?: number | null;
+   114→  waistMeasurement?: number | null;
+   115→  hipMeasurement?: number | null;
+   116→  thighMeasurement?: number | null;
+   117→  createdAt?: string;
+   118→}
+   119→
+   120→type SectionId =
+   121→  | "basic" | "goal" | "equipment" | "nutrition"
+   122→  | "health" | "recovery" | "experience" | "target" | "supplements";
+   123→
+   124→export function SportsProfileModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+   125→  useScrollLock(open);
+   126→  const { user } = useAppStore();
+   127→  const [loading, setLoading] = useState(true);
+   128→  const [profile, setProfile] = useState<OnboardingProfileDto | null>(null);
+   129→  const [baseline, setBaseline] = useState<BaselineDto | null>(null);
+   130→  const [analysis, setAnalysis] = useState<string>("");
+   131→  const [progressPhotos, setProgressPhotos] = useState<any[]>([]);
+   132→  const [userMedia, setUserMedia] = useState<any>({
+   133→    bodyPhotos: [], bloodTests: [], videoAnalysis: [], bodyAnalysis: [],
+   134→  });
+   135→  const [editingSection, setEditingSection] = useState<SectionId | null>(null);
+   136→  const [editData, setEditData] = useState<Record<string, string>>({});
+   137→  const [saving, setSaving] = useState(false);
+   138→  // v15: تاریخ عضویت در فیتاپ — از پاسخ /api/onboarding/analysis (memberSince)
+   139→  const [memberSince, setMemberSince] = useState<string | null>(null);
+   140→  const memberSinceText = (() => {
+   141→    if (!memberSince) return null;
+   142→    try {
+   143→      return new Date(memberSince).toLocaleDateString("fa-IR", { year: "numeric", month: "long", day: "numeric" });
+   144→    } catch {
+   145→      return null;
+   146→    }
+   147→  })();
+   148→
+   149→  const loadData = useCallback(async () => {
+   150→    try {
+   151→      const [onboardingRes, progressRes, mediaRes] = await Promise.all([
+   152→        fetch("/api/onboarding/analysis"),
+   153→        fetch("/api/progress"),
+   154→        fetch("/api/user-media"),
+   155→      ]);
+   156→      const onboardingData = await onboardingRes.json().catch(() => null);
+   157→      const progressData = await progressRes.json().catch(() => null);
+   158→      const mediaData = await mediaRes.json().catch(() => null);
+   159→      if (onboardingData?.profile) setProfile(onboardingData.profile);
+   160→      if (onboardingData?.baseline) setBaseline(onboardingData.baseline);
+   161→      if (onboardingData?.analysis) setAnalysis(onboardingData.analysis);
+   162→      // v15: تاریخ عضویت در فیتاپ
+   163→      setMemberSince(onboardingData?.memberSince ?? null);
+   164→      // C1-fix: کلید درست پاسخ GET /api/progress همان «photos» است (نه progressPhotos) —
+   165→      // قبلاً کارت «عکس‌های پیشرفت بدن» همیشه خالی می‌ماند. اگر photos نبود،
+   166→      // fallback به bodyPhotos از /api/user-media (همان شکل داده: id/imageUrl/type/takenAt).
+   167→      if (Array.isArray(progressData?.photos)) {
+   168→        setProgressPhotos(progressData.photos);
+   169→      } else if (Array.isArray(mediaData?.bodyPhotos)) {
+   170→        setProgressPhotos(mediaData.bodyPhotos);
+   171→      }
+   172→      if (mediaData) setUserMedia(mediaData);
+   173→    } catch {
+   174→    } finally {
+   175→      setLoading(false);
+   176→    }
+   177→  }, []);
+   178→
+   179→  useEffect(() => {
+   180→    if (open) {
+   181→      setLoading(true);
+   182→      setEditingSection(null);
+   183→      loadData();
+   184→    }
+   185→  }, [open, loadData]);
+   186→
+   187→  function startEditing(section: SectionId) {
+   188→    const p = profile;
+   189→    if (!p) return;
+   190→    const d: Record<string, string> = {};
+   191→    switch (section) {
+   192→      case "basic":
+   193→        d.age = String(p.age ?? "");
+   194→        d.height = String(p.height ?? "");
+   195→        d.weight = String(p.weight ?? "");
+   196→        d.targetWeight = String(p.targetWeight ?? "");
+   197→        d.gender = p.gender || "male";
+   198→        break;
+   199→      case "goal":
+   200→        d.goal = p.goal || "fitness";
+   201→        d.activityLevel = p.activityLevel || "moderate";
+   202→        d.workoutDays = String(p.workoutDays ?? "");
+   203→        d.workoutPlace = p.workoutPlace || "gym";
+   204→        d.workoutTime = p.workoutTime || "";
+   205→        d.workoutDaysList = (p.workoutDaysList || []).join(",");
+   206→        break;
+   207→      case "equipment":
+   208→        d.equipment = (p.equipment || []).join(", ");
+   209→        break;
+   210→      case "nutrition":
+   211→        d.dietType = p.dietType || "standard";
+   212→        d.preferredCuisine = p.preferredCuisine || "";
+   213→        d.dislikedFoods = p.dislikedFoods || "";
+   214→        d.allergies = p.allergies || "";
+   215→        break;
+   216→      case "health":
+   217→        d.injuries = p.injuries || "";
+   218→        d.diseases = p.diseases || "";
+   219→        d.drugAllergies = p.drugAllergies || "";
+   220→        d.currentMedications = p.currentMedications || "";
+   221→        d.medicalConditions = (p.medicalConditions || []).join(",");
+   222→        break;
+   223→      case "recovery":
+   224→        d.sleepHours = String(p.sleepHours ?? "");
+   225→        d.stressLevel = String(p.stressLevel ?? "");
+   226→        d.waterHabit = String(p.waterHabit ?? "");
+   227→        d.bodyFrame = p.bodyFrame || "";
+   228→        break;
+   229→      case "experience":
+   230→        d.trainingExperience = p.trainingExperience || "beginner";
+   231→        d.previousTrainingType = p.previousTrainingType || "";
+   232→        d.maxLifts = p.maxLifts || "";
+   233→        break;
+   234→      case "target":
+   235→        d.targetDate = p.targetDate || "";
+   236→        break;
+   237→      case "supplements":
+   238→        d.currentSupplements = p.currentSupplements || "";
+   239→        break;
+   240→    }
+   241→    setEditData(d);
+   242→    setEditingSection(section);
+   243→  }
+   244→
+   245→  function cancelEditing() {
+   246→    setEditingSection(null);
+   247→    setEditData({});
+   248→  }
+   249→
+   250→  async function saveSection() {
+   251→    if (!editingSection) return;
+   252→    setSaving(true);
+   253→    try {
+   254→      const payload: Record<string, any> = {};
+   255→      const numFields: Record<SectionId, string[]> = {
+   256→        basic: ["age", "height", "weight", "targetWeight"],
+   257→        goal: ["workoutDays"],
+   258→        equipment: [],
+   259→        nutrition: [],
+   260→        health: [],
+   261→        recovery: ["sleepHours", "stressLevel", "waterHabit"],
+   262→        experience: [],
+   263→        target: [],
+   264→        supplements: [],
+   265→      };
+   266→      for (const [k, v] of Object.entries(editData)) {
+   267→        if (numFields[editingSection].includes(k)) {
+   268→          payload[k] = v === "" ? null : Number(v);
+   269→        } else {
+   270→          payload[k] = v;
+   271→        }
+   272→      }
+   273→      const res = await fetch("/api/onboarding/profile", {
+   274→        method: "PUT",
+   275→        headers: { "Content-Type": "application/json" },
+   276→        body: JSON.stringify(payload),
+   277→      });
+   278→      if (!res.ok) throw new Error();
+   279→      const data = await res.json();
+   280→      if (data?.ok) {
+   281→        toast.success("پروفایل به‌روزرسانی شد و به مربی هوشمند تزریق شد ✅");
+   282→      } else {
+   283→        toast.success("پرونده ورزشی به‌روزرسانی شد ✅");
+   284→      }
+   285→      setEditingSection(null);
+   286→      setEditData({});
+   287→      await loadData();
+   288→    } catch {
+   289→      toast.error("خطا در ذخیره پروفایل");
+   290→    } finally {
+   291→      setSaving(false);
+   292→    }
+   293→  }
+   294→
+   295→  const p = profile;
+   296→
+   297→  if (!open) return null;
+   298→
+   299→  return (
+   300→    <motion.div
+   301→      initial={{ opacity: 0 }}
+   302→      animate={{ opacity: 1 }}
+   303→      exit={{ opacity: 0 }}
+   304→      className="fixed inset-0 z-[70] bg-black/40 backdrop-blur-sm flex items-end sm:items-center justify-center"
+   305→      onClick={onClose}
+   306→      role="dialog"
+   307→      aria-modal="true"
+   308→      aria-label="پرونده ورزشی"
+   309→    >
+   310→      <motion.div
+   311→        initial={{ y: 60, opacity: 0, scale: 0.98 }}
+   312→        animate={{ y: 0, opacity: 1, scale: 1 }}
+   313→        exit={{ y: 40, opacity: 0 }}
+   314→        transition={{ type: "spring", damping: 26, stiffness: 300 }}
+   315→        onClick={(e) => e.stopPropagation()}
+   316→        className="w-full sm:max-w-lg h-[94vh] sm:h-[90vh] bg-white sm:rounded-3xl rounded-t-3xl flex flex-col overflow-hidden shadow-2xl"
+   317→        dir="rtl"
+   318→      >
+   319→        {/* Header */}
+   320→        <div
+   321→          className="relative flex items-center justify-between p-4 text-white shrink-0 overflow-hidden"
+   322→          style={{ background: "linear-gradient(135deg, #f59e0b, #f97316)" }}
+   323→        >
+   324→          <div className="absolute -left-8 -top-8 w-32 h-32 rounded-full bg-white/10" />
+   325→          <div className="relative flex items-center gap-2">
+   326→            <div className="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center">
+   327→              <Dumbbell className="w-5 h-5 text-white" />
+   328→            </div>
+   329→            <div>
+   330→              <h2 className="font-black text-base leading-tight">پرونده ورزشی</h2>
+   331→              <p className="text-[10px] opacity-80">همه‌چیز درباره بدن و اهدافت — با ویرایش سریع</p>
+   332→            </div>
+   333→          </div>
+   334→          <Button
+   335→            variant="ghost"
+   336→            size="icon"
+   337→            onClick={onClose}
+   338→            className="relative rounded-full text-white hover:bg-white/20 hover:text-white"
+   339→            aria-label="بستن پرونده ورزشی"
+   340→          >
+   341→            <X className="w-5 h-5" />
+   342→          </Button>
+   343→        </div>
+   344→
+   345→        {/* Content */}
+   346→        <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-3 bg-slate-50/50">
+   347→          {loading ? (
+   348→            <div className="space-y-3">
+   349→              <Skeleton className="h-28 rounded-2xl" />
+   350→              <Skeleton className="h-40 rounded-2xl" />
+   351→              <Skeleton className="h-40 rounded-2xl" />
+   352→              <Skeleton className="h-40 rounded-2xl" />
+   353→            </div>
+   354→          ) : !p ? (
+   355→            <div className="flex flex-col items-center justify-center py-20 text-center gap-3">
+   356→              <div className="w-14 h-14 rounded-2xl bg-orange-100 flex items-center justify-center">
+   357→                <Dumbbell className="w-7 h-7 text-orange-500" />
+   358→              </div>
+   359→              <p className="text-sm text-slate-500">پرونده ورزشی یافت نشد — اول آنبوردینگ را کامل کنید.</p>
+   360→            </div>
+   361→          ) : (
+   362→            <>
+   363→              {/* خلاصه بالا */}
+   364→              <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+   365→                <Card className="p-4 bg-white">
+   366→                  {/* v15: تاریخ عضویت در فیتاپ (درخواست مالک — آنبوردینگ/پرونده کامل) */}
+   367→                  {memberSinceText && (
+   368→                    <div className="flex items-center justify-center gap-1.5 mb-3 pb-3 border-b border-orange-50">
+   369→                      <CalendarDays className="w-3.5 h-3.5 text-orange-500" />
+   370→                      <p className="text-[11px] text-orange-700 font-bold">عضو فیتاپ از {memberSinceText}</p>
+   371→                    </div>
+   372→                  )}
+   373→                  <div className="grid grid-cols-4 gap-2 text-center">
+   374→                    <SummaryChip label="سن" value={p.age ? `${toPersianDigits(p.age)}` : "—"} />
+   375→                    <SummaryChip label="قد" value={p.height ? `${toPersianDigits(p.height)}` : "—"} unit="cm" />
+   376→                    <SummaryChip label="وزن" value={p.weight ? `${toPersianDigits(p.weight)}` : "—"} unit="kg" />
+   377→                    <SummaryChip label="هدف" value={p.goalLabel || "—"} />
+   378→                  </div>
+   379→                </Card>
+   380→              </motion.div>
+   381→
+   382→              {/* ۹ سکشن پرونده */}
+   383→              <Card className="p-4 space-y-4 bg-white">
+   384→                {/* ۱) اطلاعات پایه */}
+   385→                <Section
+   386→                  title="اطلاعات پایه"
+   387→                  icon={<Activity className="w-4 h-4 text-primary" />}
+   388→                  editing={editingSection === "basic"}
+   389→                  onEdit={() => startEditing("basic")}
+   390→                  onCancel={cancelEditing}
+   391→                  onSave={saveSection}
+   392→                  saving={saving}
+   393→                >
+   394→                  {editingSection === "basic" ? (
+   395→                    <div className="grid grid-cols-2 gap-2">
+   396→                      <EditSelect
+   397→                        label="جنسیت"
+   398→                        value={editData.gender || "male"}
+   399→                        onChange={(v) => setEditData({ ...editData, gender: v })}
+   400→                        options={[
+   401→                          { value: "male", label: "آقا" },
+   402→                          { value: "female", label: "خانم" },
+   403→                        ]}
+   404→                      />
+   405→                      <EditField label="سن (سال)" value={editData.age || ""} onChange={(v) => setEditData({ ...editData, age: v })} type="number" />
+   406→                      <EditField label="قد (cm)" value={editData.height || ""} onChange={(v) => setEditData({ ...editData, height: v })} type="number" />
+   407→                      <EditField label="وزن (kg)" value={editData.weight || ""} onChange={(v) => setEditData({ ...editData, weight: v })} type="number" />
+   408→                      <EditField label="وزن هدف (kg)" value={editData.targetWeight || ""} onChange={(v) => setEditData({ ...editData, targetWeight: v })} type="number" />
+   409→                    </div>
+   410→                  ) : (
+   411→                    <div className="grid grid-cols-2 gap-2">
+   412→                      <InfoRow label="جنسیت" value={p.genderLabel || "—"} />
+   413→                      <InfoRow label="سن" value={`${toPersianDigits(p.age)} سال`} />
+   414→                      <InfoRow label="قد" value={`${toPersianDigits(p.height)} cm`} />
+   415→                      <InfoRow label="وزن فعلی" value={`${toPersianDigits(p.weight)} kg`} />
+   416→                      {p.targetWeight != null && <InfoRow label="وزن هدف" value={`${toPersianDigits(p.targetWeight)} kg`} />}
+   417→                    </div>
+   418→                  )}
+   419→                </Section>
+   420→
+   421→                {/* ۲) هدف و فعالیت */}
+   422→                <Section
+   423→                  title="هدف و فعالیت"
+   424→                  icon={<Target className="w-4 h-4 text-amber-500" />}
+   425→                  editing={editingSection === "goal"}
+   426→                  onEdit={() => startEditing("goal")}
+   427→                  onCancel={cancelEditing}
+   428→                  onSave={saveSection}
+   429→                  saving={saving}
+   430→                >
+   431→                  {editingSection === "goal" ? (
+   432→                    <div className="grid grid-cols-2 gap-2">
+   433→                      <EditSelect
+   434→                        label="هدف اصلی"
+   435→                        value={editData.goal || "fitness"}
+   436→                        onChange={(v) => setEditData({ ...editData, goal: v })}
+   437→                        options={(Object.keys(GOAL_LABELS) as Goal[]).map((g) => ({ value: g, label: GOAL_LABELS[g] }))}
+   438→                      />
+   439→                      <EditSelect
+   440→                        label="سطح فعالیت"
+   441→                        value={editData.activityLevel || "moderate"}
+   442→                        onChange={(v) => setEditData({ ...editData, activityLevel: v })}
+   443→                        options={(Object.keys(ACTIVITY_LABELS) as ActivityLevel[]).map((g) => ({ value: g, label: ACTIVITY_LABELS[g] }))}
+   444→                      />
+   445→                      <EditField label="روزهای تمرین در هفته" value={editData.workoutDays || ""} onChange={(v) => setEditData({ ...editData, workoutDays: v })} type="number" />
+   446→                      <EditSelect
+   447→                        label="محیط تمرین"
+   448→                        value={editData.workoutPlace || "gym"}
+   449→                        onChange={(v) => setEditData({ ...editData, workoutPlace: v })}
+   450→                        options={(Object.keys(WORKOUT_PLACE_LABELS) as WorkoutPlace[]).map((g) => ({ value: g, label: WORKOUT_PLACE_LABELS[g] }))}
+   451→                      />
+   452→                      <EditSelect
+   453→                        label="زمان ترجیحی تمرین"
+   454→                        value={editData.workoutTime || ""}
+   455→                        onChange={(v) => setEditData({ ...editData, workoutTime: v })}
+   456→                        options={[
+   457→                          { value: "", label: "—" },
+   458→                          ...(Object.keys(WORKOUT_TIME_LABELS) as WorkoutTime[]).map((g) => ({ value: g, label: WORKOUT_TIME_LABELS[g] })),
+   459→                        ]}
+   460→                      />
+   461→                      <div className="col-span-2">
+   462→                        <Label className="mb-1 block text-[11px] text-muted-foreground">روزهای انتخابی هفته</Label>
+   463→                        <div className="flex flex-wrap gap-1.5">
+   464→                          {PERSIAN_WEEKDAYS.map((day) => {
+   465→                            const selected = (editData.workoutDaysList || "").split(",").map((s) => s.trim()).includes(day);
+   466→                            return (
+   467→                              <button
+   468→                                key={day}
+   469→                                type="button"
+   470→                                onClick={() => {
+   471→                                  const current = (editData.workoutDaysList || "").split(",").map((s) => s.trim()).filter(Boolean);
+   472→                                  const next = selected ? current.filter((d) => d !== day) : [...current, day];
+   473→                                  setEditData({ ...editData, workoutDaysList: next.join(",") });
+   474→                                }}
+   475→                                className={`text-[11px] px-2.5 py-1 rounded-lg transition ${
+   476→                                  selected ? "bg-primary text-primary-foreground" : "bg-muted/60 text-foreground hover:bg-muted"
+   477→                                }`}
+   478→                              >
+   479→                                {day}
+   480→                              </button>
+   481→                            );
+   482→                          })}
+   483→                        </div>
+   484→                      </div>
+   485→                    </div>
+   486→                  ) : (
+   487→                    <div className="grid grid-cols-1 gap-2">
+   488→                      <InfoRow label="هدف اصلی" value={p.goalLabel} />
+   489→                      <InfoRow label="سطح فعالیت" value={p.activityLabel} />
+   490→                      <InfoRow label="روزهای تمرین" value={`${toPersianDigits(p.workoutDays)} روز در هفته`} />
+   491→                      {p.workoutDaysList && p.workoutDaysList.length > 0 && (
+   492→                        <InfoRow label="روزهای انتخابی" value={p.workoutDaysList.join("، ")} />
+   493→                      )}
+   494→                      <InfoRow label="محیط تمرین" value={p.workoutPlaceLabel} />
+   495→                      {p.workoutTimeLabel && <InfoRow label="زمان ترجیحی تمرین" value={p.workoutTimeLabel} />}
+   496→                    </div>
+   497→                  )}
+   498→                </Section>
+   499→
+   500→                {/* ۳) تجهیزات */}
+   501→                <Section
+   502→                  title="تجهیزات"
+   503→                  icon={<Dumbbell className="w-4 h-4 text-violet-500" />}
+   504→                  editing={editingSection === "equipment"}
+   505→                  onEdit={() => startEditing("equipment")}
+   506→                  onCancel={cancelEditing}
+   507→                  onSave={saveSection}
+   508→                  saving={saving}
+   509→                >
+   510→                  {editingSection === "equipment" ? (
+   511→                    <EditTextArea
+   512→                      label="تجهیزات در دسترس (با کاما جدا کنید)"
+   513→                      value={editData.equipment || ""}
+   514→                      onChange={(v) => setEditData({ ...editData, equipment: v })}
+   515→                      placeholder="مثلاً: دمبل، هالتر، دستگاه پرس سینه، کش"
+   516→                    />
+   517→                  ) : (
+   518→                    p.equipment && p.equipment.length > 0 ? (
+   519→                      <div className="flex flex-wrap gap-1.5">
+   520→                        {p.equipment.map((eq) => (
+   521→                          <span key={eq} className="text-[11px] px-2 py-1 rounded-lg bg-muted/60 text-foreground">
+   522→                            {eq}
+   523→                          </span>
+   524→                        ))}
+   525→                      </div>
+   526→                    ) : (
+   527→                      <p className="text-xs text-muted-foreground">بدون تجهیزات خاص</p>
+   528→                    )
+   529→                  )}
+   530→                </Section>
+   531→
+   532→                {/* ۴) تغذیه */}
+   533→                <Section
+   534→                  title="تغذیه"
+   535→                  icon={<Salad className="w-4 h-4 text-emerald-500" />}
+   536→                  editing={editingSection === "nutrition"}
+   537→                  onEdit={() => startEditing("nutrition")}
+   538→                  onCancel={cancelEditing}
+   539→                  onSave={saveSection}
+   540→                  saving={saving}
+   541→                >
+   542→                  {editingSection === "nutrition" ? (
+   543→                    <div className="grid grid-cols-2 gap-2">
+   544→                      <EditSelect
+   545→                        label="نوع رژیم"
+   546→                        value={editData.dietType || "standard"}
+   547→                        onChange={(v) => setEditData({ ...editData, dietType: v })}
+   548→                        options={(Object.keys(DIET_LABELS) as DietType[]).map((g) => ({ value: g, label: DIET_LABELS[g] }))}
+   549→                      />
+   550→                      <EditSelect
+   551→                        label="سبک آشپزی"
+   552→                        value={editData.preferredCuisine || ""}
+   553→                        onChange={(v) => setEditData({ ...editData, preferredCuisine: v })}
+   554→                        options={[
+   555→                          { value: "", label: "—" },
+   556→                          ...(Object.keys(PREFERRED_CUISINE_LABELS) as PreferredCuisine[]).map((g) => ({ value: g, label: PREFERRED_CUISINE_LABELS[g] })),
+   557→                        ]}
+   558→                      />
+   559→                      <EditField label="حساسیت غذایی" value={editData.allergies || ""} onChange={(v) => setEditData({ ...editData, allergies: v })} />
+   560→                      <div className="col-span-2">
+   561→                        <EditTextArea
+   562→                          label="غذاهای دوست‌نداشته/حذفی"
+   563→                          value={editData.dislikedFoods || ""}
+   564→                          onChange={(v) => setEditData({ ...editData, dislikedFoods: v })}
+   565→                          placeholder="مثلاً: بادمجان، کرفس، فست‌فود"
+   566→                        />
+   567→                      </div>
+   568→                    </div>
+   569→                  ) : (
+   570→                    <div className="grid grid-cols-1 gap-2">
+   571→                      <InfoRow label="نوع رژیم" value={p.dietLabel} />
+   572→                      <InfoRow label="حساسیت غذایی" value={p.allergies?.trim() ? p.allergies : "ندارد"} />
+   573→                      {p.dislikedFoods?.trim() && <InfoRow label="غذاهای دوست‌نداشته" value={p.dislikedFoods} />}
+   574→                      {p.preferredCuisineLabel && <InfoRow label="سبک آشپزی" value={p.preferredCuisineLabel} />}
+   575→                      {p.waterHabit != null && <InfoRow label="مصرف آب فعلی" value={`${toPersianDigits(p.waterHabit)} لیوان در روز`} />}
+   576→                    </div>
+   577→                  )}
+   578→                </Section>
+   579→
+   580→                {/* ۵) سلامت */}
+   581→                <Section
+   582→                  title="سلامت و پزشکی"
+   583→                  icon={<HeartPulse className="w-4 h-4 text-rose-500" />}
+   584→                  editing={editingSection === "health"}
+   585→                  onEdit={() => startEditing("health")}
+   586→                  onCancel={cancelEditing}
+   587→                  onSave={saveSection}
+   588→                  saving={saving}
+   589→                >
+   590→                  {editingSection === "health" ? (
+   591→                    <div className="grid grid-cols-1 gap-2">
+   592→                      <EditTextArea label="آسیب‌دیدگی‌ها" value={editData.injuries || ""} onChange={(v) => setEditData({ ...editData, injuries: v })} placeholder="مثلاً: آسیب زانوی راست، دیسک کمر" />
+   593→                      <EditTextArea label="بیماری‌ها" value={editData.diseases || ""} onChange={(v) => setEditData({ ...editData, diseases: v })} placeholder="مثلاً: دیابت نوع ۲، فشار خون" />
+   594→                      <EditField label="آلرژی دارویی" value={editData.drugAllergies || ""} onChange={(v) => setEditData({ ...editData, drugAllergies: v })} />
+   595→                      <EditField label="داروهای مصرفی" value={editData.currentMedications || ""} onChange={(v) => setEditData({ ...editData, currentMedications: v })} />
+   596→                      <div>
+   597→                        <Label className="mb-1.5 block text-[11px] text-muted-foreground">شرایط پزشکی خاص</Label>
+   598→                        <div className="flex flex-wrap gap-1.5">
+   599→                          {(Object.keys(MEDICAL_CONDITION_LABELS) as MedicalConditionKey[]).map((c) => {
+   600→                            const selected = (editData.medicalConditions || "").split(",").map((s) => s.trim()).includes(c);
+   601→                            return (
+   602→                              <button
+   603→                                key={c}
+   604→                                type="button"
+   605→                                onClick={() => {
+   606→                                  const current = (editData.medicalConditions || "").split(",").map((s) => s.trim()).filter(Boolean);
+   607→                                  const next = selected ? current.filter((x) => x !== c) : [...current, c];
+   608→                                  setEditData({ ...editData, medicalConditions: next.join(",") });
+   609→                                }}
+   610→                                className={`text-[11px] px-2.5 py-1 rounded-lg transition ${
+   611→                                  selected ? "bg-rose-500 text-white" : "bg-muted/60 text-foreground hover:bg-muted"
+   612→                                }`}
+   613→                              >
+   614→                                {MEDICAL_CONDITION_LABELS[c]}
+   615→                              </button>
+   616→                            );
+   617→                          })}
+   618→                        </div>
+   619→                      </div>
+   620→                    </div>
+   621→                  ) : (
+   622→                    <div className="grid grid-cols-1 gap-2">
+   623→                      <InfoRow label="آسیب‌دیدگی" value={p.injuries?.trim() ? p.injuries : "ندارد"} />
+   624→                      <InfoRow label="بیماری‌ها" value={p.diseases?.trim() ? p.diseases : "ندارد"} />
+   625→                      <InfoRow label="آلرژی دارویی" value={p.drugAllergies?.trim() ? p.drugAllergies : "ندارد"} />
+   626→                      <InfoRow label="داروهای مصرفی" value={p.currentMedications?.trim() ? p.currentMedications : "ندارد"} />
+   627→                      <InfoRow label="شرایط پزشکی" value={p.medicalConditionsLabel || "ندارد"} />
+   628→                    </div>
+   629→                  )}
+   630→                </Section>
+   631→
+   632→                {/* ۶) ریکاوری */}
+   633→                <Section
+   634→                  title="ریکاوری"
+   635→                  icon={<Moon className="w-4 h-4 text-teal-500" />}
+   636→                  editing={editingSection === "recovery"}
+   637→                  onEdit={() => startEditing("recovery")}
+   638→                  onCancel={cancelEditing}
+   639→                  onSave={saveSection}
+   640→                  saving={saving}
+   641→                >
+   642→                  {editingSection === "recovery" ? (
+   643→                    <div className="grid grid-cols-2 gap-2">
+   644→                      <EditField label="ساعت خواب شبانه" value={editData.sleepHours || ""} onChange={(v) => setEditData({ ...editData, sleepHours: v })} type="number" />
+   645→                      <EditField label="سطح استرس (۱-۵)" value={editData.stressLevel || ""} onChange={(v) => setEditData({ ...editData, stressLevel: v })} type="number" />
+   646→                      <EditField label="مصرف آب (لیوان/روز)" value={editData.waterHabit || ""} onChange={(v) => setEditData({ ...editData, waterHabit: v })} type="number" />
+   647→                      <EditSelect
+   648→                        label="فرم بدن"
+   649→                        value={editData.bodyFrame || ""}
+   650→                        onChange={(v) => setEditData({ ...editData, bodyFrame: v })}
+   651→                        options={[
+   652→                          { value: "", label: "—" },
+   653→                          ...(Object.keys(BODY_FRAME_LABELS) as BodyFrame[]).map((g) => ({ value: g, label: BODY_FRAME_LABELS[g] })),
+   654→                        ]}
+   655→                      />
+   656→                    </div>
+   657→                  ) : (
+   658→                    <div className="grid grid-cols-2 gap-2">
+   659→                      {p.sleepHours != null && <InfoRow label="ساعت خواب" value={`${toPersianDigits(p.sleepHours)} ساعت`} />}
+   660→                      {p.stressLevel != null && (
+   661→                        <InfoRow label="سطح استرس" value={p.stressLevel <= 2 ? "کم" : p.stressLevel <= 3 ? "متوسط" : "زیاد"} />
+   662→                      )}
+   663→                      {p.waterHabit != null && <InfoRow label="مصرف آب" value={`${toPersianDigits(p.waterHabit)} لیوان/روز`} />}
+   664→                      {p.bodyFrameLabel && <InfoRow label="فرم بدن" value={p.bodyFrameLabel} />}
+   665→                    </div>
+   666→                  )}
+   667→                </Section>
+   668→
+   669→                {/* ۷) تجربه ورزشی */}
+   670→                <Section
+   671→                  title="تجربه ورزشی"
+   672→                  icon={<Trophy className="w-4 h-4 text-amber-500" />}
+   673→                  editing={editingSection === "experience"}
+   674→                  onEdit={() => startEditing("experience")}
+   675→                  onCancel={cancelEditing}
+   676→                  onSave={saveSection}
+   677→                  saving={saving}
+   678→                >
+   679→                  {editingSection === "experience" ? (
+   680→                    <div className="grid grid-cols-1 gap-2">
+   681→                      <EditSelect
+   682→                        label="سابقه ورزشی"
+   683→                        value={editData.trainingExperience || "beginner"}
+   684→                        onChange={(v) => setEditData({ ...editData, trainingExperience: v })}
+   685→                        options={(Object.keys(TRAINING_EXPERIENCE_LABELS) as TrainingExperience[]).map((g) => ({ value: g, label: TRAINING_EXPERIENCE_LABELS[g] }))}
+   686→                      />
+   687→                      <EditField label="نوع تمرین قبلی" value={editData.previousTrainingType || ""} onChange={(v) => setEditData({ ...editData, previousTrainingType: v })} />
+   688→                      <EditTextArea label="حداکثر وزنه‌ها (اسکوات/پرس/ددلیفت)" value={editData.maxLifts || ""} onChange={(v) => setEditData({ ...editData, maxLifts: v })} placeholder="مثلاً: اسکوات ۱۰۰، پرس ۸۰، ددلیفت ۱۲۰" />
+   689→                    </div>
+   690→                  ) : (
+   691→                    <div className="grid grid-cols-1 gap-2">
+   692→                      <InfoRow label="سابقه ورزشی" value={p.trainingExperienceLabel || "مشخص نشده"} />
+   693→                      {p.previousTrainingType?.trim() && <InfoRow label="نوع تمرین قبلی" value={p.previousTrainingType} />}
+   694→                      {p.maxLifts?.trim() && <InfoRow label="حداکثر وزنه‌ها" value={p.maxLifts} />}
+   695→                    </div>
+   696→                  )}
+   697→                </Section>
+   698→
+   699→                {/* ۸) تاریخ هدف */}
+   700→                <Section
+   701→                  title="تاریخ هدف"
+   702→                  icon={<Calendar className="w-4 h-4 text-cyan-500" />}
+   703→                  editing={editingSection === "target"}
+   704→                  onEdit={() => startEditing("target")}
+   705→                  onCancel={cancelEditing}
+   706→                  onSave={saveSection}
+   707→                  saving={saving}
+   708→                >
+   709→                  {editingSection === "target" ? (
+   710→                    <div className="flex flex-col gap-0.5">
+   711→                      <span className="text-[10px] text-muted-foreground">تاریخ هدف (میلادی)</span>
+   712→                      <Input
+   713→                        type="date"
+   714→                        value={editData.targetDate || ""}
+   715→                        onChange={(e) => setEditData({ ...editData, targetDate: e.target.value })}
+   716→                        className="h-9 rounded-lg text-sm"
+   717→                        dir="ltr"
+   718→                      />
+   719→                    </div>
+   720→                  ) : (
+   721→                    <InfoRow
+   722→                      label="تاریخ هدف"
+   723→                      value={p.targetDate ? new Date(p.targetDate).toLocaleDateString("fa-IR") : "مشخص نشده"}
+   724→                    />
+   725→                  )}
+   726→                </Section>
+   727→
+   728→                {/* ۹) مکمل‌ها */}
+   729→                <Section
+   730→                  title="مکمل‌ها"
+   731→                  icon={<Pill className="w-4 h-4 text-violet-500" />}
+   732→                  editing={editingSection === "supplements"}
+   733→                  onEdit={() => startEditing("supplements")}
+   734→                  onCancel={cancelEditing}
+   735→                  onSave={saveSection}
+   736→                  saving={saving}
+   737→                >
+   738→                  {editingSection === "supplements" ? (
+   739→                    <EditTextArea
+   740→                      label="مکمل‌های فعلی مصرفی"
+   741→                      value={editData.currentSupplements || ""}
+   742→                      onChange={(v) => setEditData({ ...editData, currentSupplements: v })}
+   743→                      placeholder="مثلاً: کراتین ۵ گرم، پروتئین وی، امگا ۳"
+   744→                    />
+   745→                  ) : (
+   746→                    <InfoRow label="مکمل‌های فعلی" value={p.currentSupplements?.trim() ? p.currentSupplements : "ندارد"} />
+   747→                  )}
+   748→                </Section>
+   749→
+   750→                {/* Baseline */}
+   751→                {baseline && (
+   752→                  <Section title="اندازه‌های اولیه بدن (Baseline)" icon={<Ruler className="w-4 h-4 text-violet-500" />}>
+   753→                    <div className="grid grid-cols-2 gap-2">
+   754→                      <InfoRow label="وزن اولیه" value={`${toPersianDigits(baseline.weight)} kg`} />
+   755→                      {baseline.chestMeasurement != null && <InfoRow label="دور سینه" value={`${toPersianDigits(baseline.chestMeasurement)} cm`} />}
+   756→                      {baseline.armMeasurement != null && <InfoRow label="دور بازو" value={`${toPersianDigits(baseline.armMeasurement)} cm`} />}
+   757→                      {baseline.waistMeasurement != null && <InfoRow label="دور کمر" value={`${toPersianDigits(baseline.waistMeasurement)} cm`} />}
+   758→                      {baseline.hipMeasurement != null && <InfoRow label="دور باسن" value={`${toPersianDigits(baseline.hipMeasurement)} cm`} />}
+   759→                      {baseline.thighMeasurement != null && <InfoRow label="دور ران" value={`${toPersianDigits(baseline.thighMeasurement)} cm`} />}
+   760→                    </div>
+   761→                    {baseline.createdAt && (
+   762→                      <p className="text-[10px] text-muted-foreground mt-1.5">
+   763→                        ثبت شده در: {new Date(baseline.createdAt).toLocaleDateString("fa-IR")}
+   764→                      </p>
+   765→                    )}
+   766→                  </Section>
+   767→                )}
+   768→              </Card>
+   769→
+   770→              {/* تحلیل هوشمند */}
+   771→              {analysis && (
+   772→                <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+   773→                  <Card className="p-4 bg-white">
+   774→                    <div className="flex items-center gap-2 mb-2">
+   775→                      <Sparkles className="w-4 h-4 text-amber-500" />
+   776→                      <h3 className="font-bold text-sm">تحلیل فیتاپ هوشمند</h3>
+   777→                    </div>
+   778→                    <p className="text-xs text-muted-foreground leading-relaxed whitespace-pre-line">
+   779→                      {analysis}
+   780→                    </p>
+   781→                  </Card>
+   782→                </motion.div>
+   783→              )}
+   784→
+   785→              {/* عکس‌های پیشرفت */}
+   786→              <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+   787→                <Card className="p-4 bg-white">
+   788→                  <div className="flex items-center gap-2 mb-3">
+   789→                    <Camera className="w-4 h-4 text-violet-500" />
+   790→                    <h3 className="font-bold text-sm">عکس‌های پیشرفت بدن</h3>
+   791→                  </div>
+   792→                  {progressPhotos.length > 0 ? (
+   793→                    <div className="grid grid-cols-3 gap-2">
+   794→                      {progressPhotos.slice(0, 9).map((photo: any) => (
+   795→                        <div key={photo.id} className="relative group">
+   796→                          {/* v15: MediaImage — فایل گم‌شده placeholder شکیل نشان می‌دهد */}
+   797→                          <MediaImage
+   798→                            src={photo.imageUrl}
+   799→                            alt={photo.type || "عکس پیشرفت"}
+   800→                            className="w-full h-24"
+   801→                            fallbackLabel="فایل حذف شده"
+   802→                          />
+   803→                          <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition flex flex-col justify-end p-1.5 pointer-events-none">
+   804→                            <p className="text-[9px] text-white font-medium">{photo.takenAt ? new Date(photo.takenAt).toLocaleDateString("fa-IR") : ""}</p>
+   805→                          </div>
+   806→                        </div>
+   807→                      ))}
+   808→                    </div>
+   809→                  ) : (
+   810→                    <p className="text-xs text-muted-foreground text-center py-4">هنوز عکس پیشرفتی ثبت نشده است</p>
+   811→                  )}
+   812→                </Card>
+   813→              </motion.div>
+   814→
+   815→              {/* تحلیل عکس بدن */}
+   816→              {userMedia?.bodyAnalysis?.length > 0 && (
+   817→                <Card className="p-4 bg-white">
+   818→                  <div className="flex items-center gap-2 mb-3">
+   819→                    <Activity className="w-4 h-4 text-orange-500" />
+   820→                    <h3 className="font-bold text-sm">تحلیل عکس بدن ({toPersianDigits(userMedia.bodyAnalysis.length)})</h3>
+   821→                  </div>
+   822→                  <div className="space-y-3">
+   823→                    {userMedia.bodyAnalysis.map((item: any) => (
+   824→                      <div key={item.id} className="p-3 rounded-xl bg-orange-50/50 border border-orange-100">
+   825→                        <span className="text-[11px] text-muted-foreground">{new Date(item.createdAt).toLocaleDateString("fa-IR")}</span>
+   826→                        {item.mediaUrl && (
+   827→                          <div className="my-2">
+   828→                            {/* v15: MediaImage — fallback برای فایل حذف‌شده */}
+   829→                            <MediaImage
+   830→                              src={item.mediaUrl}
+   831→                              alt="عکس بدن"
+   832→                              className="w-full h-32"
+   833→                              fallbackLabel="فایل حذف شده"
+   834→                              rounding="rounded-lg"
+   835→                            />
+   836→                          </div>
+   837→                        )}
+   838→                        {item.result?.analysis && (
+   839→                          <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap mt-1">{item.result.analysis}</p>
+   840→                        )}
+   841→                      </div>
+   842→                    ))}
+   843→                  </div>
+   844→                </Card>
+   845→              )}
+   846→
+   847→              {/* تحلیل آزمایش خون */}
+   848→              {userMedia?.bloodTests?.length > 0 && (
+   849→                <Card className="p-4 bg-white">
+   850→                  <div className="flex items-center gap-2 mb-3">
+   851→                    <TestTube className="w-4 h-4 text-rose-500" />
+   852→                    <h3 className="font-bold text-sm">تحلیل آزمایش خون ({toPersianDigits(userMedia.bloodTests.length)})</h3>
+   853→                  </div>
+   854→                  <div className="space-y-3">
+   855→                    {userMedia.bloodTests.map((item: any) => (
+   856→                      <div key={item.id} className="p-3 rounded-xl bg-rose-50/50 border border-rose-100">
+   857→                        <span className="text-[11px] text-muted-foreground">{new Date(item.createdAt).toLocaleDateString("fa-IR")}</span>
+   858→                        {item.result?.summary && (
+   859→                          <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap mt-1">{item.result.summary}</p>
+   860→                        )}
+   861→                      </div>
+   862→                    ))}
+   863→                  </div>
+   864→                </Card>
+   865→              )}
+   866→
+   867→              {/* تحلیل ویدیویی */}
+   868→              {userMedia?.videoAnalysis?.length > 0 && (
+   869→                <Card className="p-4 bg-white">
+   870→                  <div className="flex items-center gap-2 mb-3">
+   871→                    <Video className="w-4 h-4 text-cyan-500" />
+   872→                    <h3 className="font-bold text-sm">تحلیل ویدیویی بدن ({toPersianDigits(userMedia.videoAnalysis.length)})</h3>
+   873→                  </div>
+   874→                  <div className="space-y-3">
+   875→                    {userMedia.videoAnalysis.map((item: any) => (
+   876→                      <div key={item.id} className="p-3 rounded-xl bg-cyan-50/50 border border-cyan-100">
+   877→                        <span className="text-[11px] text-muted-foreground">{new Date(item.createdAt).toLocaleDateString("fa-IR")}</span>
+   878→                        {item.mediaUrl && (
+   879→                          <div className="my-2">
+   880→                            {/* فیکس v45: preload="none" حذف شد — خودِ ویدیو با دکمهٔ پلی روی آن نمایش داده می‌شود
+   881→                                (فقط نمایش؛ منطق تحلیل ویدیو دست نخورده است) */}
+   882→                            <InlineVideoPreview
+   883→                              src={item.mediaUrl}
+   884→                              videoClassName="w-full h-32 object-cover rounded-lg"
+   885→                            />
+   886→                          </div>
+   887→                        )}
+   888→                        {item.result?.analysis && (
+   889→                          <p className="text-xs text-slate-600 leading-relaxed whitespace-pre-wrap mt-1">{item.result.analysis}</p>
+   890→                        )}
+   891→                      </div>
+   892→                    ))}
+   893→                  </div>
+   894→                </Card>
+   895→              )}
+   896→
+   897→              <p className="text-center text-[10px] text-muted-foreground pb-2">
+   898→                پرونده ورزشی {user?.name || "شما"} — هر تغییری بدهی، مربی هوشمند بلافاصله آن را می‌بیند.
+   899→              </p>
+   900→            </>
+   901→          )}
+   902→        </div>
+   903→      </motion.div>
+   904→    </motion.div>
+   905→  );
+   906→}
+   907→
+   908→function SummaryChip({ label, value, unit }: { label: string; value: string; unit?: string }) {
+   909→  return (
+   910→    <div className="rounded-xl bg-slate-50 border border-slate-100 p-2">
+   911→      <p className="text-[9px] text-slate-400 mb-0.5">{label}</p>
+   912→      <p className="text-xs font-black text-slate-800 truncate" title={value}>
+   913→        {value}{unit ? ` ${unit}` : ""}
+   914→      </p>
+   915→    </div>
+   916→  );
+   917→}
+   918→
+   919→function Section({
+   920→  title,
+   921→  icon,
+   922→  children,
+   923→  editing,
+   924→  onEdit,
+   925→  onCancel,
+   926→  onSave,
+   927→  saving,
+   928→}: {
+   929→  title: string;
+   930→  icon?: React.ReactNode;
+   931→  children: React.ReactNode;
+   932→  editing?: boolean;
+   933→  onEdit?: () => void;
+   934→  onCancel?: () => void;
+   935→  onSave?: () => void;
+   936→  saving?: boolean;
+   937→}) {
+   938→  return (
+   939→    <div className="border-t border-border/50 pt-3 first:border-t-0 first:pt-0">
+   940→      <div className="flex items-center justify-between mb-2">
+   941→        <div className="flex items-center gap-1.5">
+   942→          {icon}
+   943→          <h4 className="text-xs font-bold text-muted-foreground">{title}</h4>
+   944→        </div>
+   945→        {editing ? (
+   946→          <div className="flex gap-1.5">
+   947→            <Button size="sm" variant="outline" className="h-7 px-2 rounded-lg text-[11px]" onClick={onCancel} disabled={saving}>
+   948→              انصراف
+   949→            </Button>
+   950→            <Button size="sm" className="h-7 px-2 rounded-lg text-[11px] gap-1" onClick={onSave} disabled={saving}>
+   951→              {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+   952→              ذخیره
+   953→            </Button>
+   954→          </div>
+   955→        ) : onEdit ? (
+   956→          <Button size="sm" variant="ghost" className="h-7 px-2 rounded-lg text-[11px] gap-1 text-muted-foreground" onClick={onEdit}>
+   957→            <Pencil className="w-3 h-3" />
+   958→            ویرایش
+   959→          </Button>
+   960→        ) : null}
+   961→      </div>
+   962→      {children}
+   963→    </div>
+   964→  );
+   965→}
+   966→
+   967→function InfoRow({ label, value }: { label: string; value: string }) {
+   968→  return (
+   969→    <div className="flex items-center justify-between p-2.5 rounded-xl bg-muted/40 gap-2">
+   970→      <span className="text-xs text-muted-foreground shrink-0">{label}</span>
+   971→      <span className="text-sm font-medium text-left" dir="auto">{value}</span>
+   972→    </div>
+   973→  );
+   974→}
+   975→
+   976→function EditField({ label, value, onChange, type = "text" }: { label: string; value: string; onChange: (v: string) => void; type?: string }) {
+   977→  return (
+   978→    <div className="flex flex-col gap-0.5">
+   979→      <span className="text-[10px] text-muted-foreground">{label}</span>
+   980→      <Input
+   981→        type={type}
+   982→        value={value}
+   983→        onChange={(e) => onChange(e.target.value)}
+   984→        className="h-9 rounded-lg text-sm"
+   985→        dir="ltr"
+   986→      />
+   987→    </div>
+   988→  );
+   989→}
+   990→
+   991→function EditTextArea({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
+   992→  return (
+   993→    <div className="flex flex-col gap-0.5">
+   994→      <span className="text-[10px] text-muted-foreground">{label}</span>
+   995→      <Textarea
+   996→        value={value}
+   997→        onChange={(e) => onChange(e.target.value)}
+   998→        placeholder={placeholder}
+   999→        className="rounded-lg text-sm min-h-[60px] resize-y"
+  1000→        dir="rtl"
+  1001→      />
+  1002→    </div>
+  1003→  );
+  1004→}
+  1005→
+  1006→/**
+  1007→ * فیکس کرش «A <Select.Item /> must have a value prop that is not an empty string»
+  1008→ * (گزارش لاگ خطاهای مالک — تب پلن‌ها): آپشن «—» (value: "") در Radix Select
+  1009→ * مجاز نیست چون رشتهٔ خالی یعنی «پاک‌کردن انتخاب». سنتینل داخلی EMPTY_VALUE
+  1010→ * جای آن را می‌گیرد و در رفت‌وبرگشت (value ورودی و onChange خروجی) به "" ترجمه
+  1011→ * می‌شود — بدون تغییر هیچ call-site (سه انتخاب: زمان ترجیحی، سبک آشپزی، فرم بدن).
+  1012→ */
+  1013→const EMPTY_SELECT_VALUE = "__fitup_empty__";
+  1014→
+  1015→function EditSelect({
+  1016→  label,
+  1017→  value,
+  1018→  onChange,
+  1019→  options,
+  1020→}: {
+  1021→  label: string;
+  1022→  value: string;
+  1023→  onChange: (v: string) => void;
+  1024→  options: { value: string; label: string }[];
+  1025→}) {
+  1026→  const toSentinel = (v: string) => (v === "" ? EMPTY_SELECT_VALUE : v);
+  1027→  const fromSentinel = (v: string) => (v === EMPTY_SELECT_VALUE ? "" : v);
+  1028→  return (
+  1029→    <div className="flex flex-col gap-0.5">
+  1030→      <span className="text-[10px] text-muted-foreground">{label}</span>
+  1031→      <Select
+  1032→        value={toSentinel(value)}
+  1033→        onValueChange={(v) => onChange(fromSentinel(v))}
+  1034→      >
+  1035→        <SelectTrigger className="h-9 rounded-lg text-sm">
+  1036→          <SelectValue placeholder="—" />
+  1037→        </SelectTrigger>
+  1038→        <SelectContent dir="rtl">
+  1039→          {options.map((opt, idx) => (
+  1040→            <SelectItem
+  1041→              key={opt.value === "" ? EMPTY_SELECT_VALUE : `${opt.value}-${idx}`}
+  1042→              value={toSentinel(opt.value)}
+  1043→            >
+  1044→              {opt.label}
+  1045→            </SelectItem>
+  1046→          ))}
+  1047→        </SelectContent>
+  1048→      </Select>
+  1049→    </div>
+  1050→  );
+  1051→}
+  1052→
