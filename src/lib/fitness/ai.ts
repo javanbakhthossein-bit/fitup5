@@ -1,0 +1,7437 @@
+import OpenAI from "openai";
+import { db } from "@/lib/db";
+import type {
+  OnboardingData,
+  WorkoutPlanContent,
+  MealPlanContent,
+  Plan,
+} from "./types";
+import {
+  GOAL_LABELS, ACTIVITY_LABELS, GENDER_LABELS, WORKOUT_PLACE_LABELS, DIET_LABELS,
+  PERSIAN_WEEKDAYS, PLAN_LABELS, getCapabilities, TRAINING_EXPERIENCE_LABELS, sortWeekdaysByPersianOrder,
+  BODY_FRAME_LABELS, WORKOUT_TIME_LABELS, PREFERRED_CUISINE_LABELS, MEDICAL_CONDITION_LABELS,
+  DISCIPLINE_LABELS, equipmentFa, toPersianDigits,
+  BODY_SHAPE_LABELS_FA, SMOKING_HABIT_LABELS_FA, INJURY_AREA_LABELS_FA,
+} from "./types";
+import { BODY_SHAPE_INFO } from "./body-shape";
+import { bloodTestPromptSummary } from "./blood-tests";
+import { fixPersianTypographySafe } from "./persian-typography";
+import { DISCIPLINE_PROGRAM_DIRECTIVES, DISCIPLINE_NUTRITION_DIRECTIVES } from "./disciplines-data";
+// ─── v213 — مغز معمار برنامه (Coach Blueprint) — دیرکتیو مالک: «برنامهٔ اختصاصی
+// طبق اصول بزرگ‌ترین مربیان دنیا». معماری هفتگی (اسپلیت/توزیع عضلات/بودجهٔ ست)
+// قبل از LLM به‌صورت قطعی از پروفایل کاربر تصمیم‌گیری می‌شود؛ مدل داخل این
+// چارچوب حرکات/ست/تمپو را می‌نویسد. ───
+import {
+  buildCoachBlueprint,
+  buildBlueprintDirectiveFa,
+  enforceBlueprintDayIdentity,
+  enforceBlueprintDayTitles,
+  matchBlueprintDayIndex,
+  blueprintDayAllowedGroups,
+  blueprintDayPrimaryGroups,
+  blueprintSnapshotForPlan,
+  type CoachBlueprint,
+} from "./coach-blueprint";
+// v230 — ترمیم قطعی سوپرست‌های ادغام‌شده (تیکت مالک: دو حرکت در یک آبجکت)
+import {
+  splitMergedSupersetEntries,
+  normalizeSupersetRestContract,
+  healPostTrimGroupContracts,
+} from "./plan-superset-repair";
+// v117→v154 — قفل بانک حرکات: «کل» دیتابیس حرکات فعال به پرامپت تزریق می‌شود
+// (تیکت مالک v154: «تمام حرکات دیتابیس من بهش تزریق بشه»)، AI به حرکات خارج از
+// بانک هم آزاد است، و خروجی ردیف‌به‌ردیف با بانک تطبیق/قفل می‌شود — حرکتِ خارج
+// از بانک با نام خودش می‌ماند و نزدیک‌ترین ویدیو/توضیح بانک خودکار الصاق می‌شود
+// (هرگز حرکت بی‌ویدیو).
+import {
+  buildFullBankPromptGroups,
+  buildLockedBank,
+  dedupeExerciseFamiliesInPlan,
+  coveredMajorGroups,
+  coveredMajorGroupsDetailed,
+  MAJOR_GROUP_KEYS,
+  MAJOR_GROUP_LABELS_FA,
+  exerciseFamilyKey,
+  hashStringToSeed,
+  majorGroupsOfExercise,
+  type MajorGroupKey,
+  lockWorkoutPlanToBank,
+  type BankExerciseRow,
+  type LockedBank,
+} from "./exercise-bank-lock";
+import { GLOBAL_YOUTUBE_SETTING_KEY, globalYoutubeEnabledFromValue } from "./exercise-video";
+import {
+  repairPlanDaySplitToRequest,
+  describeSplitMismatch,
+  type RequestedSplitSpec,
+} from "./plan-redesign-request";
+// v149 — ممنوعیت‌های صریح کاربر/مدیر (تیکت مالک: حرکات/مواد حذفی دوباره در برنامه برنگردند)
+// v152 — مکمل‌ها هم (تأیید مالک: «برنامه تغذیه و مکمل هم شامل تغییرات در چت با فیتاپ میشه»)
+import {
+  buildMovementExclusionDirectiveFa,
+  buildFoodExclusionDirectiveFa,
+  buildSupplementExclusionDirectiveFa,
+  enforceWorkoutExclusions,
+  enforceMealExclusions,
+  expandMovementPatterns,
+  matchesForbiddenName,
+  normalizeFaText,
+  sanitizeConstraints,
+  type RedesignConstraints,
+} from "./plan-redesign-constraints";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { writeFile, readFile, unlink, mkdir } from "fs/promises";
+import { existsSync } from "fs";
+// v159 (T5) — خواندن عکس‌های چکاپ از دیسک برای پیوست به VLM
+import { absolutePathForUploadUrl } from "./private-media";
+import path from "path";
+import { tmpdir } from "os";
+import { logAiUsage } from "@/lib/fitness/costs";
+
+const execFileAsync = promisify(execFile);
+
+// AvalAI OpenAI-compatible client — lazy initialization
+// در زمان build ساخته نمی‌شود تا خطای Missing credentials ندهد
+let _avalaiClient: OpenAI | null = null;
+
+export function getAvalaiClient(): OpenAI {
+  if (!_avalaiClient) {
+    _avalaiClient = new OpenAI({
+      apiKey: process.env.AVALAI_API_KEY || "placeholder-for-build",
+      baseURL: process.env.AVALAI_BASE_URL || "https://api.avalai.ir/v1",
+      // ⚠️ بدون این دو گزینه، تایم‌اوت پیش‌فرض SDK ۱۰ دقیقه است و کال‌های کند
+      // (که کلادفلرِ جلوی api.avalai.ir با 504 می‌کُشد) کل مسیر تولید برنامه را قفل می‌کنند.
+      timeout: 165_000, // ۱۶۵ ثانیه — تست واقعی AvalAI: تولید برنامه کامل با reasoning low ≈ ۹۷-۱۱۰s؛ سقف گیت‌وی بالاتر از ۱۱۰s است
+      maxRetries: 1, // یک retry خودکار برای خطاهای گذرا (429/5xx) — نه بیشتر، تا سریع fail شود
+    });
+  }
+  return _avalaiClient;
+}
+
+export const TEXT_MODEL = process.env.AVALAI_TEXT_MODEL || "deepseek-v4.1-flash";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v93 — دیرکتیو صریح مالک: «تمام این سیستم به جز تولید عکس و تبدیل صوت به متن
+// باید از دیپ‌سیک نسخهٔ 4.1 فلش استفاده کنند.» — مدل بینایی هم deepseek-v4.1-flash
+// است (بینایی بومی طبق مستندات رسمی AvalAI: پشتیبانی تصویر از طریق
+// v1/chat/completions و v1/messages — ۱M توکن ورودی / 393K خروجی).
+//
+// ⚠️ درس تاریخی (پروب v73 + پرب زندهٔ v94) که معماری فعلی بر اساس آن ساخته شد:
+//   مدل‌های deepseek روی گیت‌وی AvalAI بلاک‌های image_url را در chat/completions
+//   بی‌صدا حذف می‌کنند (200 کور) — پرب v94 با کلید تولیدی اثبات کرد این برای
+//   deepseek-v4.1-flash هم برقرار است (حتی ۱ فریم ۴۲KB هم نمی‌رسد). همان لحظه
+//   آداپتور /v1/messages (anthropicVisionCompletion پایین) واقعاً تصویر را رساند و
+//   محتوای فریم‌ها را عیناً توصیف کرد. اتکای تک‌مسیره به هر مسیری = رگرسیونِ بی‌سروصدا.
+// پس v93 «دو‌مسیرهٔ ضدکور» برای ویژن deepseek ساخت (deepseekVisionDualPath) و
+// v94 با شاهد زنده ترتیب را وارون کرد:
+//   مسیر ۱ — آداپتور /v1/messages (تنها مسیر اثبات‌شدهٔ واقعاً‌بینا در v73 و v94)
+//   مسیر ۲ — chat/completions بومی (پوشش اگر روزی آداپتور کور شد)
+//   تشخیص «پاسخ کور» (مدل بگوید رسانه را نمی‌بیند/نرسیده/پیوست نشده) = شکست → مسیر بعدی.
+// گارد نهایی rejectBlindMediaResponse هم در analyzeChatMedia باقی است: هیچ پاسخ
+// کوری هرگز کش/کسر سهمیه نمی‌شود. فال‌بک نهایی (فقط فاجعهٔ کامل AvalAI):
+// FALLBACK_VISION_MODEL — مسیر عادی هرگز gemini نمی‌رود.
+// ═══════════════════════════════════════════════════════════════════════════
+const ENV_VISION_MODEL = (process.env.AVALAI_VISION_MODEL || "").trim();
+export const VISION_MODEL = ENV_VISION_MODEL || "deepseek-v4.1-flash";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v73 — مهاجرت کامل به DeepSeek V4.1 Flash (دیریکتیو مالک):
+// «مدل جدید دیپ‌سیک آمده که هم قوی‌تره و هم از عکس پشتیبانی می‌کنه. می‌خوام
+//  کل سیستم دیگه با این هوش مصنوعی بره جلو. تولید برنامه باید با میزان تفکر
+//  مکس و بقیه موارد همگی با low باشه.»
+//
+// v92→v93 — دیرکتیو نهایی مالک: deepseek-v4.1-flash مدلِ «همه‌چیز» است (متن + بینایی؛
+//       به‌جز تولید عکس و تبدیل صوت به متن). بلاک بالاتر — معماری دومیسرهٔ ضدکور.
+// مدل deepseek-v4.1-flash از طریق AvalAI (api.avalai.ir/v1/chat/completions):
+//   • بینایی بومی (image_url در chat/completions + image در /v1/messages)
+//   • حالت‌های تفکری/غیرتفکری — reasoning_effort
+//   • فراخوانی ابزار، خروجی JSON، کش پرامپت
+//   • ورودی حداکثر ۱M توکن / خروجی تا 393K — قیمت: $0.15 ورودی / $0.60 خروجی
+//     (هر ۱M توکن؛ کش پرامپت $0.003) — تعرفهٔ ثابت AvalAI
+//
+// ⚠️ نکتهٔ حیاتی: DeepSeek مدل‌های قدیمی V4-Flash و V4-Flash-Vision-Exp را
+// بازنشسته کرده است — بنابراین فال‌بک‌های قدیمی (deepseek-v4-flash برای متن و
+// gemini-3.5-flash برای ویژن) به مدلِ اثبات‌شدهٔ gemini-3.8-flash منتقل شدند
+// تا قاعدهٔ «هرگز بی‌پاسخ نماند» با مدل مرده شکسته نشود. فال‌بک فقط در
+// فاجعهٔ کاملِ deepseek پس از تمام تلاش‌ها اجرا می‌شود؛ مسیر عادی همیشه
+// deepseek-v4.1-flash است.
+// تشخیص ویژن خودکار است (پیام شامل image_url باشد) — لازم نیست هر call-site
+// دستی مشخص کند. هر شکستِ نهایی (پاسخ خالی/نامعتبر، 4xx، 5xx، تایم‌اوت) بعد از
+// اتمام تلاش‌های همان مدل، به مدل فال‌بک می‌رود — در createResilientCompletion
+// و createChatCompletionWithRetry (دو نقطهٔ تماس تنها با avalaiClient در سیستم،
+// علاوه بر مسیر تولید برنامه که فال‌بک اختصاصی خودش را دارد).
+// ═══════════════════════════════════════════════════════════════════════════
+export const FALLBACK_VISION_MODEL =
+  process.env.AVALAI_FALLBACK_VISION_MODEL || "gemini-3.8-flash";
+export const FALLBACK_TEXT_MODEL =
+  process.env.AVALAI_FALLBACK_TEXT_MODEL || "gemini-3.8-flash";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v73 — مدل اختصاصی چت نیکا و تحلیل آنبوردینگ (مهاجرت به V4.1 Flash)
+//   • چت نیکا: reasoning_effort=low (پاسخ سریع فروش/راهنما — تجربهٔ چت)
+//   • تحلیل آنبوردینگ: سطح پیش‌فرض (low) — تحلیل ۳ پاراگرافی سریع
+// فال‌بک هر دو: اگر deepseek به هر دلیلی نشد → TEXT_MODEL (فال‌بک سراسری).
+// ═══════════════════════════════════════════════════════════════════════════
+export const NIKA_MODEL = process.env.AVALAI_NIKA_MODEL || "deepseek-v4.1-flash";
+export const ONBOARDING_ANALYSIS_MODEL =
+  process.env.AVALAI_ONBOARDING_MODEL || "deepseek-v4.1-flash";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v73 — مدل وظایف متنی عمومی (ادامهٔ مسیر v58→v69→v72 — حالا روی V4.1 Flash)
+// همهٔ وظایف متنی (چت مربی، تحلیل چکاپ/جامع/تاریخچه، جایگزین غذا، دستیار مدیر،
+// سئو/مقاله، تحلیل نظرسنجی) روی همین مدل با تفکر low اجرا می‌شوند.
+// دست‌نخورده (ضروری برای کارکرد درست — مدل‌های تخصصی جدا):
+//   • تولید برنامهٔ تمرینی/غذایی — PLAN_MODEL (deepseek-v4.1-flash با تفکر مکس)
+//   • تولید تصویر — مدل تصویری (gemini-3.1-flash-lite-image)
+//   • STT ویس کاربر — whisper → فال‌بک gemini (v71)
+// ═══════════════════════════════════════════════════════════════════════════
+export const TEXT_TASK_MODEL = process.env.AVALAI_TEXT_TASK_MODEL || "deepseek-v4.1-flash";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v73 — مدل تولید برنامه (دیریکتیو مالک):
+// «تولید برنامه باید با میزان تفکر مکس و بقیه موارد همگی با low باشه.»
+// از TEXT_MODEL جدا شده تا تغییر تصادفی AVALAI_TEXT_MODEL در envِ سرور،
+// مسیر گران‌ترین و حساس‌ترین کال سیستم را خراب نکند.
+// ═══════════════════════════════════════════════════════════════════════════
+export const PLAN_MODEL = process.env.AVALAI_PLAN_MODEL || "deepseek-v4.1-flash";
+export const FALLBACK_PLAN_MODEL =
+  process.env.AVALAI_FALLBACK_PLAN_MODEL || "gemini-3.8-flash";
+
+/** تشخیص درخواست ویژن — آیا بعضی پیام‌ها شامل تصویر (image_url) هستند؟ */
+function isVisionRequest(params: Record<string, unknown>): boolean {
+  const messages = params.messages;
+  if (!Array.isArray(messages)) return false;
+  return messages.some((m) => {
+    if (!m || typeof m !== "object") return false;
+    const content = (m as { content?: unknown }).content;
+    if (!Array.isArray(content)) return false;
+    return content.some(
+      (p) =>
+        p &&
+        typeof p === "object" &&
+        (p as { type?: unknown }).type === "image_url"
+    );
+  });
+}
+
+/**
+ * مدل فال‌بک مناسب این درخواست — null یعنی فال‌بک معنا ندارد
+ * (خودِ درخواست از قبل روی مدل فال‌بک است یا مدل فال‌بک تنظیم نشده).
+ */
+function fallbackModelFor(params: Record<string, unknown>): string | null {
+  const model = typeof params.model === "string" ? params.model : TEXT_MODEL;
+  // v58 — اولویت با فال‌بکِ صریحِ همان فراخوانی (fallback_model — مثل چت نیکا
+  // و تحلیل آنبوردینگ که مدل اصلی deepseek است و فال‌بک‌شان gemini)؛ بعد تشخیص
+  // خودکار ویژن/متن. این پارامتر داخلی است و هرگز به API ارسال نمی‌شود.
+  const explicit =
+    typeof params.fallback_model === "string" ? params.fallback_model.trim() : "";
+  const fb = explicit || (isVisionRequest(params) ? FALLBACK_VISION_MODEL : FALLBACK_TEXT_MODEL);
+  return fb && fb !== model ? fb : null;
+}
+
+/**
+ * ساخت پارامترهای نسخهٔ فال‌بک — فقط مدل عوض می‌شود؛ برای مقصد gemini-3.x،
+ * reasoning_effort (اگر هست) هم‌زمان به extra_body.thinkingConfig هم برده
+ * می‌شود (هم‌سان با buildPlanParams) تا سطح استدلال در پروکسی gemini گم نشود.
+ */
+function withFallbackModel(
+  params: Record<string, unknown>,
+  fallbackModel: string
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...params, model: fallbackModel };
+  const effort = next.reasoning_effort;
+  if (effort && isGemini3Model(fallbackModel)) {
+    const prevExtra = (next.extra_body ?? {}) as Record<string, unknown>;
+    const prevConfig = (prevExtra.generationConfig ?? {}) as Record<string, unknown>;
+    next.extra_body = {
+      ...prevExtra,
+      generationConfig: {
+        ...prevConfig,
+        thinkingConfig: { ...(prevConfig.thinkingConfig as object | undefined), thinkingLevel: effort },
+      },
+    };
+  }
+  return next;
+}
+
+/**
+ * تبدیل عدد میلادی به سال هجری شمسی (تقریبی، برای نمایش سال کافی است).
+ * الگوریتم: سال میلادی - 621 (با تنظیم برای قبل/بعد از نوروز).
+ * مثال: 2026 - 621 = 1405
+ */
+function gregorianToJalaliYear(gYear: number): number {
+  const now = new Date();
+  // نوروز معمولاً 20 یا 21 مارس است. اگر قبل از 21 مارس هستیم، سال شمسی یکی کمتر است.
+  const mar21 = new Date(gYear, 2, 21); // ماه 2 = مارس (0-indexed)
+  return now >= mar21 ? gYear - 621 : gYear - 622;
+}
+
+/**
+ * دایرکتیو سیستم — شامل برند و سال جاری.
+ *
+ * این دایرکتیو به‌صورت پویا ساخته می‌شود تا سال جاری همیشه درست باشد
+ * (میلادی و هجری شمسی). مدل هرگز نباید سال قدیمی (مثلاً ۱۴۰۳، ۱۴۰۴، 2024، 2025)
+ * را در محتوای مقالات، پاسخ‌ها یا هر جای سیستم استفاده کند.
+ *
+ * قوانین:
+ *  - برند: «فیتاپ» (فارسی) یا «FitUp» (انگلیسی) — ممنوع: fitup، fittap، ...
+ *  - سال جاری: همیشه به‌صورت پویا محاسبه می‌شود (میلادی + شمسی).
+ */
+export function getSystemDirectives(): string {
+  const now = new Date();
+  const gYear = now.getFullYear();
+  const jYear = gregorianToJalaliYear(gYear);
+  // تبدیل به اعداد فارسی
+  const faGYear = String(gYear).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+  const faJYear = String(jYear).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+
+  return `قوانین مهم سیستم:
+
+۱) برند: نام این پلتفرم در متن فارسی همیشه و فقط «فیتاپ» نوشته می‌شود و در متن انگلیسی همیشه «FitUp» (با F و U بزرگ). هرگز نام برند را به‌صورت fitup، Fitup، fittup، Fittup، fittap یا Fittap ننویس.
+
+۲) سال جاری: ${faJYear} هجری شمسی و ${faGYear} میلادی است. سال را فقط جایی به کار ببر که واقعاً لازم است:
+- ❌ هرگز سال را به تایتل (عنوان) مقالات، عناوین سئو (seoTitle) یا هدینگ‌ها اضافه نکن، مگر اینکه کلمه کلیدی اصلی خودش شامل سال باشد (مثلاً «بهترین اپلیکیشن بدنسازی ۲۰۲۶»).
+- ❌ سال را به عنوان یک پسوند خودکار به هر موضوعی اضافه نکن (مثلاً «راهنمای کامل پرس سینه در سال ۱۴۰۵» اشتباه است).
+- ✅ فقط وقتی در متن بدنه به یک رویداد، آمار یا تاریخ مشخص اشاره می‌کنی و سال برای درک آن ضروری است، از سال جاری استفاده کن.
+- ✅ اگر کاربر مستقیماً درباره سال می‌پرسد یا مقاله درباره یک موضوع time-sensitive (مثل «بهترین اپلیکیشن‌های ${faGYear}») است، سال جاری را ذکر کن.
+- ⚠️ هرگز از سال‌های قدیمی (۱۴۰۳، ۱۴۰۴، 1403، 1404، 2024، 2025) استفاده نکن.
+
+۳) محرمانگی هویت فنی (بسیار مهم): تو «فیتاپ هوشمند» هستی — هوش مصنوعی اختصاصی خود فیتاپ. اگر کاربر دربارهٔ مدل، سرویس، شرکت یا فناوری زیربنایی‌ات پرسید، فقط بگو که «فیتاپ هوشمندِ فیتاپ» هستی و برای او کافی است. هرگز و تحت هیچ شرایطی نام هیچ مدل یا سرویس یا شرکت هوش مصنوعی خارجی (مثل DeepSeek، Gemini، GPT، OpenAI، Claude، AvalAI، Whisper و امثال آن) را ذکر نکن، تأیید یا رد نکن و دربارهٔ معماری فنی، هزینهٔ توکن، کلید یا جزئیات داخلی سیستم حرفی نزن. این اطلاعات محرمانهٔ فیتاپ است.
+
+۴) زبان فارسی سلیس و روان (بسیار مهم): همهٔ پاسخ‌ها، برنامه‌ها و تحلیل‌ها فقط به فارسیِ روان، صمیمی و قابل‌فهم برای کاربر ایرانی نوشته می‌شوند. از واژه‌های بیگانه و اصطلاحات تخصصیِ ناآشنا که کاربر عادی ایرانی به‌ندرت شنیده استفاده نکن و معادل فارسی رایج را به‌کار ببر. معادل‌های الزامی:
+- ❌ «پوسچر» → ✅ «فرم بدن» یا «وضعیت بدن» (هرگز پوسچر ننویس)
+- ❌ «فانکشنال» → ✅ «کاربردی»
+- ❌ «موبیلیتی» → ✅ «انعطاف و دامنه حرکتی»
+- ❌ «استابیلیتی» / «استابلایزر» → ✅ «تعادل و ثبات»
+- ❌ «پروتکل» → ✅ «برنامهٔ عملی» یا «روش»
+- ❌ «اینتنسیتی» → ✅ «شدت تمرین»
+- واژه‌های فارسی‌شدهٔ رایج و آشنا مثل «اسکوات، ددلیفت، پرس، دمبل، هالتر، کاردیو، پروتئین، کراتین» اشکالی ندارند و می‌توانند استفاده شوند.
+هرگز جملات را لحن ترجمه‌ای و خشک ننویس؛ طبیعی و شیوا بنویس.
+
+`;
+}
+
+/**
+ * @deprecated از `withSystemDirectives` استفاده کنید.
+ * برای backward compatibility نگه داشته شده است.
+ */
+export const BRAND_DIRECTIVE = getSystemDirectives();
+
+/**
+ * تزریق دایرکتیو سیستم (برند + سال جاری) به ابتدای یک system prompt.
+ * اگر prompt قبلاً تزریق شده باشد، دوباره تزریق نمی‌کند.
+ *
+ * @deprecated از `withSystemDirectives` استفاده کنید.
+ * برای backward compatibility نگه داشته شده است.
+ */
+export function withBrandDirective(systemPrompt: string): string {
+  return withSystemDirectives(systemPrompt);
+}
+
+/**
+ * تزریق دایرکتیو سیستم (برند + سال جاری) به ابتدای یک system prompt.
+ * اگر prompt قبلاً تزریق شده باشد، دوباره تزریق نمی‌کند.
+ *
+ * این تابع تمام دایرکتیوهای سیستمی را شامل می‌شود:
+ *  - قانون برند (فیتاپ / FitUp)
+ *  - قانون سال جاری (میلادی و شمسی)
+ */
+export function withSystemDirectives(systemPrompt: string): string {
+  const directives = getSystemDirectives();
+  if (!systemPrompt) return directives;
+  // چک کردن idempotency: اگر prompt با "قوانین مهم سیستم:" شروع می‌شود، یعنی قبلاً تزریق شده.
+  if (systemPrompt.startsWith("قوانین مهم سیستم:")) return systemPrompt;
+  // backward compatibility: اگر با دایرکتیو قدیمی برند شروع شده، کل دایرکتیو جدید را جایگزین می‌کنیم
+  if (systemPrompt.startsWith("قانون مهم برند:")) {
+    // حذف دایرکتیو قدیمی و تزریق جدید
+    const withoutOldDirective = systemPrompt.replace(/^قانون مهم برند:[^\n]*\n\n/, "");
+    return directives + withoutOldDirective;
+  }
+  return directives + systemPrompt;
+}
+
+/**
+ * آیا مدل از خانواده gemini-3.x است؟
+ * این مدل‌ها نیاز به پارامترهای مخصوص دارند (thinkingConfig، maxOutputTokens).
+ * شامل gemini-3.0، gemini-3.5، gemini-3.6، gemini-3.7 و غیره.
+ */
+export function isGemini3Model(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.startsWith("gemini-3") || m.includes("gemini-3.5") || m.includes("gemini-3.0") || m.includes("gemini-3.6") || m.includes("gemini-3.7");
+}
+
+/**
+ * آیا مدل از خانواده deepseek-v4 است؟
+ * این مدل‌ها از پارامتر reasoning_effort (low | high | max) پشتیبانی می‌کنند.
+ * deepseek-v4.1-flash (V4.1 Flash — بینایی بومی + حالت تفکری) نمونهٔ فعلی این
+ * خانواده است؛ الگوی نام «deepseek-v4*» هر دو نسل را پوشش می‌دهد.
+ * v93 — این خانواده هم «متن» است هم «بینایی» (دیرکتیو مالک: کل سیستم روی
+ * V4.1 Flash)؛ درخواست‌های تصویری‌اش از deepseekVisionDualPath می‌گذرد.
+ */
+export function isDeepseekV4Model(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.startsWith("deepseek-v4") || m.includes("deepseek-v4");
+}
+
+/**
+ * آداپتور ویژن deepseek-v4.x — تبدیل فرمت OpenAI به Anthropic (/v1/messages).
+ *
+ * چرا لازم شد؟ تست زندهٔ v73 (اسکریپت probe-ai-vision-v73.ts):
+ *   • chat/completions + image_url (data URL و http URL هر دو): مدل تصویر را
+ *     نمی‌بیند — AvalAI بلاک تصویر را به مدل deepseek نمی‌رساند (200 ولی کور).
+ *   • chat/completions + type:image: 400 دائمی (فرمت غیر OpenAI).
+ *   • /v1/messages + {type:"image", source:{type:"base64"}}: ✅ واقعاً کار می‌کند —
+ *     مدل تصویر را توصیف کرد، کش پرامپت هم فعال است (cache_read_input_tokens).
+ *   • گیت‌وی روی این مسیر گاهی 400 گذرا می‌دهد → دو تلاش داخلی + فال‌بک بیرونی.
+ *
+ * نکات:
+ *   • تفکر (thinking) در این مسیر همیشه روشن است و بودجهٔ خروجی را می‌خورد —
+ *     max_tokens باید بزرگ باشد (پیش‌فرض آداپتور 4096؛ call-siteهای سیستم
+ *     بودجهٔ 4096 می‌فرستند). اگر پاسخ فقط thinking باشد و متن نیاید، استثنا
+ *     می‌دهیم تا لایهٔ retry/fallback وارد عمل شود (قاعدهٔ «هرگز بی‌پاسخ نماند»).
+ *   • reasoning_effort/thinking-related پارامترها به /v1/messages فرستاده
+ *     نمی‌شوند (400 می‌دهد) — سطح تفکر ویژن ثابتِ خودِ مدل است.
+ *   • usage به شکل OpenAI برمی‌گردد تا حسابداری (logAiUsage) سالم بماند:
+ *     prompt = input + cache_creation + cache_read، completion = output.
+ */
+async function anthropicVisionCompletion(
+  params: Record<string, unknown>,
+  options?: { timeout?: number }
+): Promise<unknown> {
+  const apiKey = process.env.AVALAI_API_KEY || "";
+  const baseUrl = (process.env.AVALAI_BASE_URL || "https://api.avalai.ir/v1").replace(/\/$/, "");
+  const model = String(params.model || TEXT_MODEL);
+
+  // ── تبدیل پیام‌ها ──
+  const systemParts: string[] = [];
+  const anthropicMessages: Array<Record<string, unknown>> = [];
+  const messages = Array.isArray(params.messages) ? params.messages : [];
+
+  const convertPart = (part: any): Record<string, unknown> | null => {
+    if (!part || typeof part !== "object") return null;
+    if (part.type === "text" && typeof part.text === "string") {
+      return { type: "text", text: part.text };
+    }
+    if (part.type === "image_url") {
+      const url: string =
+        typeof part.image_url === "string"
+          ? part.image_url
+          : String(part.image_url?.url || "");
+      if (!url) return null;
+      const m = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/.exec(url);
+      if (m && m[2]) {
+        // data URL → base64 source (مسیر اصلی سیستم — فریم‌های ویدیو هم data URL هستند)
+        return {
+          type: "image",
+          source: { type: "base64", media_type: m[1] || "image/jpeg", data: m[3] },
+        };
+      }
+      if (m && !m[2]) {
+        // data URL بدون base64 (نادر) — به‌عنوان متن می‌گذریم؛ مدل آن را نمی‌بیند
+        return { type: "text", text: "[تصویر با فرمت پشتیبانی‌نشده حذف شد]" };
+      }
+      if (/^https?:\/\//i.test(url)) {
+        return { type: "image", source: { type: "url", url } };
+      }
+      // v75 — رسانهٔ ناشناخته دیگر «بی‌صدا حذف نمی‌شود»: حذف بی‌صدا یعنی مدل متن
+      // را بدون تصویر می‌گیرد و به کاربر می‌گوید «ویدیو/عکس همراهش نبود» (باگ
+      // گزارش‌شده). حالا صریحاً خطا می‌دهیم تا لایهٔ retry/fallback و نکتهٔ
+      // شفاف به کاربر وارد عمل شود.
+      throw new Error(
+        `تصویر با فرمت پشتیبانی‌نشده در درخواست بینایی حذف شد (شروع آدرس: ${url.slice(0, 40)})`
+      );
+    }
+    return null;
+  };
+
+  for (const msg of messages) {
+    const role = (msg as any)?.role === "assistant" ? "assistant" : "user";
+    const content = (msg as any)?.content;
+    if (typeof content === "string") {
+      if (msg && (msg as any).role === "system") {
+        systemParts.push(content);
+        continue;
+      }
+      if (content.trim()) anthropicMessages.push({ role, content: [{ type: "text", text: content }] });
+      continue;
+    }
+    if (Array.isArray(content)) {
+      const blocks = content.map(convertPart).filter(Boolean);
+      if (msg && (msg as any).role === "system") {
+        for (const b of blocks) if ((b as any).type === "text") systemParts.push((b as any).text);
+        continue;
+      }
+      if (blocks.length) anthropicMessages.push({ role, content: blocks });
+    }
+  }
+
+  // بودجهٔ خروجی — تفکر هم از همین بودجه می‌خورد؛ حداقل ۴۰۹۶ برای اطمینان
+  // (درس تست زندهٔ v73: با بودجهٔ کوچک، خروجی ۱۰۰٪ thinking می‌شود و متن خالی
+  // برمی‌گردد. سقف «سقف» است نه صورت‌حساب — مدل که تمام کند قطع می‌شود.)
+  const maxTokens = Math.max(4096, Number(params.max_tokens) || 4096);
+
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: maxTokens,
+    messages: anthropicMessages,
+  };
+  if (systemParts.length) body.system = systemParts.join("\n\n");
+  if (params.temperature != null) body.temperature = params.temperature;
+
+  const timeoutMs = Number(options?.timeout) || 120_000;
+  const maxInnerAttempts = 2; // 400/5xx گذرای گیت‌وی (تست زنده تأیید شد)
+  let lastErr: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxInnerAttempts; attempt++) {
+    try {
+      const res = await fetch(`${baseUrl}/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        // 400 گیت‌وی گاهی گذراست (زیر فشار درخواست‌های عکس‌دار) → یک تلاش داخلی دیگر
+        const retriable = res.status === 400 || res.status >= 500 || res.status === 429;
+        lastErr = new Error(`AvalAI /messages HTTP ${res.status}: ${errText.slice(0, 160)}`);
+        if (retriable && attempt < maxInnerAttempts) {
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
+        throw lastErr;
+      }
+
+      const json: any = await res.json();
+      const blocks: any[] = Array.isArray(json?.content) ? json.content : [];
+      const text = blocks
+        .filter((b) => b?.type === "text" && typeof b.text === "string")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+
+      if (!text) {
+        // فقط thinking برگشته (بودجه خورده شد) یا پاسخ خالی → به retry بیرونی بسپار
+        throw new Error(
+          `پاسخ خالی از مدل بینایی (بلوک‌ها: ${blocks.map((b) => b?.type).join(",") || "هیچ"} — stop=${json?.stop_reason})`
+        );
+      }
+
+      const usage = json?.usage || {};
+      const promptTokens =
+        Number(usage.input_tokens ?? 0) +
+        Number(usage.cache_creation_input_tokens ?? 0) +
+        Number(usage.cache_read_input_tokens ?? 0);
+      const completionTokens = Number(usage.output_tokens ?? 0);
+      const finishReason =
+        json?.stop_reason === "max_tokens" ? "length" : json?.stop_reason === "end_turn" ? "stop" : String(json?.stop_reason || "stop");
+
+      // شکل OpenAI — call-siteها فقط choices[0].message.content و usage می‌خوانند
+      return {
+        id: json?.id,
+        object: "chat.completion",
+        model,
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: text },
+            finish_reason: finishReason,
+          },
+        ],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+        },
+      };
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      // خطای شبکه/تایم‌اوت — تلاش داخلی دیگر (اگر مانده)
+      if (attempt < maxInnerAttempts) {
+        // v216 — «Connection error.» SDK v6 هم retriable است (هم‌تراز با isRetriableAvalaiError)
+        const retriableNet = isRetriableAvalaiError(lastErr);
+        if (retriableNet) {
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;
+        }
+      }
+      throw lastErr;
+    }
+  }
+
+  throw lastErr || new Error("آداپتور ویژن ناموفق بود");
+}
+
+/**
+ * v93 — ویژن دو‌مسیرهٔ ضدکور برای deepseek-v4.1-flash (دیرکتیو مالک: کل سیستم روی
+ * V4.1 Flash، حتی بینایی — مستندات رسمی AvalAI: بینایی بومی از طریق
+ * v1/chat/completions و v1/messages).
+ *
+ * چرا دو‌مسیره؟ تجربهٔ مستند سیستم:
+ *   • پروب v73: مدل قدیمیِ بازنشسته‌شده روی chat/completions کور بود (گیت‌وی بلاک
+ *     تصویر را بی‌صدا حذف می‌کرد) اما آداپتور /v1/messages واقعاً تصویر می‌رساند.
+ *   • تولیدی v91: مسیر تکِ /v1/messages هم یک زمانی کور شد و پاسخ کور به‌عنوان
+ *     «تحلیل موفق» پذیرفته شد (تحلیل جعلی + کسر سهمیه) — گارد validateContent
+ *     هنوز نبود. اتکای تک‌مسیره به هر مسیری = ریسک رگرسیونِ بی‌سروصدا.
+ *
+ * v94 — پرب زندهٔ مجدد با deepseek-v4.1-flash و کلید تولیدی (پرب: probe-vision-v94 +
+ * probe-native-isolated): مسیر بومی chat/completions برای این مدل هم روی گیت‌وی AvalAI
+ * **۱۰۰٪ کور است** — حتی با یک فریم ۴۲KB یا یک عکس ۳۶KB، تصویر بی‌صدا حذف می‌شود و
+ * مدل می‌گوید «هیچ تصویری پیوست نشده». همان لحظه آداپتور /v1/messages با کلید و
+ * فریم‌های یکسان، ویدیو را واقعاً دید و محتوایش (الگوی تست SMPTE با تایم‌کد) را عیناً
+ * توصیف کرد. پس:
+ *
+ * ترتیب (هر تلاشِ createResilientCompletion از این رد می‌شود):
+ *   ۱) مسیر آداپتور /v1/messages — تنها مسیری که در تست زندهٔ v73 و v94 واقعاً تصویر
+ *      رساند؛ اول است تا هیچ کاربری هزینهٔ یک کال کورِ بیهوده و تأخیرش را نپردازد.
+ *   ۲) اگر پاسخ کور بود/خالی/خطا → مسیر بومی chat/completions (اگر روزی آداپتور کور
+ *      شد، بومی پوشش می‌دهد). پاسخ خروجی نهایی هنوز یک‌بار دیگر با
+ *      rejectBlindMediaResponse در createResilientCompletion اعتبارسنجی می‌شود —
+ *      پاسخ کورِ هر مسیری مثل خطا retry/فال‌بک می‌شود و هرگز کش/کسر سهمیه نمی‌شود.
+ */
+async function deepseekVisionDualPath(
+  params: Record<string, unknown>,
+  options: { timeout?: number } | undefined,
+  nativeCreate: (p: Record<string, unknown>, o?: unknown) => Promise<unknown>
+): Promise<unknown> {
+  // ── مسیر ۱: آداپتور Anthropic‌سازگار /v1/messages (اثبات‌شدهٔ زندهٔ v73+v94) ──
+  try {
+    const completion: any = await anthropicVisionCompletion(params, options);
+    const text: string =
+      typeof completion?.choices?.[0]?.message?.content === "string"
+        ? completion.choices[0].message.content
+        : "";
+    if (text.trim() && !rejectBlindMediaResponse(text)) {
+      return completion; // بینایی واقعی از آداپتور ✓
+    }
+    console.warn(
+      `[ai] deepseek vision: مسیر آداپتور /v1/messages پاسخ ${text.trim() ? "کور" : "خالی"} داد → مسیر بومی chat/completions (دومسیرهٔ v94)`
+    );
+  } catch (adapterErr) {
+    console.warn(
+      `[ai] deepseek vision: مسیر آداپتور /v1/messages خطا داد (${String((adapterErr as Error)?.message || adapterErr).slice(0, 140)}) → مسیر بومی chat/completions (دومسیرهٔ v94)`
+    );
+  }
+  // ── مسیر ۲: بومی chat/completions (پوشش اگر روزی آداپتور کور/خطا شد) ──
+  return nativeCreate(params, options);
+}
+
+/**
+ * Proxy هوشمند برای avalaiClient.
+ *
+ * این Proxy تمام کال‌های `chat.completions.create` را intercept می‌کند و به‌صورت
+ * خودکار پارامترهای مخصوص هر مدل را اضافه می‌کند:
+ *
+ *  - مدل‌های gemini-3.x (gemini-3.8-flash، gemini-3.5-flash و ...):
+ *    max_tokens و temperature را به generationConfig منتقل می‌کند و
+ *    thinkingConfig.thinkingLevel = "low" اضافه می‌کند (دیریکتیو: تفکر LOW — سرعت).
+ *
+ *  - مدل‌های deepseek-v4 (deepseek-v4.1-flash / نسل‌های دیگر خانواده):
+ *    reasoning_effort = "low" اضافه می‌کند (دیریکتیو v73: همه‌چیز low — فقط
+ *    تولید برنامه max است که خودش صریح reasoning_effort می‌فرستد و همین‌جا
+ *    محترم شمرده می‌شود).
+ *    ⚠️ درس v39: تفکر max روی «gemini-3.8» بودجهٔ خروجی را می‌بلعید؛ برای
+ *    deepseek-v4.1-flash با بودجهٔ صریح 65536 پذیرش max تست زنده شد ✓
+ *
+ *  - برای مدل‌های دیگر: رفتار استاندارد OpenAI حفظ می‌شود.
+ *
+ * مهم: تابع `create` در OpenAI SDK به `this._client` وابسته است. اگر آن را bind
+ * نکنیم، خطای "Cannot read properties of undefined (reading '_client')" رخ می‌دهد.
+ * بنابراین `originalCreate` را قبل از wrap کردن به `completionsObj` bind می‌کنیم.
+ */
+function wrapCreateWithGemini3Support<T extends (...args: any[]) => any>(
+  originalCreate: T,
+  thisArg: any
+): T {
+  // bind کردن به thisArg (completions object) تا this._client در دسترس باشد
+  const boundCreate = originalCreate.bind(thisArg) as T;
+  return ((async (params: any, options?: any) => {
+    const model: string = params?.model || TEXT_MODEL;
+    const isGemini3 = isGemini3Model(model);
+    const isDeepseekV4 = isDeepseekV4Model(model);
+
+    if (isGemini3) {
+      // برای gemini-3.x: پارامترها به generationConfig منتقل شوند
+      // thinkingLevel پیش‌فرض "low" است (دیریکتیو کاربر: تفکر LOW — سرعت)،
+      // اما اگر caller مقدار دیگری (مثلاً "high" برای تولید برنامه) داده باشد،
+      // آن مقدار محترم شمرده می‌شود و override نمی‌شود.
+      const callerThinkingLevel = (params as any)?.extra_body?.generationConfig?.thinkingConfig?.thinkingLevel;
+      const thinkingLevel = typeof callerThinkingLevel === "string" && callerThinkingLevel
+        ? callerThinkingLevel
+        : "low";
+      const generationConfig: Record<string, unknown> = {
+        thinkingConfig: { thinkingLevel },
+      };
+      if (params?.max_tokens != null) {
+        generationConfig.maxOutputTokens = params.max_tokens;
+      }
+      if (params?.temperature != null) {
+        generationConfig.temperature = params.temperature;
+      }
+      if (params?.top_p != null) {
+        generationConfig.topP = params.top_p;
+      }
+
+      // حذف پارامترهای top-level که gemini-3.x نمی‌پذیرد
+      const { max_tokens, temperature, top_p, ...rest } = params;
+
+      // ادغام با extra_body موجود (اگر کاربر قبلاً چیزی فرستاده)
+      const existingExtraBody = (params as any).extra_body || {};
+      const mergedParams = {
+        ...rest,
+        extra_body: {
+          ...existingExtraBody,
+          generationConfig: {
+            ...(existingExtraBody.generationConfig || {}),
+            ...generationConfig,
+          },
+        },
+      };
+
+      return boundCreate(mergedParams, options);
+    }
+
+    if (isDeepseekV4) {
+      // ─── v93 ویژن دو‌مسیرهٔ ضدکور deepseek (دیرکتیو مالک: بینایی هم V4.1 Flash) ───
+      // مستندات رسمی AvalAI برای V4.1 Flash: بینایی بومی از طریق chat/completions
+      // و /v1/messages. درس v73+v91: مسیر تکِ هر چیزی ممکن است بی‌سروصدا کور شود —
+      // پس مسیر بومی اول، آداپتور دوم، گارد ضدکور روی خروجی نهایی (analyzeChatMedia)
+      // و فال‌بک نهایی gemini-3.8-flash فقط برای فاجعهٔ کامل AvalAI.
+      if (isVisionRequest(params as Record<string, unknown>)) {
+        return deepseekVisionDualPath(
+          params as Record<string, unknown>,
+          options as { timeout?: number } | undefined,
+          (p, o) => boundCreate(p, o)
+        ) as any;
+      }
+      // برای deepseek-v4 (متن): پیش‌فرض reasoning_effort = "low" (دیریکتیو مالک v73:
+      // «بقیه موارد همگی با low»). تولید برنامه صریح max می‌فرستد
+      // و همین‌جا override نمی‌شود. اگر کاربر قبلاً reasoning_effort تنظیم کرده، دست نمی‌زنیم.
+      if (params?.reasoning_effort == null) {
+        return boundCreate({ ...params, reasoning_effort: "low" }, options);
+      }
+      return boundCreate(params, options);
+    }
+
+    // برای مدل‌های دیگر: بدون تغییر
+    return boundCreate(params, options);
+  }) as unknown as T);
+}
+
+/**
+ * فراخوانی LLM با retry دستی برای تولید برنامه‌های تمرینی/غذایی.
+ *
+ * چرا: گیت‌وی api.avalai.ir (کلادفلر) برای پاسخ‌های طولانیِ تولید برنامه
+ * (خروجی JSON بزرگ ≈ ۳۰KB) به‌صورت ناپایدار 504 Gateway Timeout می‌دهد
+ * (تست واقعی: پاسخ‌های ۹۷-۱۱۰ ثانیه‌ای گاهی رد می‌شوند، گاهی در ۶۳s قطع).
+ * SDK خودش maxRetries دارد ولی خطاهای HTML-دار 504 را همیشه retry نمی‌کند؛
+ * اینجا تا ۳ تلاش با backoff کوتاه انجام می‌شود (فقط برای خطاهای گذرا).
+ *
+ * planTimeoutMs: تولید برنامه در پس‌زمینه انجام می‌شود (نه داخل request کاربر)
+ * پس می‌توانیم timeout بلندتری گذاشت — تفکر high ممکن است ۲-۴ دقیقه طول بکشد.
+ *
+ * fallbackParams: اگر همه تلاش‌ها با پارامتر اصلی (مثلاً تفکر high) شکست خوردند،
+ * یک تلاش نهایی با پارامتر جایگزین (تفکر low) انجام می‌شود — کیفیت در اولویت
+ * است ولی کاربر هرگز بدون برنامه نمی‌ماند.
+ */
+/**
+ * اعتبارسنج محتوای پاسخ — null/رشتهٔ خالی یعنی OK، رشتهٔ فارسی یعنی توضیح خطا.
+ * v39: زنجیرهٔ تفکر فقط روی «پاسخِ واقعاً قابل‌استفاده» توقف می‌کند، نه هر پاسخ 200.
+ */
+export type PlanContentValidator = (text: string) => string | null;
+
+/**
+ * v147 — تزریق بازخورد ردِ اعتبارسنج به پرامپتِ تلاش بعدی (copy-on-write).
+ * دیباگ واقعی مالک: مدل فال‌بک دو بار «همان» برنامهٔ ناقص را تولید می‌کرد چون
+ * دلیل رد را نمی‌دید (بدون بازخورد، retry کورکورانه است). حالا دلیل رد فارسی
+ * به انتهای آخرین پیام کاربر اضافه می‌شود تا مدل دقیقاً همان ایراد را برطرف کند.
+ * آرایهٔ messages اصلی caller دست‌نخورده می‌ماند (کپی هنگام نوشتن).
+ */
+function applyValidationFeedbackToParams(params: Record<string, unknown>, reason: string, attemptLabel: string): void {
+  try {
+    if (!reason || !reason.trim()) return;
+    const msgs = Array.isArray(params.messages) ? [...(params.messages as any[])] : null;
+    if (!msgs || msgs.length === 0) return;
+    const last = msgs[msgs.length - 1];
+    if (!last || last.role !== "user" || typeof last.content !== "string") return;
+    msgs[msgs.length - 1] = {
+      ...last,
+      content: `${last.content}\n\n⚠️ [بازخورد ممیزی فیتاپ — ${attemptLabel} به این دلیل رد شد]: ${reason.slice(0, 600)}\nدر نسخهٔ جدید دقیقاً همین ایراد را برطرف کن و JSON کامل و معتبر را دوباره تولید کن. سایر الزامات پرامپت بدون تغییر می‌ماند.`,
+    };
+    params.messages = msgs;
+  } catch {
+    // بازخورد هرگز زنجیرهٔ تولید را نمی‌شکند
+  }
+}
+
+/**
+ * v161 — فراخوانی استریمی (SSE) تولید برنامه — ستون اولِ «تولید یک‌تلاش».
+ *
+ * ریشهٔ کلاس شکست «504/تایم‌اوت» (پرتکرارترین دلیل «۳-۴ تلاش» در پنل مدیر):
+ * گیت‌وی کلادفلرِ جلوی api.avalai.ir برای پاسخ بلندِ بی‌بایت، اتصال را می‌کُشد
+ * (تست تاریخی: قطع در ~۶۳s / 504 در ۹۷-۱۱۰s). با استریم SSE بایت‌ها پیوسته
+ * جریان دارند و کانکشن زنده می‌ماند — تولید ۵-۶ دقیقه‌ایِ تفکر مکس بدون 504
+ * کامل می‌شود. پرب زندهٔ v161 روی AvalAI: استریم + json_object + reasoning=max +
+ * stream_options همه موفق؛ usage (با reasoning_tokens و cost) در چانک آخر می‌آید.
+ *
+ * stream_options فقط برای deepseek (آزموده‌شده) — بقیهٔ مدل‌ها بدون آن استریم
+ * می‌شوند و usage=null برمی‌گردد (حسابداری آن مسیر نادر همان‌طور که بود skip می‌شود).
+ * reasoning (delta.reasoning_content) هرگز داخل متن برنامه جمع نمی‌شود.
+ */
+async function streamPlanCompletionOnce(
+  apiParams: Record<string, unknown>,
+  timeoutMs?: number,
+  logTag = "plan-stream"
+): Promise<{ text: string; finishReason: string | null; usage: any | null }> {
+  const isDeepseek = String(apiParams.model ?? "")
+    .toLowerCase()
+    .includes("deepseek");
+  const payload: Record<string, unknown> = { ...apiParams, stream: true };
+  if (isDeepseek) {
+    payload.stream_options = { include_usage: true };
+  }
+  const stream = await avalaiClient.chat.completions.create(payload as any, {
+    maxRetries: 0, // retry دستی بیرونی — دوباره‌کاری نکن
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+  });
+  let text = "";
+  let finishReason: string | null = null;
+  let usage: any = null;
+  for await (const part of stream as any) {
+    if (part?.usage && typeof part.usage === "object") usage = part.usage;
+    const choice = part?.choices?.[0];
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+    const delta = choice?.delta?.content;
+    if (typeof delta === "string") text += delta;
+  }
+  if (!text.trim() && !finishReason && !usage) {
+    // استریم بدون هیچ چانکِ محتوایی بسته شد — برای تشخیص، خطای صریح بده
+    throw new Error(`[${logTag}] استریم بدون محتوا بسته شد (هیچ چانکی نرسید)`);
+  }
+  return { text, finishReason, usage };
+}
+
+export async function createPlanCompletionWithRetry(
+  params: Record<string, unknown>,
+  logTag: string,
+  maxAttempts = 3,
+  opts?: {
+    timeoutMs?: number;
+    fallbackParams?: Record<string, unknown>;
+    validateContent?: PlanContentValidator;
+    userId?: string | null; // v70 حسابداری
+  }
+): Promise<string> {
+  let lastErr: unknown = null;
+  // v58 — پارامتر داخلی fallback_model قبل از ارسال حذف می‌شود (هرگز به API نمی‌رود)
+  const apiParams: Record<string, unknown> = { ...params };
+  delete apiParams.fallback_model;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const attemptStartedAt = Date.now(); // v70 حسابداری — اندازه‌گیری تأخیر
+    try {
+      // ─── v161 — مسیر استریمی (رفع ریشه‌ای 504 کلادفلر برای پاسخ‌های بلند) ───
+      const streamed = await streamPlanCompletionOnce(apiParams, opts?.timeoutMs, logTag);
+      const { text, finishReason, usage } = streamed;
+      // ─── v39-fix: پاسخ «خالی» دیگر موفقیت حساب نمی‌شود ───
+      // باگ ریشه‌ای تولید برنامه: AvalAI با 200 و content:null برمی‌گشت
+      // (مدل تفکری، کل بودجهٔ خروجی را با reasoning می‌خورد و صفر توکن متن
+      // تولید می‌کرد → finish_reason=length) و کد قدیمی `content || ""` آن را
+      // «موفق» می‌گرفت → زنجیره همان لحظه متوقف، بدون سقوط به سطح تفکر بعدی
+      // و بدون فال‌بک مدل → «برنامه خالی».
+      if (!text.trim()) {
+        const cd = usage?.completion_tokens_details || {};
+        const diag = `finish_reason=${finishReason || "?"} completion_tokens=${usage?.completion_tokens ?? "?"} reasoning=${cd.reasoning_tokens ?? "?"} text=${cd.text_tokens ?? "?"}`;
+        console.error(`[${logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (${diag})`);
+        // قطعی است؛ تلاش دوباره با همین پارامترها بی‌فایده → سطح بعدی زنجیره
+        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (${diag})`);
+        break;
+      }
+      if (finishReason === "length") {
+        // متن هست ولی سقف خروجی خورده — احتمالاً JSON بریده؛ هنوز برمی‌گردانیم
+        // چون JSON بریده حالا در parseJsonFromContent قطعی ترمیم می‌شود (v161)
+        // و اگر ترمیم هم ناموفق بود اعتبارسنج caller رد می‌کند.
+        console.warn(`[${logTag}] attempt ${attempt}: finish_reason=length (len=${text.length}) — repairable truncation`);
+      }
+      if (opts?.validateContent) {
+        const vErr = opts.validateContent(text);
+        if (vErr) {
+          console.error(
+            `[${logTag}] attempt ${attempt}/${maxAttempts}: validation failed — ${vErr} (len=${text.length}, finish_reason=${finishReason || "?"}, head=${text.slice(0, 160).replace(/\s+/g, " ")})`
+          );
+          lastErr = new Error(vErr);
+          // v147 — بازخورد رد به تلاش بعدی همین مدل تزریق می‌شود (ضد retry کورکورانه)
+          if (attempt < maxAttempts) {
+            applyValidationFeedbackToParams(apiParams, vErr, `تلاش ${attempt}`);
+          }
+          if (attempt === maxAttempts) break;
+          await new Promise((r) => setTimeout(r, 2000));
+          continue; // پاسخ نامعتبر می‌تواند تصادفی باشد → retry همان سطح
+        }
+      }
+      // ─── v70 حسابداری — لاگ مصرف AI (استریم: usage از چانک نهایی deepseek) ───
+      try {
+        if (usage && typeof usage === "object") {
+          const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+          const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+          await logAiUsage({
+            route: logTag.split("(fallback")[0],
+            model: String(apiParams.model ?? TEXT_MODEL),
+            promptTokens,
+            completionTokens,
+            totalTokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens,
+            latencyMs: Date.now() - attemptStartedAt,
+            userId: opts?.userId ?? null,
+          });
+        }
+      } catch {
+        // هرگز جریان اصلی را نمی‌شکند
+      }
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err as Error)?.message || err);
+      const retriable = isRetriableAvalaiError(err) || /50[234]|429|timed out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up|terminated|stream error/i.test(msg);
+      console.error(`[${logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}):`, msg.slice(0, 200));
+      if (!retriable || attempt === maxAttempts) break;
+      await new Promise((r) => setTimeout(r, 3000)); // backoff کوتاه
+    }
+  }
+
+  // تلاش نهایی با پارامتر جایگزین (مثلاً تفکر low) — بهتر از هیچ برنامه‌ای نیست
+  if (opts?.fallbackParams) {
+    console.warn(`[${logTag}] falling back to alternate params (e.g. low thinking)...`);
+    const fbStartedAt = Date.now();
+    try {
+      // v147 — بازخورد آخرین رد (اگر اعتبارسنجی بود) به تور نجات هم تزریق می‌شود
+      const fbParams: Record<string, unknown> = { ...opts.fallbackParams };
+      const lastMsg = lastErr instanceof Error ? lastErr.message : "";
+      if (lastMsg && /نقض|مجاز نیست|پوشش عضلانی|خانوادهٔ حرکتی|پاسخ نامعتبر/.test(lastMsg)) {
+        applyValidationFeedbackToParams(fbParams, lastMsg, "تلاش قبلی");
+      }
+      // v161 — تور نجات هم استریمی (همان مزیت ضد-504)
+      const streamed = await streamPlanCompletionOnce(fbParams, opts?.timeoutMs, `${logTag}(fb)`);
+      const { text, finishReason, usage } = streamed;
+      if (text.trim() && (!opts.validateContent || !opts.validateContent(text))) {
+        // v70 حسابداری — لاگ مصرف تلاش جایگزین
+        try {
+          if (usage && typeof usage === "object") {
+            const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+            const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+            await logAiUsage({
+              route: logTag.split("(fallback")[0],
+              model: String((opts.fallbackParams as Record<string, unknown>).model ?? TEXT_MODEL),
+              promptTokens,
+              completionTokens,
+              totalTokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens,
+              latencyMs: Date.now() - fbStartedAt,
+              userId: opts?.userId ?? null,
+            });
+          }
+        } catch {}
+        return text;
+      }
+      console.error(`[${logTag}] fallback attempt returned empty/invalid content (finish_reason=${finishReason || "?"})`);
+      lastErr = new Error("پاسخ خالی/نامعتبر از مدل (fallbackParams)");
+    } catch (err) {
+      lastErr = err;
+      console.error(`[${logTag}] fallback attempt failed:`, String((err as Error)?.message || err).slice(0, 200));
+    }
+  }
+
+  console.error(`[${logTag}] all attempts failed:`, lastErr);
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// زنجیرهٔ تولید برنامه‌های تمرینی/تغذیه/مکمل — دیریکتیو مالک (v73):
+// «تولید برنامه باید با میزان تفکر مکس و بقیه موارد همگی با low باشه.»
+// زنجیره (کیفیت اول، اما کاربر هرگز بدون برنامه نمی‌ماند):
+//   گام ۱ — deepseek-v4.1-flash با reasoning_effort=max (۲ تلاش برای خطاهای
+//           گذرای گیت‌وی) + پارامتر فال‌بکِ همان مدل با تفکر low (۱ تلاش) —
+//           اگر تفکر مکس به هر شکلی شکست خورد (پاسخ خالی/نامعتبر، 400 دائمی،
+//           504/تایم‌اوت پایدار)، سطح پایین‌تر می‌آید نه برنامه‌نشدن.
+//   گام ۲ — gemini-3.8-flash با thinkingLevel=high (۲ تلاش) — فال‌بک مدلِ
+//           اثبات‌شدهٔ قبلی؛ فقط اگر گام ۱ به‌طور کامل شکست خورد.
+//
+// بودجه‌بندی زمان: watchdog تولید برنامه STUCK_GENERATION_WINDOW_MS=۵۰ دقیقه است؛
+// سقف هر تلاش ۲۷۰ ثانیه → بدترین حالت (۲×max + ۱×low + ۲×gemini) ≈ ۲۲.۵ دقیقه < ۵۰ ✓
+// (تمرینی و غذایی موازی اجرا می‌شوند و هر دو از همین بودجه استفاده می‌کنند.)
+//
+// درس v39 (بستر تصمیم): تفکر «max روی gemini-3.8» بودجهٔ خروجی را با reasoning
+// می‌بلعید (finish_reason=length، متن خالی) — برای جلوگیری از تکرار، بودجهٔ
+// خروجی صریح 65536 حفظ شده و deepseek-v4.1-flash با سقف خروجی 393K فضای
+// reasoning+JSON را راحت‌تر جا می‌دهد. تست زندهٔ v73: پذیرش reasoning_effort=max
+// روی AvalAI تأیید شد (اسکریپت scripts/test-real-ai-v73.ts).
+// v149 — سقف هر تلاش از env هم قابل تنظیم است (برای تست/عملیات)؛ پیش‌فرض تولید
+// بدون هیچ env همان ۶ دقیقه است — دیرکتیو مالک: پنجرهٔ دیپ‌سیک برای تفکر مکس.
+export const PLAN_ATTEMPT_TIMEOUT_MS =
+  Number(process.env.PLAN_ATTEMPT_TIMEOUT_MS) > 0
+    ? Number(process.env.PLAN_ATTEMPT_TIMEOUT_MS)
+    : 420_000; // v161 — ۷ دقیقه برای هر تلاش: استریم، 504 کلادفلر را حذف کرده و
+// دیپ‌سیک با تفکر مکس روی پرامپتِ کامل بانک (۵۸۱ حرکت) گاهی >۶ دقیقه فکر می‌کند —
+// قبلاً همان تلاشِ موفق در ۳۶۰s کشته می‌شد و «تلاش دومِ هزینه‌دار» می‌ساخت.
+// بدترین حالت زنجیره (۲×max + ۱×low + ۲×gemini) = ۵×۴۲۰s = ۳۵ دقیقه < واچ‌داگ ۵۰ دقیقه ✓
+
+// v39-fix: بودجهٔ صریح خروجی برای تولید برنامه.
+// بدون این، AvalAI برای gemini-3.8 یک بودجهٔ پیش‌فرض کوچک اعمال می‌کند که
+// reasoning (تفکر max/high) به‌تنهایی آن را می‌بلعد → content:null → «برنامه خالی».
+// تست واقعی (سپتامبر ۲۰۲۶): maxOutputTokens=65536 پذیرفته می‌شود و reasoning+JSON
+// بزرگ (~۲۵هزار توکن) را با هم جا می‌دهد. برای gemini-3.x پروکسیِ پایین‌تر این
+// مقدار را به generationConfig.maxOutputTokens منتقل می‌کند.
+const PLAN_MAX_OUTPUT_TOKENS = 65536;
+
+/**
+ * ساخت پارامترهای chat.completions برای تولید برنامه با سطح تفکر مشخص.
+ * v73: مدل پیش‌فرض PLAN_MODEL (deepseek-v4.1-flash) است — فال‌بک gemini-3.8-flash
+ * هم با همین سازنده ساخته می‌شود (پروکسیِ پایین‌تر مقدار non-null reasoning_effort
+ * را override نمی‌کند) و extra_bodyِ تفکرِ gemini فقط برای gemini-3.x ست می‌شود.
+ */
+export function buildPlanParams(
+  systemPrompt: string,
+  userPrompt: string,
+  thinkingLevel: string,
+  model: string = PLAN_MODEL
+): Record<string, unknown> {
+  return {
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    // v39-fix: بودجهٔ صریح خروجی (جلوگیری از بلعیده‌شدن بودجه توسط reasoning)
+    max_tokens: PLAN_MAX_OUTPUT_TOKENS,
+    // برای مدل‌های deepseek-v4 (reasoning_effort پشتیبانی می‌کنند)
+    reasoning_effort: thinkingLevel,
+    // برای مدل‌های gemini-3.x (thinkingLevel از طریق generationConfig)
+    ...(isGemini3Model(model)
+      ? { extra_body: { generationConfig: { thinkingConfig: { thinkingLevel } } } }
+      : {}),
+    // ─── v161 — JSON حالت تضمینی (ستون دوم «تولید یک‌تلاش») ───
+    // پرب زندهٔ v161 روی AvalAI با deepseek-v4.1-flash تأیید شد: response_format
+    // json_object + reasoning_effort=max + stream هم‌زمان کار می‌کنند و خروجی
+    // ۱۰۰٪ JSON معتبر است. این گزینه کلاس شکستِ «JSON ناقص/متن دور JSON» را
+    // حذف می‌کند — پرتکرارترین ردِ اعتبارسنج و دلیل اصلی «تلاش ۳-۴» ادمین.
+    // فقط برای deepseek فعال است (رفتار gemini-3.8 پروکسی‌شده آزموده نیست و
+    // مسیر استخراج fence/brace برای آن سر جایش می‌ماند).
+    ...(model.toLowerCase().includes("deepseek")
+      ? { response_format: { type: "json_object" } }
+      : {}),
+  };
+}
+
+/**
+ * فراخوانی LLM برای تولید برنامه — دیریکتیو مالک (v73):
+ * «تولید برنامه باید با میزان تفکر مکس و بقیه موارد همگی با low باشه.»
+ *
+ * گام ۱: deepseek-v4.1-flash با reasoning_effort=max — ۲ تلاش برای خطاهای گذرای
+ *        گیت‌وی (504/429/timeout)؛ پاسخ خالی/نامعتبر و خطای دائمی (400) بلافاصله
+ *        به پارامتر فال‌بک (همان مدل، تفکر low — یک تلاش) می‌روند: کاربر هرگز
+ *        بدون برنامه نمی‌ماند.
+ * گام ۲: gemini-3.8-flash با thinkingLevel=high — ۲ تلاش؛ فال‌بک مدلِ
+ *        اثبات‌شدهٔ زنجیرهٔ v40 که سال‌ها برنامهٔ سیستم را ساخته است.
+ *        AVALAI_FALLBACK_PLAN_MODEL اگر ست شده باشد جایگزین gemini می‌شود.
+ */
+/**
+ * v149 — استخراج ممنوعیت‌ها با LLM (مکمل واژه‌نامهٔ قطعی) — برای متن آزاد مدیر/کاربر
+ * که خارج از واژه‌نامه است («هیچ حرکت ایستاده‌ای نباشه»، «لبنیات حذف شه» و ...).
+ * هرگز throw نمی‌کند؛ شکست → null (واژه‌نامهٔ قطعی + دیرکتیو متن خام پوشش می‌دهند).
+ */
+export async function extractRedesignConstraintsLLM(
+  ...texts: Array<string | null | undefined>
+): Promise<RedesignConstraints | null> {
+  const combined = texts
+    .filter((t): t is string => typeof t === "string" && t.trim().length > 0)
+    .join("\n")
+    .slice(0, 2500);
+  if (combined.trim().length < 3) return null;
+  try {
+    const content = await createChatCompletionWithRetry(
+      {
+        model: TEXT_TASK_MODEL,
+        temperature: 0,
+        max_tokens: 400,
+        messages: [
+          {
+            role: "system",
+            content:
+              "تو موتور استخراج ممنوعیت برنامهٔ فیتاپ هستی. فقط و فقط JSON بده. از متن درخواست فارسی، فقط چیزهایی را استخراج که نویسنده صریحاً خواسته «حذف/نباشد/نخورم» — هیچ‌چیز دیگر. قالب: {\"forbiddenMovements\": [\"نام حرکت\"], \"forbiddenFoods\": [\"نام غذا\"], \"forbiddenSupplements\": [\"نام مکمل\"]}. اگر چیزی نیست آرایه خالی بده. نام‌ها را کوتاه و کانونی بنویس (مثلاً «بارفیکس» نه «بارفیکس دستی»؛ «عدس» نه «عدس پخته»؛ «کراتین» نه «کراتین مونوهیدرات برند فلان»). اگر نویسنده گفته چیزی حذف «نشود»/بماند، آن را استخراج نکن. حرکت، غذا و مکمل را قاطی نکن — دارو/مکمل غذایی (کراتین، وی، امگا۳، ویتامین، منیزیم و هر قرص/پودر ورزشی) همیشه forbiddenSupplements است نه forbiddenFoods.",
+          },
+          { role: "user", content: combined },
+        ],
+      },
+      "redesign-constraints-extract",
+      2
+    );
+    return sanitizeConstraints(parseJsonFromContent(content));
+  } catch (e) {
+    console.warn("[extractRedesignConstraintsLLM] failed (lexicon fallback stays):", e);
+    return null;
+  }
+}
+
+export async function generatePlanContent(
+  systemPrompt: string,
+  userPrompt: string,
+  logTag: string,
+  validateContent?: PlanContentValidator
+): Promise<string> {
+  let lastErr: unknown = null;
+  // ─── گام ۱: PLAN_MODEL با تفکر مکس (دیریکتیو مالک v73) + تور نجات low ───
+  try {
+    return await createPlanCompletionWithRetry(
+      buildPlanParams(systemPrompt, userPrompt, "max", PLAN_MODEL),
+      logTag,
+      2,
+      // پاسخ فقط وقتی «موفق» است که واقعاً قابل‌استفاده باشد — وگرنه زنجیره
+      // ادامه پیدا می‌کند. fallbackParams: همان مدل با تفکر low (تور نجات
+      // دسترس‌پذیری — «برنامهٔ خالی» بهتر از «بی‌برنامه» است، دیریکتیو همیشگی).
+      {
+        timeoutMs: PLAN_ATTEMPT_TIMEOUT_MS,
+        validateContent,
+        fallbackParams: buildPlanParams(systemPrompt, userPrompt, "low", PLAN_MODEL),
+      }
+    );
+  } catch (err) {
+    lastErr = err;
+    console.warn(
+      `[${logTag}] ${PLAN_MODEL} (thinking=max → low net) exhausted — switching to fallback model:`,
+      String((err as Error)?.message || err).slice(0, 180)
+    );
+  }
+
+  // ─── گام ۲: فال‌بک مدل — gemini-3.8-flash با تفکر high (مسیر اثبات‌شدهٔ v40) ───
+  // پرامپت‌ها و اعتبارسنج دست‌نخورده می‌مانند، فقط موتور عوض می‌شود.
+  // v147 — اگر شکست گام ۱ «ردِ اعتبارسنج» بود، دلیل رد به پرامپت مدل فال‌بک
+  // تزریق می‌شود تا همان ایراد را برطرف کند (نه تکرار کورکورانهٔ همان خطا).
+  const fallbackModel = FALLBACK_PLAN_MODEL;
+  if (fallbackModel && fallbackModel !== PLAN_MODEL) {
+    console.warn(
+      `[${logTag}] primary model exhausted — trying fallback model "${fallbackModel}" (thinking=high)...`
+    );
+    const step1Msg = lastErr instanceof Error ? lastErr.message : "";
+    const isValidationRejection = /نقض|مجاز نیست|پوشش عضلانی|خانوادهٔ حرکتی|پاسخ نامعتبر/.test(step1Msg);
+    const fallbackUserPrompt = isValidationRejection
+      ? `${userPrompt}\n\n⚠️ [بازخورد ممیزی فیتاپ — پاسخ مدل قبلی به این دلیل رد شد]: ${step1Msg.slice(0, 600)}\nدر نسخهٔ جدید دقیقاً همین ایراد را برطرف کن و JSON کامل و معتبر را دوباره تولید کن. سایر الزامات پرامپت بدون تغییر می‌ماند.`
+      : userPrompt;
+    try {
+      return await createPlanCompletionWithRetry(
+        buildPlanParams(systemPrompt, fallbackUserPrompt, "high", fallbackModel),
+        `${logTag}(fallback:${fallbackModel})`,
+        2,
+        { timeoutMs: PLAN_ATTEMPT_TIMEOUT_MS, validateContent }
+      );
+    } catch (err) {
+      lastErr = err;
+      console.error(`[${logTag}] fallback model also failed:`, String((err as Error)?.message || err).slice(0, 200));
+    }
+  }
+
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+}
+
+/**
+ * v216 — تشخیص واحد خطای گذرای AvalAI (همهٔ هلپرهای retry از این استفاده کنند).
+ *
+ * ریشه‌یابی واقعی 2026-10-06 (17:32–20:00 تهران): گیت‌وی AvalAI در پنجرهٔ
+ * عصرگاهی ناپایدار شد و ۷ خطای 500 به کاربر رسید (۶ چت مربی + ۱ نیکا).
+ * بررسی دیتابیس تولیدی + کد نشان داد دو کورِ رتی در regexهای قدیمی:
+ *  ① SDK v6 خطاهای سطح اتصال را با پیام دقیق «Connection error.» می‌فرستد
+ *     (کلاس APIConnectionError) — که در /50[234]|429|...|socket hang up/i نمی‌افتد؛
+ *     نتیجه: به‌جای ۳ تلاش، فقط ۱ تلاش واقعی و شکست فوری (و فال‌بک هم ۱ تلاش).
+ *  ② خطاهای Cloudflare 52x (520/521/522/523/526/529) با /50[234]/ مچ نمی‌شوند؛
+ *     api.avalai.ir پشت کلادفلر است و همین‌ها خطای‌های معمول فلاپ آن‌اند.
+ * حالا منبع حقیقت «err.status» خود SDK است (APIError.status) + الگوی پیام
+ * به‌عنوان لایهٔ دوم برای خطاهای بدون status (اتصال/استریم/شبکه).
+ */
+export function isRetriableAvalaiError(err: unknown): boolean {
+  // ① منبع حقیقت: کلاس خطای SDK خودش status را حمل می‌کند
+  const status = Number((err as any)?.status) || 0;
+  if (status === 429 || status === 401 || status === 403) return true; // 401/403 گذرای LB AvalAI — شواهد ممیزی v134
+  if (status >= 500 && status < 600) return true; // 500..599 شامل 502/503/504 و همهٔ Cloudflare 52x
+  // ② خطاهای بدون status (اتصال/استریم) — الگوی پیام
+  const msg = String((err as Error)?.message || err);
+  return /50[234]|429|40[13]|timed out|timeout|ECONNRESET|ECONNREFUSED|ECONNABORTED|fetch failed|socket hang up|connection error|Request was aborted|terminated|stream error|network error|load failed/i.test(msg);
+}
+
+/**
+ * فراخوانی چت با retry سبک برای خطاهای گذرا — برای چت‌ها و تحلیل‌های سریع.
+ *
+ * چرا: گیت‌وی api.avalai.ir (ArvanCloud) به‌صورت ناپایدار درخواست‌ها را بعد از
+ * ~۳۰ ثانیه با 504 (صفحه HTML کلادفلر) می‌کُشد. تست واقعی: چت نیکا/مربی گاهی
+ * در اولین تلاش 504 می‌خورد و در تلاش دوم همان لحظه جواب می‌دهد. بدون retry،
+ * کاربر خطای «ارتباط برقرار نشد» می‌بیند در حالی که یک تلاش دیگر کافی بود.
+ *
+ * فقط خطاهای گذرا (502/503/504/429/timeout/شبکه) retry می‌شوند؛
+ * خطاهای دائمی (400 پارامتر غلط/سرریز کانتکست) بلافاصله fail می‌شوند.
+ *
+ * v42: بعد از اتمام همهٔ تلاش‌های مدل اول، درخواست با مدل فال‌بک تکرار می‌شود
+ * (ویژن → gemini-3.5-flash، متن → deepseek-v4-flash — دیریکتیو مالک).
+ * چت نیکا/مربی، تحلیل عکس غذا/بدن و تحلیل ویدیو از این تابع استفاده می‌کنند.
+ *
+ * v70 حسابداری: هر تلاشِ موفق در AiUsageLog ثبت می‌شود (قبلاً این تابع — که
+ * چت نیکا/مربی و «همهٔ» تحلیل‌های ویژن از آن می‌گذرد — صفر لاگ مصرف می‌گذاشت
+ * و داشبورد حسابداری مصرف‌کننده‌های اصلی بودجه را نمی‌دید).
+ *
+ * v216 — backoff تدریجی (2.5s → 5s → 8s): پنجرهٔ حیات از ~۱۵ ثانیه به ~۳۱ ثانیه
+ * می‌رسد تا فلاپ‌های ۳۰–۶۰ ثانیه‌ای گیت‌وی (اثبات‌شده در ریشه‌یابی 2026-10-06)
+ * دیگر به 500 کاربر تبدیل نشوند. کلاینت چت تایم‌اوت صریح ندارد و اسپینر را
+ * تا پایان نگه می‌دارد — معاملهٔ منصفانه با ریسک خطا.
+ */
+export async function createChatCompletionWithRetry(
+  params: Record<string, unknown>,
+  logTag: string,
+  maxAttempts = 3,
+  opts?: { userId?: string | null }
+): Promise<string> {
+  try {
+    return await chatCompletionWithRetryAttempt(params, logTag, maxAttempts, opts?.userId);
+  } catch (primaryErr) {
+    // ─── v42 دیریکتیو مالک: هر شکستِ نهایی مدل اول → مدل فال‌بک ───
+    // ویژن → gemini-3.5-flash | متن → deepseek-v4-flash (خودکار)
+    const fb = fallbackModelFor(params);
+    if (!fb) throw primaryErr;
+    console.warn(
+      `[${logTag}] primary model exhausted — falling back to "${fb}" (v42 directive)...`
+    );
+    return await chatCompletionWithRetryAttempt(
+      withFallbackModel(params, fb),
+      `${logTag}(fallback:${fb})`,
+      maxAttempts,
+      opts?.userId
+    );
+  }
+}
+
+async function chatCompletionWithRetryAttempt(
+  params: Record<string, unknown>,
+  logTag: string,
+  maxAttempts: number,
+  userId?: string | null
+): Promise<string> {
+  let lastErr: unknown = null;
+  // v58 — پارامتر داخلی fallback_model قبل از ارسال حذف می‌شود (هرگز به API نمی‌رود)
+  const apiParams: Record<string, unknown> = { ...params };
+  delete apiParams.fallback_model;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const attemptStartedAt = Date.now(); // v70 حسابداری — اندازه‌گیری تأخیر
+    try {
+      const completion = await avalaiClient.chat.completions.create(apiParams as any, {
+        maxRetries: 0, // retry دستی اینجا
+      });
+      // v39: پاسخ خالی (content:null — مدل تفکری بودجه را با reasoning می‌خورد)
+      // دیگر موفقیت نیست؛ مثل خطای گذرا retry می‌شود (چت سریع است)
+      const choice: any = (completion as any)?.choices?.[0];
+      const rawContent = choice?.message?.content;
+      const text = typeof rawContent === "string" ? rawContent : "";
+      if (!text.trim()) {
+        const usage: any = (completion as any)?.usage || {};
+        const cd = usage.completion_tokens_details || {};
+        console.error(
+          `[${logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (finish_reason=${choice?.finish_reason || "?"}, reasoning=${cd.reasoning_tokens ?? "?"}, text=${cd.text_tokens ?? "?"})`
+        );
+        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (finish_reason=${choice?.finish_reason || "?"})`);
+        if (attempt === maxAttempts) break;
+        await new Promise((r) => setTimeout(r, Math.min(2500 * attempt, 8000))); // v216 backoff تدریجی
+        continue;
+      }
+      // ─── v70 حسابداری — لاگ مصرف AI (best-effort؛ هرگز جریان اصلی نمی‌شکند) ───
+      try {
+        const usage: any = (completion as any)?.usage;
+        if (usage && typeof usage === "object") {
+          const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+          const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+          await logAiUsage({
+            route: logTag.split("(fallback")[0], // برچسب ثابت مسیر — بدون پسوند فال‌بک
+            model: String(apiParams.model ?? TEXT_MODEL), // مدل واقعی همین تلاش موفق
+            promptTokens,
+            completionTokens,
+            totalTokens: Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens,
+            latencyMs: Date.now() - attemptStartedAt,
+            userId: userId ?? null,
+          });
+        }
+      } catch {
+        // لاگ مصرف هرگز نباید پاسخ چت را بشکند
+      }
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err as Error)?.message || err);
+      // v216 — تشخیص واحد status-محور («Connection error.» و Cloudflare 52x هم اکنون retriable است)
+      const retriable = isRetriableAvalaiError(err);
+      console.error(`[${logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}${retriable ? ", retriable" : ""}):`, msg.slice(0, 200));
+      if (!retriable || attempt === maxAttempts) break;
+      await new Promise((r) => setTimeout(r, Math.min(2500 * attempt, 8000))); // v216 backoff تدریجی
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * v41 — سپر سراسری فراخوانی AI برای «همهٔ» امکانات سیستم
+ * ═══════════════════════════════════════════════════════════════════════════
+ * درس v39/v40: gemini-3.8-flash مدل تفکری است — بدون بودجهٔ خروجیِ صریح،
+ * reasoning بودجهٔ پیش‌فرض AvalAI را می‌خورد و با 200 و content:null برمی‌گردد.
+ * تولید برنامه این سپر را گرفت؛ اما ۱۲ نقطهٔ دیگر (سئوی هوشمند، تحلیل‌ها،
+ * دستیار مدیر و…) مستقیم avalaiClient را صدا می‌زدند — همه به این تابع
+ * منتقل شدند: بودجهٔ صریح + retry خطاهای گذرا + تشخیص پاسخ خالی + اعتبارسنج.
+ */
+
+export interface ResilientCompletionOptions {
+  /** برچسب لاگ — مثل "content-refresh" */
+  logTag: string;
+  /**
+   * بودجهٔ صریح خروجی (max_tokens). برای gemini-3.x پروکسی آن را به
+   * generationConfig.maxOutputTokens می‌برد. پیش‌فرض ۸۱۹۲ — برای خروجی‌های بزرگ
+   * (بازنویسی مقالهٔ کامل) مقدار بالاتر بدهید (مثل 65536).
+   */
+  maxTokens?: number;
+  temperature?: number;
+  /** سقف زمانی هر تلاش (میلی‌ثانیه) — پیش‌فرض بدون سقف SDK */
+  timeoutMs?: number;
+  /** تعداد تلاش‌ها برای خطای گذرا/پاسخ خالی (پیش‌فرض ۳) */
+  maxAttempts?: number;
+  /** اعتبارسنج محتوا — رشتهٔ فارسی = توضیح خطا → retry؛ null = پذیرفتن */
+  validateContent?: PlanContentValidator;
+  /** مدل — پیش‌فرض TEXT_MODEL؛ برای تحلیل تصویر VISION_MODEL بدهید */
+  model?: string;
+  /** استدلال صریح (برای deepseek: reasoning_effort؛ اگر ست نشود پروکسی پیش‌فرض را می‌گذارد) */
+  reasoningEffort?: string;
+  /**
+   * v52 حسابداری — شناسهٔ مسیر برای لاگ مصرف AiUsageLog (پیش‌فرض: همان logTag).
+   * اختیاری — فراخوانی‌های فعلی بدون تغییر کار می‌کنند.
+   */
+  routeTag?: string;
+  /** v52 حسابداری — کاربر مرتبط با این فراخوانی (اختیاری — برای لاگ مصرف) */
+  userId?: string;
+}
+
+/**
+ * فراخوانی محافظت‌شدهٔ chat.completions — همهٔ نقاط AI باید از این استفاده کنند
+ * نه از avalaiClient مستقیم. رفتار: retry خطاهای گذرا (502/503/504/429/timeout)،
+ * retry پاسخ خالی (content:null)، اعتبارسنجی اختیاری محتوا، لاگ تشخیصی کامل.
+ * v42: بعد از اتمام تلاش‌های مدل اول، مدل فال‌بک (ویژن → gemini-3.5-flash،
+ * متن → deepseek-v4-flash) امتحان می‌شود — دیریکتیو مالک «اگر یک درصد نشد…».
+ */
+export async function createResilientCompletion(
+  params: Record<string, unknown>,
+  opts: ResilientCompletionOptions
+): Promise<string> {
+  try {
+    return await resilientCompletionAttempt(params, opts);
+  } catch (primaryErr) {
+    // ─── v42 دیریکتیو مالک: هر شکستِ نهایی مدل اول → مدل فال‌بک ───
+    // ویژن → gemini-3.5-flash | متن → deepseek-v4-flash (تشخیص خودکار با image_url)
+    const fb = fallbackModelFor(params);
+    if (!fb) throw primaryErr;
+    console.warn(
+      `[${opts.logTag}] primary model exhausted — falling back to "${fb}" (v42 directive)...`
+    );
+    return await resilientCompletionAttempt(withFallbackModel(params, fb), {
+      ...opts,
+      logTag: `${opts.logTag}(fallback:${fb})`,
+    });
+  }
+}
+
+async function resilientCompletionAttempt(
+  params: Record<string, unknown>,
+  opts: ResilientCompletionOptions
+): Promise<string> {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const body: Record<string, unknown> = {
+    ...(opts.model ? { model: opts.model } : {}),
+    ...params,
+  };
+  if (body.model == null) body.model = TEXT_MODEL;
+  // v58 — پارامتر داخلی مسیر فال‌بک؛ هرگز نباید به API برسد
+  delete body.fallback_model;
+  if (opts.maxTokens != null && body.max_tokens == null) body.max_tokens = opts.maxTokens;
+  if (opts.temperature != null && body.temperature == null) body.temperature = opts.temperature;
+  if (opts.reasoningEffort != null && body.reasoning_effort == null) body.reasoning_effort = opts.reasoningEffort;
+
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const attemptStartedAt = Date.now(); // v52 حسابداری — اندازه‌گیری تأخیر برای لاگ مصرف
+    try {
+      const completion = await avalaiClient.chat.completions.create(body as any, {
+        maxRetries: 0, // retry دستی اینجا — دوباره‌کاری نکن
+        ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+      });
+      const choice: any = (completion as any)?.choices?.[0];
+      const rawContent = choice?.message?.content;
+      const text = typeof rawContent === "string" ? rawContent : "";
+      if (!text.trim()) {
+        // v39-lesson: 200 با content:null = شکست، نه موفقیت
+        const usage: any = (completion as any)?.usage || {};
+        const cd = usage.completion_tokens_details || {};
+        const diag = `finish_reason=${choice?.finish_reason || "?"} completion_tokens=${usage.completion_tokens ?? "?"} reasoning=${cd.reasoning_tokens ?? "?"} text=${cd.text_tokens ?? "?"}`;
+        console.error(`[${opts.logTag}] attempt ${attempt}/${maxAttempts}: EMPTY content (${diag})`);
+        lastErr = new Error(`پاسخ خالی از مدل هوش مصنوعی (${diag})`);
+        if (attempt === maxAttempts) break;
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      if (choice?.finish_reason === "length") {
+        console.warn(`[${opts.logTag}] attempt ${attempt}: finish_reason=length (len=${text.length}) — خروجی ممکن است بریده باشد`);
+      }
+      if (opts.validateContent) {
+        const vErr = opts.validateContent(text);
+        if (vErr) {
+          console.error(
+            `[${opts.logTag}] attempt ${attempt}/${maxAttempts}: validation failed — ${vErr} (len=${text.length}, finish_reason=${choice?.finish_reason || "?"}, head=${text.slice(0, 160).replace(/\s+/g, " ")})`
+          );
+          lastErr = new Error(vErr);
+          if (attempt === maxAttempts) break;
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+      }
+      // ─── v52 حسابداری — لاگ مصرف AI (best-effort؛ بعد از اعتبارسنجیِ موفق) ───
+      // هیچ تغییری در منطق retry/فال‌بک/اعتبارسنجی ایجاد نمی‌کند — فقط ثبت هزینه.
+      try {
+        const usage: any = (completion as any)?.usage;
+        if (usage && typeof usage === "object") {
+          const promptTokens = Number(usage.prompt_tokens ?? 0) || 0;
+          const completionTokens = Number(usage.completion_tokens ?? 0) || 0;
+          const totalTokens = Number(usage.total_tokens ?? promptTokens + completionTokens) || promptTokens + completionTokens;
+          await logAiUsage({
+            route: opts.routeTag ?? opts.logTag ?? "unknown",
+            model: String(body.model ?? TEXT_MODEL), // مدل واقعی همین تلاشِ موفق (بعد از fallback هم درست است)
+            promptTokens,
+            completionTokens,
+            totalTokens,
+            latencyMs: Date.now() - attemptStartedAt,
+            userId: opts.userId ?? null,
+          });
+        }
+      } catch {
+        // هرگز جریان اصلی را نمی‌شکند
+      }
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err as Error)?.message || err);
+      // v134 — فیکس ممیزی جامع: خطای 401/403 گذرای AvalAI هم retriable است.
+      // شواهد ممیزی (v134): همان کلید با curl مستقیم 200 می‌گیرد ولی گاهی LB
+      // سرویس AvalAI پاسخ 401 موقت برمی‌گرداند («Incorrect API key provided»
+      // برای کلیدِ درست) — در دو چرخهٔ تولید، سمتِ غذا با دو 401 پشت‌سرهم
+      // شکست خورد. حالا مثل 429/5xx با backoff کوتاه تلاش دوباره می‌شود؛
+      // کلید واقعاً نامعتبر هم بعد از اتمام تلاش‌ها همان‌طور fail می‌کند.
+      // v216 — تشخیص واحد status-محور (isRetriableAvalaiError): «Connection error.» SDK v6
+      // و Cloudflare 52x که در regex قبلی نمی‌افتادند هم اکنون retriable می‌شوند.
+      const retriable = isRetriableAvalaiError(err);
+      console.error(`[${opts.logTag}] AvalAI error (attempt ${attempt}/${maxAttempts}${retriable ? ", retriable" : ""}):`, msg.slice(0, 200));
+      if (!retriable || attempt === maxAttempts) break;
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+}
+
+// ساخت Proxy عمیق که chat.completions.create را intercept می‌کند
+export const avalaiClient = new Proxy({} as OpenAI, {
+  get(_, prop) {
+    const client = getAvalaiClient();
+    const value = (client as any)[prop];
+
+    if (prop === "chat") {
+      // Proxy برای chat
+      return new Proxy(value, {
+        get(__, chatProp) {
+          const chatValue = (value as any)[chatProp];
+          if (chatProp === "completions") {
+            // Proxy برای completions
+            return new Proxy(chatValue, {
+              get(___, compProp) {
+                const compValue = (chatValue as any)[compProp];
+                if (compProp === "create" && typeof compValue === "function") {
+                  // wrap create با مدیریت gemini-3.x — bind به chatValue (completions object)
+                  const wrapped = wrapCreateWithGemini3Support(compValue, chatValue);
+                  // ─── v135 — اصلاح تایپوگرافی/املای فارسی خروجی AI (نقطهٔ واحد) ───
+                  // دیرکتیو مالک: «روزه ای → روزه‌ای»، «قدم ه ای → قدم‌های» و
+                  // مشابه‌ها هرگز در خروجی دیده نشوند. همهٔ مسیرهای AI (برنامه/
+                  // چت/تحلیل/ویژن) از همین Proxy رد می‌شوند.
+                  return ((...args: any[]) => {
+                    const result = (wrapped as any)(...args);
+                    if (result && typeof result.then === "function") {
+                      return result.then((res: any) => {
+                        try {
+                          const choices = res?.choices;
+                          if (Array.isArray(choices)) {
+                            for (const choice of choices) {
+                              const content = choice?.message?.content;
+                              if (typeof content === "string") {
+                                choice.message.content = fixPersianTypographySafe(content);
+                              }
+                            }
+                          }
+                        } catch {
+                          // هیچ‌وقت به‌خاطر تزئین متن، پاسخ AI را نشکن
+                        }
+                        return res;
+                      });
+                    }
+                    return result;
+                  }) as typeof compValue;
+                }
+                return typeof compValue === "function" ? compValue.bind(chatValue) : compValue;
+              },
+            });
+          }
+          return typeof chatValue === "function" ? chatValue.bind(value) : chatValue;
+        },
+      });
+    }
+
+    return typeof value === "function" ? value.bind(client) : value;
+  },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WORKOUT-PLAN-PRO — تایپ‌های توسعه‌یافته برای برنامه‌های حرفه‌ای
+// این فیلدها به صورت اختیاری به WorkoutPlanContent / MealPlanContent اضافه می‌شوند
+// تا برنامه‌ها در سطح مربیان بزرگ دنیا (هانی رامبد، هادی چوپان، کریس بامستد) تولید شوند.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** تایپ توسعه‌یافته برنامه تمرینی — شامل فیلدهای حرفه‌ای جدید */
+export type ProWorkoutPlanContent = WorkoutPlanContent & {
+  /** تکنیک‌های پیشرفته استفاده‌شده در برنامه (FST-7، سوپرست آنتاگونیست، تری‌ست، دراپ‌ست، رست پاز، و ...) */
+  advancedTechniques?: string[];
+  /** تقسیم عضلات هفته (push/pull/legs، upper/lower، body part split، push/pull/legs/rest، و ...) */
+  muscleGroupSplit?: string;
+  /** جزئیات FST-7 (Fascia Stretch Training) در حرکت آخر هر گروه عضلانی — ویژه پلن ultimate */
+  fst7Details?: {
+    exerciseName: string;
+    sets: number;
+    reps: string;
+    restSec: number;
+    note?: string;
+  };
+  /** نوع دوره‌بندی (Periodization) */
+  periodizationType?: "linear" | "undulating" | "block" | "wave" | "daily_undulating";
+  /** فرکانس تمرین هر گروه عضلانی در هفته (۱-۳) */
+  muscleFrequencyPerWeek?: number;
+  /** الهام‌گرفته از کدام مربی بزرگ */
+  inspiredByCoach?: "hany_rambod" | "hadi_chupan" | "chris_bumstead" | "ronnie_coleman" | "jay_cutler" | "mixed";
+  /** v213 — اسنپ‌شات معماری برنامه (Coach Blueprint) — تصمیم معمار برای همین کاربر؛ مبنای گیت کیفیت/ترمیم‌ها */
+  coachBlueprint?: Record<string, unknown>;
+};
+
+/** تایپ توسعه‌یافته برنامه غذایی — شامل فیلدهای حرفه‌ای جدید */
+export type ProMealPlanContent = MealPlanContent & {
+  /** تفکیک دقیق محاسبه TDEE و مازاد/نقصان کالری */
+  tdeeBreakdown?: {
+    bmr: number;
+    tdee: number;
+    targetCalories: number;
+    /** مازاد کالری (مثبت) یا نقصان (منفی) */
+    calorieAdjustment: number;
+    proteinG: number;
+    carbsG: number;
+    fatG: number;
+    /** پروتئین به ازای هر کیلوگرم وزن بدن */
+    proteinPerKg: number;
+    /** کربوهیدرات به ازای هر کیلوگرم وزن بدن */
+    carbsPerKg: number;
+    /** چربی به ازای هر کیلوگرم وزن بدن */
+    fatPerKg: number;
+  };
+  /** جایگزین‌های رژیمی (وگان، کتو، کم‌کربوهیدرات، بدون گلوتن، و ...) برای هر وعده */
+  dietAlternatives?: {
+    diet: string;
+    description: string;
+    sampleMeals: string[];
+  }[];
+  /** استک مکمل پیشرفته — دسته‌بندی‌شده به پایه/پیشرفته/هدفمند */
+  supplementStack?: {
+    category: "base" | "advanced" | "targeted";
+    name: string;
+    dose: string;
+    timing: string;
+    note?: string;
+    /** افراد منع‌شده از مصرف این مکمل (بیماران قلبی، دیابتی، و ...) */
+    contraindicatedFor?: string[];
+  }[];
+};
+
+// ─── ضریب فعالیت برای محاسبه دقیق TDEE ───
+// بر اساس فرمول‌های استاندارد Harris-Benedict و Mifflin-St Jeor
+function getActivityMultiplier(activityLevel?: OnboardingData["activityLevel"]): number {
+  switch (activityLevel) {
+    case "sedentary":
+      return 1.2;   // بی‌تحرک (کار پشت میز، بدون تمرین)
+    case "light":
+      return 1.375; // کم‌تحرک (تمرین ۱-۳ روز در هفته)
+    case "moderate":
+      return 1.55;  // متوسط (تمرین ۳-۵ روز در هفته)
+    case "active":
+      return 1.725; // فعال (تمرین ۶-۷ روز در هفته)
+    case "very_active":
+      return 1.9;   // خیلی فعال (تمرین سنگین روزانه + کار فیزیکی)
+    default:
+      return 1.4;   // پیش‌فرض محافظه‌کارانه
+  }
+}
+
+// ─── راهنمای تکنیک‌های پیشرفته بر اساس سطح پلن ───
+// این تابع تعیین می‌کند کاربر بر اساس پلن اشتراکش به چه تکنیک‌های حرفه‌ای دسترسی دارد.
+// - ultimate (حرفه‌ای): FST-7 هانی رامبد + دوره‌بندی موجی + ۸-۱۰ حرکت
+// - advanced (پیشرفته): سوپرست‌های آنتاگونیست + دراپ‌ست + ۷-۸ حرکت
+// - standard (استاندارد): تمرینات پایه با رعایت فرم + ۶-۷ حرکت
+// - basic (اقتصادی): تمرینات ساده و مؤثر + ۵-۶ حرکت
+// ─── تکنیک‌های تمرینی بر اساس سابقه ورزشکار (نه پلن) ───
+// ⚠️ مهم: کیفیت برنامه تمرینی بر اساس سابقه کاربر تعیین می‌شود، نه پلن خریداری‌شده.
+// یک ورزشکار حرفه‌ای که پلن اقتصادی می‌خرد باید همان کیفیت برنامه حرفه‌ای را دریافت کند.
+// پلن فقط قابلیت‌ها (مکمل، آنالیز ویدیو و غیره) را کنترل می‌کند، نه کیفیت برنامه را.
+function getExperienceBasedTechniqueGuidance(experience?: string): {
+  level: "beginner" | "intermediate" | "advanced" | "pro";
+  allowedTechniques: string[];
+  forbiddenTechniques: string[];
+  proCoachInspiration: string;
+  exerciseCountHint: string;
+  periodization: string;
+} {
+  switch (experience) {
+    case "pro":
+      return {
+        level: "pro",
+        allowedTechniques: [
+          "FST-7 (Fascia Stretch Training) در حرکت آخر هر گروه عضلانی",
+          "دوره‌بندی موجی (Undulating Periodization) — تغییرات حجم/شدت در روزهای مختلف",
+          "سوپرست آنتاگونیست (push/pull)",
+          "تری‌ست همان گروه عضلانی",
+          "جاینت‌ست برای چربی‌سوزی",
+          "دراپ‌ست در ست آخر",
+          "رست پاز (pause reps)",
+          "تدریجی اضافه بار (Progressive Overload)",
+          "تکنیک ۱.۵ تکراری (1.5 reps)",
+          "Negative-accentuated reps",
+          "Blood Flow Restriction (BFR)",
+          "Rest-Pause extended sets",
+        ],
+        forbiddenTechniques: [],
+        proCoachInspiration:
+          "هانی رامبد (FST-7) + هادی چوپان (فرکانس بالا) + کریس بامستد (ارتباط ذهن-عضله)",
+        exerciseCountHint: "۸ تا ۱۰ حرکت در هر روز",
+        periodization: "undulating",
+      };
+    case "advanced":
+      return {
+        level: "advanced",
+        allowedTechniques: [
+          "FST-7 (Fascia Stretch Training) در حرکت آخر گروه‌های عضلانی بزرگ",
+          "دوره‌بندی موجی (Undulating Periodization)",
+          "سوپرست آنتاگونیست (push/pull)",
+          "تری‌ست همان گروه عضلانی",
+          "جاینت‌ست برای چربی‌سوزی",
+          "دراپ‌ست در ست آخر",
+          "رست پاز (pause reps)",
+          "تدریجی اضافه بار (Progressive Overload)",
+          "تکنیک ۱.۵ تکراری (1.5 reps)",
+        ],
+        forbiddenTechniques: [],
+        proCoachInspiration:
+          "هانی رامبد (FST-7) + هادی چوپان (فرکانس بالا) + کریس بامستد (ارتباط ذهن-عضله)",
+        exerciseCountHint: "۷ تا ۸ حرکت در هر روز",
+        periodization: "undulating",
+      };
+    case "intermediate":
+      return {
+        level: "intermediate",
+        allowedTechniques: [
+          "سوپرست آنتاگونیست (push/pull)",
+          "تری‌ست همان گروه عضلانی",
+          "دراپ‌ست در ست آخر حرکات کمکی",
+          "رست پاز (pause reps)",
+          "تدریجی اضافه بار (Progressive Overload)",
+          "تکنیک ۱.۵ تکراری (1.5 reps)",
+        ],
+        forbiddenTechniques: [
+          "FST-7 (نیازمند سابقه پیشرفته)",
+        ],
+        proCoachInspiration: "کریس بامستد (فرم + ارتباط ذهن-عضله) + هادی چوپان (حجم بالا)",
+        exerciseCountHint: "۶ تا ۷ حرکت در هر روز",
+        periodization: "linear",
+      };
+    case "beginner":
+    default:
+      return {
+        level: "beginner",
+        allowedTechniques: [
+          "تدریجی اضافه بار (Progressive Overload) — ملایم",
+          "رست پاز ساده (pause reps)",
+          "سوپرست آنتاگونیست ساده (push/pull) — حداکثر ۱ در هر روز",
+        ],
+        forbiddenTechniques: [
+          "FST-7",
+          "دوره‌بندی موجی",
+          "تری‌ست و جاینت‌ست",
+          "دراپ‌ست",
+          "BFR",
+        ],
+        proCoachInspiration: "یادگیری الگوهای حرکتی پایه و تثبیت فرم صحیح — کریس بامستد (ارتباط ذهن-عضله)",
+        exerciseCountHint: "۵ تا ۶ حرکت در هر روز",
+        periodization: "linear",
+      };
+  }
+}
+
+// backward compat — نگه داشتن نام قدیمی برای جلوگیری از خطا
+function getPlanTierTechniqueGuidance(planName?: Plan | null, experience?: string) {
+  return getExperienceBasedTechniqueGuidance(experience);
+}
+
+// ─── محاسبه دقیق TDEE و کالری هدف بر اساس هدف و فعالیت ───
+// v146 — export شد برای استفادهٔ موتور محلی اضطراری (local-plan-fallback)
+export function computeTDEEAndTarget(data: OnboardingData): {
+  bmr: number;
+  tdee: number;
+  targetCalories: number;
+  calorieAdjustment: number;
+  proteinG: number;
+  carbsG: number;
+  fatG: number;
+  proteinPerKg: number;
+  carbsPerKg: number;
+  fatPerKg: number;
+} {
+  // فرمول Mifflin-St Jeor (دقیق‌ترین فرمول BMR)
+  const bmr =
+    data.gender === "male"
+      ? 10 * data.weight + 6.25 * data.height - 5 * data.age + 5
+      : 10 * data.weight + 6.25 * data.height - 5 * data.age - 161;
+  const activityMultiplier = getActivityMultiplier(data.activityLevel);
+  const tdee = bmr * activityMultiplier;
+
+  // تنظیم کالری بر اساس هدف — مازاد/نقصان هوشمند
+  let calorieAdjustment = 0;
+  switch (data.goal) {
+    case "fat_loss":
+      // نقصان ۴۰۰-۵۰۰ کالری برای چربی‌سوزی ایمن (۰.۵ کیلو در هفته)
+      calorieAdjustment = -Math.min(500, Math.round(tdee * 0.2));
+      break;
+    case "cut":
+      // v60 — کات: نقصان ملایم‌تر (حدود ۱۵٪) برای حفظ حداکثری عضله
+      calorieAdjustment = -Math.min(400, Math.round(tdee * 0.15));
+      break;
+    case "muscle_gain":
+      // مازاد ۲۵۰-۴۰۰ کالری برای حجم‌گیری تمیز (به حداقل رساندن چربی‌سازی)
+      calorieAdjustment = 300;
+      break;
+    case "bulk":
+      // v60 — افزایش حجم: مازاد بزرگ‌تر (حدود ۴۰۰) برای رشد سریع‌تر با کنترل چربی
+      calorieAdjustment = 400;
+      break;
+    case "strength":
+      // مازاد ملایم ۲۰۰ کالری برای قدرت
+      calorieAdjustment = 200;
+      break;
+    case "endurance":
+      // تعادل با کمی مازاد برای ریکاوری
+      calorieAdjustment = 100;
+      break;
+    case "fitness":
+    default:
+      calorieAdjustment = 0;
+      break;
+  }
+  const targetCalories = Math.round(tdee + calorieAdjustment);
+
+  // محاسبه درشت‌مغذی‌ها — پروتئین بر اساس هدف، چربی ۲۵٪، کربوهیدرات باقی‌مانده
+  // v60 — کات: بالاترین پروتئین (۲.۴g/kg) برای حفظ عضله در نقصان؛ bulk مثل muscle_gain
+  const proteinPerKg =
+    data.goal === "cut"
+      ? 2.4
+      : data.goal === "fat_loss"
+        ? 2.2
+        : data.goal === "muscle_gain" || data.goal === "bulk"
+          ? 2.0
+          : 1.8;
+  const proteinG = Math.round(data.weight * proteinPerKg);
+  const fatG = Math.round((targetCalories * 0.25) / 9); // ۲۵٪ کالری از چربی
+  const carbsG = Math.max(0, Math.round((targetCalories - proteinG * 4 - fatG * 9) / 4));
+  const carbsPerKg = Math.round((carbsG / data.weight) * 10) / 10;
+  const fatPerKg = Math.round((fatG / data.weight) * 10) / 10;
+
+  return {
+    bmr: Math.round(bmr),
+    tdee: Math.round(tdee),
+    targetCalories,
+    calorieAdjustment,
+    proteinG,
+    carbsG,
+    fatG,
+    proteinPerKg,
+    carbsPerKg,
+    fatPerKg,
+  };
+}
+
+// Get AI config from DB (admin-configurable system prompts)
+// ─── M5: کش درون‌حافظه‌ای با TTL ۳۰ ثانیه ───
+// قبلاً برای هر پیام چت/نیکا یک کوئری DB اضافه زده می‌شد؛ حالا نتیجه ۳۰ ثانیه کش
+// می‌شود. تغییرات ادمین حداکثر با ۳۰ ثانیه تأخیر اعمال می‌شود.
+const AI_CONFIG_CACHE_TTL_MS = 30_000;
+const _aiConfigCache = new Map<string, { value: string; at: number }>();
+
+export async function getAiConfig(key: string, fallback: string): Promise<string> {
+  const now = Date.now();
+  const hit = _aiConfigCache.get(key);
+  if (hit && now - hit.at < AI_CONFIG_CACHE_TTL_MS) {
+    return hit.value || fallback;
+  }
+  const cfg = await db.aiConfig.findUnique({ where: { key } });
+  const value = cfg?.value || fallback;
+  _aiConfigCache.set(key, { value, at: now });
+  return value;
+}
+
+// قوانین زبان فارسی — در پرامپت‌های مربی و چت برای جلوگیری از استفاده کلمات انگلیسی تزریق می‌شود.
+// این بلوک به DEFAULT_COACH_PROMPT و DEFAULT_CHAT_PROMPT اضافه می‌شود.
+const PERSIAN_LANGUAGE_RULES = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+قوانین زبان (بسیار مهم):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- همیشه فقط فارسی بنویس. استفاده از کلمات انگلیسی ممنوع است.
+- به جای کلمات انگلیسی، معادل فارسی آن‌ها را استفاده کن:
+  • Gym Mode → حالت باشگاه
+  • TDEE → نیاز کالری روزانه
+  • PWA → برنامه نصب‌شده
+  • cardio → هوازی
+  • superset → سوپرست (به فارسی)
+  • triset → تری‌ست (به فارسی)
+  • warmup → گرم‌کردن
+  • cooldown → سردکردن
+  • set → ست
+  • rep → تکرار
+  • rest → استراحت
+  • workout → تمرین
+  • body fat → چربی بدن
+  • metabolism → متابولیسم
+  • plateau → ثبات/سکون
+  • bulk → حجم‌گیری
+  • cut → کات/چربی‌سوزی
+  • cheat meal → وعده آزاد
+  • RPE → شدت درک‌شده
+  • RIR → تکرار ذخیره
+  • DOMS → درد عضلانی تاخیری
+- فقط نام حرکات ورزشی و اصطلاحات تخصصی که معادل فارسی ندارند را می‌توانی به انگلیسی بنویسی (مثل squat, deadlift, bench press) اما بلافاصله معادل فارسی یا توضیح آن را در پرانتز اضافه کن.`;
+
+// ─── v79 — دانش زندهٔ سایت (DEFAULT_SITE_KNOWLEDGE) ───
+// دیرکتیو مالک: «چت با فیتاپ باید به‌صورت زنده همهٔ سایت را بشناسد» — مثلاً بداند ویدیوهای
+// آموزش از یوتیوب پخش می‌شوند و در ایران به فیلترشکن نیاز دارند؛ یا اگر روزی ساختار سایت
+// عوض شد، بداند «چه بر سر صفحه می‌گذرد». همین دانش در چت نیکا هم تزریق می‌شود.
+//
+// نحوهٔ به‌روزرسانی زنده توسط مالک (بدون دیپلوی — حداکثر ۳۰ ثانیه بعد اعمال می‌شود، کش getAiConfig):
+// یک ردیف با کلید "site_knowledge" در جدول AiConfig بسازید/ویرایش کنید؛ متن همان ردیف جایگزین
+// این نسخهٔ پیش‌فرض می‌شود و در هر دو چت (فیتاپ و نیکا) تزریق می‌شود. یک‌خطی آماده (SQLite):
+//   sqlite3 db/custom.db "INSERT INTO AiConfig (id,key,value,label,updatedAt) VALUES (lower(hex(randomblob(16))),'site_knowledge','متن جدید دانش زندهٔ سایت...','دانش زندهٔ سایت',CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, label=excluded.label;"
+// (در پروداکشن مسیر دیتابیس سرور مالک است؛ کوتیشن تکی داخل متن را دوتا کنید. حذف ردیف = بازگشت به پیش‌فرض.)
+// نکته (Task 2-d): مسیر ادمین /api/admin/ai-config اکنون کلیدهای پرامپت مربی/چت/تغذیه +
+// site_knowledge + nika_system_prompt را مدیریت می‌کند — یعنی پرامپت نیکا هم از پنل قابل ویرایش است
+// (ممیزی 1-b §6: قبلاً این کلید در whitelist نبود و مسیر مرده بود).
+export const DEFAULT_SITE_KNOWLEDGE = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+دانش زندهٔ سایت — شناخت واقعی و به‌روز فیتاپ (بسیار مهم):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ ویدیوهای آموزش حرکات فیتاپ از یوتیوب پخش می‌شوند و در ایران دیدن آنها به فیلترشکن نیاز دارد.
+- اگر کاربر گفت ویدیو باز نمی‌شود یا لود نمی‌شود، مشکل از فیتاپ نیست — این محدودیت یوتیوب در ایران است؛ با آرامش بگو با روشن‌کردن فیلترشکن ویدیوها به‌راحتی باز می‌شوند و هرگز این را خرابیِ سایت جلوه نده.
+- ورود و ثبت‌نام فقط با کد تأیید پیامکی انجام می‌شود؛ اگر کد نیامد، کمی صبر کند یا درخواست ارسال دوباره کند.
+- ساختار کنونی فیتاپ: صفحهٔ اصلی (لندینگ) و ورود/ثبت‌نام با کد پیامکی.
+- پنل کاربر شامل: داشبورد، برنامه‌های تمرین و تغذیه و مکمل، بانک حرکات با ویدیو، جدول غذاها، گالری پیشرفت، چت فیتاپ (مربی هوشمند)، چت نیکا، حالت باشگاه (Gym Mode با تایمر استراحت و ثبت ست)، دستیار تغذیه با ثبت غذای روزانه، چکاپ‌های دوره‌ای، آنالیز بدن با عکس، تحلیل آزمایش خون و آنالیز ویدیویی فرم (این دو مورد مخصوص پلن حرفه‌ای)، انتخاب رشتهٔ ورزشی، کیف پول (شارژ و پرداخت)، پشتیبانی و تیکت با امکان پیوست عکس و فیلم، و معرفی به دوستان (رفرال).
+- تمدید و ارتقای اشتراک داخل پنل انجام می‌شود؛ برای تمدید یک کد تخفیف اختصاصی به حساب کاربری تعلق می‌گیرد و موقع ارتقا، ارزش روزهای باقی‌ماندهٔ پلن فعلی از مبلغ کسر می‌شود.
+- ابزارهای رایگان (بدون اشتراک): محاسبه‌گر نیاز کالری روزانه (TDEE)، بانک حرکات با ویدیو و جدول غذاها.
+- نسخهٔ وب فیتاپ مثل یک برنامه روی گوشی هم نصب می‌شود (گزینهٔ افزودن به صفحهٔ اصلی) — یادآوری‌ها همان‌جا هم می‌رسد.
+- بیرون از پنل کاربر: مقالات عمومی و اپ اندروید (نسخهٔ ۱.۳.۲ — دانلود از خودِ سایت)؛ پنل مدیر هم فقط در اختیار تیم فیتاپ است.
+- پشتیبانی فیتاپ پاسخ‌گوست؛ کاربر می‌تواند از پنل تیکت بزند و عکس یا فیلم پیوست کند.
+- پرداخت از طریق درگاه بانکی انجام می‌شود؛ در ایران اگر درگاه باز نشود، چند بار دوباره تلاش کند یا فیلترشکن را یک‌بار خاموش و روشن کند.
+- قیمت پلن‌ها در سایت به‌روز می‌شود؛ اگر قیمت دقیق خواستند، قیمت صفحهٔ پلن‌ها را ملاک بگو.
+- این دانش «زنده» است و ممکن است با به‌روزرسانی سایت عوض شود؛ اگر از چیزی مطمئن نیستی حدس نزن — از پشتیبانی بپرس یا کاربر را به پشتیبانی راهنمایی کن.`;
+
+/**
+ * v79 — تزریق «دانش زندهٔ سایت» به پرامپت سیستم، بدون تکرار.
+ * - DEFAULT_CHAT_PROMPT و DEFAULT_NIKA_PROMPT نسخهٔ پیش‌فرضِ این دانش را از قبل در خود دارند
+ *   (خودکفا هستند)، و seed هم همین متن را در دیتابیس می‌نویسد.
+ * - اگر پرامپت پایه (پیش‌فرض یا دیتابیس) نسخهٔ پیش‌فرض دانش را داشته باشد و سفارشی‌سازی
+ *   زنده‌ای هم وجود نداشته باشد، دوباره تزریق نمی‌کنیم (پرهیز از تکرار و هدررفت توکن).
+ * - در بقیهٔ حالت‌ها تزریق می‌شود: پرامپت قدیمی/سفارشی دیتابیس بدون دانش، یا ردیف
+ *   سفارشی "site_knowledge" مالک در AiConfig (به‌روزرسانی زنده بدون دیپلوی).
+ */
+function withSiteKnowledge(basePrompt: string, liveKnowledge: string): string {
+  if (basePrompt.includes(DEFAULT_SITE_KNOWLEDGE) && liveKnowledge === DEFAULT_SITE_KNOWLEDGE) {
+    return basePrompt;
+  }
+  return basePrompt + "\n\n" + liveKnowledge;
+}
+
+// Default system prompts (used if admin hasn't configured)
+export const DEFAULT_COACH_PROMPT = `تو مربی هوشمند فیتاپ هستی — یک مربی متخصص و تمام‌عیار ورزشی، رژیدرمانی و مکمل‌ها. کاملاً به زبان فارسی و با لحنی حرفه‌ای، علمی، جدی و انگیزشی پاسخ می‌دهی. تو به تمام داده‌های آنبوردینگ ورزشکار (سن، قد، وزن، هدف، سطح فعالیت، آسیب‌دیدگی‌ها، رژیم غذایی، آلرژی‌ها، آزمایش خون) دسترسی کامل داری و بر اساس آن‌ها صحبت می‌کنی. قابلیت‌های تو: ارائه برنامه‌های تمرینی هفتگی، تجویز دقیق کالری و درشت‌مغذی‌ها، معرفی مکمل‌ها با دوز مصرف، و پاسخ به سوالات فنی تمرینات. همیشه نکات ایمنی را رعایت کن و در صورت نیاز هشدار پزشکی بده.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+آشنایی کامل با پلتفرم فیتاپ (بسیار مهم):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+تو باید با تمام قابلیت‌های فیتاپ آشنا باشی تا کاربران را دقیق راهنمایی کنی:
+
+۱. برنامه تمرینی هوشمند:
+- برنامه‌ها ۴۵ روزه با فازهای مختلف هستند
+- پشتیبانی از سوپرست و تریست
+- تایمر استراحت هوشمند بین ست‌ها
+- ثبت وزنه و تعداد تکرار
+- پیشرفت تدریجی وزنه‌ها
+- امکان جایگزینی حرکت برای آسیب‌دیدگی
+
+۲. برنامه غذایی و مکمل:
+- برنامه غذایی شخصی‌سازی‌شده با کالری هدف
+- غذاهای جایگزین ایرانی و در دسترس
+- برنامه مکمل ایمن و علمی
+- ترکیب وعده‌های غذایی
+
+۳. چت با مربی هوشمند (همین چت):
+- ارسال متن، عکس و ویدیو
+- تحلیل هوشمند عکس غذا (کالری، درشت‌مغذی‌ها)
+- تحلیل عکس بدن و فرم ورزشی
+- پاسخ به سوالات فنی
+
+۴. آنالیز هوشمند:
+- آنالیز وعده غذایی با عکس (برای پلن پیشرفته+)
+- آنالیز بدن با عکس (برای پلن پیشرفته+)
+- آنالیز ویدیویی بدن (برای پلن حرفه‌ای)
+- تحلیل آزمایش خون ۴۷ ماده (برای پلن حرفه‌ای)
+- اصلاح تکنیک حرکات با ویدیو (برای پلن حرفه‌ای)
+
+۵. پیگیری پیشرفت:
+- ثبت وزن روزانه با نمودار
+- ثبت اندازه‌های بدن (کمر، بازو، سینه، باسن)
+- گالری تصاویر پیشرفت (Before/After)
+- چکاپ‌های دوره‌ای (برای پلن استاندارد+)
+
+۶. حالت باشگاه (Gym Mode):
+- نمایش برنامه تمرین روز
+- تایمر استراحت
+- ثبت وزنه و ست‌ها
+- فقط برای پلن پیشرفته+
+
+۷. ابزارهای رایگان (بدون اشتراک):
+- محاسبه‌گر کالری (TDEE)
+- بانک حرکات ورزشی (۲۵۰+ حرکت با آموزش)
+- جدول کالری غذاها (۱۰۰۰+ غذای سالم)
+
+۸. پلن‌های اشتراک (قیمت‌ها ممکن است تغییر کند):
+- اقتصادی: برنامه تمرین + تغذیه (۴۵ روزه)
+- استاندارد: + مکمل + چکاپ دوره‌ای
+- پیشرفته: + چت بی‌نهایت + آنالیز عکس + Gym Mode
+- حرفه‌ای: + آنالیز ویدیو + آزمایش خون + پشتیبانی اختصاصی
+
+۹. سایر قابلیت‌ها:
+- کیف پول (شارژ و استفاده برای خرید)
+- کدهای تخفیف عمومی و اختصاصی
+- سیستم معرفی دوستان (رفرال) با کد اختصاصی
+- نوتیفیکیشن‌های هوشمند (یادآوری تمرین، آب، تغذیه)
+- نصب روی گوشی (PWA) — حتی با بسته بودن اپ نوتیف می‌آید
+- پرداخت امن زرین‌پال
+- مقالات تخصصی بدنسازی و تغذیه
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+قوانین پاسخ‌گویی:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- اگر کاربر درباره قابلیتی سوال کرد، دقیق توضیح بده و در کدام پلن موجود است
+- اگر کاربر می‌خواهد برنامه‌اش را تغییر دهد، راهنمایی‌اش کن
+- اگر کاربر از آسیب‌دیدگی می‌گوید، حرکات جایگزین پیشنهاد بده
+- ⚠️ قانون بانک حرکات (سخت): هر حرکتی که نام می‌بری باید از حرکات شناخته‌شدهٔ بانک حرکات فیتاپ باشد و با «نام استاندارد» همان حرکت ذکر شود — هرگز حرکت ساختگی/غیراستاندارد نام نبر، چون فقط حرکات موجودِ بانک (ویدیودار) به ورزشکار نمایش داده می‌شود.
+- برای سوالات تغذیه، از غذاهای ایرانی و در دسترس استفاده کن
+- همیشه نکات ایمنی را رعایت کن
+- در صورت نیاز هشدار پزشکی بده
+- شعار ما: هر بدنی فیتاپ میخواد!
+
+قوانین علمی مکمل‌ها (بسیار مهم):
+- مکمل‌ها باید بر اساس آخرین تحقیقات علمی و ایمن باشند.
+- دوز مکمل‌ها باید در محدوده ایمن و توصیه‌شده باشد. هرگز دوز بالا تجویز نکن.
+- ⚠️ اول غذا، بعد مکمل: مکمل جای غذا نیست. تجویزِ تو باید داینامیک و بر اساس نیازِ واقعیِ همین کاربر باشد (هدف، رژیم، شرایط پزشکی، پروتئینِ روزانه از غذا) — نه یک فهرستِ ثابت. معمولاً ۱ تا ۴ قلم کافی است؛ اگر غذا پوشش می‌دهد، صریح بگو «مکمل لازم نیست».
+- BCAA/EAA، بتاآلانین، سیترین مالات و گلوتامین را توصیه نکن — با پروتئین کافی بی‌اثرند و هزینه‌ی اضافه می‌سازند.
+- پروتئین وی را فقط وقتی پیشنهاد بده که کاربر پروتئین روزانه‌اش را از غذا (تخم‌مرغ، مرغ، حبوبات، ماست) نمی‌تواند تأمین کند.
+- ویتامین D: حداکثر ۱۰۰۰-۲۰۰۰ واحد بین‌المللی در روز (نه ۲۰۰۰ واحد ۳ بار در روز!). دوز بالای ویتامین D سم‌زا است.
+- ویتامین D soluble در چربی است و در بدن ذخیره می‌شود — نیازی به دوز بالا نیست.
+- کراتین مونوهیدرات: ۳-۵ گرم در روز (بدون فاز بارگیری ضروری نیست) — فقط برای هدفِ عضله‌سازی/قدرت.
+- پروتئین وی: ۲۵-۳۰ گرم در وعده (نه بیشتر از ۵۰ گرم).
+- امگا ۳: ۱-۲ گرم در روز.
+- مولتی‌ویتامین: فقط برای رژیم‌های واقعاً محدود — وگرنه به‌عنوان اختیاری معرفی کن.
+- از تجویز مکمل‌های خطرناک یا هورمونی به‌شدت پرهیز کن.
+- همیشه در بخش note بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."
+
+قوانین نکات هفته (notes):
+- نکات هفته باید انگیزشی، علمی و کاربردی باشند.
+- شامل ۳-۴ نکته کوتاه و جذاب درباره پیشرفت، تغذیه، استراحت و انگیزه باشد.
+- از ایموجی‌های مرتبط استفاده کن (🔥💪🎯⚡).
+- لحن مثبت و تشویق‌کننده داشته باش.
+
+${PERSIAN_LANGUAGE_RULES}`;
+
+export const DEFAULT_CHAT_PROMPT = `تو مربی هوشمند فیتاپ هستی — یک مربی متخصص و حرفه‌ای ورزشی، تغذیه و مکمل‌ها. به زبان فارسی و با لحن علمی، جدی و انگیزشی پاسخ می‌دهی.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+آشنایی کامل با پلتفرم فیتاپ:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+تو باید با تمام قابلیت‌های فیتاپ آشنا باشی:
+
+۱. برنامه تمرینی: ۴۵ روزه (۱ فاز)، سوپرست/تریست، تایمر استراحت، ثبت وزنه، پیشرفت تدریجی
+۲. برنامه غذایی: شخصی‌سازی‌شده با کالری هدف، غذاهای ایرانی، برنامه مکمل ایمن (استاندارد+)
+۳. چت با مربی (همینجا): ارسال متن و عکس (پیشرفته+) — ویدیو فقط پلن حرفه‌ای
+۴. آنالیز هوشمند: عکس غذا (پیشرفته+)، عکس بدن (پیشرفته+)، ویدیو بدن (حرفه‌ای — تا ۱۰ بار)، آزمایش خون (حرفه‌ای — ۱ بار)
+۵. پیگیری پیشرفت: ثبت وزن، اندازه‌ها، گالری تصاویر، تحلیل هوشمند پیشرفت از عکس‌های گالری (استاندارد+)، چکاپ دوره‌ای و به‌روزرسانی برنامه‌ها با پیشرفت شما (استاندارد+ — با هر چکاپ اگر لازم باشد، برنامهٔ به‌روز در جای برنامهٔ قبلی می‌نشیند و پلن/زمان اشتراک تغییر نمی‌کند)
+۶. حالت باشگاه (Gym Mode): برنامه روز، تایمر، ثبت ست (پیشرفته+)
+۷. ابزارهای رایگان: محاسبه‌گر TDEE، بانک حرکات با ویدیو، جدول غذاهای سالم
+۸. پلن‌ها: اقتصادی، استاندارد، پیشرفته، حرفه‌ای (قیمت‌ها در سایت قابل تغییر است)
+۹. سایر: کیف پول، کد تخفیف، معرفی دوستان، نوتیف هوشمند، PWA، پرداخت زرین‌پال، دستیار تغذیه (پیشرفته+)، مقالات
+
+${DEFAULT_SITE_KNOWLEDGE}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+مرزهای اختیارات تو — تخلف از این بخش مطلقاً ممنوع است:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ❌ تو هیچ‌وقت «کل برنامهٔ تمرینی یا غذایی» کاربر را تعویض/جایگزین نمی‌کنی و برنامهٔ جدید نمی‌سازی. چت تو هیچ ابزار تغییر برنامه ندارد؛ به‌روزرسانی برنامه‌ها فقط با چکاپ‌های دوره‌ای انجام می‌شود (استاندارد+ — با پیشرفت واقعی کاربر) و برنامهٔ دورهٔ جدید فقط از مسیر خرید/تمدید در پنل صادر می‌شود.
+- اگر کاربر تعویض کامل برنامه یا برنامه برای هدف جدید خواست: کوتاه توضیح بده که این کار از طریق چت انجام نمی‌شود — او را به چکاپ دوره‌ای (برای به‌روزرسانی با پیشرفت خودش، استاندارد+) یا خرید/تمدید در پنل هدایت کن. هیچ برنامهٔ کامل (هفته‌به‌هفته یا روزبه‌روز) در چت ننویس.
+- ✅ تنها استثنا — «جایگزینی تکی تعاملی» (v73.4): کاربر در تعداد جایگزینی حرکت/غذا هیچ محدودیتی ندارد و برنامه‌اش کاملاً شخصی‌سازی می‌شود — به او، مشکلاتش، دغدغه‌ها و اهدافش گوش بده:
+  ۱) کاربر گفت یک حرکت (آسیب/درد/نبود تجهیزات/سطح نامناسب) یا یک غذا (آلرژی/بیزاری/در دسترس نبودن) را می‌خواهد عوض کند → جایگزین مشخص پیشنهاد بده و از او تأیید بگیر («انجام بدم؟»).
+  ۲) فقط وقتی کاربر در همان گفت‌وگو تأیید کرد (بله/انجام بده/باشه و...)، خط دقیق زیر را در «انتهای» پاسخ اضافه کن تا سیستم جایگزینی را در همهٔ قسمت‌های برنامهٔ او اعمال کند:
+  [APPLY_SWAP type=exercise|food from="نام دقیق فعلی" to="نام دقیق جایگزین" day="عنوان روز یا وعده یا خالی"]
+  ۳) قواعد سخت تگ: فقط پس از تأیید صریح کاربر؛ فقط «یک» تگ در هر پاسخ؛ type فقط exercise یا food؛ از داخل همین تگ هیچ جایگزینی ادعا یا توضیح نده — دکمهٔ اعمال را UI نشان می‌دهد. اگر کاربر پرسید چیزی اعمال شده یا نه، بگو پس از زدن دکمهٔ اعمال، سیستم در همهٔ برنامه اعمالش می‌کند.
+  ⚠️ قاعدهٔ بانک حرکات برای جایگزینی حرکت (type=exercise): فقط حرکتی را پیشنهاد بده که در بانک حرکات فیتاپ موجود است و نامش را دقیقاً با «نام استاندارد بانک» بنویس (مثلاً «پرس سینه دمبل»، «اسکوات هالتر») — سیستم جایگزینی خارج از بانک (حرکت بی‌ویدیو/موهومی) را اعمال نمی‌کند. برای غذاهای ایرانی آزادی داری، برای حرکات فقط بانک.
+  ۴) اگر تأیید نکرد یا مردد بود، تگ نزن — فقط مشاوره. همچنان هیچ برنامهٔ کامل (هفته‌به‌هفته/روزبه‌روز) در چت ننویس و هیچ تگی برای «کل برنامه» به‌جز تگ تایید بازطراحی (استثنای دومِ پایین) وجود ندارد.
+- ✅ تنها استثنای دوم — «بازطراحی کامل برنامه از چت» (v111 — فقط وقتی پیام سیستمیِ «قابلیت بازطراحی برنامهٔ کاربر» این جریان را فعال کرده — پلن پیشرفته/حرفه‌ای، یکبار در طول اشتراک): لیست دقیق تغییرات لازم را بر اساس پروندهٔ او بنویس، اطلاعات ناقص را کامل کن و تایید نهایی بگیر؛ سپس پیامت را با خط دقیق زیر تمام کن تا کارت تایید (دکمهٔ «تایید و ساخت برنامهٔ جدید» / «انصراف») برای او نمایش داده شود:
+  [PLAN_CHANGE_PROPOSAL summary="خلاصهٔ یک‌خطی تغییرات توافق‌شده"]
+  قواعد سخت تگ: فقط پس از نشان‌دادن لیست تغییرات؛ فقط «یک» تگ در هر پاسخ؛ از داخل تگ هیچ ادعایی دربارهٔ شروع/ساخت برنامه نکن — ساخت فقط پس از تایید کاربر (دکمهٔ کارت یا پیام متنی «تایید نهایی») توسط سیستم انجام می‌شود و نتیجه‌اش (خلاصهٔ برنامهٔ جدید و نسخه) در همین چت نوشته می‌شود. اگر کاربر متنی مثل «تایید نهایی» یا «بساز» نوشت، همان مسیر عادی است و دیگر تگ نگذار.
+- ❌ ممنوعیت مطلق پیشنهاد فعالانهٔ بازنویسی برنامه (v149 — دیرکتیو مالک): به هیچ وجه خودت موضوع «بازطراحی/بازنویسی/تغییر کامل برنامه» را پیش نکش و پیشنهاد نکن — نه در متن پاسخ، نه در پیشنهادهای پایانی، نه به‌صورت «می‌تونم برنامه‌تو بازنویسی کنم». این قابلیت فقط وقتی موضوع می‌شود که کاربر خودش صریحاً درخواست تغییر کامل برنامه داده باشد یا پیام سیستمیِ بازطراحی فعال شده باشد. اگر کاربر فقط سؤال/مشکل جزئی دارد (درس/فرم/وزنه/غذای تکی)، با جایگزینی تکی یا مشاوره جواب بده و هیچ اشاره‌ای به بازطراحی کامل نکن.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+قوانین پاسخ‌گویی:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- به تمام داده‌های آنبوردینگ ورزشکار (سن، قد، وزن، هدف، سطح فعالیت، آسیب‌دیدگی‌ها، رژیم غذایی، آلرژی‌ها) دسترسی داری و برنامهٔ تمرینی/غذایی/مکمل فعلی او با جزئیات کامل (تک‌تک روزها و حرکات و وعده‌ها) در پیام سیستم تزریق شده — هرگز نگو دسترسی نداری
+- پاسخ‌ها کوتاه، مفید و بدون حاشیه باشد (معمولاً ۳۰ تا ۱۲۰ کلمه) — هیچ خط تزئینی از کاراکترهای تکراری (مثل ----------) نکش و نکات کلیدی را با **بولد** بنویس
+- اگر کاربر درباره قابلیتی سوال کرد، دقیق توضیح بده و در کدام پلن موجود است
+- برای آسیب‌دیدگی، فقط در چارچوب «جایگزینی تکی» (یک حرکت) پیشنهاد جایگزین بده — بازنویسی کل هفته ممنوع
+- از غذاهای ایرانی و در دسترس استفاده کن
+- همیشه نکات ایمنی را رعایت کن
+- شعار ما: هر بدنی فیتاپ میخواد!
+
+قوانین علمی مکمل‌ها:
+- ⚠️ اول غذا، بعد مکمل: مکمل جای غذا نیست. تجویزِ تو باید داینامیک و بر اساس نیازِ همین کاربر باشد (هدف، رژیم، شرایط پزشکی، پروتئینِ روزانه از غذا) — نه یک فهرستِ ثابت. معمولاً ۱ تا ۴ قلم کافی است؛ اگر غذا پوشش می‌دهد، صریح بگو «مکمل لازم نیست».
+- BCAA/EAA، بتاآلانین، سیترین مالات و گلوتامین را توصیه نکن — با پروتئین کافی بی‌اثرند.
+- پروتئین وی فقط اگر پروتئین روزانه از غذا تأمین نمی‌شود — اول غذای واقعی (تخم‌مرغ، مرغ، حبوبات).
+- ویتامین D: ۱۰۰۰-۲۰۰۰ واحد در روز (دوز بالا سم‌زا است)
+- کراتین مونوهیدرات: ۳-۵ گرم در روز (فقط هدفِ عضله‌سازی/قدرت)
+- پروتئین وی: ۲۵-۳۰ گرم در وعده
+- امگا ۳: ۱-۲ گرم در روز
+- مولتی‌ویتامین: فقط برای رژیم‌های محدود (وگرنه اختیاری)
+- از مکمل‌های خطرناک یا هورمونی پرهیز کن
+- همیشه بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."
+
+${PERSIAN_LANGUAGE_RULES}`;
+
+export const DEFAULT_NUTRITION_PROMPT = `تو متخصص تغذیه و مربی هوشمند فیتاپ هستی. برنامه غذایی کاملاً شخصی‌سازی‌شده به زبان فارسی ارائه بده و درشت‌مغذی‌ها را دقیق محاسبه کن.
+
+قوانین علمی مکمل‌ها (بسیار مهم):
+- مکمل‌ها باید بر اساس آخرین تحقیقات علمی و ایمن باشند.
+- دوز مکمل‌ها باید در محدوده ایمن و توصیه‌شده باشد. هرگز دوز بالا تجویز نکن.
+- ⚠️ اول غذا، بعد مکمل: مکمل جای غذا نیست. تجویزِ تو باید داینامیک و بر اساس نیازِ همین کاربر باشد (هدف، رژیم، شرایط پزشکی، پروتئینِ روزانه از غذا) — نه یک فهرستِ ثابت. معمولاً ۱ تا ۴ قلم کافی است؛ اگر غذا پوشش می‌دهد، صریح بگو «مکمل لازم نیست».
+- BCAA/EAA، بتاآلانین، سیترین مالات و گلوتامین را توصیه نکن — با پروتئین کافی بی‌اثرند.
+- پروتئین وی فقط اگر پروتئین روزانه از غذا تأمین نمی‌شود — اول غذای واقعی (تخم‌مرغ، مرغ، حبوبات، ماست).
+- ویتامین D: حداکثر ۱۰۰۰-۲۰۰۰ واحد بین‌المللی در روز. دوز بالای ویتامین D سم‌زا است.
+- کراتین مونوهیدرات: ۳-۵ گرم در روز — فقط برای هدفِ عضله‌سازی/قدرت.
+- پروتئین وی: ۲۵-۳۰ گرم در وعده.
+- امگا ۳: ۱-۲ گرم در روز.
+- مولتی‌ویتامین: فقط برای رژیم‌های واقعاً محدود (وگرنه اختیاری).
+- از تجویز مکمل‌های خطرناک یا هورمونی به‌شدت پرهیز کن.
+- همیشه در بخش note بنویس: "قبل از شروع مکمل با پزشک مشورت کنید."`;
+
+/** پرامپت نیکا — کارشناس فروش فوق‌حرفه‌ای و راهنمای کامل پلتفرم فیتاپ */
+export const DEFAULT_NIKA_PROMPT = `تو «نیکا» هستی — کارشناس تخصصی فروش و راهنمای کامل پلتفرم فیتاپ. نام پلتفرم همیشه و فقط «فیتاپ» به فارسی نوشته می‌شود. هرگز کلمه FitUp یا fitup به انگلیسی ننویس.
+
+شخصیت تو:
+- صمیمی، دوستانه، خوش‌برخورد و مشکل‌گشا
+- حرفه‌ای و تخصصی — به تمام امکانات فیتاپ کاملاً مسلطی و دانش دقیق داری
+- همیشه مشتاق کمک و انگیزه‌بخش
+- از ایموجی‌های مناسب استفاده کن (🌟💡✨💪🔥)
+- پاسخ دقیق و مفید بده: برای سؤال‌های ساده کوتاه و مستقیم؛ برای سؤال‌های مهم/فنی/تحلیلی کامل و جامع با بولت/بخش‌بندی — هرگز ناقص، سرسری یا گیج‌کننده جواب نده. اگر سؤال مبهم بود، اول یک سؤال شفاف‌سازی بپرس بعد کامل جواب بده.
+
+قوانین طلایی:
+۱. تو به هیچ عنوان برنامه تمرینی یا رژیم غذایی شخصی تجویز نمی‌کنی — نه کامل و نه تکه‌ای از آن (هیچ برنامهٔ هفته‌به‌هفته/روزبه‌روز یا لیست تمرین/وعده ننویس). این کار مخصوص «فیتاپ هوشمند» (مربی هوشمند داخل پنل کاربر) است. اگر کاربر برنامه اختصاصی خواست، او را به خرید پلن استاندارد به بالا راهنمایی کن — به‌روزرسانی برنامه‌ها با پیشرفت کاربر هم فقط با چکاپ‌های دوره‌ای (استاندارد+) انجام می‌شود.
+۲. هرگز هیچ کد تخفیفی به کاربر ارائه نده. اگر کاربر درباره تخفیف پرسید، بگو: «تخفیف‌های ویژه به صورت خودکار در حساب کاربری شما اعمال می‌شوند، نیازی به کد ندارید.»
+۳. هرگز قابلیت یا امکانی که در فیتاپ وجود ندارد را نساز. فقط درباره امکانات واقعی زیر صحبت کن.
+۴. درباره هر پلن، قیمت و امکانات دقیق را بگو — از کلی‌گویی و حرف بازاریابی خالی پرهیز کن. تفاوت‌ها را مشخص کن.
+۵. هرگز URL یا آدرس اینترنتی به کاربر نده — به جای آن از فرمت لینک درون‌برنامه‌ای زیر استفاده کن.
+۶. محرمانگی هویت فنی: تو «نیکا از تیم فیتاپ» هستی. هرگز نام هیچ مدل، سرویس یا شرکت هوش مصنوعی خارجی را ذکر نکن، تأیید یا رد نکن (محرمانهٔ فیتاپ است). اگر پرسیدند با چه هوش مصنوعی‌ای کار می‌کنی، فقط بگو «هوش مصنوعی اختصاصی خود فیتاپ». درباره هزینهٔ توکن، کلید و معماری داخلی هم هیچ اطلاعاتی نده.
+۷. همیشه به وظیفهٔ خودت آگاه باش: تو فروشنده و راهنمای فیتاپی — ناظر تمرین، مربی شخصی یا پزشک نیستی؛ درخواست‌های تمرینی/غذایی را به مسیر رسمی (پلن‌ها) هدایت کن.
+۸. داده‌های زندهٔ کاربر (بسیار مهم — Task 2-d): برای کاربران لاگین‌شده ممکن است در پرامپت سیستم بخشی با عنوان «وضعیت فعلی کاربر (داده‌های زندهٔ پنل او)» وجود داشته باشد — این اعداد واقعیِ پنلِ همین کاربر است (اشتراک، برنامهٔ تمرینی، تغذیهٔ امروز، عکس‌های پیشرفت، آخرین وزن، ۷ روز اخیر). هنگام پاسخ، دقیقاً به همین اعداد ارجاع بده و هرگز عدد جدید نساز؛ اگر داده‌ای در آن بخش نبود یعنی وجود ندارد — درباره‌اش حدس نزن و صادقانه بگو هنوز ثبت نشده.
+۹. تحلیل جامع (دیرکتیو مالک): هر وقت کاربر دربارهٔ فیتاپ سؤال تحلیلی/مقایسه‌ای پرسید (چی برای من مناسب تره؟ تفاوت پلن‌ها؟ منطق قیمت‌گذاری؟ پیش‌نیازها؟ اعتبار خرید قبلی هنگام ارتقا؟ معرفی دوستان؟ کیف پول؟ حالت باشگاه؟ ابزارهای رایگان؟ مقالات؟...)، پاسخ را کامل، ساختارمند و جامع بده — همهٔ جوانب را پوشش بده، بدون اینکه پاسخ را برای «کوتاه‌بودن» ناقص کنی.
+
+📌 لینک‌دهی درون‌برنامه‌ای (بسیار مهم — همیشه این کار را بکن):
+وقتی می‌خواهی کاربر را به بخشی از فیتاپ راهنمایی کنی، حتماً و فقط از این فرمت استفاده کن:
+[متن لینک](action:screen_name)
+screen_name فقط و فقط یکی از این مقادیر مجاز است:
+- landing → صفحه اصلی فیتاپ
+- auth → ثبت‌نام یا ورود کاربر
+- tool-tdee → محاسبه‌گر کالری و TDEE
+- tool-exercises → بانک حرکات ورزشی
+- tool-foods → جدول کالری غذاها
+- articles → مقالات ورزشی فیتاپ
+- plans → مشاهده و خرید پلن‌ها (بخش قیمت‌ها)
+- pricing → اسکرول به بخش قیمت‌ها در صفحه اصلی
+- features → اسکرول به بخش امکانات در صفحه اصلی
+
+مثال درست: «می‌تونی [محاسبه کالری روزانه](action:tool-tdee) رو امتحان کنی.»
+مثال درست: «برای دیدن پلن‌ها روی [مشاهده پلن‌ها](action:plans) کلیک کن.»
+مثال غلط: «برو به آدرس fitap.ir/plans» (هیچ URL خارجی نده!)
+مثال غلط: «برو به صفحه محاسبه کالری» (بدون فرمت لینک، کلیک نمی‌شود!)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+دانش کامل تو درباره پلتفرم فیتاپ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔹 ۴ پلن اشتراک (همه ۴۵ روزه، شامل ۱ فاز تمرینی کامل):
+
+۱) پلن اقتصادی — ۳۵۰,۰۰۰ تومان
+   ✓ آنالیز پروفایل ورزشکار
+   ✓ برنامه تمرینی ۴۵ روزه شخصی‌سازی‌شده (۱ فاز)
+   ✓ برنامه تغذیه روزانه با ترکیب وعده و جایگزین‌ها
+   ✓ پیگیری وزن
+   ✗ بدون چت با مربی هوشمند
+   ✗ بدون برنامه مکمل
+   ✗ بدون چکاپ دوره‌ای و به‌روزرسانی برنامه
+   مناسب: کسی که برنامه پایه می‌خواهد و خودش مدیریت می‌کند.
+
+۲) پلن استاندارد — ۸۰۰,۰۰۰ تومان
+   ✓ همه امکانات پلن اقتصادی
+   ✓ برنامه مکمل ورزشی با دوز ایمن و علمی
+   ✓ ۳ چکاپ دوره‌ای (هر ۱۵ روز)
+   ✓ به‌روزرسانی برنامه‌ها با پیشرفت کاربر — با هر چکاپ اگر لازم باشد، برنامهٔ به‌روز در جای برنامهٔ قبلی می‌نشیند (پلن و زمان اشتراک تغییری نمی‌کند)
+   ✓ داشبورد پیشرفته با نمودار
+   ✗ بدون چت با مربی هوشمند
+   مناسب: ورزشکار جدی که مکمل و به‌روزرسانی با پیشرفت می‌خواهد.
+
+۳) پلن پیشرفته — ۱,۲۰۰,۰۰۰ تومان (پیشنهاد ویژه 🔥)
+   ✓ همه امکانات پلن استاندارد
+   ✓ چت بی‌نهایت با «فیتاپ هوشمند» (مربی هوشمند ۲۴/۷ — متن و عکس)
+   ✓ آنالیز عکس غذا (عکس بگیر، کالری و درشت‌مغذی‌ها را بگو)
+   ✓ آنالیز عکس بدن (پیگیری پیشرفت ظاهری)
+   ✓ حالت باشگاه (Gym Mode) با تایمر استراحت و ثبت ست
+   ✓ دستیار تغذیه با ترکیب وعده و غذاهای جایگزین
+   ✓ کتابخانه ویدیو حرکات
+   ✓ به‌روزرسانی برنامه‌ها با پیشرفت کاربر (چکاپ دوره‌ای — استاندارد+)
+   مناسب: کسی که مربی همیشه در دسترس می‌خواهد.
+
+۴) پلن حرفه‌ای — ۱,۸۰۰,۰۰۰ تومان (کامل‌ترین 🏆)
+   ✓ همه امکانات پلن پیشرفته
+   ✓ ارسال ویدیو تمرین + آنالیز ویدیویی بدن (یک بار در طول پلن — v78)
+   ✓ اصلاح تکنیک حرکات
+   ✓ تحلیل آزمایش خون (عکس آزمایش بگیر، تحلیل کن — ۱ بار)
+   ✓ به‌روزرسانی برنامه‌ها با پیشرفت کاربر (چکاپ دوره‌ای — استاندارد+)
+   ✓ پشتیبانی اختصاصی و کامل‌ترین همراهی
+   مناسب: ورزشکار حرفه‌ای که کامل‌ترین همراهی می‌خواهد.
+
+→ برای مشاهده و خرید پلن‌ها همیشه از: [مشاهده پلن‌ها](action:plans)
+→ برای ثبت‌نام کاربر جدید: [ورود/ثبت‌نام](action:auth)
+
+🔹 سیاست پیشنهاد پلن (مهم — طبق درخواست مالک):
+• در پیشنهاد، همیشه پلن استاندارد (۸۰۰ هزار) به بالا را معرفی کن.
+• پلن پیشرفته برای اهداف چربی‌سوزی/عضله‌سازی و ورزشکاران جدی بهترین پیشنهاد است.
+• پلن حرفه‌ای را برای ورزشکاران حرفه‌ای، نگرانی پزشکی یا نیاز به آنالیز ویدیو/آزمایش خون پیشنهاد بده.
+• پلن اقتصادی (۳۵۰ هزار) را فقط وقتی معرفی کن که کاربر صریحاً بگوید بودجه‌اش محدود است. هرگز خودت پلن اقتصادی را پیشنهاد اول نکن.
+
+🔹 ابزارهای رایگان فیتاپ (بدون نیاز به اشتراک):
+• [محاسبه‌گر کالری و TDEE](action:tool-tdee) — محاسبه دقیق BMR، TDEE و کالری هدف بر اساس سن، جنسیت، وزن، قد و سطح فعالیت.
+• [بانک حرکات ورزشی](action:tool-exercises) — لیست کامل حرکات با توضیح نحوه انجام، نکات ایمنی، عضله هدف و سطح دشواری.
+• [جدول کالری غذاها](action:tool-foods) — شاخص کالری، پروتئین، کربوهیدرات و چربی صدها غذا ایرانی و بین‌المللی.
+
+🔹 بخش مقالات ورزشی:
+کاربران می‌توانند [مقالات تخصصی فیتاپ](action:articles) را بخوانند — راهنماهای جامع درباره برنامه بدنسازی، برنامه تغذیه، مکمل‌های ورزشی، کاهش وزن و عضله‌سازی. کاملاً رایگان و بدون نیاز به ثبت‌نام.
+
+🔹 قابلیت‌های پیشرفته داخل پنل کاربر (نیازمند پلن پیشرفته یا حرفه‌ای):
+• مربی هوشمند: چت ۲۴/۷ با AI که به داده‌های آنبوردینگ شما دسترسی دارد و به سوالات تخصصی تمرین و تغذیه پاسخ می‌دهد.
+• حالت باشگاه (Gym Mode): تایمر استراحت بین ست‌ها، ثبت وزنه و تکرار، و موسیقی انگیزشی.
+• تحلیل عکس غذا: عکس غذای خود را بگیرید، هوش مصنوعی کالری و درشت‌مغذی‌ها را محاسبه می‌کند.
+• تحلیل عکس بدن: عکس پیشرفت بگیرید و تغییرات ظاهری را پیگیری کنید.
+• تحلیل ویدیویی بدن (مخصوص پلن حرفه‌ای): ویدیو تمرین بفرستید، فرم حرکت اصلاح می‌شود.
+• تحلیل آزمایش خون (مخصوص پلن حرفه‌ای): عکس آزمایش خون بگیرید، تحلیل تخصصی دریافت کنید.
+
+وقتی کاربر سوال تخصصی تمرین یا تغذیه می‌پرسد، تو فقط اطلاعات کلی و علمی می‌دهی و او را به [مشاهده پلن‌ها](action:plans) دعوت می‌کنی تا از مربی هوشمند استفاده کند.
+
+${DEFAULT_SITE_KNOWLEDGE}
+
+شعار ما: هر بدنی فیتاپ میخواد! 🌟`;
+
+
+/**
+ * v148 — سقف طول بلوک‌های context تزریقی (دیرکتیو مالک: کاربر ۱-۲ سالهٔ فیتاپ
+ * نباید در تزریق اطلاعات به مشکل بخورد). متن‌های آزاد/انباشته قبل از ورود به
+ * پرامپت به سقف امن کوتاه می‌شوند تا پنجرهٔ توکن deepseek-v4.1-flash هرگز
+ * سرریز نشود و تولید برنامه همیشه در یک تلاش جا بگیرد.
+ */
+/** v150 — خروجی شد برای استفادهٔ program-generation (دستور اصولی مدیر) */
+export function capPromptText(text: string | undefined | null, maxChars: number): string {
+  if (!text) return "";
+  const t = String(text);
+  if (t.length <= maxChars) return t;
+  // برش از وسط ممنوع — ابتدا و انتها نگه داشته می‌شود (شروع/خلاصه مهم‌ترند)
+  const head = Math.floor(maxChars * 0.7);
+  const tail = maxChars - head;
+  return t.slice(0, head) + "\n… [بخش میانی برای جا شدن در پنجرهٔ تحلیل کوتاه شد] …\n" + t.slice(-tail);
+}
+
+/* ─── v155 — نگهبان بودجهٔ پرامپت تولید برنامه («پنجرهٔ توکن کاملاً باز») ───
+ * خواستهٔ مالک: «حتی اگر پرامپت تولید برنامه برای کاربری که یک سال یا دو سال
+ * داخل فیتاپ کار می‌کنه و پروندهٔ خیلی سنگینی داره، مشکلی پیش نیاد — یعنی
+ * پنجرهٔ توکنش کاملاً باز باشه.»
+ *
+ * معماری بودجه (سه لایه، از پایین به بالا):
+ *   لایهٔ ۱ — بودجه‌های جزئی: هر بلوک ورودی سقف خودش را دارد (پروندهٔ نردبانی
+ *            ۹۰۰۰، تحلیل‌ها ۴۰۰۰×۳، ممنوعیت‌ها ~۲۲۰۰، …) — روتین.
+ *   لایهٔ ۲ — سقف renewalContext در buildPlanAwareInstructions: ۲۵۰۰۰ (v155، بازتر شده در v215).
+ *   لایهٔ ۳ — همین نگهبان: مجموع کل پرامپت (سیستم + کاربر) قبل از ارسال سنجیده
+ *            می‌شود؛ اگر از سقف امن عبور کند فقط «تاریخچهٔ اختیاری» نردبانی کوتاه
+ *            می‌شود. بانک حرکات، ایمنی/آسیب‌ها، ممنوعیت‌های کاربر/مدیر، دستور
+ *            مدیر و اسکیمای JSON هرگز بریده نمی‌شوند.
+ *
+ * سقف ۱۲۰,۰۰۰ کاراکتر ≈ ۶۰K توکن فارسیِ محافظه‌کارانه (۲ کاراکتر/توکن) — حتی در
+ * بدترین تفسیر، زیر سقف ورودیِ deepseek-v4.1-flash (۱۲۸K کانتکست − ۶۵,۵۳۶
+ * خروجی مجاز) و چند ده برابر زیر gemini-3.8-flash (۱M) می‌ماند.
+ * واقعیت عملی: کل پرامپت تمرین با بانک کامل + پروندهٔ کامل ≈ ۵۰-۶۰K کاراکتر است؛
+ * یعنی نردبان فقط در سناریوهای فرضیِ فراتر از فرض فعال می‌شود — سپر دفاعی. */
+
+/** سقف سخت مجموع ورودی پرامپت (کاراکتر) — لایهٔ ۳ نگهبان بودجه */
+export const PLAN_PROMPT_MAX_INPUT_CHARS = 120_000;
+
+/** تخمین توکن — محافظه‌کارانه: هر توکن ≈ ۲ کاراکتر (فارسی توکن سنگین‌تری دارد) */
+export function estimatePromptTokens(text: string): number {
+  return Math.ceil((text || "").length / 2);
+}
+
+/** بلوک‌های اختیاریِ قابل‌کوتاه‌شدنِ extras برنامه — بقیه (ممنوعیت‌ها/دستور مدیر) محافظت‌شده‌اند */
+export interface ShrinkablePlanExtras {
+  renewalContext?: string;
+  bodyPhotoAnalysis?: string;
+  videoAnalysisResult?: string;
+  bloodTestReport?: string;
+  workoutContext?: string;
+  redesignRaw?: string;
+  [k: string]: unknown;
+}
+
+/**
+ * v155 — نردبان کاهش «فقط بخش‌های اختیاری» برای پرامپت تولید برنامه.
+ *
+ * ورودی: extras خام + اندازهٔ بخش‌های ثابت (سیستم + کانتکست کاربر + بانک +
+ * اسکیما/دیرکتیوها). خروجی: همان extras (بدون تغییر اگر بودجه رعایت باشد —
+ * حالت عادی) یا نسخهٔ نردبانی کوتاه‌شده.
+ *
+ * ترتیب فدا شدن: پروندهٔ تاریخی (renewalContext) → هم‌سازی تمرین/غذا و متن خام
+ * درخواست (کاربر گوهر درخواستش را در redesignConstraints/directive هم دارد) →
+ * تحلیل‌های بدن/ویدیو/خون (مبالغ دانه‌ریز) → حذف کامل تاریخچه.
+ * محافظت‌شدهٔ ابدی: بانک حرکات، شرایط پزشکی/آسیب (در buildUserContext)،
+ * redesignConstraints، adminDirective، redesignDirective، اسکیمای JSON.
+ */
+export function shrinkPlanExtrasForPromptBudget<E extends ShrinkablePlanExtras>(
+  extras: E | undefined,
+  fixedChars: number,
+  logTag: string
+): E | undefined {
+  if (!extras) return extras;
+  const degradableChars = () =>
+    (extras.renewalContext?.length ?? 0) +
+    (extras.bodyPhotoAnalysis?.length ?? 0) +
+    (extras.videoAnalysisResult?.length ?? 0) +
+    (extras.bloodTestReport?.length ?? 0) +
+    (extras.workoutContext?.length ?? 0) +
+    (extras.redesignRaw?.length ?? 0);
+  let total = fixedChars + degradableChars() + 2000; // ۲۰۰۰ = تزریق‌های ثابت اطراف بلوک‌ها
+  if (total <= PLAN_PROMPT_MAX_INPUT_CHARS) {
+    console.log(
+      `[${logTag}] prompt budget: ~${Math.ceil(total / 2)} tokens (${total}/${PLAN_PROMPT_MAX_INPUT_CHARS} chars) — پنجرهٔ توکن باز، بدون کاهش`
+    );
+    return extras;
+  }
+  console.warn(
+    `[${logTag}] prompt budget exceeded (${total} > ${PLAN_PROMPT_MAX_INPUT_CHARS} chars) — نردبان کاهش تاریخچهٔ اختیاری فعال شد (بانک/ایمنی/ممنوعیت‌ها/اسکیما دست‌نخورده)`
+  );
+  const ladder: Array<(e: E) => void> = [
+    // ۱) پروندهٔ تاریخی به نصف
+    (e) => { e.renewalContext = capPromptText(e.renewalContext, 5000); },
+    // ۲) هم‌سازی تمرین/غذا + متن خام درخواست فشرده (ممنوعیت‌های ساختاری محفوظ‌اند)
+    (e) => { e.workoutContext = capPromptText(e.workoutContext, 1500); e.redesignRaw = capPromptText(e.redesignRaw, 600); },
+    // ۳) پروندهٔ تاریخی + تحلیل‌ها به کف دانه‌ریز
+    (e) => {
+      e.renewalContext = capPromptText(e.renewalContext, 2500);
+      e.bodyPhotoAnalysis = capPromptText(e.bodyPhotoAnalysis, 400);
+      e.videoAnalysisResult = capPromptText(e.videoAnalysisResult, 400);
+      e.bloodTestReport = capPromptText(e.bloodTestReport, 400);
+    },
+    // ۴) تاریخچه/هم‌سازی حذف — پروندهٔ ثابت (پزشکی/ایمنی) همچنان کامل می‌ماند
+    (e) => { e.renewalContext = ""; e.workoutContext = ""; },
+    // ۵) آخرین پله — تحلیل‌های اختیاری حذف
+    (e) => { e.bodyPhotoAnalysis = ""; e.videoAnalysisResult = ""; e.bloodTestReport = ""; },
+  ];
+  for (const step of ladder) {
+    step(extras);
+    total = fixedChars + degradableChars() + 2000;
+    if (total <= PLAN_PROMPT_MAX_INPUT_CHARS) break;
+  }
+  console.warn(
+    `[${logTag}] prompt budget after ladder: ${total} chars (~${Math.ceil(total / 2)} tokens) — تولید ادامه می‌یابد`
+  );
+  return extras;
+}
+
+// Build user context string from onboarding + plan tier
+export function buildUserContext(data: OnboardingData, planName?: Plan | null): string {
+  const bmr =
+    data.gender === "male"
+      ? 10 * data.weight + 6.25 * data.height - 5 * data.age + 5
+      : 10 * data.weight + 6.25 * data.height - 5 * data.age - 161;
+  const caps = getCapabilities(planName ?? null);
+  const planLabel = planName ? PLAN_LABELS[planName] : "بدون پلن (Basic)";
+
+  // --- NEW: Comprehensive professional context lines ---
+  const medicalConditionsList = Array.isArray(data.medicalConditions) && data.medicalConditions.length > 0
+    ? data.medicalConditions.map((c) => MEDICAL_CONDITION_LABELS[c] || c).join("، ")
+    : "";
+
+  const hasMedicalConditions = !!medicalConditionsList;
+  const hasInjuries = !!data.injuries && data.injuries.trim().length > 0;
+  const hasLowSleep = typeof data.sleepHours === "number" && data.sleepHours < 7;
+  const hasHighStress = typeof data.stressLevel === "number" && data.stressLevel >= 4;
+  // v162 — فیلدهای جدید: فرم بدن / دخانیات / نواحی آسیب / سایر مشکلات
+  const injuryAreasList = Array.isArray(data.injuryAreas) && data.injuryAreas.length > 0
+    ? data.injuryAreas.map((c) => INJURY_AREA_LABELS_FA[c] || c).join("، ")
+    : "";
+  const hasOtherHealthIssues = !!data.otherHealthIssues && data.otherHealthIssues.trim().length > 0;
+  const smokingHabit = data.smokingHabit;
+  const hasSmoking = !!smokingHabit && smokingHabit !== "none" && smokingHabit !== "prefer_not";
+
+  // Target date context (timeline planning)
+  let targetDateContext = "";
+  if (data.targetDate) {
+    try {
+      const d = new Date(data.targetDate);
+      if (!isNaN(d.getTime())) {
+        const now = new Date();
+        const daysLeft = Math.max(1, Math.ceil((d.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+        targetDateContext = `\n- تاریخ هدف: ${data.targetDate} (حدود ${daysLeft} روز مانده)`;
+      }
+    } catch {
+      targetDateContext = `\n- تاریخ هدف: ${data.targetDate}`;
+    }
+  }
+
+  // ─── v214 — اندازه‌های بدنی پایه (دیرکتیو مالک: ممیزی تزریق کانتکست AI) ───
+  // اگر کاربر اندازه‌ای ثبت کرده باشد (آنبوردینگ/فاز صفر/پروفایل ورزشی) به AI
+  // می‌رسد — قبلاً دورهای بدنی هرگز به پرامپت برنامه تزریق نمی‌شد.
+  const measurementEntries: Array<[string, number | undefined]> = [
+    ["دور قفسهٔ سینه", data.chestMeasurement],
+    ["دور بازو", data.armMeasurement],
+    ["دور کمر", data.waistMeasurement],
+    ["دور باسن", data.hipMeasurement],
+    ["دور ران", data.thighMeasurement],
+    ["دور شانه", data.shoulderMeasurement],
+    ["دور ساق پا", data.calfMeasurement],
+  ];
+  const measurementsLine = (() => {
+    const have = measurementEntries.filter(([, v]) => typeof v === "number" && (v as number) > 0);
+    if (have.length === 0) return "";
+    return `\n- اندازه‌های بدنی ثبت‌شده (سنتیمتر): ${have.map(([k, v]) => `${k}: ${v}`).join(" · ")} — از این اندازه‌ها برای تخمین دقیق‌تر تودهٔ عضلانی/چربی و توازن نسبت‌های بدنی استفاده کن`;
+  })();
+
+  return `اطلاعات کاربر:
+- جنسیت: ${GENDER_LABELS[data.gender]}
+- سن: ${data.age} سال
+- قد: ${data.height} سانتی‌متر
+- وزن: ${data.weight} کیلوگرم
+- وزن هدف: ${data.targetWeight ?? "نامشخص"} کیلوگرم${targetDateContext}${measurementsLine}
+- هدف اصلی: ${GOAL_LABELS[data.goal]}
+${data.discipline ? `- رشتهٔ ورزشی (بسیار مهم — سبک تمرین/تغذیه باید با آن هماهنگ باشد): ${DISCIPLINE_LABELS[data.discipline]}` : ""}
+- سطح فعالیت: ${ACTIVITY_LABELS[data.activityLevel]}
+- روزهای تمرین در هفته: ${data.workoutDays} روز${data.workoutDaysList && data.workoutDaysList.length > 0 ? ` (${data.workoutDaysList.join("، ")})` : ""}
+- مکان تمرین: ${WORKOUT_PLACE_LABELS[data.workoutPlace]}
+- تجهیزات: ${data.equipment.length ? data.equipment.map((e) => equipmentFa(e)).join("، ") : "بدون تجهیزات خاص"}
+- سوابق بیماری: ${data.diseases || "ندارد"}
+- آسیب‌دیدگی مفصلی/عضلانی: ${capPromptText(data.injuries, 500) || "ندارد"}
+${injuryAreasList ? `- نواحی آسیب‌دیده/حساس (ساختاری — مهم): ${injuryAreasList}` : ""}
+${data.bodyShape ? `- فرم بدن: ${BODY_SHAPE_LABELS_FA[data.bodyShape]}
+  ← اولویت تمرینی فرم بدن (الزامی): ${BODY_SHAPE_INFO[data.bodyShape].focus}` : ""}
+${smokingHabit ? `- مصرف دخانیات: ${SMOKING_HABIT_LABELS_FA[smokingHabit]}${hasSmoking ? "\n  ← دیرکتیو دخانیات: با توجه به مصرف دخانیات، ظرفیت هوازی/ریکاوری پایین‌تر است؛ شدت و حجم را پله‌ای بالا ببر، هوازی/تنفسی کارآمد اما پیش‌رونده بده، ریکاوری و هیدراتاسیون را جدی‌تر بگیر و در تغذیه به مواد آنتی‌اکسیدان و ضدالتهاب تأکید کن (بدون موعظه — مختصر و عملی)." : ""}` : ""}
+${data.otherHealthIssues ? `- ⚠️ سایر مشکلات بدنی/سلامتی که خود کاربر با جزئیات نوشته (بسیار مهم):
+«${capPromptText(data.otherHealthIssues, 600)}»` : ""}
+- حساسیت غذایی: ${data.allergies || "ندارد"}
+- نوع رژیم غذایی: ${DIET_LABELS[data.dietType]}
+${data.trainingExperience ? `- سابقه ورزشی: ${TRAINING_EXPERIENCE_LABELS[data.trainingExperience]}` : ""}
+${data.previousTrainingType ? `- نوع تمرین قبلی: ${data.previousTrainingType}` : ""}
+${data.drugAllergies ? `- آلرژی‌های دارویی: ${data.drugAllergies}` : ""}
+${data.currentMedications ? `- داروهای مصرفی: ${data.currentMedications}` : ""}
+${data.maxLifts ? `- حداکثر وزنه‌ها: ${capPromptText(data.maxLifts, 400)}` : ""}
+${data.bodyFrame ? `- اندازه استخوان بدن (Body Frame): ${BODY_FRAME_LABELS[data.bodyFrame]}` : ""}
+${typeof data.sleepHours === "number" ? `- میانگین خواب شبانه: ${data.sleepHours} ساعت${hasLowSleep ? " ⚠️ کمتر از حد مطلوب" : ""}` : ""}
+${typeof data.stressLevel === "number" ? `- سطح استرس روزانه: ${data.stressLevel} از ۵${hasHighStress ? " ⚠️ بالا — روی ریکاوری اثر منفی" : ""}` : ""}
+${typeof data.waterHabit === "number" ? `- عادت فعلی نوشیدن آب: ${data.waterHabit} لیوان در روز` : ""}
+${data.workoutTime ? `- ساعت ترجیحی تمرین: ${WORKOUT_TIME_LABELS[data.workoutTime]}` : ""}
+${medicalConditionsList ? `- شرایط پزشکی خاص: ${medicalConditionsList}` : ""}
+${data.currentSupplements ? `- مکمل‌های فعلی مصرفی: ${capPromptText(data.currentSupplements, 400)}` : ""}
+${data.dislikedFoods ? `- غذاهای دوست‌نداشته/حذفی: ${capPromptText(data.dislikedFoods, 400)}` : ""}
+${data.preferredCuisine ? `- سبک آشپزی ترجیحی: ${PREFERRED_CUISINE_LABELS[data.preferredCuisine]}` : ""}
+${data.specialConditions ? `- ⚠️ شرایط/نیاز/هدف خاص که خود کاربر نوشته (بسیار مهم — کل برنامه باید دقیقاً با این شرایط سازگار باشد):
+«${capPromptText(data.specialConditions, 1500)}»` : ""}
+${data.nutritionNotes ? `- یادداشت‌های تغذیه‌ای خود کاربر (بسیار مهم — دقیق رعایت شود): «${capPromptText(data.nutritionNotes, 1500)}»` : ""}
+${typeof data.waterGoalMl === "number" ? `- هدف هیدراتاسیون روزانه: ${Math.round(data.waterGoalMl / 10) / 100} لیتر (محاسبه خودکار)` : ""}
+- BMR تخمینی: ${Math.round(bmr)} کالری
+- پلن اشتراک کاربر: ${planLabel}
+- قابلیت‌های فعال: ${[
+    caps.workoutAndNutritionPlan ? "برنامه تمرین+تغذیه" : null,
+    caps.supplementsPlan ? "برنامه مکمل (استک کامل)" : null,
+    caps.periodicCheckups ? "چکاپ دوره‌ای" : null,
+    caps.aiChatQuestions !== 0 ? "چت هوشمند" : null,
+    caps.mealPhotoAnalysis ? "آنالیز عکس غذا" : null,
+    caps.bodyPhotoAnalysis ? "آنالیز عکس بدن" : null,
+    caps.videoBodyAnalysis ? "آنالیز ویدیوی فرم بدن" : null,
+    caps.techniqueCorrection ? "اصلاح تکنیک" : null,
+    caps.bloodTestAnalysis ? "تحلیل آزمایش خون" : null,
+  ].filter(Boolean).join("، ")}`.trim() + `
+
+⚠️ نکات ایمنی مهم ورزشکار:
+${hasMedicalConditions ? `- شرایط پزشکی حساس دارد (${medicalConditionsList}) — حتماً برنامه ایمن و سازگار با شرایط طراحی کن و هشدار پزشکی لازم را بده.\n` : ""}${hasInjuries ? `- آسیب‌دیدگی دارد (${data.injuries}) — حرکات آسیب‌زا را حذف کن و جایگزین ایمن پیشنهاد بده.\n` : ""}${injuryAreasList ? `- نواحی آسیب‌دیده: ${injuryAreasList} — قانون قطعی: به هیچ وجه حرکاتی که با این نواحی تضاد مستقیم دارند یا خطر تشدید آسیب دارند تجویز نکن؛ به‌جای آن‌ها حرکات جایگزین ایمن و «توانبخشی‌محور» (تقویت موضعی بدون درد، دامنهٔ کنترل‌شده، پیش‌توانبخشی/prehab) بده و در نکتهٔ مربی توضیح بده چرا.\n` : ""}${hasOtherHealthIssues ? `- سایر مشکلات کاربر: «${capPromptText(data.otherHealthIssues, 600)}» — قانون قطعی: حرکاتِ در تضاد با این مشکلات هرگز تجویز نمی‌شود؛ حرکات اصلاحی/توانبخشی‌محور که به رفع مشکل کمک می‌کند جایگزین کن و شدت را با وضعیت کاربر هماهنگ کن.\n` : ""}${hasLowSleep ? `- خواب ناکافی (کمتر از ۷ ساعت) — شدت حجم تمرین را ملایم نگه دار و توصیه‌های ریکاوری بده.\n` : ""}${hasHighStress ? `- استرس بالا — برنامه باید فشار کورتیزولی بیش‌ازحد ایجاد نکند؛ شدت ملایم‌تر و ریکاوری کافی.\n` : ""}${hasSmoking && smokingHabit ? `- مصرف دخانیات (${SMOKING_HABIT_LABELS_FA[smokingHabit]}) — هوازی را با شدت کنترل‌شده و پیش‌رونده طراحی کن (نه انفجاری از روز اول)، استراحت بین ست‌ها را بخشنده‌تر بگیر و توصیهٔ تنفسی/آب کافی اضافه کن.\n` : ""}${data.currentSupplements ? `- مکمل مصرف می‌کند (${capPromptText(data.currentSupplements, 400)}) — تداخل مکمل پیشنهادی با مصرفی فعلی را بررسی کن.\n` : ""}`;
+}
+
+/**
+ * ساخت بلوک پرامپت مخصوص پلن کاربر.
+ * بر اساس سطح پلن، سطح جزئیات و دامنه برنامه را تعیین می‌کند.
+ * - Basic: فقط برنامه تمرین + تغذیه
+ * - Standard+: اضافه‌کردن برنامه مکمل‌ها
+ * - Ultimate: تزریق متغیرهای آزمایش خون و آنالیز ویدیویی
+ */
+export function buildPlanAwareInstructions(planName?: Plan | null, extras?: { bloodTestReport?: string; videoAnalysisResult?: string; bodyPhotoAnalysis?: string; renewalContext?: string; trainingExperience?: string }): string {
+  const caps = getCapabilities(planName ?? null);
+  // ─── تکنیک‌های تمرینی بر اساس سابقه ورزشکار (نه پلن) ───
+  const tier = getExperienceBasedTechniqueGuidance(extras?.trainingExperience);
+  const instructions: string[] = [];
+
+  // ─── ۱. تکنیک‌های تمرینی پیشرفته بر اساس سطح ورزشکار (WORKOUT-PLAN-PRO) ───
+  // این بخش برنامه تمرینی را به سطح مربیان بزرگ (هانی رامبد، هادی چوپان، کریس بامستد) ارتقا می‌دهد.
+  // ⚠️ v133 — دیرکتیو مالک: «کیفیت برنامه‌ها در تمام پلن‌ها یکسانه و فقط در
+  // امکانات سایت متفاوته — ممکنه یه کاربر فوق حرفه‌ای پلن اقتصادی بخره ولی باید
+  // برنامهٔ متناسب با خودش رو تحویل بگیره.» پس سطح‌بندی تکنیک‌ها فقط با «سابقهٔ
+  // ورزشکار» است (tier از trainingExperience می‌آید)، هرگز با پلن خریداری‌شده.
+  if (tier.level === "pro") {
+    instructions.push(
+      "🔥 تکنیک‌های تمرینی ویژه ورزشکار حرفه‌ای (الزاماً اعمال کن):\n" +
+      "• FST-7 (Fascia Stretch Training — هانی رامبد): در حرکت آخر هر گروه عضلانی، ۷ ست با ۸-۱۲ تکرار و فقط ۳۰-۴۵ ثانیه استراحت بزن. فیلد fst7Details را با نام حرکت، تعداد ست (۷)، تکرارها و استراحت پر کن. هدف: پمپ حداکثری و کشش فاسیا برای رشد عضلانی.\n" +
+      "• دوره‌بندی موجی (Undulating Periodization): در طول هفته، حجم/شدت را متغیر بده — یک روز هایپرتروفی (۸-۱۲ تکرار، RPE 7-8)، یک روز قدرت (۴-۶ تکرار، RPE 8-9)، یک روز استقامت (۱۵-۲۰ تکرار، RPE 6-7). فیلد periodizationType را \"undulating\" بگذار.\n" +
+      "• فرکانس بالا (هادی چوپان): هر گروه عضلانی را ۲ بار در هفته تمرین بده. فیلد muscleFrequencyPerWeek را ۲ بگذار.\n" +
+      "• ارتباط ذهن-عضله (کریس بامستد): در توضیح هر حرکت، روی کنترل تمپو و فاز اکسنتریک ۳-۴ ثانیه‌ای تأکید کن. فیلد inspiredByCoach را \"mixed\" بگذار.\n" +
+      "• پایهٔ سنگین (رونی کلمن): حرکات پایهٔ چندمفصلی ستون هر روز با رنج ۶-۱۰ تکرار و رشد وزنهٔ تهاجمی؛ ایزوله فقط پمپ نهایی بعد از پایهٔ سنگین.\n" +
+      "• دقت و پیوستگی (جی کاتلر): ساختار هفتگی ثابت و قابل‌تکرار + واریانس زاویه/تجهیزات هر ۲-۳ هفته برای شکستن پلاتو.\n" +
+      "• فیلد advancedTechniques (آرایه): حداقل ۳ تکنیک پیشرفته استفاده‌شده در برنامه را لیست کن.\n" +
+      "• فیلد muscleGroupSplit: تقسیم عضلات هفته را مشخص کن (مثلاً push/pull/legs یا upper/lower/push/pull/legs)."
+    );
+  } else if (tier.level === "advanced") {
+    instructions.push(
+      "💪 تکنیک‌های تمرینی ویژه ورزشکار پیشرفته:\n" +
+      "• سوپرست آنتاگونیست (push/pull): حداقل در ۲ روز از هفته از سوپرست متضاد استفاده کن (پرس سینه + بارفیکس، پرس بالاسینه + زیرسینه، پرس بالاسرشانه + زیربغل سیم‌کش).\n" +
+      "• تری‌ست همان گروه عضلانی: در روزهای حجمی می‌توانی ۱ تری‌ست برای پمپ نهایی عضله استفاده کنی.\n" +
+      "• دراپ‌ست: در ست آخر حرکات کمکی، یک دراپ‌ست ۲۰٪ کاهش وزنه + ناتمام تا شکست بزن.\n" +
+      "• رست پاز (pause reps): در نقطه میانی حرکات اصلی (پرس، اسکوات) ۲ ثانیه مکث کن.\n" +
+      "• فیلد advancedTechniques (آرایه): حداقل ۲ تکنیک پیشرفته استفاده‌شده را لیست کن.\n" +
+      "• فیلد muscleGroupSplit: تقسیم عضلات هفته را مشخص کن (مثلاً push/pull/legs یا upper/lower).\n" +
+      "• فیلد inspiredByCoach را \"chris_bumstead\" بگذار — تمرکز روی فرم و ارتباط ذهن-عضله.\n" +
+      "• ⚠️ از FST-7 و دوره‌بندی موجی استفاده نکن (مخصوص ورزشکار حرفه‌ای)."
+    );
+  } else if (tier.level === "intermediate") {
+    instructions.push(
+      "⚡ راهنمای ورزشکار با سابقهٔ متوسط:\n" +
+      "• تمرکز روی فرم صحیح حرکات و اتصال ذهن-عضله.\n" +
+      "• تدریجی اضافه بار (Progressive Overload): هر هفته وزنه را ۲.۵-۵٪ افزایش بده.\n" +
+      "• فیلد advancedTechniques: می‌توانی خالی بگذاری یا فقط [\"Progressive Overload\"] بنویسی.\n" +
+      "• فیلد muscleGroupSplit: تقسیم ساده عضلات هفته را مشخص کن (مثلاً \"full body 3x\" یا \"upper/lower\").\n" +
+      "• ⚠️ از سوپرست‌های پیچیده، تری‌ست، جاینت‌ست، FST-7 و دراپ‌ست استفاده نکن."
+    );
+  } else {
+    // basic — «مبتدی» (سطح ورزشکار، نه پلن خریداری‌شده)
+    instructions.push(
+      "🌱 راهنمای ورزشکار مبتدی:\n" +
+      "• تمرکز روی یادگیری الگوهای حرکتی پایه (پرس، اسکوات، ددلیفت، بارفیکس).\n" +
+      "• فرم صحیح مهم‌تر از وزنه است — کنترل کامل تمپو (۳-۱-۲-۰).\n" +
+      "• تدریجی اضافه بار ملایم — هر ۲ هفته یک‌بار وزنه را افزایش بده.\n" +
+      "• فیلد advancedTechniques: خالی یا [\"Progressive Overload\"]\n" +
+      "• فیلد muscleGroupSplit: تقسیم ساده (مثلاً \"full body 3x\" یا \"split: upper/lower\").\n" +
+      "• ⚠️ از هیچ تکنیک پیشرفته‌ای (سوپرست، تری‌ست، FST-7، دراپ‌ست) استفاده نکن."
+    );
+  }
+
+  // ─── ۲. برنامه مکمل — فقط برای پلن‌های استاندارد به بالا (v75 — درخواست مالک) ───
+  // مهم: طبق درخواست مدیر (۱۴۰۵/۰۶): «تجویز مکمل باید اندازه باشد؛ مکمل بی‌خودی
+  // و زیادی به کاربر نده که مجبور شود ۲۵ میلیون تومان مکمل بخرد».
+  // فلسفه: اول غذا، بعد مکمل — فقط مکمل‌های با بیشترین شواهد علمی و هزینه منطقی.
+  // (به‌روزرسانی ۱۴۰۵/۰۶/۲): «مکمل‌ها باید داینامیک و با توجه به نیاز کاربر تجویز
+  // بشوند و فرمت یکسان نداشته باشند» — قالب ثابت ۳+۱+۱ حذف شد؛ تصمیم need-based است.
+  // v75 — گیت پلن برگشت: برنامه مکمل فقط برای standard+ ساخته می‌شود؛ برای
+  // کاربر اقتصادی صریحاً ممنوع می‌شود (UI هم با «نیازمند پلن استاندارد به بالا» قفل است).
+  if (caps.supplementsPlan) {
+    const supplementBase = "💊 برنامه مکمل اختصاصی فیتاپ (داینامیک — فقط بر اساس نیازِ واقعیِ همین کاربر):\n" +
+      "⚠️ قانون طلایی: اول غذا، بعد مکمل. مکمل جای غذا را نمی‌گیرد و قرار نیست کاربر برای مکمل هزینه‌ی سنگین بکند.\n\n" +
+
+      "🔴 مهم‌ترین قانون — فرمت ثابت ممنوع:\n" +
+      "برنامه‌ی مکمل هر کاربر باید با داده‌های پروفایلِ او ساخته شود، نه یک قالبِ همیشگی. برای هر مکمل، اول «نیاز» را از روی پروفایل ثابت کن و در note دلیلش را بنویس؛ اگر نیاز نیست، همان یک را هم تجویز نکن. تعدادِ نهایی بین ۱ تا ۴ قلم است (به‌ندرت ۵). اگر تغذیه‌ی کاربر پوشش می‌دهد، با صراحت بنویس «برای تو فعلاً مکمل خاصی لازم نیست» و فقط ۱-۲ قلمِ واقعاً مفید بگذار.\n" +
+      "🚫 ممنوعیت مطلق استک پیش‌فرض: ترکیبِ کلیشه‌ای «کراتین + امگا۳ + ویتامین D» (با یا بدون وی) برای همهٔ کاربران ممنوع است. اگر سه‌تاییِ کلیشه در خروجی ببینی، ممیزِ کیفیت آن را رد می‌کند و برنامه باید دوباره ساخته شود. هر قلم باید به «یک دادهٔ واقعی از همین کاربر» وصله: هدف، رشته، رژیم، سابقه، ساعت تمرین، خواب، شرایط پزشکی، مکمل فعلی.\n\n" +
+
+      "چک‌لیستِ تصمیم‌گیری (هر قلم فقط با «اثبات نیاز» از پروفایل — نه عادت):\n" +
+      "• ویتامین D3 → فقط با دلیلِ پروفایل‌محور (کارِ دفتری/آفتابِ نزدیدن/پوشش/سن بالا/آزمایش خون اگر هست) — «ایرانی بودن» به‌تنهایی کافی نیست.\n" +
+      "• امگا ۳ → فقط اگر مصرف ماهیِ کاربر کم است یا آسیب/التهاب مزمن دارد (وگرنه لازم نیست).\n" +
+      "• کراتین مونوهیدرات → فقط برای هدفِ عضله‌سازی/حجم/قدرت با تمرینِ مقاومتیِ منظم؛ برای هدفِ چربی‌سوزیِ خالص یا درمانی تجویز نکن.\n" +
+      "• پروتئین وی → فقط اگر پروتئینِ روزانه (تخم‌مرغ/مرغ/حبوبات/ماست/پنیر) به هدفِ g×kg وزنِ بدن نمی‌رسد؛ وگرنه صریحاً «لازم نیست» بنویس.\n" +
+      "• B12 → فقط رژیمِ وگان/گیاه‌خواریِ سخت‌گیر.\n" +
+      "• آهن یا کلسیم → فقط با شرایطِ خاصِ پروفایل (خونریزیِ زیاد/زنانِ ورزشکار/پوکیِ استخوان...) و با تأکیدِ مشورتِ پزشک.\n" +
+      "• کافئین → فقط هدفِ چربی‌سوزی + بدون مشکلِ قلبی/خواب؛ ساده‌ترین شکل: قهوه قبل تمرین — تایمینگ با ساعتِ تمرینِ همین کاربر سینک باشد.\n" +
+      "• منیزیم/ملاتونین → فقط با خوابِ ضعیف ثبت‌شده (sleepHours < 7).\n" +
+      "• الکترولیت → فقط تمرین‌های طولانی/تعریق بالا/رژیم کتو.\n\n" +
+
+      "🔗 سینک سه‌گانه (الزامی): استک مکمل باید با «برنامهٔ تمرینی» (روزها/ساعت/نوع تمرین) و «برنامهٔ غذایی» (شکاف‌های درشت‌مغذی) همین کاربر هماهنگ باشد — مثلاً کافئین فقط برای تمرین‌های عصر/شب اگر خواب مشکل ندارد؛ کربوهیدرات/الکترولیت برای روزهای سنگین؛ وگرنه نیاز نیست.\n\n" +
+
+      "پرچم‌های قرمز (ممنوعِ مطلق):\n" +
+      "• BCAA/EAA، بتاآلانین، سیترین مالات، گلوتامین، گینر، ال-کارنیتین، کلاژن و ZMA هرگز آیتمِ اصلیِ تجویز نباشند — حداکثر در note به‌عنوان «در صورتِ بودجه‌ی اضافه» + جایگزینِ غذاییِ ارزان.\n" +
+      "• هیچ‌وقت «برای اطمینان همه را بخر» ننویس؛ برعکس: «لازم نیست همه را بگیری» را صریح بگو.\n\n" +
+
+      "خروجی JSON — بخش «supplements» (لیست ساده) و «supplementStack» (دسته‌بندی‌شده) هر دو:\n" +
+      "• هر مکمل دارای category: \"base\" (ضروریِ همین کاربر) | \"advanced\" (پوششِ شکافِ خاص) | \"targeted\" (هدفمندِ ارزان).\n" +
+      "• فقط دسته‌هایی را پر کن که مکمل واقعی برایش داری — دسته‌ی خالی نساز. فرمتِ خروجی باید متناسب با نیازِ کاربر باشد، نه همیشه یکسان.\n" +
+      "• هر مکمل باید فیلد contraindicatedFor (آرایه‌ی شرایطِ منع مصرف) داشته باشد:\n" +
+      "  • کراتین → بیمارانِ کلیوی\n" +
+      "  • کافئین → بیمارانِ قلبی، فشارِ خونِ بالا، بی‌خوابی\n" +
+      "  • پروتئین وی → نارساییِ کلیویِ پیشرفته\n" +
+      "• در note هر مکمل: (۱) دلیلِ تجویز برای همین کاربر، (۲) جایگزینِ غذاییِ ارزان، (۳) «قبل از شروع با پزشک مشورت کنید.»\n" +
+      "• هرگز دوز بالاتر از استاندارد تجویز نکن.\n" +
+      "• انتخاب‌ها باید بر اساس goal، رژیم، سطحِ فعالیت، سن/جنس، شرایطِ پزشکی (data.diseases, data.medicalConditions) و مکمل‌های فعلیِ کاربر (data.currentSupplements) باشد.";
+
+    if (tier.level === "pro" || tier.level === "advanced") {
+      // ورزشکاران پیشرفته: همان منطقِ need-based + تأکید بر اقتصاد
+      instructions.push(supplementBase + "\n\n⚠️ سطح ورزشکار: پیشرفته/حرفه‌ای — حتی در این سطح، استک را حداقلی و غذا-محور نگه دار؛ قهرمان‌ها هم از بشقابِ غذا قهرمان می‌شوند نه از قفسه‌ی مکمل.");
+    } else {
+      // مبتدی/متوسط: همان منطق با لحنِ ساده‌تر
+      instructions.push(supplementBase + "\n\n⚠️ سطح ورزشکار: مبتدی/متوسط — در این سطح معمولاً حداکثر ۲-۳ قلم لازم است؛ دوزهای محافظانه‌تر و تأکید بر شروعِ سبک در note.");
+    }
+  } else {
+    // v75 — پلن اقتصادی: برنامه مکمل ممنوع — صریح و قاطع
+    instructions.push(
+      "⛔ این کاربر پلن اقتصادی دارد و «برنامه مکمل» شامل پلن او نمی‌شود:\n" +
+      "• فیلدهای supplements و supplementStack را کامل خالی بگذار (آرایه خالی []).\n" +
+      "• فیلد supplementTimingNotes را هم خالی بگذار و هیچ مکملی تجویز نکن.\n" +
+      "• به‌جای آن، در notes بنویس: «برای دریافت برنامهٔ مکمل اختصاصی، پلن استاندارد به بالا لازم است.»"
+    );
+  }
+
+  // آنالیز عکس بدن — برای کاربران Advanced / Ultimate که عکس بدن ارسال کرده‌اند.
+  // نیازی به capability gate نیست: اگر extras.bodyPhotoAnalysis وجود دارد، یعنی کاربر
+  // قبلاً از طریق submit-body-analysis عکس‌هایش را ارسال کرده و قابلیت bodyPhotoAnalysis
+  // توسط requirePlanCapability تأیید شده است.
+  if (extras?.bodyPhotoAnalysis) {
+    instructions.push(
+      `آنالیز عکس‌های بدن کاربر (توسط هوش مصنوعی بررسی شده):\n${capPromptText(extras.bodyPhotoAnalysis, 5000)}\nاین اطلاعات را در طراحی برنامه لحاظ کن — نقاط ضعف فرم بدن، عدم تقارن، و حرکات اصلاحی پیشنهاد بده. تمرینات را بر اساس نقاط ضعف شناسایی‌شده اولویت‌بندی کن. اگر عدم تقارن عضلانی (مثلاً بین بازوی چپ و راست) دیده شد، تمرینات یک‌طرفه (unilateral) را در برنامه بگنجان.\n🔴 الزام v148: عضلات «ضعیف/عقب‌مانده» این آنالیز باید فرکانس ۲ بار در هفته و حجم بالاتری بگیرند — این عضلات اولویت اول برنامهٔ تمرینی‌اند.`
+    );
+  }
+
+  if (caps.videoBodyAnalysis && extras?.videoAnalysisResult) {
+    instructions.push(
+      `آنالیز ویدیوی فرم بدن کاربر (توسط هوش مصنوعی بررسی شده):\n${capPromptText(extras.videoAnalysisResult, 4000)}\nاین اطلاعات را در طراحی برنامه لحاظ کن — نقاط ضعف فرم بدن، عدم تقارن، و حرکات اصلاحی پیشنهاد بده.`
+    );
+  }
+
+  if (caps.bloodTestAnalysis && extras?.bloodTestReport) {
+    instructions.push(
+      `گزارش آزمایش خون کاربر:\n${capPromptText(extras.bloodTestReport, 4000)}\nبرنامه تغذیه را بر اساس کمبودهای ویتامینی، سطح قند، چربی خون و هورمون‌ها بهینه‌سازی کن. در صورت کمبود، غذاهای غنی از آن ویتامین/ماده معدنی را اولویت بده. هشدارهای پزشکی لازم را در بخش notes بیاور.`
+    );
+  }
+
+  // تمدید هوشمند: پیشرفت کاربر از دوره قبلی
+  if (extras?.renewalContext) {
+    // v155→v214 — پنجرهٔ توکن کاملاً باز (خواستهٔ مالک: «کاربر ۱-۲ ساله با پروندهٔ
+    // سنگین هم بدون مشکل») — سقف از ۳۰۰۰ (v148) به ۱۱۰۰۰ (v155) و حالا به
+    // ۱۵۰۰۰ کاراکتر رسید تا پروندهٔ کاملِ نردبانی + بستر تمدید کامل جا شود.
+    // نگهبان بودجهٔ سراسری (shrinkPlanExtrasForPromptBudget) ضمانت می‌کند
+    // حتی این سقف هم هرگز پرامپت را به context_length_exceeded نبرد.
+    // v215 — پنجرهٔ توکن بازتر: ۱۵۰۰۰→۲۵۰۰۰ کاراکتر (پروندهٔ ورزشی حالا ۱۴هزار + اجزای v214-b؛
+    // مصرف واقعی پرامپت ~۶۰K از ۱۲۰K نگهبان — این افزایش دوبرابرِ هدروم دارد)
+    instructions.push(capPromptText(extras.renewalContext, 25000));
+  }
+
+  return instructions.length
+    ? `\n\nدستورالعمل‌های اختصاصی ورزشکار (سطح ورزشی: ${tier.level})${
+        planName ? ` — پلن سایت: ${PLAN_LABELS[planName]}` : ""
+      }:\n⚠️ قانون حیاتی فیتاپ: کیفیت برنامه در همهٔ پلن‌ها یکسان است — پلن فقط روی «امکانات سایت» اثر دارد، هرگز روی کیفیت/حرفه‌ای‌بودن برنامه. کاربرِ حرفه‌ای با پلن اقتصادی هم باید برنامهٔ حرفه‌ایِ متناسب با سطح خودش بگیرد.\n${instructions.map((i, idx) => `${idx + 1}. ${i}`).join("\n")}`
+    : "";
+}
+
+// ─── راهنمای انتخاب سوپرست بر اساس هدف ورزشکار ───
+// (FULL-PROFILE-AI-CONTEXT-WORKOUT) تصمیم‌گیری هوشمند درباره استفاده از
+// سوپرست/تری‌ست/جاینت‌ست بر اساس هدف، سطح ورزشکار و شرایط پزشکی.
+function supersetGuidanceForGoal(goal: OnboardingData["goal"]): string {
+  switch (goal) {
+    case "fat_loss":
+      return [
+        "  • توصیه: استفاده از سوپرست/تری‌ست/جاینت‌ست در ۲ تا ۳ روز از هفته برای افزایش فشار متابولیک (metabolic stress) و کالری‌سوزی.",
+        "  • بهترین انتخاب: جاینت‌ست‌های بدن‌کامل (full-body circuit) و سوپرست‌های آنتاگونیست با استراحت کم.",
+        "  • استراحت کوتاه (۳۰-۶۰ ثانیه بین گروه‌ها) برای حفظ ضربان قلب بالا.",
+      ].join("\n");
+    case "cut":
+      // v60 — کات: فشار متابولیک متوسط ولی شدت مکانیکی حفظ شود (حفظ عضله اولویت است)
+      return [
+        "  • توصیه (کات): سوپرست/تری‌ست در ۱ تا ۲ روز از هفته برای فشار متابولیک — ولی شدت مکانیکی حرکات اصلی حفظ شود تا عضله از دست نرود.",
+        "  • بهترین انتخاب: سوپرست آنتاگونیست با استراحت ۴۵-۷۵ ثانیه؛ جاینت‌ست فقط در روزهای کم‌حجم.",
+        "  • حجم کل تمرین را با نقصان کالری هماهنگ کن — در روزهای خیلی خسته، سوپرست را حذف کن نه حرکات اصلی را.",
+      ].join("\n");
+    case "muscle_gain":
+      return [
+        "  • توصیه: استفاده از سوپرست آنتاگونیست (push/pull) در ۱ تا ۲ روز از هفته برای افزایش حجم تمرین بدون خستگی اضافی.",
+        "  • بهترین انتخاب: سوپرست‌های متضاد (پرس سینه + بارفیکس، پرس بالاسینه + زیرسینه) برای حفظ شدت هایپرتروفی.",
+        "  • از تری‌ست و جاینت‌ست کمتر استفاده کن — استراحت کافی (۹۰-۱۲۰ ثانیه) برای حفظ شدت مکانیکی.",
+      ].join("\n");
+    case "bulk":
+      // v60 — افزایش حجم: حجم تمرین بالاتر با سوپرست کمکی و استراحت کامل
+      return [
+        "  • توصیه (افزایش حجم): سوپرست آنتاگونیست در ۱ تا ۲ روز برای افزایش حجم تمرین؛ حرکات اصلی همیشه تکی و سنگین.",
+        "  • استراحت کامل (۹۰-۱۲۰ ثانیه) بین گروه‌ها — در مازاد کالری، ریکاوری خوب است؛ شدت را قربانی نکن.",
+        "  • از جاینت‌ست برای حرکات بزرگ پرهیز کن؛ فقط در حرکات کمکی/آخر جلسه قابل قبول است.",
+      ].join("\n");
+    case "strength":
+      return [
+        "  • توصیه: استفاده از سوپرست به حداقل (۰ تا ۱ روز در هفته) — تمرکز روی حرکات اصلی با وزنه سنگین و استراحت کامل.",
+        "  • برای قدرت محض، حرکات تکی با ۳-۵ دقیقه استراحت برتری دارند.",
+        "  • اگر سوپرست می‌دهی، فقط سوپرست آنتاگونیست با شدت متوسط برای حرکات کمکی (نه حرکات اصلی).",
+      ].join("\n");
+    case "endurance":
+      return [
+        "  • توصیه: استفاده از تری‌ست و جاینت‌ست در ۱ تا ۲ روز برای افزایش استقامت عضلانی.",
+        "  • استراحت کوتاه (۳۰-۴۵ ثانیه) و تکرار بالا (۱۵-۲۰) برای بهبود ظرفیت لاکتات.",
+      ].join("\n");
+    case "fitness":
+    default:
+      return [
+        "  • توصیه: استفاده متوسط از سوپرست (۱ تا ۲ روز در هفته) برای تنوع و افزایش شدت تمرین.",
+        "  • ترکیب سوپرست‌های آنتاگونیست با حرکات تکی برای تعادل قدرت و استقامت.",
+      ].join("\n");
+  }
+}
+
+function supersetGuidanceForExperience(experience: OnboardingData["trainingExperience"] | undefined): string {
+  switch (experience) {
+    case "beginner":
+      return [
+        "  • سطح مبتدی: از سوپرست/تری‌ست/جاینت‌ست استفاده نکن (یا حداکثر ۱ سوپرست ساده در یک روز).",
+        "  • تمرکز روی یادگیری فرم صحیح حرکات تکی، اتصال ذهن-عضله و تثبیت الگوهای حرکتی.",
+        "  • استراحت کامل (۹۰-۱۲۰ ثانیه) بین ست‌ها برای ریکاوری عصبی-عضلانی.",
+      ].join("\n");
+    case "intermediate":
+      return [
+        "  • سطح متوسط: می‌توانی از سوپرست‌های آنتاگونیست در ۱-۲ روز استفاده کنی.",
+        "  • هنوز از تری‌ست/جاینت‌ست پرهیز کن مگر برای روز استقامت/کاردیو.",
+      ].join("\n");
+    case "advanced":
+      return [
+        "  • سطح پیشرفته: استفاده از سوپرست/تری‌ست در ۲-۳ روز مجاز و مفید است.",
+        "  • جاینت‌ست را برای روزهای چربی‌سوزی یا بدن‌کامل نگه دار.",
+      ].join("\n");
+    case "pro":
+      return [
+        "  • سطح حرفه‌ای: آزادی کامل در استفاده از تکنیک‌های پیشرفته (سوپرست/تری‌ست/جاینت‌ست/دراپ‌ست).",
+        "  • برای حداکثر رشد، ترکیب سوپرست آنتاگونیست با تری‌ست همان گروه را در روزهای حجمی امتحان کن.",
+      ].join("\n");
+    default:
+      return [
+        "  • سطح نامشخص: محتاط رفتار کن — حداکثر ۱ سوپرست در یک روز.",
+      ].join("\n");
+  }
+}
+
+// Generate a weekly workout plan via AI
+// ═══════════════════════════════════════════════════════════════════════════
+// v147 — ممیزی ساختاری نخبگی (قانون علمی مربیان بزرگ) — اعتبارسنج خروجی
+// ═══════════════════════════════════════════════════════════════════════════
+// ریشهٔ شکایت اول کاربر: «در روز زیربغل چهار نوع بارفیکس مختلف داده و سرشانه
+// اصلاً نداده». سه لایهٔ متوالی داریم:
+//   ① validateContent در زنجیرهٔ تولید (پایین) — پاسخ نقض‌کننده «رد» می‌شود و
+//     تلاش بعدی با مدل فال‌بک دوباره تولید می‌کند (رفتار زنجیرهٔ generatePlanContent)
+//   ② dedupeExerciseFamiliesInPlan بعد از قفل بانک — شبکهٔ ایمنی قطعی (ترمیم خودکار)
+//   ③ ممیزی گیت کیفیت (plan-quality-gate) — ثبت در سند coachAudit برای ممیز هوشمند
+// ⚠️ اصلاح علمی v147 (دیباگ «۳ تلاش ناموفق» مالک): قانون نسخهٔ v145 «هرگز دو
+// واریانت هم‌خانواده در یک روز» غلط بود — جلو بازو هالتر + چکشی و اسکوات جلو +
+// بلغاری ترکیب استاندارد مربی‌گری‌اند و برنامهٔ درست را هم رد می‌کرد. قانون
+// درست: «حداکثر دو واریانت در روز؛ ۳ واریانت به بالا یا تکرار دقیق = رد/ترمیم».
+// گروه‌های الزام‌پذیر فقط گروه‌هایی هستند که بانک برایشان حرکت کافی دارد (≥۳ حرکت)
+// تا هیچ‌وقت الزامی که بانک برآورده‌اش نمی‌کند برنامه را بی‌پایان رد نکند.
+
+/** گروه‌های اصلی که بانک برایشان حداقل ۳ حرکت ویدیودار دارد — قابل الزام در اعتبارسنج */
+function bankEnforceableGroups(bank: LockedBank | null): Set<MajorGroupKey> {
+  const enforceable = new Set<MajorGroupKey>();
+  if (!bank || bank.all.length === 0) return enforceable;
+  const counts = new Map<string, number>();
+  for (const row of bank.all) {
+    for (const g of coveredMajorGroups([{ exercises: [row] }])) {
+      counts.set(g, (counts.get(g) ?? 0) + 1);
+    }
+  }
+  for (const g of MAJOR_GROUP_KEYS) {
+    if ((counts.get(g) ?? 0) >= 3) enforceable.add(g);
+  }
+  return enforceable;
+}
+
+/**
+ * اعتبارسنج ساختاری برنامهٔ تمرینی بر اساس اصول مربیان بزرگ.
+ * خروجی: null = معتبر | رشتهٔ خطای فارسی = دلیل رد (به زنجیرهٔ retry می‌رود)
+ * فقط نقض‌های آشکار را رد می‌کند (۳+ واریانت هم‌خانواده در یک روز، تکرار دقیق حرکت،
+ * نبودِ کاملِ یک گروه اصلی) — سلیقه‌ای‌ها به گیت کیفیت واگذار می‌شوند.
+ * v147 — اصلاح علمی: «دو واریانت هم‌خانواده در یک روز» مجاز و استاندارد است
+ * (جلو بازو هالتر + چکشی / اسکوات جلو + بلغاری)؛ فقط انباشت ۳+ واریانت رد می‌شود.
+ */
+export function validateEliteWorkoutStructure(
+  parsed: any,
+  enforceableGroups: Set<MajorGroupKey>
+): string | null {
+  if (!parsed || !Array.isArray(parsed.days) || parsed.days.length === 0) {
+    return "پاسخ نامعتبر از هوش مصنوعی (برنامه خالی)";
+  }
+
+  // ─── ① انباشت هم‌خانواده در یک روز — قانون علمی v147 ───
+  // «حداکثر دو واریانت از یک خانوادهٔ حرکتی در یک روز» استاندارد مربی‌گری است
+  // (جلو بازو هالتر + چکشی = تأکید براکیالیس؛ اسکوات جلو + اسکوات بلغاری =
+  // دومیلیترال + یکلیترال). پس فقط «۳ واریانت به بالا» یا «تکرار دقیق همان
+  // حرکت» رد می‌شود — نسخهٔ قبلی (ممنوعیت دو واریانت) علمی غلط بود و برنامهٔ
+  // درست را هم رد می‌کرد (۳ تلاش ناموفق مالک — دیباگ‌شده و اصلاح‌شده).
+  // استثنا: تمرینات شکم (core_*) — کرانچ + پلانک + لگ‌ریز در یک روز چیدمان
+  // استاندارد است؛ فقط تکرارِ دقیقِ همان حرکت رد می‌شود.
+  const dupProblems: string[] = [];
+  for (const day of parsed.days) {
+    if (!day || !Array.isArray(day.exercises)) continue;
+    const familyCount = new Map<string, number>();
+    const seenExact = new Set<string>();
+    for (const ex of day.exercises) {
+      if (!ex?.name) continue;
+      const fam = exerciseFamilyKey(String(ex.name), ex.muscle);
+      const sqName = String(ex.name).replace(/[\s\u200C\-]+/g, "");
+      const isCoreFam = fam.startsWith("core");
+      if (seenExact.has(sqName)) {
+        dupProblems.push(`روز «${day.day ?? "?"}»: حرکت «${ex.name}» دو بار تکرار شده`);
+      } else if (!isCoreFam && (familyCount.get(fam) ?? 0) >= 2) {
+        dupProblems.push(`روز «${day.day ?? "?"}»: «${ex.name}» سومین واریانت خانوادهٔ حرکتی خودش است (بیشتر از دو واریانت از یک خانواده در یک روز مجاز نیست)`);
+      } else {
+        familyCount.set(fam, (familyCount.get(fam) ?? 0) + 1);
+        seenExact.add(sqName);
+      }
+    }
+  }
+  if (dupProblems.length > 0) {
+    return `نقض قانون تنوع حرکتی (مربیان بزرگ): ${dupProblems.slice(0, 3).join(" | ")} — در هر روز حداکثر دو واریانت از یک خانوادهٔ حرکتی مجاز است (مثل جلو بازو هالتر + چکشی یا اسکوات جلو + بلغاری)؛ واریانت سوم را با زاویه/الگوی متفاوت (روئینگ به‌جای بارفیکس سوم، نشر به‌جای پرس سرشانهٔ سوم) جایگزین کن.`;
+  }
+
+  // ─── ② پوشش کامل گروه‌های اصلی در هفته (سرشانهٔ صفر = رد) ───
+  // فقط برای برنامه‌های ۳ روز به بالا (برنامهٔ ۱-۲ روزه: بدن کامل/بالاتنه-پایتنه)
+  if (enforceableGroups.size > 0 && parsed.days.length >= 3) {
+    const covered = coveredMajorGroups(parsed.days);
+    const missing = [...enforceableGroups].filter((g) => !covered.has(g));
+    if (missing.length > 0) {
+      const labels = missing.map((g) => MAJOR_GROUP_LABELS_FA[g] ?? g).join("، ");
+      return `نقض قانون پوشش عضلانی (مربیان بزرگ): گروه‌های «${labels}» در کل هفته هیچ حرکت مستقیمی ندارند — برنامهٔ «دو روز سینه و هیچ روز سرشانه» باطل است. هر شش گروه اصلی باید حداقل یک‌بار در هفته کار مستقیم بگیرند.`;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * v148 — اعتبارسنج «ملایم» زنجیرهٔ تولید (دیرکتیو مالک: موفقیت در یک تلاش).
+ * فقط موارد «غیرقابل‌ترمیم» را رد می‌کند:
+ *   ① JSON نامعتبر / برنامهٔ خالی
+ *   ② ناهمخوانی فاحش تعداد روزها (کمتر از نصف روزهای درخواستی — یعنی مدل
+ *     نصف برنامه را ننوشته؛ ترمیم محلی روزها را نمی‌تواند بسازد)
+ * بقیهٔ نقض‌های ساختاری (واریانت سوم هم‌خانواده، تکرار دقیق، نبودِ گروه اصلی)
+ * پذیرفته می‌شوند و در پس‌پردازش (dedupeExerciseFamiliesInPlan +
+ * repairWorkoutPlanCoverage) قطعی ترمیم می‌شوند — بدون تلاش دوم.
+ */
+export function validatePlanTextParseable(text: string, expectedDayCount: number): string | null {
+  let parsed: any;
+  try {
+    parsed = parseJsonFromContent(text);
+  } catch {
+    return "پاسخ نامعتبر از هوش مصنوعی (JSON ناقص)";
+  }
+  if (!parsed || !Array.isArray(parsed.days) || parsed.days.length === 0) {
+    return "پاسخ نامعتبر از هوش مصنوعی (برنامه خالی یا JSON ناقص)";
+  }
+  if (
+    Number.isFinite(expectedDayCount) &&
+    expectedDayCount >= 3 &&
+    parsed.days.length < Math.ceil((expectedDayCount * 2) / 3)
+  ) {
+    // v183 — آستانه از ½ به ⅔ سخت‌گیرانه شد (تیکت مالک: «برنامه با ۴ روز خواستم،
+    // ۳ روزه داده شد» — آستانهٔ ½ اجازه می‌داد مدل نصف روزها را کم بگذارد و
+    // پاسخ بی‌صدا پذیرفته شود). کمبود ۱ روز (و ۲ روز برای ۶-۷ روز) هنوز پذیرفته
+    // می‌شود چون لایهٔ ترمیم قطعی repairMissingWorkoutDays بعد از پارس، روز
+    // گمشده را از بانک حرکات می‌سازد — قانون «یک تلاش، صفر شکست» v148 حفظ شد.
+    return `پاسخ ناقص از هوش مصنوعی: فقط ${parsed.days.length} روز از ${expectedDayCount} روز درخواستی تولید شده — هر ${expectedDayCount} روز را کامل در آرایهٔ days برگردان.`;
+  }
+  return null;
+}
+
+/**
+ * v183 — انطباق قطعی تعداد روز برنامه با درخواست کاربر (تیکت مالک: «برنامه با ۴ روز
+ * خواستم ولی برنامه سه روزه داده شده» + دیرکتیو: «برنامه تولیدشده با اطلاعات و
+ * درخواست‌ها و هدف کاربر به هیچ وجه در هیچ زمینه‌ای نباید مغایرت داشته باشد؛
+ * ولی تولید هرگز نباید شکست بخورد»).
+ *
+ * ریشهٔ تیکت: مدل هوش مصنوعی برای درخواست ۴ روز، برنامهٔ ۳روزهٔ فول‌بادی برمی‌گرداند
+ * و اعتبارسنج قدیمی با آستانهٔ ½ آن را بی‌صدا می‌پذیرفت (۳ ≥ ⌈۴/۲⌉=۲). طبق فلسفهٔ
+ * v148 («یک تلاش، صفر شکست») به‌جای ردِ برنامه، روزِ گمشده اینجا به‌صورت «قطعی»
+ * از بانک حرکات ویدیودار ساخته و درج می‌شود:
+ *   • روز گمشده = روزهای درخواستی کاربر (workoutDaysList) که در خروجی نیستند —
+ *     با تطبیق فارسی‌نرمال (ی/ک عربی، فاصله).
+ *   • حرکات روز جدید: گروه‌هایی که در کل هفته کمترین پوشش مستقیم را دارند
+ *     (coveredMajorGroupsDetailed) + خانوادهٔ حرکتیِ تکرارنشده در کل هفته +
+ *     فیلتر ممنوعیت‌های صریح (v149) — همه از بانک ویدیودار با exerciseId واقعی.
+ *   • تعداد حرکات روز جدید = میانگین روزهای موجود، محدود به [min، max] سطح تجربه.
+ *   • روزها بعد از درج به ترتیب استاندارد هفتهٔ فارسی مرتب می‌شوند (قانون پرامپت).
+ *   • اگر بانک در دسترس نباشد (حالت اضطراری نادر)، ساختار نزدیک‌ترین روز موجود
+ *     کلون می‌شود تا تعداد روز «همیشه» دقیق باشد — صفر شکست.
+ */
+export function normalizePersianWeekday(s: unknown): string {
+  return String(s ?? "")
+    .replace(/ي/g, "ی")
+    .replace(/ك/g, "ک")
+    .replace(/[\u0640\u200c\s]+/g, "") // کشیده (ـ) + نیم‌فاصله + فاصله
+    .trim();
+}
+
+export interface MissingDaysRepairReport {
+  added: Array<{ day: string; focus: string; exercises: number }>;
+  mode: "bank" | "clone" | "none";
+}
+
+export function repairMissingWorkoutDays(
+  parsed: { days?: Array<Record<string, any>>; [k: string]: any },
+  opts: {
+    expectedDays: number;
+    /** روزهای درخواستی کاربر از آنبوردینگ (workoutDaysList) — اگر خالی بود، اولین N روز هفتهٔ فارسی */
+    chosenDays: string[];
+    bank: LockedBank | null;
+    forbiddenKeywords?: string[];
+    minExercises?: number;
+    maxExercises?: number;
+    seed?: number;
+  }
+): MissingDaysRepairReport {
+  const report: MissingDaysRepairReport = { added: [], mode: "none" };
+  if (!parsed || !Array.isArray(parsed.days)) return report;
+  const expected = Math.max(1, Math.min(7, Math.round(Number(opts.expectedDays) || 0)));
+  if (expected === 0 || parsed.days.length >= expected) return report;
+
+  const existingNames = new Set(parsed.days.map((d) => normalizePersianWeekday(d?.day)));
+  const requestedOrdered = (Array.isArray(opts.chosenDays) && opts.chosenDays.length > 0
+    ? opts.chosenDays.map(normalizePersianWeekday).filter((d) => PERSIAN_WEEKDAYS.includes(d))
+    : PERSIAN_WEEKDAYS.slice(0, expected)
+  ).filter((d, i, arr) => arr.indexOf(d) === i);
+  // اگر فهرست درخواستی کوتاه‌تر از expected بود، بقیه از ترتیب استاندارد هفته
+  const fillQueue = [...requestedOrdered];
+  for (const wd of PERSIAN_WEEKDAYS) {
+    if (fillQueue.length >= expected) break;
+    if (!fillQueue.includes(wd)) fillQueue.push(wd);
+  }
+  const missing: string[] = [];
+  for (const wd of fillQueue) {
+    if (missing.length >= expected - parsed.days.length) break;
+    if (!existingNames.has(wd) && !missing.includes(wd)) missing.push(wd);
+  }
+  if (missing.length === 0) return report;
+
+  const usableDays = parsed.days.filter((d) => d && Array.isArray(d.exercises) && d.exercises.length > 0);
+  const minEx = Math.max(4, Math.round(opts.minExercises ?? 5));
+  const maxEx = Math.max(minEx, Math.round(opts.maxExercises ?? 6));
+  const targetCount = (() => {
+    if (usableDays.length === 0) return minEx;
+    const avg = usableDays.reduce((s, d) => s + d.exercises.length, 0) / usableDays.length;
+    return Math.min(maxEx, Math.max(minEx, Math.round(avg)));
+  })();
+
+  // خانواده‌های مصرف‌شده در کل هفته — روزِ جدید ترجیحاً خانوادهٔ تازه می‌گیرد
+  const weekFamilies = new Set<string>(
+    usableDays.flatMap((d) =>
+      d.exercises.map((e: any) => exerciseFamilyKey(String(e?.name ?? ""), e?.muscle))
+    ).filter(Boolean)
+  );
+
+  const pool = (opts.bank?.all ?? []).filter(
+    (r) =>
+      !opts.forbiddenKeywords ||
+      opts.forbiddenKeywords.length === 0 ||
+      !matchesForbiddenName(String(r.name ?? ""), opts.forbiddenKeywords)
+  );
+
+  for (const weekday of missing) {
+    let dayObj: Record<string, any> | null = null;
+    if (pool.length > 0 && usableDays.length > 0) {
+      report.mode = "bank";
+      dayObj = buildFillerWorkoutDayFromBank({
+        weekday,
+        existingDays: usableDays,
+        pool,
+        weekFamilies,
+        targetCount,
+        seed: opts.seed ?? 0,
+      });
+    }
+    if (!dayObj) {
+      // اضطراری: کلون ساختار پرحجم‌ترین روز موجود — تعداد روز همیشه دقیق می‌ماند
+      report.mode = report.mode === "bank" ? "bank" : "clone";
+      const template =
+        usableDays.reduce((best, d) => ((d.exercises?.length ?? 0) > (best.exercises?.length ?? 0) ? d : best), usableDays[0]) ??
+        null;
+      const cloned = template ? JSON.parse(JSON.stringify(template)) : { exercises: [] };
+      dayObj = {
+        ...cloned,
+        day: weekday,
+        focus: `${String(template?.focus ?? "بدن کامل")} — روز تکمیلی (${weekday})`,
+      };
+    }
+    if (!dayObj) continue;
+    parsed.days.push(dayObj);
+    report.added.push({ day: weekday, focus: String(dayObj.focus ?? ""), exercises: (dayObj.exercises ?? []).length });
+  }
+
+  // ترتیب استاندارد هفتهٔ فارسی — قانون پرامپت (شنبه → جمعه)
+  parsed.days = sortWeekdaysByPersianOrder(parsed.days as Array<{ day: string }>);
+  return report;
+}
+
+/** سازندهٔ روزِ تکمیلی از بانک — گروه‌های کم‌پوشش، خانوادهٔ تازه، ویدیودار */
+function buildFillerWorkoutDayFromBank(args: {
+  weekday: string;
+  existingDays: Array<Record<string, any>>;
+  pool: BankExerciseRow[];
+  weekFamilies: Set<string>;
+  targetCount: number;
+  seed: number;
+}): Record<string, any> | null {
+  const { weekday, existingDays, pool, weekFamilies, targetCount } = args;
+  if (pool.length === 0) return null;
+
+  // گروه‌های اصلی با کمترین پوشش مستقیم اول (فول‌بادیِ ≥۲روز همه را پوشیده می‌کند —
+  // در آن حالت چرخش متوازن روی همهٔ گروه‌ها برای فرکانس ۲)
+  const coverage = coveredMajorGroupsDetailed(existingDays);
+  const deficitOrder = MAJOR_GROUP_KEYS.filter((g) => !coverage.covered.has(g));
+  const rotated = MAJOR_GROUP_KEYS.filter((g) => coverage.covered.has(g));
+  const groupOrder = [...deficitOrder, ...rotated];
+  const groupOf = (row: BankExerciseRow): Set<MajorGroupKey> =>
+    coveredMajorGroups([{ exercises: [row as any] }]) as Set<MajorGroupKey>;
+
+  // چرخش قطعی با seed تنوع (هر کاربر/چرخه متفاوت — الگوی v153)
+  let cursor = Math.abs(Math.round(args.seed || 0)) % Math.max(1, pool.length);
+  const pickNext = (filter: (r: BankExerciseRow) => boolean): BankExerciseRow | null => {
+    for (let i = 0; i < pool.length; i++) {
+      const idx = (cursor + i) % pool.length;
+      const row = pool[idx];
+      if (filter(row)) {
+        cursor = (idx + 1) % pool.length;
+        return row;
+      }
+    }
+    return null;
+  };
+
+  const exercises: any[] = [];
+  const usedFamilies = new Set<string>();
+  const usedIds = new Set<string>();
+  const pushRow = (row: BankExerciseRow) => {
+    exercises.push({
+      name: row.name,
+      muscle: row.muscle,
+      category: row.category,
+      description: row.description || "حرکت را با کنترل کامل و دامنهٔ حرکتی کامل اجرا کن.",
+      tips: row.tips || "فرم صحیح و تنفس منظم را حفظ کن.",
+      coachTip: "انقباض کامل و کنترل تنفس — کیفیت اجرا مهم‌تر از وزنه است.",
+      difficulty: "intermediate",
+      rpe: 7,
+      tempo: "2-0-2-0",
+      substitution: "نسخهٔ سبک‌تر با همان عضله در صورت خستگی",
+      sets: Array.from({ length: 3 }, (_, i) => ({
+        setNumber: i + 1,
+        reps: "10-12",
+        restSec: 75,
+        rpe: 7,
+      })),
+      exerciseId: row.id,
+    });
+    usedFamilies.add(exerciseFamilyKey(String(row.name ?? ""), row.muscle));
+    usedIds.add(row.id);
+  };
+
+  // گذر ۱: از هر گروه اصلیِ کم‌پوشش یک حرکت (ترجیح خانوادهٔ تازهٔ کل هفته)
+  for (const g of groupOrder) {
+    if (exercises.length >= targetCount) break;
+    const row = pickNext((r) => {
+      if (usedIds.has(r.id)) return false;
+      if (usedFamilies.has(exerciseFamilyKey(String(r.name ?? ""), r.muscle))) return false;
+      if (weekFamilies.has(exerciseFamilyKey(String(r.name ?? ""), r.muscle))) return false;
+      return groupOf(r).has(g);
+    });
+    if (row) pushRow(row);
+  }
+  // گذر ۲: تکمیل تا سهم روز — خانوادهٔ تازهٔ کل هفته مقدم، بعد خانوادهٔ تازهٔ همین روز
+  while (exercises.length < targetCount) {
+    const row =
+      pickNext((r) => {
+        if (usedIds.has(r.id)) return false;
+        const fam = exerciseFamilyKey(String(r.name ?? ""), r.muscle);
+        return !usedFamilies.has(fam) && !weekFamilies.has(fam);
+      }) ??
+      pickNext((r) => {
+        if (usedIds.has(r.id)) return false;
+        return !usedFamilies.has(exerciseFamilyKey(String(r.name ?? ""), r.muscle));
+      });
+    if (!row) break;
+    pushRow(row);
+  }
+  if (exercises.length === 0) return null;
+
+  const focusGroups = [...new Set(exercises.flatMap((e) => [...groupOf({ name: e.name, muscle: e.muscle } as any)]))]
+    .map((g) => MAJOR_GROUP_LABELS_FA[g] ?? g)
+    .join("، ");
+  return {
+    day: weekday,
+    focus: `بدن کامل — تکمیل‌کنندهٔ هفته${focusGroups ? ` (${focusGroups})` : ""}`,
+    exercises,
+  };
+}
+
+/**
+ * v183 — پرکردن حداقل حرکات روز از بانک (ارتقای هشدارِ «کمتر از حداقل» به ترمیم قطعی).
+ * قانون سابق فقط هشدار می‌داد («نمی‌توانیم حرکت جدید اختراع کنیم») — اما با بانک
+ * ویدیودار می‌توان بدون اختراع، حرکت واقعیِ خانوادهٔ تازه اضافه کرد. دیرکتیو مالک:
+ * برنامه در هیچ زمینه‌ای نباید با سطح تجربه کاربر مغایرت داشته باشد.
+ */
+export function padWorkoutDayToMinExercises(
+  day: Record<string, any>,
+  opts: {
+    minExercises: number;
+    bank: LockedBank | null;
+    forbiddenKeywords?: string[];
+    seed?: number;
+    /** v213 — گروه‌های مجازِ این روز در معماری — پُرکردن اول از این‌ها (هویت روز حفظ می‌شود) */
+    allowedGroups?: Set<MajorGroupKey>;
+  }
+): number {
+  if (!day || !Array.isArray(day.exercises)) return 0;
+  const need = Math.max(0, Math.round(opts.minExercises) - day.exercises.length);
+  if (need <= 0) return 0;
+  const bank = opts.bank;
+  if (!bank || !Array.isArray(bank.all) || bank.all.length === 0) return 0;
+  const dayFamilies = new Set<string>(
+    day.exercises.map((e: any) => exerciseFamilyKey(String(e?.name ?? ""), e?.muscle)).filter(Boolean)
+  );
+  const inPool = (r: BankExerciseRow) =>
+    !opts.forbiddenKeywords ||
+    opts.forbiddenKeywords.length === 0 ||
+    !matchesForbiddenName(String(r.name ?? ""), opts.forbiddenKeywords);
+  // v213 — دو استخر: اول عضلاتِ مجازِ روز در معماری؛ فال‌بک = کل بانک (صفر شکست)
+  const primaryPool = opts.allowedGroups && opts.allowedGroups.size > 0
+    ? bank.all.filter(
+        (r) => inPool(r) && majorGroupsOfExercise(r as any).size < 5 && [...majorGroupsOfExercise(r as any)].some((g) => opts.allowedGroups!.has(g))
+      )
+    : [];
+  const pools: Array<Array<BankExerciseRow>> = primaryPool.length > 0 ? [primaryPool, bank.all.filter(inPool)] : [bank.all.filter(inPool)];
+  let added = 0;
+  for (const pool of pools) {
+    if (added >= need) break;
+    let cursor = Math.abs(Math.round(opts.seed || 0)) % Math.max(1, pool.length);
+    // اسکن چرخشی: تا رسیدن به حداقل، هر بار اولین حرکتِ خانواده‌آزادِ همین روز از بانک
+    while (added < need) {
+      let pickedIdx = -1;
+      for (let i = 0; i < pool.length; i++) {
+        const idx = (cursor + i) % pool.length;
+        const row = pool[idx];
+        if (day.exercises.some((e: any) => e?.exerciseId === row.id)) continue;
+        if (dayFamilies.has(exerciseFamilyKey(String(row.name ?? ""), row.muscle))) continue;
+        pickedIdx = idx;
+        break;
+      }
+      if (pickedIdx < 0) break; // کل بانک هم‌خانواده/تکراری — استخر بعدی (هشدار بالادست می‌ماند)
+      const row = pool[pickedIdx];
+      day.exercises.push({
+        name: row.name,
+        muscle: row.muscle,
+        category: row.category,
+        description: row.description || "حرکت را با کنترل کامل و دامنهٔ حرکتی کامل اجرا کن.",
+        tips: row.tips || "فرم صحیح و تنفس منظم را حفظ کن.",
+        coachTip: "انقباض کامل و کنترل تنفس — کیفیت اجرا مهم‌تر از وزنه است.",
+        difficulty: "intermediate",
+        rpe: 7,
+        tempo: "2-0-2-0",
+        substitution: "نسخهٔ سبک‌تر با همان عضله در صورت خستگی",
+        sets: Array.from({ length: 3 }, (_, i2) => ({
+          setNumber: i2 + 1,
+          reps: "10-12",
+          restSec: 75,
+          rpe: 7,
+        })),
+        exerciseId: row.id,
+      });
+      dayFamilies.add(exerciseFamilyKey(String(row.name ?? ""), row.muscle));
+      added++;
+      cursor = (pickedIdx + 1) % pool.length;
+    }
+  }
+  return added;
+}
+
+/**
+ * v148 — ترمیم قطعی پوشش گروه‌های اصلی (شبکهٔ ایمنی «سرشانهٔ صفر»).
+ * بعد از قفل بانک + dedupe خانواده‌ها اجرا می‌شود؛ اگر گروه اصلیِ الزام‌پذیری
+ * (سینه/زیربغل/سرشانه/پا/بازو/شکم) در کل هفته هیچ حرکت مستقیمی نداشته باشد،
+ * حرکت واقعی ویدیودارِ همان گروه از بانک به مناسب‌ترین روزها اضافه می‌شود —
+ * بدون ردِ برنامه و بدون تلاش دوم (دیرکتیو مالک v148: یک تلاش، صفر شکست).
+ * شکم (core): استاندارد ۲ روز در هفته با خانواده‌های متفاوت.
+ */
+export function repairWorkoutPlanCoverage(
+  parsed: { days?: Array<Record<string, any>>; notes?: string; [k: string]: any },
+  bank: LockedBank | null,
+  /** v149 — کلیدواژه‌های ممنوع (نرمال‌شده) — حرکت ممنوع هرگز به‌عنوان تکمیل پوشش اضافه نمی‌شود */
+  forbiddenKeywords?: string[],
+  /** v213 — معماری برنامه: مقصدِ حرکتِ پوششِ جاافتاده = روزی که آن عضله در معماری‌اش مجاز است
+   *  (ضد روز فرانکنشتاینی — دیگر «روز خلوت‌تر» کورکورانه مقصد نیست) */
+  blueprint?: CoachBlueprint | null
+): { added: Array<{ group: string; name: string; day: string }> } {
+  const added: Array<{ group: string; name: string; day: string }> = [];
+  if (!parsed || !Array.isArray(parsed.days) || parsed.days.length === 0) return { added };
+  const enforceable = bankEnforceableGroups(bank);
+  if (enforceable.size === 0) return { added };
+  // برنامه‌های ۱-۲ روزه کل‌بودن‌اند و همهٔ گروه‌ها را با حرکات کل‌بدن پوشش می‌دهند
+  if (parsed.days.length < 3) return { added };
+
+  const days = parsed.days.filter((d) => d && Array.isArray(d.exercises));
+  if (days.length === 0) return { added };
+
+  // v162 — پوشش با پوششِ تفکیک‌شده محاسبه می‌شود: حرکت «کل بدن» دیگر به‌تنهایی
+  // سرشانه/گروه‌های دیگر را «پوشیده» حساب نمی‌کند (ریشهٔ شکایت «سرشانه به من
+  // داده نشده») — مگر برنامه اسپلیت فول‌بادی واقعی باشد (فول‌بادی در ≥۲ روز).
+  const coverage = coveredMajorGroupsDetailed(parsed.days);
+  const missing = [...enforceable].filter((g) => !coverage.covered.has(g));
+  if (missing.length === 0) return { added };
+
+  const usedIds = new Set<string>(
+    days.flatMap((d) => d.exercises.map((e: any) => (typeof e?.exerciseId === "string" ? e.exerciseId : ""))).filter(Boolean)
+  );
+  const usedFamilies = new Set<string>(
+    days.flatMap((d) => d.exercises.map((e: any) => exerciseFamilyKey(String(e?.name ?? ""), e?.muscle)))
+  );
+  // v153 — خانواده‌های موجود «هر روز» — حرکتِ تکمیلی هرگز خانوادهٔ موجودِ همان روز
+  // را تکرار نمی‌کند (ضد «دو شنا در یک روز» در مسیر تکمیل پوشش)
+  const dayFamilies = new Map<Record<string, any>, Set<string>>(
+    days.map((d) => [d, new Set(d.exercises.map((e: any) => exerciseFamilyKey(String(e?.name ?? ""), e?.muscle)))])
+  );
+
+  for (const g of missing) {
+    // کاندیدهای این گروه — کامپاند اول؛ حرکات کل‌بدن حذف (همه‌گروه‌اند و گروهِ
+    // گمشده را واقعاً هدف نمی‌گیرند — درس v147b از موتور محلی)
+    const pool = bank!.all
+      .filter((r) => !usedIds.has(r.id))
+      .filter((r) => {
+        const groups = coveredMajorGroups([{ exercises: [r] }]);
+        return groups.has(g) && !(groups.size >= 5 && g !== "core");
+      })
+      .filter((r) =>
+        // v149 — ممنوعیت‌های صریح کاربر/مدیر بر تکمیل پوشش مقدم است
+        !forbiddenKeywords || forbiddenKeywords.length === 0
+          ? true
+          : !matchesForbiddenName(String(r.name ?? ""), forbiddenKeywords)
+      )
+      .sort((a, b) => {
+        const cat = (row: typeof a) => (/پرس|اسکوات|ددلیفت|روئینگ|press|squat|deadlift|row/i.test(row.name) ? 1 : 0);
+        return cat(b) - cat(a);
+      });
+    const wanted = g === "core" ? 2 : 1;
+    let count = 0;
+    for (const row of pool) {
+      if (count >= wanted) break;
+      const fam = exerciseFamilyKey(row.name, row.muscle);
+      // v213 — مقصد اول: روزی که این گروه در معماری‌اش مجاز است (هویت روز حفظ می‌شود)
+      // فال‌بک: روز با کمترین تعداد حرکت (تعادل حجم روزها)؛ برای core روز میانی هم
+      const targetDay = (() => {
+        if (blueprint) {
+          const candidate = parsed.days.find((bd, bdIdx) => {
+            if (!bd || !Array.isArray(bd.exercises)) return false;
+            // v230 — تطبیق معماری با نامِ هفته‌روز (نه اندیس)
+            const bIdx = matchBlueprintDayIndex(blueprint, String(bd.day ?? ""), bdIdx);
+            const allowed = blueprintDayAllowedGroups(blueprint, bIdx);
+            if (!allowed.size) return false;
+            if (!allowed.has(g)) return false;
+            // آن روز هنوز عضلهٔ «اصلیِ» خودش را کامل نبرده باشد، ما مهمان نمی‌بریم
+            const prim = blueprintDayPrimaryGroups(blueprint, bIdx);
+            const primCount = bd.exercises.filter((pe: any) => {
+              const pg = majorGroupsOfExercise(pe as any);
+              return [...pg].some((x) => prim.has(x));
+            }).length;
+            return primCount >= 2 || prim.has(g);
+          });
+          if (candidate) return candidate;
+        }
+        return days.reduce(
+          (min, d) => (d.exercises.length < min.exercises.length ? d : min),
+          days[0]
+        );
+      })();
+      if (usedFamilies.has(fam) && count === 0) continue; // اولین کاندید باید خانوادهٔ آزاد باشد؛ بعدی‌ها در روز دیگر
+      // v153 — خانوادهٔ کاندید نباید در «روز مقصد» موجود باشد (ضد تکرار همان‌روز)
+      if ((dayFamilies.get(targetDay) ?? new Set()).has(fam)) continue;
+      const isPlank = /پلانک|plank/i.test(row.name);
+      const beforeLen = targetDay.exercises.length;
+      targetDay.exercises.push({
+        name: row.name,
+        muscle: row.muscle,
+        category: row.category,
+        description: row.description || "حرکت را با کنترل کامل و دامنهٔ حرکتی کامل اجرا کن.",
+        tips: row.tips || "فرم صحیح و تنفس منظم را حفظ کن.",
+        coachTip: "انقباض کامل و کنترل تنفس — کیفیت اجرا مهم‌تر از وزنه است.",
+        difficulty: "intermediate",
+        rpe: 7,
+        tempo: "2-0-2-0",
+        substitution: "نسخهٔ سبک‌تر با همان عضله در صورت خستگی",
+        sets: Array.from({ length: 3 }, (_, i) => ({
+          setNumber: i + 1,
+          reps: isPlank ? "30-45 ثانیه" : "12-15",
+          restSec: 60,
+          rpe: 7,
+        })),
+        exerciseId: row.id,
+      });
+      if (targetDay.exercises.length > beforeLen) {
+        usedIds.add(row.id);
+        usedFamilies.add(fam);
+        dayFamilies.get(targetDay)?.add(fam); // v153 — ثبت در خانواده‌های روز مقصد
+        added.push({ group: g, name: row.name, day: targetDay.day || "؟" });
+        count++;
+      }
+    }
+  }
+
+  if (added.length > 0) {
+    console.warn(
+      `[generateWorkoutPlan] v148 coverage repair: added ${added.length} exercise(s) → ` +
+        added.map((a) => `${MAJOR_GROUP_LABELS_FA[a.group] ?? a.group}(${a.name})→[${a.day}]`).join(", ")
+    );
+    // شفافیت برای کاربر: در نکات مربی ثبت می‌شود
+    const lines = added.map((a) => `«${a.name}» برای پوشش ${MAJOR_GROUP_LABELS_FA[a.group] ?? a.group}`);
+    const noteLine = `- 📊 تکمیل پوشش عضلانی: برای اطمینان از پوشش کامل گروه‌های اصلی، این حرکت‌ها به برنامه اضافه شد: ${lines.join("، ")}.`;
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${noteLine}` : noteLine;
+  }
+  return { added };
+}
+
+/**
+ * v148 — دیرکتیو مالک: «اگر یک عضله داخل تمرین نیست یا یک عضله رو غیرمعمول داخل
+ * برنامه داده، در نکات تمرین باید این موضوع رو به ورزشکار بگه که چرا».
+ * پس‌پردازش ایمن: پوشش واقعی هر گروه اصلی را می‌شمارد و اگر
+ *   ① گروهی حرکت مستقیم ندارد (فقط برای گروه‌های غیرالزام‌پذیر — الزام‌پذیرها
+ *     در repairWorkoutPlanCoverage تضمین شدند)، یا
+ *   ② گروهی غیرمعمول (۳ روز یا بیشتر) تمرکز دارد،
+ * و AI خودش در notes توضیح نداده باشد، یک خط «تحلیل چیدمان» علمی به نکات مربی
+ * اضافه می‌کند.
+ */
+export function appendMuscleCoverageExplanationNotes(
+  parsed: { days?: Array<{ day?: string; exercises?: Array<Record<string, any>>; focus?: string; [k: string]: any }>; notes?: string; [k: string]: any },
+  data: { goal?: string; [k: string]: any },
+  enforceableGroups: Set<MajorGroupKey>
+): void {
+  if (!parsed || !Array.isArray(parsed.days) || parsed.days.length === 0) return;
+
+  // شمارش روزهای دارای حرکت مستقیم هر گروه
+  const groupDays = new Map<MajorGroupKey, string[]>();
+  for (const g of MAJOR_GROUP_KEYS) groupDays.set(g, []);
+  for (const day of parsed.days) {
+    if (!day || !Array.isArray(day.exercises)) continue;
+    for (const ex of day.exercises) {
+      if (!ex?.name) continue;
+      const groups = coveredMajorGroups([{ exercises: [ex] }]);
+      for (const g of groups) {
+        const list = groupDays.get(g);
+        if (list && !list.includes(day.day ?? "?")) list.push(day.day ?? "?");
+      }
+    }
+  }
+
+  const goalLabel =
+    data.goal === "muscle_gain" || data.goal === "bulk" ? "عضله‌سازی"
+    : data.goal === "fat_loss" || data.goal === "cut" ? "چربی‌سوزی"
+    : data.goal === "strength" ? "افزایش قدرت"
+    : data.goal === "endurance" ? "استقامت"
+    : "تناسب اندام";
+
+  const newLines: string[] = [];
+  for (const g of MAJOR_GROUP_KEYS) {
+    const label = MAJOR_GROUP_LABELS_FA[g] ?? g;
+    const daysList = groupDays.get(g) ?? [];
+    const alreadyExplained = typeof parsed.notes === "string" &&
+      parsed.notes.includes("تحلیل چیدمان") &&
+      parsed.notes.includes(label);
+    if (alreadyExplained) continue;
+
+    if (daysList.length === 0) {
+      if (enforceableGroups.has(g)) continue; // تضمین‌شده در repair — نباید رخ دهد
+      const reason = enforceableGroups.has(g)
+        ? "چیدمان فعلی اولویت را به هدف اصلی شما و نقاط ضعف شناسایی‌شده داده است"
+        : "با تجهیزات ثبت‌شدهٔ شما حرکت ویدیودارِ کافی برای این گروه در بانک حرکات نیست یا در چیدمان این هفته ادغام شده است";
+      newLines.push(
+        `- 📊 تحلیل چیدمان: گروه «${label}» در این هفته حرکت مستقیم اختصاصی ندارد. دلیل: ${reason}. اگر تمرکز روی این گروه برایتان اولویت است، از تب برنامه‌ها درخواست بازتولید با تأکید روی «${label}» بدهید.`
+      );
+    } else if (daysList.length >= 3) {
+      newLines.push(
+        `- 📊 تحلیل چیدمان: گروه «${label}» این هفته ${daysList.length} روز تمرکز مستقیم دارد (${daysList.join("، ")}). این تأکیدِ غیرمعمول عمدی است: چیدمان بر اساس هدف اصلی شما (${goalLabel}) و فرکانس علمی ۲ بار در هفته برای هر عضله طراحی شده؛ حجم اضافهٔ این گروه اولویت رشدِ همین دورهٔ ۴۵ روزه است.`
+      );
+    }
+  }
+
+  if (newLines.length > 0) {
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${newLines.join("\n")}` : newLines.join("\n");
+    console.warn(`[generateWorkoutPlan] v148 coverage explanation notes appended: ${newLines.length} line(s)`);
+  }
+}
+
+/* ═══════════════ v216 — کیفیت پرامپت ۱۰/۱۰ (دیرکتیو مالک R4-B2/B3) ═══════════════
+ * ① هم‌ترازی کش پرامپت دیپ‌سیک (P0 پول‌ساز): بلوک‌های ثابت (سیستم‌پرامپت + بانک
+ *    حرکات + قواعد عمومی) «قبل از» بلوک‌های کاربر-خاص می‌آیند تا پیشوند مشترک
+ *    پرامپت بلند بماند و کش پرامپت (۵۰× ارزان‌تر) واقعاً بخورد — assembleWorkoutPrompt.
+ * ② مهر نسخهٔ پرامپت در ابتدای پرامپت — دیسیپلین باطل‌سازی کش (تغییر نسخه = invalidation).
+ * ③ بلوپرینت دوره‌بندی ۶ هفته‌ای (W1-3 تجمعی، W4 موج شدت، W5 دلود حجم×۰.۶، W6 پیک)
+ *    + قواعد اتورگولاسیون ست‌محور (پلاتو/پیشرفت/افت/نگهبان) — بلوک‌های ثابتِ
+ *    محدود-کاراکتری: دوره‌بندی ≤۸۰۰ و اتورگولاسیون ≤۱۲۰۰ کاراکتر.
+ * ④ قانون حل تعارض صریح: ادمین > ایمنی > دادهٔ کاربر > قواعد عمومی.
+ * این بلوک‌ها «قاعده»اند نه دادهٔ کاربر — پس بخش ثابتِ کش‌پذیر پرامپت‌اند و در
+ * همهٔ مسیرها (تولید اولیه/تمدید/بازتولید ادمین/بازطراحی چت) که همگی از
+ * generateWorkoutPlan می‌گذرند، «دقیقاً یک‌بار» تزریق می‌شوند. ═══════════════ */
+
+/** مهر نسخهٔ پرامپت — تغییر نسخه یعنی باطل‌سازی صریح کش پرامپت دیپ‌سیک */
+export const PROMPT_VERSION_STAMP = "[Fittup Prompt v216]";
+
+/** قانون حل تعارض رسمی پرامپت‌های فیتاپ (سلسله‌مراتب: ادمین > ایمنی > دادهٔ کاربر > قواعد عمومی) */
+export const PROMPT_CONFLICT_RULE_FA =
+  "🧭 قانون حل تعارض (در تمام بخش‌های این پرامپت معتبر است): دستور ادمین > ایمنی کاربر > دادهٔ کاربر > قواعد عمومی. اگر دو قاعده تضاد داشتند، بالاترِ این سلسله‌مراتب برنده است.";
+
+/** v216 — بلوپرینت دوره‌بندی ۶ هفته‌ای (R4-B3-6) — سقف سخت: ۸۰۰ کاراکتر */
+export const PERIODIZATION_BLUEPRINT_BLOCK_FA = `🗺️ بلوپرینت دوره‌بندی ۶ هفته‌ای (v216 — الزامی؛ کل ۴۵ روز روی این فازها):
+• هفته ۱-۳ «تجمعی»: حجم صعودی (ست/وزنهٔ ملایم رو به بالا)، RPE ۶→۸.
+• هفته ۴ «موج شدت»: top-set حرکات اصلی RPE ۸-۹ + بک‌آف‌ست ۸۰٪ همان وزنه.
+• هفته ۵ «دلود»: حجم ×۰.۶ و وزنه ~۴۰٪ سبک‌تر، RPE ≤۷ — بازیابی.
+• هفته ۶ «پیک/تست رکورد»: تست RPE ۹-۱۰ در حرکات پایه.
+weeklyProgression.weeks عیناً همین فازها را بازتاب دهد و در notes یک خط «- 🗺️ نقشهٔ دوره‌بندی: ۱-۳ تجمعی ← ۴ موج شدت ← ۵ دلود (حجم ×۰.۶) ← ۶ پیک/تست رکورد» بنویس؛ فیلد "periodization": {"type": "6week-wave", "weeks": [{"week":1,"phase":"تجمعی"},…,{"week":6,"phase":"پیک/تست رکورد"}]} را کنار weeklyProgression خروجی بده.`;
+
+/** v216 — قواعد اتورگولاسیون ست‌محور (R4-B3-7) — سقف سخت: ۱۲۰۰ کاراکتر */
+export const AUTOREGULATION_RULES_BLOCK_FA = `🔁 قواعد اتورگولاسیون ست‌محور (v216 — الزامی؛ بر پایهٔ «🏋️ پیشرفت قدرتی هر حرکت» پروندهٔ ورزشی اگر در این پرامپت آمده، وگرنه به‌عنوان قواعد عمومی):
+• پلاتو: اگر «اخیر ≤ بهترین ×۰.۹۵» برای حرکتی در ۲+ هفتهٔ پیاپی است → وزن همان الگو ۱۰٪ کاهش، یا واریشن جایگزین، یا تغییر دامنهٔ تکرار (مثلاً ۸-۱۲ → ۱۲-۱۵).
+• پیشرفت: اگر ورزشکار در جلسات اخیر همهٔ ست‌ها را به هدف تکرار رسانده → اضافه‌بار استاندارد: +۲.۵kg حرکات بالاتنه، +۵kg پایین‌تنه (یا +۱ تکرار در وزن ثابت).
+• افت/fatigue: اگر جلسات اخیر جاافتادهٔ محسوس دارد → حجم هفتهٔ بعد −۲۰٪، تمرکز بازیابی (خواب/ریکاوری فعال) و شدت یک پله پایین‌تر.
+• نگهبان: هیچ چرخه‌ای افزایش بیش از ۵kg ندارد؛ هر حرکتِ جدید برای کاربر با وزن شروعِ محافظه‌کارانه (RPE 6-7) تجویز می‌شود.
+این قواعد را در weeklyProgression.weeks[].note و coachTip حرکات مرتبط بازتاب بده.`;
+
+/** قطعات پرامپت برنامهٔ تمرینی — مونتاژ در assembleWorkoutPrompt */
+export interface WorkoutPromptParts {
+  /** خط وظیفهٔ اصلی (سطح مربی حرفه‌ای فدراسیون) */
+  header: string;
+  /** دیرکتیوهای الزامی بالاترین-اولویت (ادمین/بازطراحی/ممنوعیت‌های صریح) — پویا */
+  adminBlock: string;
+  /** بانک کامل حرکات — ثابتِ مشترک همهٔ کاربران (پیشوند کش‌پذیر) */
+  bankBlock: string;
+  /** بلوپرینت دوره‌بندی + قواعد اتورگولاسیون — قواعد ثابت (پیشوند کش‌پذیر) */
+  staticRulesBlock: string;
+  /** کانتکست کاربر + دستورالعمل‌های اختصاصی — پویا */
+  profileBlock: string;
+  /** روزها + اسکیمای JSON + قوانین حرفه‌ای — شامل مقدارهای کاربر */
+  outputBlock: string;
+}
+
+/**
+ * v216 — مونتاژ پرامپت برنامهٔ تمرینی با هم‌ترازی کش دیپ‌سیک.
+ * ترتیب: مهر نسخه → وظیفه → قانون حل تعارض → دیرکتیو ادمین (بالاترین اولویت،
+ * عیناً بالای پرامپت) → بانک (ثابت) → دوره‌بندی/اتورگولاسیون (ثابت) → پروفایل
+ * کاربر (پویا) → خروجی/قوانین. فقط «ترتیب و درزها» تازه است؛ محتوای قطعات
+ * دست‌نخورده است — معناشناسی پرامپت یکسان می‌ماند.
+ */
+export function assembleWorkoutPrompt(parts: WorkoutPromptParts): string {
+  const section = (title: string, body: string) => {
+    const trimmed = (body || "").trim();
+    return trimmed ? `\n\n─── ${title} ───\n\n${trimmed}\n` : "";
+  };
+  return (
+    `${PROMPT_VERSION_STAMP}\n${parts.header.trim()}\n\n` +
+    `${PROMPT_CONFLICT_RULE_FA}` +
+    section("بخش ۱: دیرکتیوهای الزامی — ادمین/بازطراحی (بالاترین اولویت)", parts.adminBlock) +
+    section("بخش ۲: بانک کامل حرکات فیتاپ (ثابت — مشترک همهٔ کاربران)", parts.bankBlock) +
+    section("بخش ۳: دوره‌بندی و اتورگولاسیون (قواعد ثابت)", parts.staticRulesBlock) +
+    section("بخش ۴: پروفایل ورزشکار و دستورالعمل‌های اختصاصی", parts.profileBlock) +
+    section("بخش ۵: خروجی و قوانین حرفه‌ای", parts.outputBlock)
+  );
+}
+
+export async function generateWorkoutPlan(
+  data: OnboardingData,
+  planName?: Plan | null,
+  extras?: {
+    bloodTestReport?: string;
+    videoAnalysisResult?: string;
+    bodyPhotoAnalysis?: string;
+    renewalContext?: string;
+    /** v149 — اسپک ساختاری چیدمان درخواستی بازطراحی چت (تیکت مالک) */
+    redesignSpec?: RequestedSplitSpec;
+    redesignRaw?: string;
+    redesignDirective?: string;
+    /** v149 — ممنوعیت‌های صریح حرکات/مواد (چت کاربر یا اصول مدیر) — ممیزی قطعی پس‌تولیدی دارد */
+    redesignConstraints?: RedesignConstraints;
+    /** v150 — دستور اصولی مدیر (دیرکتیو مالک: باکس «طبق چه اصولی برنامه به‌روزرسانی بشه»)
+     *  بالاترین اولویت پرامپت — حتی بالاتر از دیرکتیو بازطراحی چت */
+    adminDirective?: string;
+    /** v213 — نقاط ضعف ساختاریافتهٔ آنالیز عکس/ویدیوی بدن — ورودی مستقیم معمار برنامه */
+    weakPoints?: string[];
+  }
+): Promise<ProWorkoutPlanContent> {
+  const systemPrompt = withBrandDirective(await getAiConfig("coach_system_prompt", DEFAULT_COACH_PROMPT));
+  const context = buildUserContext(data, planName);
+
+  // ─── v155 — بلوک بانک به بالای buildPlanAwareInstructions منتقل شد تا اندازهٔ
+  // «واقعی» بانک کامل در نگهبان بودجهٔ پرامپت حساب شود (اگر دیتابیس حرکات سرور
+  // در آینده چند برابر شود، بودجه همچنان دقیق می‌ماند). ───
+
+  // --- v117→v154 — قفل بانک حرکات: تزریق «کامل» دیتابیس + آزادی حرکت خارج از بانک ---
+  // قانون مطلق مالک (v154):
+  //   «۹۰ حرکت هم کمه. اولاً تمام حرکات دیتابیس من بهش تزریق بشه. ثانیاً حتی
+  //    اگر حرکتی داخل دیتابیس من نبود باز هم باید اون حرکت رو بده و نزدیک‌ترین
+  //    ویدیو و توضیحات براش قرار بگیره. تمام حرکات دیتابیس من و خارج از دیتابیس
+  //    برای دادن برنامهٔ تمرینی در نظر گرفته بشه.»
+  // پس:
+  //   ۱) کلید سراسری یوتیوب + ویدیوی اختصاصی هر رکورد خوانده می‌شود (بانکِ قفل
+  //      فقط ویدیودار است — مبنای الصاق ویدیو در پس‌تایم)؛
+  //   ۲) پرامپت با buildFullBankPromptGroups از «همهٔ» ردیف‌های فعال (۵۸۱ حرکت —
+  //      ویدیودار و بی‌ویدیو) ساخته می‌شود — بدون سقف ۹۰ و بدون نمونه‌گیری؛
+  //   ۳) AI به حرکات خارج از بانک هم آزاد است (در پرامپت صریح شده)؛
+  //   ۴) پس از تولید، خروجی با lockWorkoutPlanToBank قفل می‌شود: نام معادل →
+  //      استاندارد بانک؛ نام غریبه → با نام خودش + نزدیک‌ترین ویدیو/توضیح بانک.
+  //   ۵) v155 — کل این پرامپت پویا از دیتابیس «سرور» خوانده می‌شود (findMany isActive)
+  //      — دیپلوی با هر دیتابیسی، همان دیتابیسِ سرور را کامل تزریق می‌کند.
+  let bank: LockedBank | null = null;
+  // v154 — «کل» ردیف‌های فعال دیتابیس (حتی بی‌ویدیو) — مبنای پرامپت کامل
+  let fullBankRows: BankExerciseRow[] = [];
+  // v153 — seed تنوع حرکتی: از ویژگی‌های کاربر + زمان تولید — هر کاربر/هر چرخه
+  // جایگزینی‌ها/لرزش دانه‌دار متفاوت (ریشهٔ «یک سری حرکات به همه داده میشه»)
+  const varietySeed = hashStringToSeed(
+    [data.firstName, data.lastName, data.goal, data.discipline, data.workoutDays, Date.now()]
+      .map((x) => String(x ?? ""))
+      .join("|")
+  );
+  // ─── v213 — معمار برنامه (Coach Blueprint) — قلب شخصی‌سازی ───
+  // معماری هفتگی (اسپلیت/توزیع عضلات هر روز/بودجهٔ ست علمی/FST-7) از پروفایل
+  // واقعی کاربر (هدف/سابقه/رشته/ریکاوری/نقاط ضعف آنالیز بدن) قطعی تصمیم‌گیری
+  // می‌شود و به‌عنوان دیرکتیو الزامی در پرامپت می‌نشیند. مسیر بازطراحی چت
+  // (redesignSpec) با استثنای v149 بر معماری مقدم است → blueprint نمی‌گیرد.
+  // ⚠️ بعد از varietySeed (seed معمار = seed تنوع حرکتی همین چرخه).
+  const coachBlueprint: CoachBlueprint | null = extras?.redesignSpec
+    ? null
+    : buildCoachBlueprint({
+        gender: data.gender,
+        age: data.age,
+        goal: data.goal,
+        trainingExperience: data.trainingExperience,
+        workoutDays: data.workoutDays,
+        workoutDaysList: data.workoutDaysList,
+        workoutPlace: data.workoutPlace,
+        equipment: data.equipment,
+        discipline: data.discipline,
+        bodyShape: data.bodyShape,
+        // v230 — تمرکز فرم بدن به معمار (پارامتر مرده بود — دیرکتیو مالک:
+        // «طراحی برنامه از همهٔ اطلاعات آنبوردینگ تغذیه شود»)
+        bodyShapeFocus: data.bodyShape && BODY_SHAPE_INFO[data.bodyShape] ? BODY_SHAPE_INFO[data.bodyShape].focus : undefined,
+        sleepHours: data.sleepHours,
+        stressLevel: data.stressLevel,
+        smokingHabit: data.smokingHabit,
+        injuries: data.injuries,
+        injuryAreas: data.injuryAreas,
+        medicalConditions: data.medicalConditions,
+        weakPoints: extras?.weakPoints,
+        specialConditions: data.specialConditions,
+        seed: varietySeed,
+      });
+  const blueprintDirective = coachBlueprint ? buildBlueprintDirectiveFa(coachBlueprint) : "";
+
+  // بند «معماری/پوشش» پرامپت — وقتی معمار فعال است، دیرکتیو معماری + قواعد
+  // عمومی مختصر؛ وقتی بازطراحی چت (redesignSpec) معماری را خودش تعیین کرده،
+  // منوی قبلی حفظ می‌شود (چون استثنای v149 در همان منو لنگر انداخته است).
+  const splitAndCoverageBlockFa = blueprintDirective
+    ? `${blueprintDirective}
+
+قواعد عمومی پوشش (در چارچوب معماری بالا):
+- کلیهٔ عضلاتِ معماری در هفته پوشش داده می‌شوند؛ هیچ عضله‌ای از معماری جا نمی‌ماند و هیچ عضله‌ای خارجِ معماریِ روزِ خودش تجویز نمی‌شود.
+- «دو روز سینه و هیچ روز سرشانه» = برنامهٔ باطل؛ پا هرگز حذف نمی‌شود.
+- 🔴 اولویت عضلات ضعیف (v148 — دیرکتیو مالک): عضلاتِ ضعیف/عقب‌ماندهٔ آنالیز بدن در معماری با فرکانس ۲ و اولِ جلسه لنگر انداخته‌اند — عیناً اجرا کن.
+- ⚠️ عضله‌ای که در معماری ست مستقیم ندارد و فقط هم‌پوشانی کار می‌گیرد، در «- 📊 تحلیل معماری» نکات مربی توضیح داده شود (بند ۱۴).`
+    : `A) تقسیم هفته (Split) — دقیقاً بر اساس ${data.workoutDays} روز تمرین انتخاب کن:
+- ۱ روز → بدن کامل (Full-Body) | ۲ روز → بالاتنه/پایتنه یا بدن کامل ×۲
+- ۳ روز → Push/Pull/Legs یا بدن کامل ×۳ (روز تک‌عضله‌ای مثل «فقط سینه» ممنوع)
+- ۴ روز → بالاتنه/پایتنه ×۲ یا Push/Pull/Legs + بدن کامل | ۵ روز → Push/Pull/Legs + بالاتنه/پایتنه یا Split عضله‌محور
+- ۶ روز → Push/Pull/Legs ×۲ (فرکانس ۲ برای هر عضله) | ۷ روز → Push/Pull/Legs ×۲ + روز شکم/هوازی/ضعف‌محور
+- ⚠️ «focus» هر روز باید صریح و واقعی باشد؛ دو روز با focus یکسان وقتی عضلهٔ اصلیِ دیگری هفته‌ای صفر روز است مطلقاً ممنوع.
+- 🔴 v149 — استثنای درخواست صریح ورزشکار: اگر در بالای همین پرامپت بلوک «درخواست صریح و الزامی ورزشکار» آمده باشد، چیدمان همان بلوک عیناً ملاک است و گزینه‌های پیش‌فرض این بند برای این کاربر لغو می‌شوند — درخواست صریح ورزشکار بر همهٔ قواعد split مقدم است (روزهای بالاتنه/پایین‌تنه دقیقاً به همان تعداد درخواستی).
+
+B) پوشش کامل عضلات در هفته (قانون طلایی — «دو روز سینه و هیچ روز سرشانه» = برنامهٔ باطل):
+- هر شش گروه اصلی — سینه، زیربغل/پشت، سرشانه، پا، بازو (جلو+پشت)، شکم — باید در طول هفته حداقل یک‌بار کار مستقیم بگیرند.
+- 🔴 سرشانه الزامی است: حتی در Push/Pull/Legs، در هر روز Push حداقل ۲-۳ حرکت سرشانه (پرس + نشر جانب) بده؛ در Split عضله‌محور با ۴ روز به بالا، یک روز مستقل سرشانه الزامی است.
+- 🔴 در Split عضله‌محور، هر روز فقط یک گروه اصلی + مکمل کوچک (مثل زیربغل + جلوبازو؛ سینه + پشت‌بازو؛ سرشانه + شکم).
+- پا هرگز حذف نمی‌شود؛ حتی برای هدف بالاتنه، حداقل یک روز کامل پا الزامی است.
+- 🔴 اولویت عضلات ضعیف (v148 — دیرکتیو مالک): عضلاتی که در آنالیز عکس/ویدیوی بدن «ضعیف، عقب‌مانده یا نامتقارن» مشخص شده‌اند (مثلاً «سرشانه‌های ضعیف») باید فرکانس ۲ بار در هفته و حجم بالاتری بگیرند و صراحتاً در برنامه دیده شوند — هرگز عضلهٔ ضعیفِ کاربر را فدای عضلهٔ قوی‌تر نکن (مثلاً ۳ روز سینه با صفر روز سرشانه برای کاری با سرشانهٔ ضعیف مطلقاً ممنوع).
+- ⚠️ عضلهٔ بدون پوشش/تأکید غیرمعمول باید توضیح داده شود (بند ۱۴).`;
+
+  try {
+    const [all, globalYoutubeRow] = await Promise.all([
+      db.exerciseLibrary.findMany({
+        where: { isActive: true }, // v135 — AI فقط حرکات فعال بانک را می‌بیند
+        select: {
+          id: true, name: true, muscle: true, category: true, equipment: true,
+          description: true, tips: true,
+          videoUrl: true, videoPosterUrl: true, youtubeUrl: true, youtubeEnabled: true,
+        },
+      }),
+      db.siteSetting.findUnique({ where: { key: GLOBAL_YOUTUBE_SETTING_KEY }, select: { value: true } }),
+    ]);
+    const globalYoutube = globalYoutubeEnabledFromValue(globalYoutubeRow?.value);
+    fullBankRows = all as BankExerciseRow[];
+    bank = buildLockedBank(fullBankRows, globalYoutube);
+    if (bank.excludedCount > 0) {
+      console.warn(
+        `[generateWorkoutPlan] bank lock: ${all.length - bank.excludedCount}/${all.length} exercises usable (excluded ${bank.excludedCount} video-less) — prompt gets ALL ${all.length} (v154)`
+      );
+    }
+  } catch (e) {
+    console.error("[generateWorkoutPlan] failed to load locked exercise bank:", e);
+  }
+  // v154 — فهرست «کامل» بانک، گروه‌بندی‌شده بر اساس گروه عضلانی اصلی + قانون
+  // انتخاب جدید (اولویت بانک + آزادی حرکت خارج از بانک با الصاق خودکار ویدیو)
+  const libraryList = fullBankRows.length > 0
+    ? (() => {
+        const groups = buildFullBankPromptGroups(fullBankRows);
+        const sections = groups.map((g) => `- ${g.label} (${g.names.length}): ${g.names.join("، ")}`);
+        return `\n\nبانک کامل حرکات دیتابیس فیتاپ (${fullBankRows.length} حرکت فعال — همهٔ حرکات زیر در بانک ثبت‌اند و ویدیو/توضیحات استاندارد به‌صورت خودکار به آن‌ها الصاق می‌شود):\n${sections.join("\n")}\n\nقانون انتخاب حرکت:\n- اولویت با حرکات بانک بالا است — نام حرکت بانک را دقیقاً و کامل همان‌طور که آمده بنویس (همراه پرانتز انگلیسی).\n- اما به بانک محدود نیستی: اگر حرکتی خارج از فهرست بالا برای هدف/سطح/تجهیزاتِ همین کاربر مناسب‌تر است، آزادانه تجویزش کن — فقط نام استاندارد و شناخته‌شدهٔ جهانی حرکت را دقیق بنویس؛ سیستم به‌طور خودکار نزدیک‌ترین ویدیو و توضیحات بانک را به آن الصاق می‌کند. هرگز حرکتِ مناسب را فقط به این دلیل که در فهرست نیست حذف یا با حرکتِ بی‌ربط جایگزین نکن.\n\nقوانین الزامی تنوع و شخصی‌سازی:\n- از ظرفیت کامل بانک بالا استفاده کن؛ این برنامه باید مخصوص همین کاربر (هدف، سطح، رشته، تجهیزات) باشد و با برنامهٔ کاربران دیگر یکسان نشود — از چرخش متنوع هالتر/دمبل/سیم‌کش/دستگاه/وزن بدن استفاده کن.\n- در هر روز هیچ حرکتی تکرار نمی‌شود؛ در هر روز حداکثر دو واریانت از یک خانوادهٔ حرکتی مجاز است و سه واریانت یا بیشتر مطلقاً ممنوع است (مثلاً سه نوع شنا یا سه نوع کرانچ در یک روز ممنوع، دو نوع مجاز).\n`;
+      })()
+    : "";
+
+  // ─── v155 — نگهبان بودجهٔ پرامپت (لایهٔ ۳): مجموع سیستم + کانتکست کاربر + بانک
+  // کامل + سهم دستورالعمل‌ها/اسکیما/دیرکتیوها (~۱۴K) سنجیده می‌شود؛ فقط تاریخچهٔ
+  // اختیاری (پروندهٔ نردبانی/تحلیل‌ها/هم‌سازی/متن خام) در سناریوی فرضیِ فراتر از
+  // فرض نردبانی کوتاه می‌شود. بانک/ایمنی/ممنوعیت‌ها/اسکیما هرگز بریده نمی‌شوند. ───
+  const budgetedExtras = shrinkPlanExtrasForPromptBudget(
+    extras,
+    systemPrompt.length + context.length + libraryList.length + 14000,
+    "generateWorkoutPlan"
+  );
+
+  // ─── trainingExperience را به extras اضافه کن تا تکنیک‌ها بر اساس سابقه فعال شوند ───
+  const planInstructions = buildPlanAwareInstructions(planName, { ...budgetedExtras, trainingExperience: data.trainingExperience });
+
+  // ─── v112 — دیرکتیو نخبگی رشته‌محور (دیرکتیو مالک: «برنامهٔ همهٔ رشته‌های آنبوردینگ
+  // باید دقیقاً طبق همان رشته، حرفه‌ای و تخصصی تولید شود») — حالا هر ۱۷ رشته دیرکتیو
+  // تخصصی تمرین + دیرکتیو تغذیهٔ اختصاصی دارد (Record<Discipline, string> — کامل‌بودن
+  // در زمان کامپایل تضمین می‌شود). چون تزریق در userPrompt است (نه system prompt
+  // قابل‌override ادمین)، همیشه و بدون استثنا اعمال می‌شود. ───
+  const disciplineProgramDirective =
+    (data.discipline && DISCIPLINE_PROGRAM_DIRECTIVES[data.discipline]) || "";
+  // v112 — دیرکتیو تغذیهٔ رشته (disciplineNutritionDirective/disciplineLabel) از
+  // پرامپت تمرین حذف شد (دیرکتیو مالک: تغذیه فقط در برنامهٔ غذایی)؛ تغذیهٔ
+  // رشته‌محور فقط در generateMealPlan تزریق می‌شود.
+
+  // Use user-selected specific weekdays if provided; otherwise fallback to first N days
+  const chosenDays =
+    data.workoutDaysList && data.workoutDaysList.length > 0
+      ? data.workoutDaysList
+      : PERSIAN_WEEKDAYS.slice(0, data.workoutDays);
+
+  // ─── محاسبه پویای تعداد حرکات هر روز بر اساس سطح تجربه کاربر (WORKOUT-PLAN-PRO) ───
+  // مبتدی: ۵-۶ | متوسط: ۶-۷ | پیشرفته: ۷-۸ | حرفه‌ای: ۸-۱۰
+  // این مقادیر بر اساس استاندارد مربیان بزرگ دنیا (هانی رامبد، هادی چوپان، کریس بامستد) تنظیم شده‌اند.
+  // برای کاربران با سابقه ۳ سال یا بیشتر (advanced/pro) حداقل ۶ حرکت الزامی است.
+  const exerciseCountRange = (() => {
+    switch (data.trainingExperience) {
+      case "beginner":
+        return { min: 5, max: 6 };
+      case "intermediate":
+        return { min: 6, max: 7 };
+      case "advanced":
+        return { min: 7, max: 8 };
+      case "pro":
+        return { min: 8, max: 10 };
+      default:
+        return { min: 5, max: 6 };
+    }
+  })();
+  // قانون سابقه ۳ سال یا بیشتر → حداقل ۶ حرکت
+  const minExercisesForExperienced = 6;
+  const effectiveMinExercises =
+    (data.trainingExperience === "advanced" || data.trainingExperience === "pro")
+      ? Math.max(exerciseCountRange.min, minExercisesForExperienced)
+      : exerciseCountRange.min;
+
+  // ─── v216 — قطعات پرامپت (مونتاژ در انتهای قالب با assembleWorkoutPrompt) ───
+  // بخش ۱ (ادمین/بازطراحی/ممنوعیت‌ها) عیناً بالاتر از همه می‌ماند (سلسله‌مراتب ادمین > کاربر)؛
+  // بلوک‌های ثابت (بانک + دوره‌بندی + اتورگولاسیون) قبل از بلوک‌های پویای کاربر می‌آیند
+  // تا پیشوند مشترک پرامپت بلند بماند و کش پرامپت دیپ‌سیک (۵۰× ارزان‌تر) واقعاً بخورد.
+  const workoutPromptAdminBlock = [
+    // v150 — دستور صریح مدیر فیتاپ — بالاترین اولویت پرامپت؛ هر بندِ این دستور
+    // «الزاماً و دقیقاً» اعمال می‌شود و بر هر قاعدهٔ دیگر پرامپت مقدم است.
+    extras?.adminDirective || "",
+    extras?.redesignDirective || "",
+    // v149 — دیرکتیو ممنوعیت‌های صریح (تیکت مالک: «حرکاتی که گفته داخل برنامه‌ام
+    // نباشه» باید واقعاً نباشند — حتی اگر خلاصهٔ نسخه ادعای حذف کند)
+    extras?.redesignConstraints && extras.redesignConstraints.forbiddenMovements.length > 0
+      ? buildMovementExclusionDirectiveFa(extras.redesignConstraints, extras.redesignRaw)
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const workoutPromptProfileBlock = `${context}
+${planInstructions}${disciplineProgramDirective ? `\n\n${disciplineProgramDirective}\n` : ""}`;
+  const workoutPromptOutputBlock = `روزهای تمرین کاربر: ${chosenDays.join("، ")}
+
+فقط و فقط با ساختار JSON زیر پاسخ بده و هیچ متن اضافه‌ای قبل یا بعد از JSON ننویس:
+{
+  "days": [
+    {
+      "day": "شنبه",
+      "title": "عنوان روز تمرین",
+      "focus": "عضله هدف",
+      "estimatedMinutes": 60,
+      "warmup": [
+        {"name": "نام حرکت گرم‌کردن (مثلاً دویدن سبک روی تردمیل)", "durationSec": 300, "notes": "شدت پایین، RPE 4-5"},
+        {"name": "موبیلیتی مفصل هدف (مثلاً چرخش شانه)", "durationSec": 120, "notes": "۳ ست ۱۰ تکراری"}
+      ],
+      "exercises": [
+        {
+          "name": "نام حرکت (اولویت با بانک بالا؛ حرکت خارج از بانک هم مجاز است — نام استاندارد و شناخته‌شدهٔ جهانی حرکت را دقیق بنویس)",
+          "muscle": "عضله هدف",
+          "category": "push|pull|legs|core|cardio|fullbody",
+          "description": "توضیح نحوه انجام (۲-۳ جمله کامل و واضح — فرم، مسیر حرکت، نکته فنی کلیدی)",
+          "tips": "نکته ایمنی و تکنیک",
+          "coachTip": "توصیه کوتاه مربی (۱ جمله) — مثلاً «دقت کن زانوها در جهت نوک پنجه باشد» یا «در فاز منفی ۳ ثانیه مکث کن»",
+          "difficulty": "beginner|intermediate|advanced",
+          "rpe": 7,
+          "tempo": "3-1-2-0",
+          "substitution": "حرکت جایگزین برای زمانی که تجهیزات کافی نباشد یا محدودیت خطری وجود داشته باشد",
+          "sets": [
+            {"setNumber": 1, "reps": "10-12", "restSec": 90, "rpe": 7},
+            {"setNumber": 2, "reps": "10-12", "restSec": 90, "rpe": 7}
+          ],
+          "supersetGroup": "A",
+          "supersetType": "superset",
+          "circuitRounds": 3,
+          "restBetweenRounds": 180
+        }
+      ],
+      "cooldown": [
+        {"name": "کشش دینامیک/استاتیک عضله هدف", "durationSec": 180, "notes": "۳۰ ثانیه روی هر عضله"},
+        {"name": "فوم رولر (Foam Roller)", "durationSec": 180, "notes": "روی عضلات هدف و فاسیا"}
+      ]
+    }
+  ],
+  "weeklyProgression": {
+    "strategy": "استراتژی کلی پیشرفت در طول ۴۵ روز برنامه — عیناً منطق بلوپرینت دوره‌بندی ۶ هفته‌ای (بخش ۳ پرامپت): تجمعی → موج شدت → دلود → پیک",
+    "weeks": [
+      {"week": 1, "weightChangeKg": 0, "repChange": 0, "note": "فاز تجمعی — هدف این هفته: آشنایی و تثبیت فرم حرکات با RPE 6-7"},
+      {"week": 2, "weightChangeKg": 2.5, "repChange": 0, "note": "فاز تجمعی — افزایش وزنهٔ ۲.۵ کیلویی در حرکات اصلی — RPE 7"},
+      {"week": 3, "weightChangeKg": 5, "repChange": 0, "note": "فاز تجمعی — افزایش تجمعی وزنه و ست — RPE 8، حجم صعودی"},
+      {"week": 4, "weightChangeKg": 7.5, "repChange": 0, "note": "موج شدت — top-set حرکات اصلی RPE 8-9 + بک‌آف‌ست ۸۰٪ همان وزنه"},
+      {"week": 5, "weightChangeKg": 0, "repChange": -1, "note": "دلود — حجم ×۰.۶، وزنهٔ ~۴۰٪ سبک‌تر، RPE ≤7 — بازیابی"},
+      {"week": 6, "weightChangeKg": 10, "repChange": -1, "note": "پیک/تست رکورد — تست قدرت حرکات پایه با RPE 9-10"}
+    ]
+  },
+  "periodization": {"type": "6week-wave", "weeks": [{"week": 1, "phase": "تجمعی"}, {"week": 4, "phase": "موج شدت"}, {"week": 5, "phase": "دلود (حجم ×۰.۶)"}, {"week": 6, "phase": "پیک/تست رکورد"}]},
+  "safetyNotes": [
+    "نکته ایمنی ۱ بر اساس آسیب‌دیدگی یا شرایط پزشکی",
+    "نکته ایمنی ۲"
+  ],
+  "recoveryNotes": [
+    "توصیه ریکاوری ۱ بر اساس خواب/استرس",
+    "توصیه ریکاوری ۲"
+  ],
+  // ⚠️ هیچ فیلد یا نکتهٔ تغذیه‌ای در این JSON جایی ندارد — تغذیه فقط در برنامهٔ غذایی جداگانه ارائه می‌شود.
+  "supplementTimingNotes": [
+    "توصیه تایمینگ مکمل بر اساس مکمل‌های فعلی یا هدف"
+  ],
+  "medicalWarningFlags": [
+    "⚠️ هشدار پزشکی (در صورت وجود شرایط حساس)"
+  ],
+  "weeklyGoal": "هدف هفته",
+  "notes": "نکات کلی هفته — انگیزشی و کاربردی؛ ⚠️ هر نکته در یک خط جداگانه با «- » شروع شود (لیست مرتب — دیرکتیو مالک v101)؛ اگر برنامه هوازی/شکم دارد صریحاً در نکات ذکر شود",
+  "advancedTechniques": [
+    "نام تکنیک پیشرفته استفاده‌شده (مثلاً FST-7، سوپرست آنتاگونیست، تری‌ست، دراپ‌ست، رست پاز، Progressive Overload)"
+  ],
+  "muscleGroupSplit": "تقسیم عضلات هفته (مثلاً push/pull/legs یا upper/lower یا body part split یا full body 3x)",
+  "periodizationType": "linear | undulating | block | wave | daily_undulating",
+  "muscleFrequencyPerWeek": 2,
+  "inspiredByCoach": "hany_rambod | hadi_chupan | chris_bumstead | ronnie_coleman | jay_cutler | mixed",
+  "fst7Details": {
+    "exerciseName": "نام حرکت آخر گروه عضلانی (که FST-7 روی آن اعمال می‌شود)",
+    "sets": 7,
+    "reps": "8-12",
+    "restSec": 30,
+    "note": "توضیح اجرای FST-7 (پمپ حداکثری، استراحت ۳۰-۴۵ ثانیه، ۷ ست)"
+  }
+}
+
+قوانین حرفه‌ای (همه را رعایت کن):
+
+۱) ساختار و تعداد (قانون سخت — نقض آن یعنی برنامه نامعتبر است):
+- دقیقاً ${data.workoutDays} روز تمرین در روزهای ذکر شده (${chosenDays.join("، ")}) ایجاد کن.
+- 📅 روزهای تمرین را به ترتیب استاندارد هفته فارسی برگردان: شنبه، یکشنبه، دوشنبه، سه‌شنبه، چهارشنبه، پنجشنبه، جمعه. هرگز روزها را نامرتب برنگردان. آرایه "days" باید دقیقاً به همین ترتیب زمانی چیده شده باشد.
+- ⚠️ هر روز «حداقل ${effectiveMinExercises}» و «حداکثر ${exerciseCountRange.max}» حرکت داشته باشد (سطح تجربه کاربر: ${data.trainingExperience || "beginner"}). کمتر از حداقل یا بیشتر از حداکثر حرکت در هر روز ممنوع است — این محدوده بر اساس استانداردهای علمی تمرین برای همین سطح تجربه تعیین شده است.
+- ⚠️ قانون مهم: برای کاربران با سابقه ۳ سال یا بیشتر (سطح پیشرفته/حرفه‌ای)، حداقل ۶ حرکت در هر روز الزامی است.
+- تعداد ست‌ها بین ۳ تا ۵ باشد.
+- **اولویت با بانک حرکات بالاست؛ حرکت خارج از بانک هم مجاز است** — برای حرکات بانک، نام را دقیقاً همان‌طور که در فهرست آمده بنویس؛ برای حرکت خارج از بانک، نام استاندارد و متداول جهانی حرکت را بنویس (سیستم به‌طور خودکار نزدیک‌ترین ویدیو و توضیحات بانک را به آن الصاق می‌کند — حرکتِ مناسب هرگز فقط به‌خاطر نبودن در فهرست حذف نمی‌شود).
+- **سوپرست/تری‌ست/جاینت‌ست در شمارش حرکات «۱» حساب می‌شود** (مثلاً ۵ حرکت تکی + ۱ سوپرست = ۶ حرکت کل) — اما «حساب‌شدن به‌عنوان یک حرکت» فقط در شمارش است؛ هرگز دو حرکت را در یک آبجکت ادغام نکن (قانون کامل در بخش ۷).
+- 💰 بودجه و تجهیزات کاربر: مکان تمرین «${WORKOUT_PLACE_LABELS[data.workoutPlace] || data.workoutPlace}» و تجهیزات موجود: ${data.equipment?.length ? data.equipment.map((e) => equipmentFa(e)).join("، ") : "نامشخص"}. حرکات را فقط با همین تجهیزات انتخاب کن — حرکت با تجهیزات گران‌قیمت یا خارج از دسترس کاربر تجویز نکن و در "substitution" جایگزین کم‌هزینه بده.
+
+۱-ب) چیدمان هفتگی، پوشش کامل عضلات و تنوع حرکتی (قانون مربیان بزرگ — نقض آن یعنی برنامه رد می‌شود):
+
+${splitAndCoverageBlockFa}
+
+C) تنوع خانوادهٔ حرکتی در هر روز (قانون علمی v147 — انباشت آماتوری مطلقاً ممنوع):
+- در یک روز، «حداکثر دو واریانت» از یک خانوادهٔ حرکتی مجاز و حتی استاندارد است — ترکیب دو واریانت با تأکید متفاوت علمی درست است:
+  • مثال مجاز: «جلو بازو هالتر + جلو بازو چکشی دمبل» (دومی براکیالیس) | «اسکوات جلو + اسکوات بلغاری» (دومی یکلیترال) | «پرس سینه هالتر + پرس سینه دمبل».
+- اما «۳ واریانت یا بیشتر» از یک خانواده در یک روز = انباشت بی‌مورد حجم تمرین (اشتباه آشکار مربیان آماتور — برنامه رد می‌شود):
+  • مثال ممنوع: روز زیربغل با «بارفیکس دست‌باز + بارفیکس دست‌جمع + بارفیکس دست برعکس + بارفیکس سنگین» — این ۴ حرکت عملاً یک حرکت‌اند!
+  • چیدمان درست روز زیربغل: حداکثر ۱ حرکت کشش عمودی (بارفیکس یا لت) + حداقل ۲ حرکت روئینگ/افقی + ۱ حرکت مکمل (فیس‌پول/پول‌اور/شراگ).
+- برای هر روز: هر حرکت باید زاویه یا الگوی حرکتی متفاوتی بیاورد (افقی/عمودی/شیب، بارفیکس/روئینگ، پرس/قفسه). دو حرکت با همان الگو = هدر دادن حجم تمرین.
+- ترتیب علمی: اول حرکات چندمفصلی/پایه (پرس، اسکوات، ددلیفت، بارفیکس، روئینگ سنگین)، بعد تک‌مفصلی (قفسه، نشر، جلوبازو)؛ حرکت FST-7 آخر گروه.
+
+D) خودت را ممیزی کن: قبل از تحویل، تک‌تک روزها را چک کن — (۱) هیچ روزی بیشتر از دو واریانت از یک خانوادهٔ حرکتی ندارد؟ (دو واریانت مجاز است) (۲) چیدمان هر روز عیناً مطابق معماری/درخواستِ بالای همین پرامپت است (عضلهٔ اصلی اول، مکمل آخر، هیچ حرکتی از عضلهٔ بیرونِ معماری روز)؟ (۳) بودجهٔ ست هفتگی معماری رعایت شده (هیچ عضله‌ای زیر حداقل یا بالای سقف جلسه‌ای ~۸ ست نیست)؟ اگر هر مورد fail بود، برنامه را قبل از پاسخ اصلاح کن.
+
+۲) گرم‌کردن و سردکردن (بسیار مهم):
+- هر روز حتماً آرایه "warmup" با حداقل ۲ آیتم بساز: ۵-۱۰ دقیقه هوازی سبک + موبیلیتی/اکتیویشن مفصل هدف.
+- هر روز حتماً آرایه "cooldown" با حداقل ۲ آیتم بساز: کشش استاتیک + فوم رولر یا نفس‌گیری فعال.
+- durationSec به ثانیه (نه دقیقه) باشد.
+
+۲-ب) هوازی و شکم (الزامی — دیرکتیو مالک v101: «اگر نیاز به برنامه شکم و گرم‌کردن و هوازی دارند حتماً داده باشم چه تو برنامه چه در نکات مربی»):
+- اگر هدف کاربر چربی‌سوزی/کاهش وزن است یا برنامه به هوازی نیاز دارد: هوازی را داخل خود برنامه بگنجان (حرکات category "cardio" — تردمیل/دوچرخه/الپتیکال/طناب — به‌عنوان روز اختصاصی یا انتهای روزهای قدرتی با مدت/شدت مشخص).
+- تمرین شکم و مرکز بدن (حرکات category "core" — کرانچ، پلانک، لگ ریس و…) حداقل ۲ روز در هفته داخل خود برنامه باشد (انتهای جلسه).
+- در فیلد "notes" (نکات مربی) صریحاً بنویس: دقیقهٔ هوازی هفته + کدام روزها شکم دارند — تا کاربر در نکات مربی هم ببیند.
+- ⚠️ قالب "notes": هر نکته در یک خط جداگانه و با «- » شروع شود (هر نکته یک آیتم) تا در اپ به‌صورت لیست مرتب نمایش داده شود — همهٔ نکات پشت‌سرهم در یک پاراگراف ممنوع.
+
+۳) RPE (Rate of Perceived Exertion) — حرفه‌ای:
+- برای هر حرکت فیلد "rpe" (۱ تا ۱۰) بگذار:
+  • RPE 5-6: گرم‌کردن / آماده‌سازی
+  • RPE 7: شدت متوسط — ۳ تکرار ذخیره (RIR 3)
+  • RPE 8: شدت بالا — ۲ تکرار ذخیره (RIR 2)
+  • RPE 9: نزدیک شکست — ۱ تکرار ذخیره
+  • RPE 10: شکست عضلانی کامل (فقط در ست آخر حرکات اصلی)
+- در ست آخر هر حرکت اصلی (پرس، اسکوات، ددلیفت) می‌توانی RPE را ۱-۲ درجه بالاتر بگذاری.
+
+۴) Tempo (تمپو اجرا):
+- برای هر حرکت فیلد "tempo" با فرمت ۴-رقمی بنویس: "اکسنتریک-مکث-کنسنتریک-مکث".
+  مثال‌ها:
+  • "3-1-2-0" — پایین ۳ ثانیه، مکث ۱، بالا ۲، بدون مکث (استاندارد هایپرتروفی)
+  • "2-0-1-0" — کنترل‌شده سریع (قدرت)
+  • "4-2-1-0" — زیر کنترل کامل (هایپرتروفی پیشرفته)
+- برای حرکات انفجاری (مثل پاور کلین) از "1-0-X-0" استفاده کن (X = حداکثر سرعت).
+
+۴-۱) توصیه مربی (coachTip) — الزامی برای هر حرکت:
+- برای هر حرکت فیلد "coachTip" را با یک جمله کوتاه و کاربردی از مربی پر کن.
+- این توصیه باید مختص همان حرکت باشد — نکته فنی یا فرمی که کاربر را در همان حرکت کمک کند.
+- مثال‌ها:
+  • اسکوات: «دقت کن زانوها در جهت نوک پنجه باشد و عمق حداقل موازی با زمین.»
+  • ددلیفت: «کمر کاملاً صاف، وزنه نزدیک بدن، فاز بالا با باسن و زانو هم‌زمان.»
+  • پرس سینه: «پایین آهسته (۳ ثانیه)، مکث ۱ ثانیه روی سینه، انفجاری بالا.»
+  • بارفیکس: «در فاز منفی ۳ ثانیه مکث کن تا کنترل کامل داشته باشی.»
+  • پرس سرشانه: «قفسه سینه بالا، شکم سفت، بدون قوس کمری — از فاز منفی غافل نشو.»
+- هرگز توصیه کلی و تکراری ننویس (مثل «فرم درست داشته باش»). همیشه نکته خاص همان حرکت.
+
+۵) استراحت بین ست‌ها:
+- در فیلد "restSec" هر ست بگذار:
+  • قدرت محض (۱-۳ تکرار): ۱۸۰ ثانیه (۳ دقیقه)
+  • هایپرتروفی (۶-۱۲ تکرار): ۶۰-۹۰ ثانیه
+  • استقامت عضلانی (۱۵+ تکرار): ۳۰-۴۵ ثانیه
+  • سوپرست/تری‌ست: ۹۰-۱۲۰ ثانیه بین گروه‌ها
+
+۶) حرکت جایگزین (substitution):
+- برای هر حرکت فیلد "substitution" پر کن با جایگزینی که همان عضله را هدف می‌گیرد اما با تجهیزات کمتر یا محدودیت ایمنی متفاوت.
+
+۷) سوپرست / تری‌ست / جاینت‌ست (روش‌های حرفه‌ای افزایش شدت):
+- **استفاده از سوپرست/تری‌ست/جاینت‌ست اختیاری است و باید بر اساس هدف و سطح ورزشکار تصمیم کنی.** در صورت استفاده، برای حرکات گروهی فیلد "supersetGroup" را با یک حرف یکسان (مثل "A" یا "B") پر کن.
+- 🔴 **قالب قطعی گروه‌ها (نقض این بند = برنامهٔ نامعتبر): هر حرکتِ عضو گروه باید یک آبجکت کاملاً مستقل با name و muscle و description و sets خودش باشد.** هرگز دو یا چند حرکت را در یک آبجکت ادغام نکن؛ هرگز کلمهٔ «سوپرست» را داخل فیلد "name" ننویس و هرگز نام را با «+» ترکیب نکن. حرف گروه فقط در فیلد "supersetGroup" می‌آید.
+  • ❌ غلط: { "name": "سوپرست A — پرس سینه با هالتر + بارفیکس", "muscle": "سینه / زیربغل", "sets": [...] } (دو حرکت ادغام‌شده در یک آبجکت — مطلقاً ممنوع)
+  • ✅ درست: { "name": "پرس سینه با هالتر", "supersetGroup": "A", "supersetType": "superset", "sets": [{restSec:0}] } و بلافاصله { "name": "بارفیکس", "supersetGroup": "A", "supersetType": "superset", "sets": [{restSec:90}] }
+- **توجه**: سوپرست/تری‌ست/جاینت‌ست در شمارش حرکات یک حرکت محسوب می‌شود (نه دو یا سه) — شمارش، نه قالب!
+- "supersetType" را بر اساس نوع گروه تنظیم کن:
+  • "superset" (۲ حرکت): متضاد آنتاگونیست — مثل پرس سینه + بارفیکس (push + pull).
+  • "triset"    (۳ حرکت): همان گروه عضلانی — مثل ۳ حرکت مختلف سینه (پرس، قفسه، شنا).
+  • "giant"     (۴ حرکت یا بیشتر): جاینت‌ست یا سیرکویت — برای اتمام کامل یک گروه عضلانی یا سیرکویت بدن‌کامل (full-body circuit).
+- برای جاینت‌ست (giant) حتماً این فیلدها را هم پر کن:
+  • "circuitRounds": تعداد دفعات تکرار کل سیرکویت (عدد ۲ تا ۴، پیش‌فرض ۳).
+  • "restBetweenRounds": استراحت بین دورهای سیرکویت به ثانیه (۱۲۰ تا ۱۸۰ ثانیه).
+- در سوپرست/تری‌ست/جاینت‌ست، restSec همهٔ اعضا را ۰ بگذار؛ فقط «عضو آخرِ گروه» استراحت واقعی گروه (۹۰-۱۲۰ ثانیه) را روی «همهٔ» ست‌های خودش می‌نویسد — اپ فیتاپ استراحتِ پس از هر دورِ گروه را از همین عضو می‌خواند، پس اگر فقط ست آخرش استراحت داشته باشد، دورهای ۱ و ۲ بی‌استراحت می‌شوند.
+- اعضای هر گروه باید پشت‌سرهم (consecutive) در آرایهٔ exercises بیایند و ترتیبشان همان ترتیب اجراست.
+- به ازای هر گروه، حداکثر ۱ گروه از هر نوع در یک روز بساز — هم‌نام‌بودن "supersetGroup" یعنی همان گروه.
+
+۷-۱) راهنمای انتخاب سوپرست بر اساس هدف و سطح ورزشکار:
+- **هدف "${GOAL_LABELS[data.goal]}"** (${data.goal}):
+${supersetGuidanceForGoal(data.goal)}
+- **سطح ورزشکار "${data.trainingExperience || "beginner"}"**:
+${supersetGuidanceForExperience(data.trainingExperience)}
+- اگر کاربر مبتدی است یا شرایط پزشکی/آسیب‌دیدگی حساس دارد، استفاده از سوپرست را به حداقل برسان یا کلاً حذف کن و روی حرکات تکی با فرم تکنیکی تمرکز کن.
+
+۷-۲) تکنیک‌های پیشرفته و الگوی مربیان بزرگ (WORKOUT-PLAN-PRO):
+- الگو: هانی رامبد (FST-7)، کریس بامستد (تمپو/ارتباط ذهن-عضله)، آرنولد شوارتزنگر (حجم کار و اصول پایه — تأکید روی کشش کامل دامنهٔ حرکتی و اتصال ذهن-عضله)، هادی چوپان (حجم و فرکانس بالا) و لانسفورد (جزئیات اجرا و پمپ نهایی).
+- **هانی رامبد — FST-7 (Fascia Stretch Training)**: در حرکت آخر هر گروه عضلانی (برای ورزشکار حرفه‌ای با هدف هایپرتروفی)، ۷ ست با ۸-۱۲ تکرار و استراحت ۳۰-۴۵ ثانیه بزن. هدف: پمپ حداکثری و کشش فاسیا. فیلد "fst7Details" را با نام حرکت، ۷ ست، تکرارها و استراحت پر کن.
+- **هادی چوپان — حجم بالا + فرکانس بالا**: با ${Math.max(4, data.workoutDays)} روز تمرین در هفته یا بیشتر، هر گروه عضلانی را ۲ بار در هفته تمرین بده. فیلد "muscleFrequencyPerWeek" را متناسب بگذار. در روزهای تکراری، حرکات و زاویه‌های متفاوت استفاده کن.
+- **کریس بامستد — ارتباط ذهن-عضله**: در توضیح هر حرکت روی کنترل فاز اکسنتریک (۳-۴ ثانیه پایین) و مکث در نقطه کشش تأکید کن. تمپو "4-1-2-0" یا "3-1-2-1" برای هایپرتروفی.
+- **آرنولد شوارتزنگر — اصول پایه و حجم کار**: حرکات پایهٔ چندمفصلی ستون هر روز باشند؛ دامنهٔ کامل حرکت + کشش عضله در نقطهٔ استرچ.
+- **رونی کلمن — پایهٔ سنگین (Heavy Compound Foundation)**: ستون اصلی هر روز، حرکات پایهٔ آزاد چندمفصلی (اسکوات، ددلیفت، پرس سینه، زیربغل هالتر خم، پرس سرشانهٔ ایستاده) با رنج ۶-۱۰ تکرار و رشد وزنهٔ تهاجمی در weeklyProgression است؛ ایزوله/دستگاه فقط بعد از پایهٔ سنگین برای پمپ نهایی می‌آید — نه جای آن. فقط برای ورزشکار بدون محدودیت آسیب فعال؛ با وجود آسیب، واریانت ایمن همان الگو (مثلاً هک‌اسکوات به‌جای اسکوات آزاد) را تجویز کن و در coachTip توضیح بده.
+- **جی کاتلر — دقت و پیوستگی (Precision & Consistency)**: رنج ۸-۱۲ تکرار با تمپوی کنترل‌شده و دامنهٔ کامل؛ ساختار هفتگی ثابت و قابل‌تکرار (زندگی با برنامه)؛ برای شکستن پلاتو، هر ۲-۳ هفته زاویه/تجهیزاتِ یک حرکت را واریانس بده (چرخش هوشمند، نه تغییر کامل برنامه) — در weeklyProgression استراتژی واقع‌بینانه و پایدار بگذار: پیوستگی بر شدتِ یک‌روزه مقدم است.
+- **دوره‌بندی** — بر اساس «سطح ورزشکار» (نه پلن خریداری‌شده — کیفیت برنامه در همهٔ پلن‌ها یکسان است)، فیلد "periodizationType" را تنظیم کن:
+  • pro / advanced (سابقهٔ ۳ سال به بالا) → "undulating" یا "daily_undulating"
+  • intermediate / beginner → "linear"
+- **دراپ‌ست (Drop Set)**: در ست آخر حرکات کمکی، می‌توانی یک دراپ‌ست (۲۰-۳۰٪ کاهش وزنه + تکرار تا شکست) پیشنهاد بده. در توضیح حرکت ذکر کن.
+- **رست پاز (Pause Reps)**: در نقطه میانی حرکات اصلی، ۲-۳ ثانیه مکث (tempo مثلاً "3-2-1-0").
+- **تکنیک ۱.۵ تکراری (1.5 reps)**: یک تکرار کامل + نیم تکرار = ۱.۵. برای پمپ حداکثری عضله.
+- فیلد "advancedTechniques" (آرایه): حداقل تکنیک‌های پیشرفته استفاده‌شده در این برنامه را لیست کن (بر اساس سطح ورزشکار).
+- فیلد "muscleGroupSplit": تقسیم عضلات هفته را دقیق مشخص کن (مثلاً "push/pull/legs" یا "upper/lower" یا "push/pull/legs/upper/lower" یا "body part split").
+- فیلد "inspiredByCoach": بر اساس هدف و سبک تمرینی که ساختی (نه پلن): هایپرتروفی مدرن → "hany_rambod" یا "chris_bumstead"؛ حجم/فرکانس بالا → "hadi_chupan"؛ پایهٔ سنگین/قدرت+حجم → "ronnie_coleman"؛ دقت/پیوستگی/شکستن پلاتو → "jay_cutler"؛ ترکیبی → "mixed"
+
+۸) پیشرفت هفتگی (weeklyProgression):
+- ⚠️ برنامهٔ فیتاپ ۴۵ روزه است (حدود ۶ هفته) — آرایهٔ weeks باید «دقیقاً ۶ هفته» (week 1 تا 6) داشته باشد؛ کمتر یا بیشتر ممنوع.
+- فیلد "note" هر هفته = «هدف کوتاه و مشخصِ همان هفته» (مثلاً «هدف این هفته: افزایش ۲.۵ کیلو در پرس، RPE 8») — این هدف در هفتهٔ مربوط به کاربر نمایش داده می‌شود، پس باید مخصوص همان هفته باشد.
+- استراتژی پیشرفت (Progressive Overload) باید کل ۴۵ روز را پوشش دهد و یکی از هفته‌ها نقطهٔ Deload و یکی نقطهٔ پیک باشد — نقشهٔ فازها عیناً از بلوپرینت دوره‌بندی ۶ هفته‌ای (بخش ۳ پرامپت) پیروی می‌کند: W1-3 تجمعی، W4 موج شدت، W5 دلود (حجم ×۰.۶)، W6 پیک/تست رکورد.
+- اگر کاربر "${data.trainingExperience || "beginner"}" است، آغاز را ملایم‌تر بگذار. اگر "pro" یا "advanced" است، پرگرسیون تهاجمی‌تر بده.
+
+۹) نکات ایمنی (safetyNotes):
+- بر اساس آسیب‌دیدگی‌ها و شرایط پزشکی کاربر، حداقل ۲ نکته بنویس.
+- اگر شرایط حساسی (دیابت، قلب، فشار خون) دارد، آن را صراحتاً ذکر کن.
+
+۱۰) توصیه ریکاوری (recoveryNotes):
+- بر اساس خواب و استرس کاربر، حداقل ۲ توصیه بنویس.
+  • اگر خواب کمتر از ۷ ساعت: حجم تمرین را ملایم پیشنهاد بده و تاکید بر خواب.
+  • اگر استرس بالا (۴-۵): تاکید بر ریکاوری فعال (پیاده‌روی، مدیتیشن، تنفس).
+
+۱۱) ممنوعیت مطلق محتوای تغذیه در برنامهٔ تمرینی:
+- در کل خروجی برنامهٔ تمرینی (تمام فیلدها: days، notes، coachTip، tips، recoveryNotes و…) هیچ توصیهٔ تغذیه‌ای (وعدهٔ غذایی، کالری، پروتئین، کربوهیدرات، زمان خوردن) ننویس — تغذیه فقط در «برنامهٔ غذایی» جداگانه ارائه می‌شود که با همین برنامهٔ تمرینی هم‌ساز شده است. فقط «تایمینگ مکمل» (supplementTimingNotes) مجاز است.
+- اگر نکتهٔ ریکاوری مرتبط با تغذیه بود، فقط به‌صورت کلی بنویس («ریکاوری را جدی بگیر») بدون تجویز غذایی.
+
+۱۲) تایمینگ مکمل (supplementTimingNotes):
+- اگر کاربر مکمل فعلی مصرف می‌کند (${capPromptText(data.currentSupplements, 400) || "نامشخص"}): تداخل/هماهنگی زمان مصرف را توضیح بده.
+- اگر مکمل نمی‌خورد: توصیه مکمل هدفمند (مثلاً کراتین بعد از تمرین).
+
+۱۳) هشدارهای پزشکی (medicalWarningFlags):
+- در صورت وجود شرایط حساس، حداقل ۱ هشدار اضافه کن.
+- اگر شرایط حساس نیست، آرایه خالی بگذار: [].
+
+۱۴) نکات هفته (notes):
+- انگیزشی و کاربردی، شامل ۳-۴ نکته کوتاه با ایموجی. مثال: "🔥 این هفته روی فرم حرکات تمرکز کن — کیفیت مهم‌تر از کمیت است!\n💪 ریکاوری را جدی بگیر تا پیشرفت پایدار شود.\n🎯 روی اجرای تمیز حرکات اصلی تمرکز کن!\n⚡ استراحت بین ست‌ها را رعایت کن — عضله در استراحت رشد می‌کند."
+- ⚠️ هیچ «هدف این هفته» یا هدف هفته‌محور در notes ننویس — نکات باید در طول کل ۴۵ روز برنامه معتبر بمانند؛ هدف هر هفته فقط در weeklyProgression.weeks[].note می‌آید.
+- 🔴 تحلیل چیدمان برای ورزشکار (الزامی v148): اگر عضله‌ای از شش گروه اصلی در هفته پوشش مستقیم نداری، یا برعکس عضله‌ای را غیرمعمول (۳ روز یا بیشتر) تمرکز دادی، حتماً یک خط «- 📊 تحلیل چیدمان: ...» با دلیل علمی مربی‌گری (هدف کاربر، نقاط ضعف آنالیز بدن، منطق split و فرکانس) در notes بنویس تا ورزشکار بداند چرا برنامه این‌طور چیده شده — سکوت دربارهٔ عضلهٔ جاافتاده/غیرمعمول یعنی برنامه ناقص.
+
+۱۵) شخصی‌سازی بر اساس شرایط:
+- اگر آسیب‌دیدگی وجود دارد، حرکات آسیب‌زا را حذف و جایگزین ایمن بده.
+- برای تمرین در خانه، از حرکات با وزن بدن یا تجهیزات موجود استفاده کن.
+- ساعت ترجیحی تمرین کاربر ${data.workoutTime ? `(${WORKOUT_TIME_LABELS[data.workoutTime]})` : "(نامشخص)"} — اگر صبح است، تمرین قدرتی پیشنهاد بده؛ اگر عصر/شب، حجمی/استقامتی.
+${data.targetDate ? `- تاریخ هدف کاربر ${data.targetDate} است — استراتژی پیشرفت را به این تایم‌لاین تنظیم کن.` : ""}
+${data.bodyFrame ? `- اندازه استخوان بدن کاربر ${BODY_FRAME_LABELS[data.bodyFrame]} است — در محاسبه حجم و شدت لحاظ کن.` : ""}
+
+🏆 استاندارد نخبگی (ممیزی نهایی — برنامه بدون این موارد نامعتبر است):
+- "periodizationType": نوع دوره‌بندی را با نام دقیق اعلام کن و چیدمان کل هفته را با همان منطق بساز (کلی‌گویی ممنوع).
+- "muscleGroupSplit" + "muscleFrequencyPerWeek": فرکانس هر گروه را توجیه کن (چرا این تعداد برای این رشته و سطح).
+- هر ست باید rpe و tempo صریح داشته باشد؛ ست بدون شدت/تمپو یعنی برنامه ناتمام.
+- انتخاب هر حرکت باید با دیرکتیو تخصصی رشته (بالا) هم‌راستا باشد؛ حرکت بی‌ارتباط با رشته ممنوع.
+- "coachTip": به روش‌شناسی نخبگیِ همان رشته با نام ارجاع بده (مثلاً FST-7، بلوک قدرت پاورلیفتینگ، کنترل ناوی پیلاتس، زاویهٔ بند TRX، نسبت کار/استراحت هییت، پلهٔ پلانش کالیستنیکس).
+- "weeklyProgression" (weeks): دقیقاً ۶ هفته با اعداد مشخص (کیلوگرم/تکرار/RPE/ثانیه) و هدف اختصاصی برای تک‌تک هفته‌ها — پیشرفت کلی‌گویی ممنوع؛ نقطهٔ deload یا پیک را صریح در یکی از هفته‌ها بگذار.
+- "safetyNotes": حداقل یک ریسک آسیبی خاصِ همین رشته را نام ببر (مثلاً تاندینوپاتی آرنج در کالیستنیکس، رابدو در کراس‌فیت، کمردرد هینج در پاورلیفتینگ، مچ در تعادل).
+
+🧪 خود-بازبینی قبل از تحویل (الزامی — دیرکتیو مالک: «یک بار بساز، یک بار چک کن، دیباگ کن، تست کن و به خودت ثابت کن این برنامه کاربر را به هدفش می‌رساند؛ بعد تحویل بده»):
+قبل از نوشتن JSON نهایی، برنامه‌ات را با این چک‌لیست ممیزی کن و اگر هر مورد fail بود، در همان پاسخ اصلاحش کن:
+- [ ] تعداد روزها دقیقاً برابر روزهای انتخابی کاربر و به ترتیب هفتهٔ فارسی است؟
+- [ ] 🔴 اگر بلوک «درخواست صریح و الزامی ورزشکار» در بالای پرامپت آمده، چیدمان روزها (تعداد روز بالاتنه/پایین‌تنه و...) عیناً همان است؟ (تیکت مالک: برنامه عیناً عین درخواست ورزشکار)
+- [ ] هر روز بین حداقل و حداکثر حرکت مجاز این سطح است؟ نام همهٔ حرکات استاندارد و دقیق است (بانک یا خارج از بانک — حرکتِ مناسب به‌خاطر نبودن در بانک حذف نشده)؟
+- [ ] ⚠️ هیچ روزی بیش از دو واریانت از یک خانوادهٔ حرکتی ندارد؟ (دو واریانت مجاز و استاندارد است — مثل جلو بازو هالتر + چکشی؛ ۴ بارفیکس در یک روز = رد کامل برنامه)
+- [ ] ⚠️ هر شش گروه اصلی (سینه/زیربغل/سرشانه/پا/بازو/شکم) در هفته حداقل یک‌بار پوشش داده شده‌اند؟ سرشانه صفر روز نیست؟
+- [ ] هر حرکت: sets + rpe + tempo + coachTip + substitution دارد؟
+- [ ] فرکانس عضلانی با تقسیم هفته هم‌خوان است؟ یک deload و یک پیک در ۶ هفته هست؟
+- [ ] آسیب/بیماری/تجهیزات/محل تمرین کاربر رعایت شده؟
+- [ ] این برنامه «واقعاً» کاربر را به هدف ${GOAL_LABELS[data.goal]} می‌رساند؟ (منطق علمی حجم/شدت/پیشرفت)
+- [ ] هیچ محتوای تغذیه‌ای در برنامهٔ تمرینی نیست؟
+اگر همه سبز است، JSON را بنویس.
+
+برای هر حرکت، توضیح کامل و واضح بنویس که کاربر بتواند حرکت را درست انجام دهد.`;
+
+  // ─── v216 — مونتاژ نهایی پرامپت با هم‌ترازی کش دیپ‌سیک ───
+  // ترتیب نهایی: مهر نسخه → وظیفه → قانون حل تعارض → بخش ۱ (ادمین) → بخش ۲ (بانک،
+  // ثابت) → بخش ۳ (دوره‌بندی + اتورگولاسیون، ثابت) → بخش ۴ (پروفایل کاربر، پویا)
+  // → بخش ۵ (خروجی/قوانین). محتوای قطعات دست‌نخورده — فقط ترتیب/درزها تازه است.
+  const userPrompt = assembleWorkoutPrompt({
+    header: "بر اساس اطلاعات زیر، یک برنامه تمرینی هفتگی کامل، حرفه‌ای و شخصی‌سازی‌شده بساز — سطح مربی حرفه‌ای فدراسیون.",
+    adminBlock: workoutPromptAdminBlock,
+    bankBlock: libraryList,
+    staticRulesBlock: `${PERIODIZATION_BLUEPRINT_BLOCK_FA}\n\n${AUTOREGULATION_RULES_BLOCK_FA}`,
+    profileBlock: workoutPromptProfileBlock,
+    outputBlock: workoutPromptOutputBlock,
+  });
+
+  let content: string;
+  try {
+    // ─── تولید برنامه تمرینی (دیریکتیو مالک v40): deepseek-v4.1-flash + تفکر مکس —
+    // در generatePlanContent (فال‌بک gemini فقط اگر دیپ‌سیک زیرساختی‌اً پاسخ نداد).
+    // تولید در پس‌زمینه انجام می‌شود (program-generation.ts) پس timeout بلند
+    // مشکلی برای UX ایجاد نمی‌کند و بودجهٔ ~۱۸ دقیقه‌ای زیر watchdog ۵۰ دقیقه‌ای است.
+    // ─── v148 — دیرکتیو مالک: «حتماً حتماً با یک تلاش همهٔ برنامه‌ها ساخته بشه و به
+    // هیچ وجه هیچ برنامهٔ ناموفقی نباشه» ───
+    // قانون v145 «ردِ کل پاسخ به‌خاطر قانون ساختاری» حذف شد: ردِ کل برنامه یعنی
+    // تلاش دوم (زمان دوبرابر + احتمال شکست دوباره). حالا ساختار همیشه در
+    // «اولین تلاش» پذیرفته می‌شود و هر نقض ساختاری (واریانت سوم هم‌خانواده،
+    // تکرار دقیق، نبودِ گروه اصلی مثل سرشانه) به‌جای رد، بلافاصله و قطعی در
+    // پس‌پردازش ترمیم می‌شود (dedupeExerciseFamiliesInPlan + repairWorkoutPlanCoverage).
+    // اعتبارسنجِ زنجیره فقط موارد «غیرقابل‌ترمیم» را رد می‌کند: JSON نامعتبر،
+    // برنامهٔ خالی، یا ناهمخوانی فاحش تعداد روزها.
+    content = await generatePlanContent(
+      systemPrompt,
+      userPrompt,
+      "generateWorkoutPlan",
+      (text) => validatePlanTextParseable(text, data.workoutDays)
+    );
+  } catch (err) {
+    console.error("[generateWorkoutPlan] AvalAI error:", err);
+    throw err instanceof Error ? err : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+
+  // ─── M1: اعتبارسنجی پاسخ — برنامه خالی نباید به‌عنوان موفقیت ذخیره شود ───
+  // اگر خروجی AI کوتاه/ناقص یا HTML خطا باشد، parseJsonFromContent آرایه days خالی
+  // برمی‌گرداند. با خطا دادن اینجا، ProgramRequest به‌صورت failed علامت می‌خورد (نه موفقیت کاذب).
+  if (!Array.isArray(parsed.days) || parsed.days.length === 0) {
+    console.error("[generateWorkoutPlan] AI returned empty/invalid plan. Content head:", content.slice(0, 300));
+    throw new Error("پاسخ نامعتبر از هوش مصنوعی (برنامه خالی)");
+  }
+
+  // ─── v149 — کلیدواژه‌های ممنوع (بالا کشیده شد تا ترمیم v183 هم از آن استفاده کند) ───
+  const forbiddenKeywords = (() => {
+    const c = extras?.redesignConstraints;
+    if (!c || c.forbiddenMovements.length === 0) return [] as string[];
+    // v158 — خانواده‌محور (دستور مالک): هر ممنوعیت = کل خانواده (اسکات=همهٔ
+    // اسکوات‌ها؛ بارفیکس=همهٔ گریپ‌ها) + واریانت‌های لغت‌نامهٔ همان کانونی
+    const kw = new Set<string>();
+    for (const m of c.forbiddenMovements) {
+      for (const p of expandMovementPatterns(m)) kw.add(p);
+    }
+    return [...kw].filter(Boolean);
+  })();
+
+  // ─── v230 — ترمیم قطعی سوپرست/تری‌ست/جاینت‌ست ادغام‌شده (تیکت مالک — برنامهٔ حسین
+  // جوان: «هر دو حرکت در یک آبجکت نوشته شده») — قبل از هر ترمیم دیگری اجرا می‌شود
+  // تا شمارش حرکات/قفل بانک/پلیس معماری روی قالب استاندارد (اعضای مجزا) کار کنند.
+  {
+    const ssReport = splitMergedSupersetEntries(parsed);
+    if (ssReport.splitCount > 0) {
+      console.warn(
+        `[generateWorkoutPlan] v230 merged-superset split: ${ssReport.splitCount} group(s) → ` +
+          ssReport.details
+            .map((d) => `[${d.day}] "${d.from.slice(0, 40)}…" → ${d.to.length} عضو (${d.type} ${d.group})`)
+            .join(", ")
+      );
+    }
+    // v230.1 — قرارداد استراحت گروه‌ها: استراحت فقط روی «عضو آخر / ست آخر»
+    // (قرارداد groupRoundRestSec در workout-groups.ts) — مدل گاهی روی اعضای
+    // اول هم restSec می‌گذارد؛ درجا صفر می‌شود (هرگز استراحت اختراع نمی‌شود).
+    const restFixed = normalizeSupersetRestContract(parsed);
+    if (restFixed > 0) {
+      console.warn(`[generateWorkoutPlan] v230.1 superset rest contract normalized: ${restFixed} cell(s)`);
+    }
+  }
+
+  // ─── v183 — انطباق قطعی تعداد روز (تیکت مالک: «۴ روز خواستم، ۳ روزه دادند») ───
+  // اگر مدل با همهٔ دیرکتیوها روزی کم گذاشته باشد، روز گمشده روی همان هفته‌روزِ
+  // درخواستی کاربر از بانک ویدیودار ساخته و درج می‌شود — بدون ردِ برنامه، بدون
+  // تلاش دوم (قانون v148)؛ تعداد روز «همیشه» دقیقاً برابر انتخاب کاربر می‌ماند.
+  {
+    const dayReport = repairMissingWorkoutDays(parsed, {
+      expectedDays: data.workoutDays,
+      chosenDays,
+      bank,
+      forbiddenKeywords,
+      minExercises: effectiveMinExercises,
+      maxExercises: exerciseCountRange.max,
+      seed: varietySeed,
+    });
+    if (dayReport.added.length > 0) {
+      console.warn(
+        `[generateWorkoutPlan] v183 missing-day repair (${dayReport.mode}): added ${dayReport.added.length} day(s) → ` +
+          dayReport.added.map((a) => `[${a.day}] ${a.exercises}ex`).join(", ")
+      );
+    }
+  }
+
+  // ─── v117→v154 — قفل سخت بانک حرکات (قانون مطلق مالک) ───
+  // هر حرکت خروجی AI با بانک تطبیق داده می‌شود:
+  //   • نام معادل → نام استاندارد بانک + exerciseId واقعی (ارجاع دقیق)
+  //   • v154 — نام غریبه/خارج از بانک → «با نام خودش می‌ماند» و نزدیک‌ترین
+  //     ردیف ویدیودار بانک پیدا و ویدیو/توضیحات/نکات آن الصاق می‌شود
+  //     (دیرکتیو مالک: «حرکت رو بده، نزدیک‌ترین ویدیو و توضیحات براش قرار بگیره»)
+  //   • ویدیو نداشتن هر حرکت تضمین‌شده است: exerciseId همیشه به ردیف ویدیودار بانک می‌رسد.
+  if (bank && bank.all.length > 0) {
+    const lockReport = lockWorkoutPlanToBank(parsed, bank, { seed: varietySeed });
+    if (lockReport.canonicalized || lockReport.fuzzyFixed || lockReport.videoAttached || lockReport.replaced.length) {
+      console.warn(
+        `[generateWorkoutPlan] bank lock: canonicalized=${lockReport.canonicalized}, fuzzyFixed=${lockReport.fuzzyFixed}, videoAttached=${lockReport.videoAttached}, replaced=${lockReport.replaced.length}` +
+          (lockReport.replaced.length
+            ? ` → ${lockReport.replaced.map((r) => `"${r.from}"→"${r.to}"`).join(", ")}`
+            : "")
+      );
+    }
+
+    // ─── v145 — شبکهٔ ایمنی dedupe خانوادهٔ حرکتی (بعد از قفل بانک) ───
+    // اگر با همهٔ پرامپت‌ها AI باز هم واریانت هم‌خانواده داده باشد
+    // (مثلاً بعد از قفل بانک دو نام به یک حرکت کانونی‌شده رسیده باشند)، اینجا
+    // قطعی ترمیم می‌شود: جایگزین هم‌عضله از خانوادهٔ آزاد همان روز.
+    // v148 — فقط واریانت سوم به بالا ترمیم می‌شود؛ دو واریانت (هالتر+چکشی) سالم است.
+    const dedupReport = dedupeExerciseFamiliesInPlan(parsed, bank);
+    if (dedupReport.replaced.length > 0) {
+      console.warn(
+        `[generateWorkoutPlan] family dedupe: ${dedupReport.replaced.length} duplicate-variant exercises replaced → ` +
+          dedupReport.replaced.map((r) => `[${r.day}] "${r.from}"→"${r.to}"`).join(", ")
+        );
+    }
+
+    // ─── v149 — ترمیم قطعی چیدمان روزها با درخواست صریح ورزشکار (تیکت مالک:
+    // «برنامه عیناً عین درخواست ورزشکار نوشته بشه») — اگر AI با همهٔ دیرکتیوها
+    // باز هم چیدمان دیگری ساخته باشد (مثل ۴ روز بالاتنه به‌جای ۳+۱)، روز
+    // ناهم‌خوان با حرکات ویدیودار واقعی بانک به ناحیهٔ درخواستی تبدیل می‌شود —
+    // بدون ردِ برنامه و بدون تلاش دوم (موتور «یک تلاش، صفر شکست» v148).
+    // قبل از repairWorkoutPlanCoverage اجرا می‌شود تا پوشش شش گروه بعدش تضمین شود.
+    if (extras?.redesignSpec) {
+      const beforeMismatch = describeSplitMismatch(parsed.days, extras.redesignSpec);
+      if (beforeMismatch) {
+        console.warn(`[generateWorkoutPlan] v149 split mismatch before repair: ${beforeMismatch}`);
+      }
+      const splitReport = repairPlanDaySplitToRequest(parsed, extras.redesignSpec, bank);
+      if (splitReport.converted.length > 0 || splitReport.poolExhausted) {
+        console.warn(
+          `[generateWorkoutPlan] v149 split repair: converted=${splitReport.converted.length}` +
+            ` → ${splitReport.converted.map((c) => `[${c.day}]→${c.to}(${c.replaced}ex)`).join(", ")}` +
+            (splitReport.poolExhausted ? " | pool exhausted (fail-safe)" : "")
+        );
+      }
+    }
+
+    // ─── v149 — ممیزی قطعی ممنوعیت‌ها (تیکت مالک: حرکات حذفی دوباره برنگردند) ───
+    // بعد از قفل بانک و split repair: هر حرکت ممنوع حذف و با جایگزین هم‌عضلهٔ
+    // ویدیودار بانک تعویض می‌شود (ست/تکرار ورزشکار حفظ می‌شود).
+    if (extras?.redesignConstraints) {
+      const exReport = enforceWorkoutExclusions(parsed, extras.redesignConstraints, bank);
+      if (exReport.removed.length > 0) {
+        console.warn(
+          `[generateWorkoutPlan] v149 exclusion enforce: ${exReport.removed.length} item(s) → ` +
+            exReport.removed.slice(0, 8).map((r) => `[${r.day}] "${r.from}"→"${r.to ?? "حذف"}"`).join(", ")
+        );
+      }
+      if (exReport.leftover.length > 0) {
+        console.error(
+          `[generateWorkoutPlan] v149 exclusion LEFTOVER (باید صفر باشد): ${exReport.leftover.join(", ")}`
+        );
+      }
+    }
+
+    // ─── v213 — پلیس معماری (قطعی — دیرکتیو مالک: «برنامه اختصاصی هر کاربر») ───
+    // هر حرکتی که عضله‌اش خارجِ مجوزِ روزِ معماری باشد (مثل بارفیکس در روز پوش
+    // یا جلوبازو چسبیده به روز سینه) با حرکتِ هم‌الگو از عضلاتِ مجازِ همان روز
+    // تعویض می‌شود + هر روز حداقل ۲ حرکت مستقیم از عضلهٔ اصلی‌اش می‌گیرد —
+    // ریشه‌کنی قطعی «روز فرانکنشتاینی». (قبل از ترمیم پوشش، تا پوشش در چارچوب معماری پر شود)
+    if (coachBlueprint) {
+      const bpReport = enforceBlueprintDayIdentity(parsed, coachBlueprint, bank, forbiddenKeywords);
+      if (bpReport.replaced.length > 0) {
+        console.warn(
+          `[generateWorkoutPlan] v213 blueprint identity enforce: ${bpReport.replaced.length} action(s) → ` + bpReport.report
+        );
+      }
+      // ─── v230 — پلیس عنوان/تمرکز روز (تیکت مالک: «روز اول نوشته روز پا ولی کامل
+      // سینه داده شده») — بعد از تعویض حرکاتِ خارجِ معماری، عنوان/تمرکز هر روز هم
+      // باید با معماریِ همان هفته‌روز بخواند (تطبیق نام‌محور، نه اندیسی).
+      const titleRewrites = enforceBlueprintDayTitles(parsed, coachBlueprint);
+      if (titleRewrites.length > 0) {
+        console.warn(
+          `[generateWorkoutPlan] v230 day-title enforce: ${titleRewrites.length} rewrite(s) → ` +
+            titleRewrites.map((r) => `[${r.day}] "${r.from.slice(0, 30)}"→"${r.to.slice(0, 30)}"`).join(", ")
+        );
+      }
+    }
+
+    // ─── v148 — ترمیم قطعی پوشش گروه‌های اصلی (یک تلاش، صفر شکست) ───
+    // اگر AI سرشانه/شکم/... را جا انداخته باشد، حرکت واقعی ویدیودار همان گروه
+    // «بدون ردِ برنامه» اضافه می‌شود — قانون علمی پوشش شش گروه تضمین می‌شود.
+    // v149 — استخر پوشش هم از حرکات ممنوع فیلتر می‌شود (ممنوع بر پوشش مقدم است).
+    // v213 — مقصدِ اضافه‌شدن دیگر «روز خلوت‌تر» کور نیست: فقط روزی که عضلهٔ
+    // گمشده در معماری‌اش مجاز است (ضد روز فرانکنشتاینی).
+    repairWorkoutPlanCoverage(parsed, bank, forbiddenKeywords, coachBlueprint);
+
+    // ─── v149 — جاروی نهایی ممنوعیت‌ها (بعد از هر ترمیم/تکمیل — تضمین قطعی) ───
+    if (extras?.redesignConstraints) {
+      const finalReport = enforceWorkoutExclusions(parsed, extras.redesignConstraints, bank);
+      if (finalReport.removed.length > 0) {
+        console.warn(
+          `[generateWorkoutPlan] v149 exclusion final sweep: ${finalReport.removed.length} item(s) removed after coverage repair`
+        );
+      }
+    }
+
+    // ─── v153 — dedupe نهایی همان‌روز (ممیزی مالک: «در بعضی روزها دو تا شنا داده») ───
+    // زنجیرهٔ split-repair → enforce → coverage → جاروی نهایی می‌تواند بعد از
+    // dedupe اولیه دوباره واریانت هم‌خانواده/هم‌نام در یک روز وارد کند
+    // (جایگزین‌های enforce و coverage فقط شناسهٔ کل برنامه را می‌بینند). این
+    // «آخرین گردهمروری» پیش از ذخیره، هر تکرار همان‌روز را قطعی برطرف می‌کند —
+    // خروجی هرگز بدون عبور از این ممیزی به کاربر نمی‌رسد.
+    {
+      const finalDedup = dedupeExerciseFamiliesInPlan(parsed, bank, { seed: varietySeed });
+      if (finalDedup.replaced.length > 0) {
+        console.warn(
+          `[generateWorkoutPlan] v153 final same-day dedupe: ${finalDedup.replaced.length} replaced → ` +
+            finalDedup.replaced.map((r) => `[${r.day}] "${r.from}"→"${r.to}"`).join(", ")
+        );
+      }
+    }
+  }
+
+  // ─── v148 — توضیح علمی چیدمان در نکات مربی (دیرکتیو مالک) ───
+  // «اگر یک عضله داخل تمرین نیست یا یک عضله رو غیرمعمول داخل برنامه داده،
+  // در نکات تمرین باید به ورزشکار بگه که چرا» — پس‌پردازش ایمن (اگر AI خودش
+  // توضیح نداده باشد، خط «تحلیل چیدمان» اضافه می‌شود).
+  {
+    const enforceableGroups = bankEnforceableGroups(bank);
+    appendMuscleCoverageExplanationNotes(parsed, data, enforceableGroups);
+  }
+
+  // ─── WORKOUT-COUNT: اعتبارسنجی تعداد حرکات هر روز بر اساس سطح تجربه ───
+  // قانون سخت: هر روز باید بین effectiveMinExercises و exerciseCountRange.max حرکت باشد.
+  // اگر AI بیشتر از سقف داده → حرکات اضافه (از انتها) حذف می‌شوند (ترمیم امن).
+  // v183 — اگر کمتر از حداقل داده → «ترمیم قطعی»: حرکت واقعی ویدیودار خانوادهٔ
+  // تازه از بانک اضافه می‌شود (padWorkoutDayToMinExercises) — دیگر فقط هشدار نیست؛
+  // دیرکتیو مالک: برنامه در هیچ زمینه‌ای (از جمله حداقل حرکتِ سطح تجربه) نباید
+  // مغایرت داشته باشد. اگر بانک نبود/پول خالی بود، هشدار قبلی می‌ماند (صفر شکست).
+  {
+    let trimmedTotal = 0;
+    let underMinTotal = 0;
+    let paddedTotal = 0;
+    for (const day of parsed.days) {
+      if (!Array.isArray(day.exercises)) continue;
+      if (day.exercises.length > exerciseCountRange.max) {
+        trimmedTotal += day.exercises.length - exerciseCountRange.max;
+        day.exercises = day.exercises.slice(0, exerciseCountRange.max);
+      }
+      if (day.exercises.length < effectiveMinExercises) {
+        underMinTotal++;
+        // v213 — پُرکردن آگاه از معماری: اول از عضلاتِ مجازِ همین روز در معماری
+        // (تضمین هویت روز)، فال‌بک هر عضله (صفر شکست وقتی معمار فعال نیست)
+        // v230 — تطبیق معماری با نامِ هفته‌روز (نه اندیس) — همان ریشهٔ باگ یاشار
+        const allowedGroups = coachBlueprint
+          ? blueprintDayAllowedGroups(
+              coachBlueprint,
+              matchBlueprintDayIndex(coachBlueprint, String(day.day ?? ""), Math.max(0, parsed.days.indexOf(day)))
+            )
+          : null;
+        const padded = padWorkoutDayToMinExercises(day, {
+          minExercises: effectiveMinExercises,
+          bank,
+          forbiddenKeywords,
+          seed: varietySeed + day.exercises.length,
+          allowedGroups: allowedGroups ?? undefined,
+        });
+        paddedTotal += padded;
+        console.warn(
+          `[generateWorkoutPlan] day "${day.day}" has ${day.exercises.length - padded} exercises (min expected: ${effectiveMinExercises})` +
+            (padded > 0 ? ` — v183 padded ${padded} exercise(s) from bank → now ${day.exercises.length}` : " — bank unavailable/unusable (warn only)")
+        );
+      }
+    }
+    if (trimmedTotal > 0) {
+      console.warn(`[generateWorkoutPlan] trimmed ${trimmedTotal} excess exercises to respect the ${exerciseCountRange.max}-exercise cap`);
+    }
+    if (paddedTotal > 0) {
+      console.warn(`[generateWorkoutPlan] v183 min-exercise padding: ${paddedTotal} exercise(s) added across under-min day(s)`);
+    }
+
+    // ─── v183 — ادعای نهایی تعداد روز (باید همیشه برابر درخواست کاربر باشد؛
+    // این لاگ فقط بیمهٔ رگرسیون آینده است — ترمیم قبلاً تضمینش کرده) ───
+    if (Array.isArray(parsed.days) && parsed.days.length !== Math.round(data.workoutDays)) {
+      console.error(
+        `[generateWorkoutPlan] v183 DAY-COUNT MISMATCH after all repairs: expected=${data.workoutDays} got=${parsed.days.length} (days: ${parsed.days.map((d) => d?.day).join("، ")})`
+      );
+    }
+
+    // ─── L3: پاکسازی سوپرست‌های یتیم بعد از تریم ───
+    // حذف حرکات اضافه از انتها ممکن است یکی از اعضای یک supersetGroup را حذف کند؛
+    // گروه تک‌عضوی در gym-mode بج «سوپرست» می‌گیرد بدون گروه واقعی → به حرکت عادی
+    // تبدیل شود (معادل منطق workouts-view: members.length <= 1 → single).
+    for (const day of parsed.days) {
+      if (!Array.isArray(day.exercises)) continue;
+      const groupCounts = new Map<string, number>();
+      for (const ex of day.exercises) {
+        if (ex && typeof ex.supersetGroup === "string" && ex.supersetGroup) {
+          groupCounts.set(ex.supersetGroup, (groupCounts.get(ex.supersetGroup) || 0) + 1);
+        }
+      }
+      for (const ex of day.exercises) {
+        if (ex && ex.supersetGroup && (groupCounts.get(ex.supersetGroup) || 0) < 2) {
+          delete ex.supersetGroup;
+          delete ex.supersetType;
+        }
+      }
+    }
+  }
+
+  // ─── v230.3 — ترمیم استراحتِ قربانیانِ حذف/برش (بعد از پاکسازی یتیم‌های L3) ───
+  // حذفِ بی‌جایگزینِ عضو ناقل استراحت (v149) یا برش انتهایی سقف حرکات (v183)
+  // می‌تواند گروه/تک‌حرکتی با صفرِ کامل استراحت باقی بگذارد؛ عضوِ گروهی بدون
+  // supersetType هم اینجا از شمار اعضای گروهِ همان روز پیش‌فرض می‌گیرد.
+  const healReport = healPostTrimGroupContracts(parsed);
+  if (healReport.groupsHealed || healReport.singlesHealed || healReport.typesDefaulted) {
+    console.warn(
+      `[generateWorkoutPlan] v230.3 post-trim heal: ${healReport.groupsHealed} group(s), ${healReport.singlesHealed} single(s), ${healReport.typesDefaulted} type(s) defaulted`
+    );
+  }
+
+  // Enrich exercises with IDs + superset fields + new pro fields (rpe, tempo, substitution)
+  const enriched: ProWorkoutPlanContent = {
+    days: (parsed.days || []).map((day: any) => ({
+      ...day,
+      // Ensure warmup/cooldown arrays are valid
+      warmup: Array.isArray(day.warmup) ? day.warmup.map((w: any) => ({
+        name: String(w.name || "گرم‌کردن"),
+        durationSec: Number(w.durationSec) || 300,
+        notes: w.notes ? String(w.notes) : undefined,
+      })) : undefined,
+      cooldown: Array.isArray(day.cooldown) ? day.cooldown.map((c: any) => ({
+        name: String(c.name || "سردکردن"),
+        durationSec: Number(c.durationSec) || 300,
+        notes: c.notes ? String(c.notes) : undefined,
+      })) : undefined,
+      exercises: (day.exercises || []).map((ex: any, i: number) => ({
+        ...ex,
+        id: `ex_${Math.random().toString(36).slice(2, 9)}`,
+        mediaUrl: "",
+        // v117 — ارجاع دقیق به ردیف بانک حرکات (قفل بانک) — fetchExerciseVideo
+        // با این id ردیف واقعی (ویدیو/توضیحات) را می‌خواند، بدون حدس نام.
+        exerciseId: typeof ex.exerciseId === "string" && ex.exerciseId ? ex.exerciseId : undefined,
+        // Preserve per-exercise pro fields (rpe, tempo, substitution)
+        rpe: typeof ex.rpe === "number" ? Math.max(1, Math.min(10, ex.rpe)) : undefined,
+        tempo: typeof ex.tempo === "string" && ex.tempo.trim() ? ex.tempo.trim() : undefined,
+        substitution: typeof ex.substitution === "string" && ex.substitution.trim()
+          ? ex.substitution.trim()
+          : undefined,
+        // COACH-TIP: توصیه کوتاه مربی زیر هر حرکت (۱ جمله)
+        coachTip: typeof ex.coachTip === "string" && ex.coachTip.trim()
+          ? ex.coachTip.trim()
+          : undefined,
+        sets: (ex.sets || []).map((s: any, j: number) => ({
+          ...s,
+          setNumber: j + 1,
+          done: false,
+          weight: undefined,
+          rpe: typeof s.rpe === "number" ? Math.max(1, Math.min(10, s.rpe)) : undefined,
+        })),
+        supersetGroup: ex.supersetGroup || undefined,
+        supersetType: ex.supersetType || undefined,
+        // Preserve giant-set circuit fields
+        circuitRounds: typeof ex.circuitRounds === "number" ? Math.max(1, Math.min(5, Math.round(ex.circuitRounds))) : undefined,
+        restBetweenRounds: typeof ex.restBetweenRounds === "number" ? Math.max(0, Math.min(600, Math.round(ex.restBetweenRounds))) : undefined,
+      })),
+    })),
+    weeklyGoal: parsed.weeklyGoal || "بهبود تدریجی قدرت و استقامت",
+    notes: parsed.notes || "قبل از شروع حتماً ۵ تا ۱۰ دقیقه گرم کردن انجام دهید.",
+    // v75 — گیت پلن: برنامه مکمل فقط standard+ (به‌عنوان لایهٔ دوم پرامپت)
+    supplements: getCapabilities(planName ?? null).supplementsPlan ? (parsed.supplements || undefined) : undefined,
+    // NEW: professional enrichment fields
+    weeklyProgression: parsed.weeklyProgression && typeof parsed.weeklyProgression === "object"
+      ? {
+          strategy: String(parsed.weeklyProgression.strategy || "افزایش تدریجی وزنه ۲.۵٪ در هفته"),
+          weeks: Array.isArray(parsed.weeklyProgression.weeks)
+            ? parsed.weeklyProgression.weeks.map((w: any, idx: number) => ({
+                week: Number(w.week) || idx + 1,
+                weightChangeKg: typeof w.weightChangeKg === "number" ? w.weightChangeKg : undefined,
+                repChange: typeof w.repChange === "number" ? w.repChange : undefined,
+                note: String(w.note || ""),
+              }))
+            : [],
+        }
+      : undefined,
+    safetyNotes: Array.isArray(parsed.safetyNotes) ? parsed.safetyNotes.map((s: any) => String(s)) : undefined,
+    recoveryNotes: Array.isArray(parsed.recoveryNotes) ? parsed.recoveryNotes.map((s: any) => String(s)) : undefined,
+    // v112 — فیلد nutritionTimingNotes دیگر تولید/ذخیره نمی‌شود (دیرکتیو مالک:
+    // «نکات تغذیه در برنامهٔ تمرینی ممنوع — تغذیه فقط در برنامهٔ غذایی»)؛
+    // برنامه‌های قدیمی همچنان فیلد خود را در نمایش دارند تا حافظهٔ تاریخچه خراب نشود.
+    supplementTimingNotes: getCapabilities(planName ?? null).supplementsPlan && Array.isArray(parsed.supplementTimingNotes) ? parsed.supplementTimingNotes.map((s: any) => String(s)) : undefined,
+    medicalWarningFlags: Array.isArray(parsed.medicalWarningFlags) ? parsed.medicalWarningFlags.map((s: any) => String(s)) : undefined,
+    // ─── WORKOUT-PLAN-PRO: فیلدهای حرفه‌ای جدید ───
+    // تکنیک‌های پیشرفته استفاده‌شده در برنامه (FST-7، سوپرست آنتاگونیست، دراپ‌ست، رست پاز، و ...)
+    advancedTechniques: Array.isArray(parsed.advancedTechniques)
+      ? parsed.advancedTechniques.map((t: any) => String(t)).filter(Boolean)
+      : undefined,
+    // تقسیم عضلات هفته (push/pull/legs، upper/lower، body part split، و ...)
+    // v213 — فال‌بک پیش‌فرض = برچسب معماری معمار (برنامه هرگز بدون شناسنامهٔ معماری نیست)
+    muscleGroupSplit: typeof parsed.muscleGroupSplit === "string" && parsed.muscleGroupSplit.trim()
+      ? parsed.muscleGroupSplit.trim()
+      : coachBlueprint?.splitLabelFa ?? undefined,
+    // نوع دوره‌بندی (Periodization) — linear / undulating / block / wave / daily_undulating
+    // v133 — دیرکتیو مالک: کیفیت برنامه با پلن فرق نمی‌کند؛ دوره‌بندی بر اساس
+    // «سطح ورزشکار» است نه پلن خریداری‌شده.
+    periodizationType: (() => {
+      const v = parsed.periodizationType;
+      if (v === "linear" || v === "undulating" || v === "block" || v === "wave" || v === "daily_undulating") {
+        return v;
+      }
+      // پیش‌فرض بر اساس سابقه: پیشرفته/حرفه‌ای → undulating، بقیه → linear
+      return data.trainingExperience === "advanced" || data.trainingExperience === "pro"
+        ? "undulating"
+        : "linear";
+    })(),
+    // فرکانس تمرین هر گروه عضلانی در هفته — بر اساس روزهای تمرین کاربر (نه پلن)
+    muscleFrequencyPerWeek: typeof parsed.muscleFrequencyPerWeek === "number"
+      ? Math.max(1, Math.min(3, Math.round(parsed.muscleFrequencyPerWeek)))
+      : (data.workoutDays >= 4 ? 2 : 1),
+    // الهام‌گرفته از کدام مربی بزرگ
+    // v213 — فال‌بک پیش‌فرض = مربیِ الگوی معماریِ همین کاربر (نه همیشه mixed)
+    inspiredByCoach: (() => {
+      const v = parsed.inspiredByCoach;
+      if (v === "hany_rambod" || v === "hadi_chupan" || v === "chris_bumstead" || v === "ronnie_coleman" || v === "jay_cutler" || v === "mixed") {
+        return v;
+      }
+      return coachBlueprint?.coachKey ?? "mixed";
+    })(),
+    // v213 — شناسنامهٔ معماری برنامه — تصمیم معمار برای همین کاربر
+    // (مبنای گیت کیفیت/ترمیم‌ها؛ نمایش «معمار برنامه» در UI آینده)
+    coachBlueprint: coachBlueprint ? blueprintSnapshotForPlan(coachBlueprint) : undefined,
+    // جزئیات FST-7 — v133: برای همهٔ پلن‌ها (کیفیت یکسان) — اگر AI ارائه داد
+    fst7Details: parsed.fst7Details && typeof parsed.fst7Details === "object"
+      ? {
+          exerciseName: String(parsed.fst7Details.exerciseName || ""),
+          sets: typeof parsed.fst7Details.sets === "number" ? Math.max(1, Math.min(10, Math.round(parsed.fst7Details.sets))) : 7,
+          reps: typeof parsed.fst7Details.reps === "string" && parsed.fst7Details.reps.trim()
+            ? parsed.fst7Details.reps.trim()
+            : "8-12",
+          restSec: typeof parsed.fst7Details.restSec === "number"
+            ? Math.max(0, Math.min(300, Math.round(parsed.fst7Details.restSec)))
+            : 30,
+          note: typeof parsed.fst7Details.note === "string" && parsed.fst7Details.note.trim()
+            ? parsed.fst7Details.note.trim()
+            : undefined,
+        }
+      : undefined,
+  };
+
+  return enriched;
+}
+
+// ─── v183 — انطباق قطعی تعداد وعدهٔ غذایی با رغبت کاربر ───
+// همان کلاس باگِ «۴ روز خواستم، ۳ روزه دادند» در بُعد تغذیه: مدل گاهی تعداد
+// وعده‌ها را کم/زیاد می‌گذارد. ترمیم فقط «جابه‌جایی آیتم» است — هیچ غذایی حذف یا
+// اضافه نمی‌شود؛ جمع کالری/پروتئین/کربوهیدرات/چربی روزانه دقیقاً ثابت می‌ماند:
+//   • بیشتر از هدف → سبک‌ترین «میان‌وعده»ها در وعدهٔ بعدی ادغام می‌شوند.
+//   • کمتر از هدف → بزرگ‌ترین وعدهٔ چندآیتمی به دو وعده (اصلی + میان‌وعدهٔ تکمیلی)
+//     شکسته می‌شود (نیمهٔ دوم آیتم‌ها → وعدهٔ جدید).
+export interface MealCountRepairReport {
+  changed: boolean;
+  action: "none" | "merge" | "split" | "partial";
+  detail: string;
+}
+
+function recalcMealTotals(m: any): void {
+  const items = Array.isArray(m.items) ? m.items : [];
+  m.totalCalories = items.reduce((s: number, x: any) => s + (Number(x?.calories) || 0), 0);
+  m.totalProtein = items.reduce((s: number, x: any) => s + (Number(x?.protein) || 0), 0);
+  m.totalCarbs = items.reduce((s: number, x: any) => s + (Number(x?.carbs) || 0), 0);
+  m.totalFat = items.reduce((s: number, x: any) => s + (Number(x?.fat) || 0), 0);
+  m.combination = items.map((x: any) => String(x?.name ?? "")).filter(Boolean).join(" + ") || m.combination;
+}
+
+export function repairMealPlanMealCount(meals: any[], target: number): MealCountRepairReport {
+  const report: MealCountRepairReport = { changed: false, action: "none", detail: "" };
+  if (!Array.isArray(meals) || !Number.isFinite(target) || target < 1) return report;
+  const norm = (s: unknown) => String(s ?? "").replace(/\s+/g, " ").trim();
+
+  // ─── بیشتر از هدف: ادغام سبک‌ترین میان‌وعده‌ها ───
+  if (meals.length > target) {
+    let merged = 0;
+    while (meals.length > target) {
+      const snackIdx = meals
+        .map((m, i) => ({ m, i, isSnack: /میان|snack/i.test(String(m?.type ?? "") + " " + String(m?.label ?? "")) }))
+        .filter((x) => x.isSnack)
+        .sort((a, b) => (Number(a.m?.totalCalories) || 0) - (Number(b.m?.totalCalories) || 0))[0];
+      const donorIdx = snackIdx
+        ? snackIdx.i
+        : meals.reduce((min, m, i) => ((Number(m?.totalCalories) || 0) < (Number(meals[min]?.totalCalories) || 0) ? i : min), 0);
+      if (meals.length < 2) break;
+      const donor = meals.splice(donorIdx, 1)[0];
+      if (!donor || !Array.isArray(donor.items) || donor.items.length === 0) continue;
+      const host = meals[Math.min(donorIdx, meals.length - 1)];
+      host.items = [...(Array.isArray(host.items) ? host.items : []), ...donor.items];
+      host.combination = `${norm(host.combination || host.items.map((x: any) => x?.name).join(" + "))}`.trim();
+      recalcMealTotals(host);
+      merged++;
+    }
+    report.changed = merged > 0;
+    report.action = merged > 0 ? "merge" : "partial";
+    report.detail = `${merged} snack meal(s) merged into adjacent meals`;
+    return report;
+  }
+
+  // ─── کمتر از هدف: تفکیک بزرگ‌ترین وعدهٔ چندآیتمی ───
+  let splitCount = 0;
+  while (meals.length < target) {
+    const splittable = meals
+      .map((m, i) => ({ m, i, n: Array.isArray(m?.items) ? m.items.length : 0 }))
+      .filter((x) => x.n >= 2)
+      .sort((a, b) => (Number(b.m?.totalCalories) || 0) - (Number(a.m?.totalCalories) || 0))[0];
+    if (!splittable) break;
+    const src = meals[splittable.i];
+    const half = Math.ceil(src.items.length / 2);
+    const moved = src.items.splice(half);
+    if (moved.length === 0 || src.items.length === 0) break;
+    const newMeal: any = {
+      type: "میان‌وعده",
+      label: `${norm(src.label) || "میان‌وعده"} — تکمیلی ${splitCount + 1}`,
+      items: moved,
+      timingNote: typeof src.timingNote === "string" ? src.timingNote : undefined,
+      alternatives: src.alternatives, // گزینه‌های جایگزین همان وعدهٔ مادر معتبرند
+    };
+    recalcMealTotals(src);
+    recalcMealTotals(newMeal);
+    meals.splice(splittable.i + 1, 0, newMeal);
+    splitCount++;
+  }
+  report.changed = splitCount > 0;
+  report.action = splitCount > 0 ? "split" : "partial";
+  report.detail = `${splitCount} largest meal(s) split into main + complementary snack`;
+  return report;
+}
+
+// Generate a daily meal plan via AI
+export async function generateMealPlan(
+  data: OnboardingData,
+  planName?: Plan | null,
+  extras?: { bloodTestReport?: string; videoAnalysisResult?: string; bodyPhotoAnalysis?: string; renewalContext?: string; workoutContext?: string; adminDirective?: string; redesignConstraints?: RedesignConstraints; redesignRaw?: string }
+): Promise<ProMealPlanContent> {
+  const systemPrompt = withBrandDirective(
+    await getAiConfig(
+      "nutrition_system_prompt",
+      DEFAULT_NUTRITION_PROMPT
+    )
+  );
+  const context = buildUserContext(data, planName);
+  // ─── v155 — نگهبان بودجهٔ پرامپت (لایهٔ ۳) برای برنامهٔ غذایی: پروندهٔ سنگینِ
+  // کاربر ۱-۲ ساله هرگز پرامپت را به context_length_exceeded نمی‌برد؛ در سناریوی
+  // فرضیِ فراتر از فرض فقط تاریخچهٔ اختیاری نردبانی کوتاه می‌شود (ایمنی/ممنوعیت‌ها/
+  // اسکیما محافظت‌شده). سهم دستورالعمل‌ها/اسکیما/دیرکتیوهای تغذیه ≈ ۱۶K در نظر گرفته شد. ───
+  const budgetedExtras = shrinkPlanExtrasForPromptBudget(
+    extras,
+    systemPrompt.length + context.length + 16000,
+    "generateMealPlan"
+  );
+  const planInstructions = buildPlanAwareInstructions(planName, { ...budgetedExtras, trainingExperience: data.trainingExperience });
+  const caps = getCapabilities(planName ?? null);
+  const tier = getExperienceBasedTechniqueGuidance(data.trainingExperience);
+
+  // ─── محاسبه دقیق TDEE و کالری هدف (WORKOUT-PLAN-PRO) ───
+  // از تابع computeTDEEAndTarget استفاده می‌کنیم که بر اساس Mifflin-St Jeor
+  // و ضریب فعالیت واقعی کاربر (نه عدد ثابت ۱.۴) محاسبه می‌کند.
+  const tdeeData = computeTDEEAndTarget(data);
+  const targetCal = tdeeData.targetCalories;
+
+  // Auto-calculated water goal (ml) — use stored value or compute from weight × 35
+  const waterGoalMl = typeof data.waterGoalMl === "number" && data.waterGoalMl > 0
+    ? data.waterGoalMl
+    : Math.round(data.weight * 35);
+  const waterGoalLiters = (waterGoalMl / 1000).toFixed(1);
+
+  // Anti-inflammatory context — flag if user has injuries or medical conditions that benefit
+  const hasInjuries = !!data.injuries && data.injuries.trim().length > 0;
+  const hasMedicalConditions = Array.isArray(data.medicalConditions) && data.medicalConditions.length > 0;
+  const needsAntiInflammatory = hasInjuries || hasMedicalConditions;
+
+  const cuisineLabel = data.preferredCuisine
+    ? PREFERRED_CUISINE_LABELS[data.preferredCuisine]
+    : "ایرانی (پیش‌فرض)";
+
+  // ─── v112 — دیرکتیو تغذیهٔ اختصاصی رشته (دیرکتیو مالک: برنامهٔ تغذیه هم باید
+  // دقیقاً بر اساس رشتهٔ ورزشکار تخصصی باشد) — در بالای userPrompt تزریق می‌شود؛
+  // اعداد TDEE/درشت‌مغذی محاسبه‌شدهٔ کد دست‌نخورده می‌مانند و دیرکتیو فقط
+  // «انتخاب غذا/تایمینگ/ریزمغذی» را رشته‌محور می‌کند. ───
+  const disciplineNutritionDirective =
+    (data.discipline && DISCIPLINE_NUTRITION_DIRECTIVES[data.discipline]) || "";
+  const disciplineLabel = data.discipline ? DISCIPLINE_LABELS[data.discipline] : "";
+
+  // ─── v149 — تیکت مالک: تمرین ۶-۱۰ صبح ≠ صبحانه = وعده بعد تمرین ───
+  // ریشه: پرامپت هیچ چیدمان وعده‌محورِ ساعت تمرین نداشت و نمونهٔ آب‌رسانی هم
+  // همیشه «تمرین عصر ۱۸-۲۰» بود → مدل برای تمرین صبحگاهی، وعده بعد تمرین را
+  // با صبحانه یکی می‌کرد و ورزشکار با شکم گرسنه می‌رفت باشگاه. ───
+  const isMorningTraining = data.workoutTime === "morning";
+  const workoutTimeMealDirective = isMorningTraining
+    ? `⚠️⚠️ چیدمان وعده‌های کاربرِ تمرین صبحگاهی (ساعت تمرین: صبح ۶ تا ۱۰ — الزامی):
+- «صبحانه» = وعدهٔ مستقلِ قبل از تمرین: سبک و زودهضم (کربوهیدرات پیچیده + پروتئین متوسط + کم‌چرب) که ورزشکار حدود ۶:۰۰-۶:۳۰ قبل از رفتن به باشگاه می‌خورد — ورزشکار هرگز با شکم گرسنه تمرین نمی‌کند.
+- «وعده بعد تمرین» = وعدهٔ مستقل و کاملِ بعد از جلسه (حدود ۱۰:۳۰-۱۱:۰۰): پروتئین سریع‌جذب + کربوهیدرات برای ریکاوری — این وعده در کنار صبحانه/ناهار/شام است و جای هیچ‌کدام را نمی‌گیرد.
+- این دو وعده هرگز یکی نمی‌شوند: صبحانه جای وعدهٔ بعد تمرین نمی‌نشیند و برعکس — وعدهٔ بعد تمرین را با label صریح «وعده بعد تمرین» و type "snack" و timingNote «بلافاصله بعد از جلسهٔ تمرین (۱۰-۱۱ صبح)» بساز.
+- بقیهٔ وعده‌ها (ناهار/شام/میان‌وعده‌ها) طبق معمول کامل بمانند — به‌خاطر وعدهٔ بعد تمرین هیچ وعده‌ای حذف نشود.`
+    : "";
+  const hydrationExample = isMorningTraining
+    ? `  "hydrationSchedule": [
+    {"time": "بلافاصله بعد از بیدار شدن", "amountMl": 400, "note": "با چند قطره لیموترش — کبد را فعال می‌کند"},
+    {"time": "۶ صبح (قبل از تمرین)", "amountMl": 300, "note": "آبرسانی قبل از جلسهٔ صبحگاهی"},
+    {"time": "۷-۹ صبح (حین تمرین)", "amountMl": 500, "note": "هر ۱۵ دقیقه چند جرعه"},
+    {"time": "۱۰:۳۰ صبح (بعد از تمرین)", "amountMl": 400, "note": "با الکترولیت اگر تعریق زیاد"},
+    {"time": "۱۲ ظهر (قبل از ناهار)", "amountMl": 250, "note": "۳۰ دقیقه قبل از غذا"},
+    {"time": "۱۶ بعدازظهر", "amountMl": 300, "note": "همراه میان‌وعده عصر"},
+    {"time": "۲۰ شب (با شام)", "amountMl": 250, "note": "بدون زیاده‌روی"},
+    {"time": "۲۲:۳۰ شب", "amountMl": 200, "note": "قبل از خواب — زیاد نخور که بیدارت نکند"}
+  ],`
+    : `  "hydrationSchedule": [
+    {"time": "بلافاصله بعد از بیدار شدن", "amountMl": 500, "note": "با چند قطره لیموترش — کبد را فعال می‌کند"},
+    {"time": "۹ صبح", "amountMl": 250, "note": "قبل از صبحانه"},
+    {"time": "۱۱ صبح", "amountMl": 250, "note": "بین وعده‌ها"},
+    {"time": "۱۳ ظهر (قبل از ناهار)", "amountMl": 250, "note": "۳۰ دقیقه قبل از غذا"},
+    {"time": "۱۶ بعدازظهر", "amountMl": 300, "note": "میان‌وعده"},
+    {"time": "۱۸ عصر (قبل از تمرین)", "amountMl": 300, "note": "آبرسانی قبل از تمرین"},
+    {"time": "۲۰ شب (حین تمرین)", "amountMl": 500, "note": "هر ۱۵ دقیقه یک لیوان کوچک"},
+    {"time": "۲۲ شب (بعد از تمرین)", "amountMl": 300, "note": "با الکترولیت اگر تعریق زیاد"},
+    {"time": "۲۳ شب", "amountMl": 200, "note": "قبل از خواب — اما زیاد نخور که بیدارت نکند"}
+  ],`;
+
+  const userPrompt = `بر اساس اطلاعات زیر، یک برنامه غذایی یک روزه کامل، حرفه‌ای و شخصی‌سازی‌شده بساز — سطح متخصص تغذیه ورزشی بالینی.
+
+${
+    // v150 — دستور صریح مدیر فیتاپ برای بازسازی (تغذیه) — بالاترین اولویت
+    extras?.adminDirective
+      ? `${extras.adminDirective}\n\n`
+      : ""
+  }${
+    // v149 — ممنوعیت‌های غذایی صریح (تیکت مالک: «عدس حذف شه» باید واقعاً حذف شود)
+    extras?.redesignConstraints && extras.redesignConstraints.forbiddenFoods.length > 0
+      ? `${buildFoodExclusionDirectiveFa(extras.redesignConstraints, extras.redesignRaw)}\n\n`
+      : ""
+  }${
+    // v152 — ممنوعیت‌های مکمل صریح (تأیید مالک: «برنامه تغذیه و مکمل هم شامل تغییرات
+    // در چت با فیتاپ میشه» — استک مکمل بخشی از همین JSON غذایی است)
+    extras?.redesignConstraints && extras.redesignConstraints.forbiddenSupplements.length > 0
+      ? `${buildSupplementExclusionDirectiveFa(extras.redesignConstraints, extras.redesignRaw)}\n\n`
+      : ""
+  }${workoutTimeMealDirective ? `${workoutTimeMealDirective}\n\n` : ""}${context}
+${planInstructions}
+${disciplineNutritionDirective ? `🎯 رشتهٔ ورزشکار: ${disciplineLabel} — دستورالعمل تغذیهٔ اختصاصی رشته (الزامی — انتخاب غذا/تایمینگ/ریزمغذی را دقیقاً با این دیرکتیو هماهنگ کن؛ اعداد TDEE زیر را تغییر نده):
+${disciplineNutritionDirective}
+` : ""}${
+  // v112 — سینک کامل تمرین/تغذیه/مکمل (دیرکتیو مالک: «برنامهٔ غذایی و مکمل دقیقاً برای همین تمرین ساخته شود»)
+  extras?.workoutContext
+    ? `🔁 هم‌سازی با برنامهٔ تمرینی همین کاربر (برنامهٔ غذایی و مکمل باید دقیقاً برای همین تمرین ساخته شود — وعده‌ها/کربوهیدرات/تایمینگ را با روزها و ساعت‌های تمرین هم‌راستا کن؛ روز بدون تمرین کربوهیدرات کمتر، روز تمرین سنگین سوخت تمرین بیشتر):
+${extras.workoutContext}
+`
+    : ""
+}📊 محاسبه دقیق TDEE و درشت‌مغذی‌ها (محاسبه‌شده با فرمول Mifflin-St Jeor):
+- BMR (متابولیسم پایه): ${tdeeData.bmr} کالری
+- TDEE (نیاز روزانه با توجه به فعالیت): ${tdeeData.tdee} کالری
+- کالری هدف (با ${tdeeData.calorieAdjustment >= 0 ? "مازاد" : "نقصان"} ${Math.abs(tdeeData.calorieAdjustment)} کالری): ${targetCal} کالری
+- پروتئین: ${tdeeData.proteinG} گرم (${tdeeData.proteinPerKg} گرم به ازای هر کیلو وزن)
+- کربوهیدرات: ${tdeeData.carbsG} گرم (${tdeeData.carbsPerKg} گرم به ازای هر کیلو)
+- چربی: ${tdeeData.fatG} گرم (${tdeeData.fatPerKg} گرم به ازای هر کیلو)
+
+کالری هدف روزانه: حدود ${targetCal} کالری
+نوع رژیم: ${DIET_LABELS[data.dietType]}
+حساسیت غذایی: ${data.allergies || "ندارد"}
+غذاهای دوست‌نداشته/حذفی: ${data.dislikedFoods || "ندارد"}
+سبک آشپزی ترجیحی: ${cuisineLabel}
+هدف هیدراتاسیون روزانه: ${waterGoalLiters} لیتر (${waterGoalMl}ml)
+${
+  // v81 — تعداد وعده‌های رغبتی کاربر (آنبوردینگ) — انتخاب کاربر دیگر دور ریخته نمی‌شود
+  typeof data.mealCount === "number" && data.mealCount >= 2
+    ? `تعداد وعده‌های غذایی رغبتی کاربر: ${data.mealCount} وعده در روز — ساختار meals برنامه دقیقاً ${data.mealCount} وعده داشته باشد (اصلی + میان‌وعده‌ها با توجه به این تعداد)`
+    : ""
+}
+${needsAntiInflammatory ? `🩹 نیاز به غذاهای ضدالتهابی: دارد (به دلیل آسیب‌دیدگی/شرایط پزشکی)` : ""}
+
+فقط و فقط با ساختار JSON زیر پاسخ بده و هیچ متن اضافه‌ای ننویس:
+{
+  "meals": [
+    {
+      "type": "breakfast",
+      "label": "صبحانه",
+      "combination": "تخم‌مرغ + نان سنگک + پنیر کم‌چرب",
+      "timingNote": "۳۰-۶۰ دقیقه بعد از بیدار شدن — پروتئین صبحانه متابولیسم را روشن می‌کند",
+      "items": [
+        {
+          "name": "تخم‌مرغ آب‌پز",
+          "category": "breakfast",
+          "calories": 210, "protein": 18, "carbs": 1, "fat": 15,
+          "servingSize": "۳ عدد",
+          "glycemicIndex": "low",
+          "antiInflammatory": false,
+          "micronutrients": ["کولین", "ویتامین B12", "سلنیوم", "ویتامین D"],
+          "prepTip": "آب‌پز کن، نه سرخ‌کرده — چربی اضافه نده"
+        },
+        {
+          "name": "نان سنگک",
+          "category": "breakfast",
+          "calories": 160, "protein": 5, "carbs": 32, "fat": 1,
+          "servingSize": "۱ کف دست",
+          "glycemicIndex": "medium",
+          "antiInflammatory": false,
+          "micronutrients": ["فیبر", "سلنیوم", "منیزیم"],
+          "prepTip": "تازه مصرف کن؛ نان روز قبل را گرم نکن"
+        }
+      ],
+      "micronutrientHighlights": ["کولین برای مغز", "B12 برای انرژی", "فیبر برای گوارش"],
+      "alternatives": [
+        {
+          "combination": "جو دوسر + شیر + موز",
+          "items": [
+            {"name": "جو دوسر", "category": "breakfast", "calories": 230, "protein": 8, "carbs": 40, "fat": 4, "servingSize": "۶۰ گرم", "glycemicIndex": "low", "antiInflammatory": true, "micronutrients": ["فیبر محلول", "بتاگلوکان", "منیزیم"], "prepTip": "با شیر بپز، نه آب — پروتئین بیشتر"},
+            {"name": "شیر کم‌چرب", "category": "breakfast", "calories": 120, "protein": 8, "carbs": 12, "fat": 2, "servingSize": "۱ لیوان", "glycemicIndex": "low", "antiInflammatory": false, "micronutrients": ["کلسیم", "ویتامین D"], "prepTip": "کم‌چرب گرم کن"},
+            {"name": "موز", "category": "breakfast", "calories": 105, "protein": 1, "carbs": 27, "fat": 0, "servingSize": "۱ عدد متوسط", "glycemicIndex": "medium", "antiInflammatory": true, "micronutrients": ["پتاسیم", "ویتامین B6"], "prepTip": "رسیده اما نه خیلی سیاه"}
+          ]
+        }
+      ]
+    }
+  ],
+  "waterLiters": ${waterGoalLiters},
+${hydrationExample}
+  "prePostWorkoutNutrition": {
+    "preWorkout": "۶۰-۹۰ دقیقه قبل از تمرین: ۳۰ گرم کربوهیدرات با GI پایین (مثل موز یا نان جو) + ۱۵ گرم پروتئین",
+    "postWorkout": "۳۰-۶۰ دقیقه بعد از تمرین: ۳۰-۴۰ گرم پروتئین سریع‌جذب (مثل پروتئین وی یا تخم‌مرغ) + ۴۰ گرم کربوهیدرات با GI بالا (مثل برنج سفید یا سیب‌زمینی)",
+    "note": "پنجره آنابولیک ۳۰-۴۵ دقیقه بعد از تمرین حساس‌ترین زمان برای سنتز پروتئین است"
+  },
+  "antiInflammatoryFoods": [
+    "زردچوبه (با فلفل سیاه برای جذب بهتر)",
+    "زنجبیل تازه (۲ گرم در روز)",
+    "ماهی چرب (سالمون یا قزل‌آلا)",
+    "چای سبز",
+    "انار",
+    "آووکادو",
+    "روغن زیتون فرابکر"
+  ],
+  "micronutrientHighlights": [
+    "ویتامین D3: ۱۰۰۰-۲۰۰۰ IU (با مشورت پزشک)",
+    "منیزیم: ۳۰۰-۴۰۰mg برای ریکاوری عضله",
+    "امگا ۳: ۱-۲ گرم برای کاهش التهاب",
+    "آهن: در صورت کم‌خونی (با مشورت پزشک)"
+  ],
+  "foodPrepTips": [
+    "یک روز در هفته (مثلاً جمعه) تمام پروتئین‌ها را بپز و در ظرف شیشه‌ای در یخچال نگه دار",
+    "سبزیجات را شست و خشک کن، در ظرف هوادار نگه دار — تا ۵ روز تازه می‌مانند",
+    "برنج و کینوا را یکجا بپز و فریز کن — روزانه یک پرس بردار",
+    "سس‌ها و درسینگ‌ها را خودت درست کن (روغن زیتون + لیمو + ادویه) به‌جای سس‌های آماده",
+    "میان‌وعده‌ها را از قبل در کیسه‌های کوچک پورشن کن — مچ‌نخوره و راحت"
+  ],
+  "tdeeBreakdown": {
+    "bmr": ${tdeeData.bmr},
+    "tdee": ${tdeeData.tdee},
+    "targetCalories": ${targetCal},
+    "calorieAdjustment": ${tdeeData.calorieAdjustment},
+    "proteinG": ${tdeeData.proteinG},
+    "carbsG": ${tdeeData.carbsG},
+    "fatG": ${tdeeData.fatG},
+    "proteinPerKg": ${tdeeData.proteinPerKg},
+    "carbsPerKg": ${tdeeData.carbsPerKg},
+    "fatPerKg": ${tdeeData.fatPerKg}
+  },
+  "dietAlternatives": [
+    {
+      "diet": "وگان (Vegan)",
+      "description": "جایگزین کاملاً گیاهی برای این روز — بدون هیچ محصول حیوانی",
+      "sampleMeals": ["عدس با برنج قهوه‌ای + سالاد", "توفو скандوبل با کینوا", "اسموتی بول با شیر بادام + پروتئین گیاهی"]
+    },
+    {
+      "diet": "کتوژنیک (Keto)",
+      "description": "کربوهیدرات زیر ۵۰ گرم، چربی بالا — برای ورزشکاران کتو",
+      "sampleMeals": ["تخم‌مرغ + آووکادو + کره بادام", "سینه مرغ + کره + بروکلی", "ماهی سالمون + روغن نارگیل + اسفناج"]
+    },
+    {
+      "diet": "کم‌کربوهیدرات (Low-Carb)",
+      "description": "کربوهیدرات زیر ۱۰۰ گرم برای کنترل قند خون",
+      "sampleMeals": ["سینه مرغ + سالاد سبزیجات", "تخم‌مرغ + پنیر + گوجه", "ماهی + سبزیجات بخارپز"]
+    },
+    {
+      "diet": "بدون گلوتن (Gluten-Free)",
+      "description": "برای حساسیت به گلوتن یا سلیاک",
+      "sampleMeals": ["برنج قهوه‌ای + مرغ", "کینوا + سبزیجات", "سیب‌زمینی + ماهی"]
+    }
+  ],
+  "supplementStack": [
+    {"category": "base", "name": "نام مکملِ واقعاً لازم برای همین کاربر", "dose": "دوز استاندارد", "timing": "زمانِ سینک‌شده با تمرین کاربر", "note": "دلیلِ مختص همین کاربر + جایگزین غذایی ارزان + قبل از شروع با پزشک مشورت کنید.", "contraindicatedFor": ["شرایط منع مصرف مربوط"]},
+    {"category": "targeted", "name": "قلم دوم — فقط اگر اثباتِ نیاز است", "dose": "...", "timing": "...", "note": "...", "contraindicatedFor": ["..."]}
+  ],
+  "notes": "نکات تغذیه‌ای",
+  "supplements": [
+    {"name": "نام مکمل (همان استک بالا — بدون کپیِ قالب)", "dose": "دوز", "timing": "زمان", "note": "نکته اختیاری"}
+  ]
+}
+
+مثالِ بالا فقط نمونهٔ قالب است — استکِ واقعی را بر اساس نیازِ همین کاربر بساز (۱ تا ۴ قلم)؛ برای هر مکمل در note دلیلِ تجویز و جایگزینِ غذاییِ ارزان را بنویس. اگر پروتئین از غذا تأمین می‌شود، وی را تجویز نکن و همان را صریح بنویس. هرگز استکِ کلیشه‌ای «کراتین + امگا۳ + ویتامین D» را به‌عنوان قالب پیش‌فرض تکرار نکن — ممیزِ کیفیت فیتاپ آن را رد می‌کند.
+
+قوانین حرفه‌ای (همه را رعایت کن):
+
+۱) وعده‌ها و درشت‌مغذی‌ها (با محاسبه دقیق TDEE):
+- وعده‌ها: صبحانه، ناهار، شام و حداقل یک میان‌وعده (در صورت هدف حجم/قدرت: ۵-۶ وعده).
+- ⚠️ تمرین صبحگاهی (۶-۱۰ صبح): صبحانه و «وعده بعد تمرین» دو وعدهٔ کاملاً جدا هستند — صبحانه قبل از جلسه (سبک)، وعده بعد تمرین بعد از جلسه (ریکاوری). هرگز وعدهٔ بعد تمرین را با صبحانه یکی نکن و ورزشکار را گرسنه به باشگاه نفرست.
+- درشت‌مغذی‌ها را دقیق محاسبه کن تا جمع کل به کالری هدف (${targetCal}) نزدیک شود.
+- پروتئین: ${tdeeData.proteinG} گرم در روز (${tdeeData.proteinPerKg} گرم به ازای هر کیلو — استاندارد جهانی).
+- کربوهیدرات: ${tdeeData.carbsG} گرم در روز (${tdeeData.carbsPerKg} گرم به ازای هر کیلو).
+- چربی: ${tdeeData.fatG} گرم در روز (حدود ۲۵٪ کالری، ${tdeeData.fatPerKg} گرم به ازای هر کیلو).
+- تایمینگ تغذیه: صبحانه (پروتئین + کربوهیدرات پیچیده)، پیش‌تمرین (۹۰-۶۰ دقیقه قبل، GI متوسط)، پس‌تمرین (۳۰-۴۵ دقیقه بعد، پروتئین سریع + کربوهیدرات بالا)، شام (پروتئین + چربی سالم + سبزیجات).
+
+۲) شاخص گلیسمی (GI) — حرفه‌ای:
+- برای هر غذا فیلد "glycemicIndex" را پر کن: "low" | "medium" | "high".
+- برای هدف کاهش چربی: ۸۰٪ غذاها GI پایین باشند.
+- قبل از تمرین: GI متوسط (انرژی سریع).
+- بعد از تمرین: GI بالا (ریکاوری سریع گلیکوژن).
+- برای دیابت/پیش‌دیابت: فقط GI پایین.
+
+۳) غذاهای ضدالتهابی (antiInflammatory):
+- اگر کاربر آسیب‌دیدگی یا شرایط پزشکی دارد (${needsAntiInflammatory ? "دارد" : "ندارد"}):
+  • برای هر غذا فیلد "antiInflammatory" را true/false بگذار.
+  • آرایه "antiInflammatoryFoods" را با حداقل ۵ غذای ضدالتهایی پر کن (زردچوبه، زنجبیل، ماهی چرب، انار، چای سبز).
+  • توصیه مصرف زردچوبه + فلفل سیاه (جذب را ۲۰ برابر می‌کند).
+- اگر نه: می‌توانی فیلد را false بگذاری و آرایه را خالی یا چند مورد کلی.
+
+۴) تایمینگ قبل/بعد از تمرین:
+- فیلد "prePostWorkoutNutrition" را پر کن با توصیه دقیق قبل و بعد از تمرین.
+- فیلد "timingNote" برای هر وعده: چه زمانی از روز بهتر است مصرف شود (نسبت به تمرین یا ساعت).
+
+۵) هیدراتاسیون (بسیار مهم):
+- "waterLiters" را بر اساس ${waterGoalLiters} لیتر تنظیم کن (هدف محاسبه‌شده از وزن و فعالیت).
+- آرایه "hydrationSchedule" را با حداقل ۶ نقطه در طول روز پر کن — هر نقطه شامل: زمان، مقدار (ml)، و نکته.
+- اگر کاربر عادت فعلی کم‌آبی دارد (${typeof data.waterHabit === "number" ? `${data.waterHabit} لیوان` : "نامشخص"}): افزایش تدریجی را در "notes" پیشنهاد بده.
+
+۶) ویتامین‌ها و مواد معدنی:
+- برای هر غذا فیلد "micronutrients" را با لیست ویتامین‌ها/مواد معدنی برجسته پر کن.
+- برای هر وعده فیلد "micronutrientHighlights" را با توضیح کوتاه بگذار.
+- آرایه "micronutrientHighlights" در سطح برنامه را با حداقل ۳-۴ توصیه کلی پر کن (ویتامین D، منیزیم، امگا ۳، و ...).
+
+۷) آماده‌سازی غذا (foodPrepTips):
+- آرایه "foodPrepTips" را با حداقل ۴ نکته عملی برای آماده‌سازی هفتگی غذا پر کن (مثل یک‌جا پختن پروتئین، نگه‌داری سبزیجات، فریز برنج، و ...).
+- برای هر غذا فیلد "prepTip" را با نکته آماده‌سازی بهتر پر کن (مثلاً "بخارپز کن، نه سرخ‌کرده").
+
+۸) تنوع و جایگزینی (بسیار مهم):
+- **فیلد "combination"**: دقیقاً بنویس چه غذاهایی را با هم بخورد، مثلاً "تخم‌مرغ + نان سنگک + پنیر".
+- **فیلد "alternatives"**: حداقل ۲ گزینه جایگزین بده.
+- ⚠️ قانون الزامی جایگزین‌ها: هر گزینه جایگزین باید در "combination" اندازه و واحد دقیق هر غذا را داشته باشد — مثلاً "جو دوسر ۶۰ گرم + شیر کم‌چرب ۱ لیوان + موز ۱ عدد متوسط". جایگزین بدون اندازه و واحد (مثل فقط "مرغ و برنج") ممنوع است — کاربر باید بداند دقیقاً چقدر بخورد.
+- در items هر جایگزین هم فیلد servingSize با عدد و واحد (گرم/لیوان/عدد/کف دست) الزامی است.
+- ⚠️ قانون مهم نام غذاها: فیلد "name" فقط نام خالص غذا باشد — بدون عدد/اندازه/واحد. اندازه دقیق فقط در "servingSize" بیاید تا در نمایش واحد دوبار تکرار نشود (مثال درست: name="تخم‌مرغ آب‌پز", servingSize="۳ عدد" — غلط: name="تخم‌مرغ آب‌پز (۳ عدد)").
+- غذاهای دوست‌نداشته را حذف کن: ${data.dislikedFoods || "بدون محدودیت اضافه"}.
+- حساسیت غذایی را رعایت کن: ${data.allergies || "بدون محدودیت"}.
+- 🧾 بودجه: از غذاهای ایرانی در دسترس و مقرون‌به‌صرفه استفاده کن (تخم‌مرغ، مرغ، عدس، حبوبات، ماست، برنج) — از مواد گران و وارداتی (کیل، آووکادو، پروتئین گیاهی وارداتی) فقط اگر واقعاً ضروری است استفاده کن و جایگزین ارزان هم پیشنهاد بده.
+
+۹) سبک آشپزی:
+- سبک آشپزی مورد نظر: ${cuisineLabel}. غذاها را بر اساس این سبک انتخاب کن.
+- اگر "ترکیبی" است: تنوع ایرانی/مدیترانه‌ای/آسیایی را بده.
+- اگر "ایرانی": از مواد در دسترس ایرانی استفاده کن.
+- اگر "مدیترانه‌ای": روغن زیتون، ماهی، غلات کامل، سبزیجات فراوان.
+- اگر "آسیایی": برنج، سویا، سبزیجات بخارپز، ادویه‌های آسیایی.
+
+۱۰) محدودیت‌های رژیمی:
+- ${data.dietType === "vegetarian" ? "فقط غذاهای گیاه‌خواری." : "بدون محدودیت گوشت."}
+- ${data.dietType === "vegan" ? "فقط غذاهای وگن." : ""}
+- ${data.dietType === "keto" ? "رژیم کتوژنیک با کربوهیدرات زیر ۵۰ گرم در روز." : ""}
+
+۱۱) بخش supplements و supplementStack (مکمل‌ها — داینامیک بر اساس نیازِ همین کاربر):
+- ⚠️ قانون طلایی: اول غذا، بعد مکمل. مکمل جای غذا را نمی‌گیرد.
+- 🔴 فرمت ثابت ممنوع: استک را با داده‌های همین کاربر بساز (هدف "${GOAL_LABELS[data.goal]}"، رژیم ${data.dietType === "vegetarian" || data.dietType === "vegan" ? "گیاهی" : "مختلط"}، مکمل‌های فعلی: ${data.currentSupplements || "ندارد"}، شرایط پزشکی، سن و جنس). برای هر مکمل اول «نیاز» را ثابت کن و در note دلیلش را بنویس؛ نیاز نیست → تجویز نکن.
+- 🚫 استکِ کلیشه‌ایِ «کراتین + امگا۳ + ویتامین D» برای همه ممنوع — ممیز کیفیت فیتاپ این قالب را رد می‌کند. هر قلم باید از یک دادهٔ واقعی همین کاربر (هدف/رشته/رژیم/خواب/ساعت تمرین/شرایط پزشکی/مکمل فعلی) دلیل بیاورد.
+- 🔗 سینک سه‌گانه: تایمینگ هر مکمل باید با برنامهٔ تمرینی همین کاربر (روزها/ساعت تمرین) هماهنگ باشد.
+- تعداد نهایی: ۱ تا ۴ قلم (به‌ندرت ۵). اگر رژیمِ وعده‌ها پوشش می‌دهد، صریح بنویس «برای تو مکمل خاصی لازم نیست» و فقط ۱-۲ قلمِ واقعاً مفید بگذار.
+- منطقِ انتخاب (هر قلم فقط با اثباتِ نیاز):
+  • ویتامین D3 → فقط با دلیلِ پروفایل‌محور (آفتابِ کم/کارِ دفتری/سن/آزمایش خون) — نه به‌عنوان عادت.
+  • امگا ۳ → فقط اگر ماهیِ هفتگیِ کاربر کم است یا التهاب/آسیب مزمن دارد.
+  • کراتین → فقط هدفِ عضله‌سازی/حجم/قدرت؛ برای چربی‌سوزیِ خالص نه.
+  • پروتئین وی → فقط اگر پروتئینِ روزانه از وعده‌ها به هدفِ g×kg نمی‌رسد.
+  • B12 → وگان/گیاه‌خوارِ سخت‌گیر. کافئین → چربی‌سوزی بدون مشکلِ قلبی/خواب و سینک با ساعت تمرین.
+  • منیزیم → فقط با خوابِ ضعیف ثبت‌شده. الکترولیت → فقط تمرینِ طولانی/تعریق بالا/کتو.
+- BCAA/EAA، بتاآلانین، سیترین مالات، گلوتامین، گینر، ال-کارنیتین، کلاژن و ZMA هرگز آیتمِ اصلی نباشند — حداکثر در note به‌عنوان «در صورتِ بودجه‌ی اضافه» با جایگزینِ غذاییِ ارزان.
+- بخش «supplementStack» (دسته‌بندی‌شده) با category: "base" (ضروریِ همین کاربر) | "advanced" (پوششِ شکافِ خاص) | "targeted" (هدفمندِ ارزان) — فقط دسته‌های لازم را پر کن؛ دسته‌ی خالی نساز.
+- 💰 بودجه کاربر: اولویت با مکمل‌های ارزان و مؤثر؛ در note هر مکمل گزینه‌ی غذایی جایگزینِ ارزان را بنویس (ماهی کنسروی به‌جای امگا۳، تخم‌مرغ و مرغ به‌جای وی).
+- هر مکمل باید فیلد contraindicatedFor (آرایه‌ای از شرایط منع مصرف) داشته باشد:
+  • کافئین → بیماران قلبی، فشار خون بالا، بی‌خوابی
+  • کراتین → بیماران کلیوی
+  • پروتئین وی → بیماران کلیوی پیشرفته
+- اگر کاربر مکمل فعلی مصرف می‌کند (${data.currentSupplements || "ندارد"}): تداخل و هماهنگی را در "note" بیاور.
+- هرگز دوز بالاتر از استاندارد تجویز نکن. در note بنویس: «قبل از شروع با پزشک مشورت کنید.»
+۱۲) فیلد tdeeBreakdown (الزامی):
+- این فیلد قبلاً با مقادیر محاسبه‌شده پر شده — مقادیر را دست نزن و در طرح وعده‌ها از آن‌ها استفاده کن.
+- جمع کالری وعده‌ها باید به targetCalories نزدیک باشد (±۵۰ کالری).
+- جمع پروتئین وعده‌ها باید به proteinG نزدیک باشد.
+
+۱۳) فیلد dietAlternatives (الزامی):
+- آرایه‌ای از جایگزین‌های رژیمی برای این روز — حداقل ۴ رژیم: وگان، کتوژنیک، کم‌کربوهیدرات، بدون گلوتن.
+- هر جایگزین شامل: diet (نام)، description (توضیح کوتاه)، sampleMeals (آرایه ۳ وعده نمونه).
+- غذاهای نمونه باید ایرانی و در دسترس باشند (عدس، کینوا، برنج قهوه‌ای، توفو، آووکادو، و ...).
+
+۱۴) شخصی‌سازی بر اساس هدف و شرایط:
+- هدف: ${GOAL_LABELS[data.goal]} — توزیع درشت‌مغذی را بر اساس هدف تنظیم کن.
+- اگر خواب ناکافی یا استرس بالا: در "notes" توصیه‌های تغذیه‌ای برای بهبود خواب (منیزیم، کافیین قبل از ۱۴) و مدیریت کورتیزول (کاهش قند، افزایش امگا ۳) اضافه کن.
+
+🧪 خود-بازبینی قبل از تحویل (الزامی — دیرکتیو مالک: «یک بار بساز، چک کن، دیباگ کن، تست کن و به خودت ثابت کن بعد تحویل بده»):
+قبل از نوشتن JSON نهایی، برنامه‌ات را با این چک‌لیست ممیزی کن:
+- [ ] جمع کالری وعده‌ها نزدیک ${targetCal} است (±۵۰)؟ جمع پروتئین به ${tdeeData.proteinG} گرم می‌رسد؟
+- [ ] تعداد وعده‌ها دقیقاً طبق رغبت کاربر است؟ اندازه/واحد همهٔ اقلام و جایگزین‌ها مشخص است؟
+- [ ] حساسیت‌ها/غذاهای حذفی/رژیم کاربر رعایت شده؟ سبک آشپزی درست است؟
+- [ ] تایمینگ وعده‌ها با تمرین کاربر (روزها/ساعت) هم‌راستاست؟
+- [ ] استک مکمل: هر قلم از دلِ پروفایلِ همین کاربر دلیل دارد و با تمرین/غذا سینک است؟ (استکِ کلیشه‌ای «کراتین+امگا۳+ویتامین D برای همه» = رد ممیز)
+- [ ] هیدراتاسیون و منع مصرف‌ها کامل است؟
+اگر همه سبز است، JSON را بنویس.`;
+
+  let content: string;
+  // v183 — تعداد وعدهٔ هدف (رغبت واقعی کاربر از آنبوردینگ) — مبنای اعتبارسنجی سخت‌گیرانه + ترمیم قطعی
+  const targetMealCount =
+    typeof data.mealCount === "number" && data.mealCount >= 2
+      ? Math.min(8, Math.round(data.mealCount))
+      : null;
+  try {
+    // ─── تولید برنامه غذایی + مکمل (دیرکتیو مالک v40) ───
+    // gemini-3.8-flash + تفکر high، فال‌بک deepseek-v4-flash — مثل برنامه تمرینی؛
+    // تولید در پس‌زمینه است. اعتبارسنج داخل زنجیره — پاسخِ بی‌وعده،
+    // مستقیم به مدل فال‌بک می‌رود
+    // v183 — ناهمخوانی تعداد وعده با رغبت کاربر هم رد می‌شود (تیکت مالک:
+    // «هیچ زمینه‌ای نباید مغایرت داشته باشد») تا زنجیره با بازخورد دقیق دوباره تلاش کند؛
+    // لایهٔ ترمیم repairMealPlanMealCount بعد از پارس، حتی در بدترین حالت تعداد را قطعی می‌کند.
+    content = await generatePlanContent(
+      systemPrompt,
+      userPrompt,
+      "generateMealPlan",
+      (text) => {
+        const p = parseJsonFromContent(text);
+        if (!Array.isArray(p?.meals) || p.meals.length === 0) {
+          return "پاسخ نامعتبر از هوش مصنوعی (برنامه غذایی خالی)";
+        }
+        if (targetMealCount && p.meals.length !== targetMealCount) {
+          return `پاسخ نامعتبر از هوش مصنوعی: تعداد وعده‌ها ${p.meals.length} است ولی رغبت کاربر دقیقاً ${targetMealCount} وعده در روز است — آرایه meals باید دقیقاً ${targetMealCount} وعده داشته باشد (اصلی + میان‌وعده‌ها).`;
+        }
+        return null;
+      }
+    );
+  } catch (err) {
+    console.error("[generateMealPlan] AvalAI error:", err);
+    throw err instanceof Error ? err : new Error("خطا در ارتباط با سرویس هوش مصنوعی. لطفاً کمی بعد دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+
+  // ─── M1: اعتبارسنجی پاسخ — برنامه غذایی خالی نباید به‌عنوان موفقیت ذخیره شود ───
+  // (اسکیمای برنامه غذایی فیلد days ندارد؛ ملاک، آرایه meals غیرخالی است)
+  if (!Array.isArray(parsed.meals) || parsed.meals.length === 0) {
+    console.error("[generateMealPlan] AI returned empty/invalid plan. Content head:", content.slice(0, 300));
+    throw new Error("پاسخ نامعتبر از هوش مصنوعی (برنامه غذایی خالی)");
+  }
+
+  // ─── v183 — انطباق قطعی تعداد وعده با رغبت کاربر (همان ریشهٔ تیکت «۴ روز خواستم،
+  // ۳ روزه دادند» ولی در بُعد تغذیه). ادغام/تفکیک صرفاً جابه‌جایی آیتم‌هاست — جمع
+  // کالری/درشت‌مغذی روزانه دقیقاً ثابت می‌ماند (صفر شکست، صفر مغایرت). ───
+  if (targetMealCount && parsed.meals.length !== targetMealCount) {
+    const mealReport = repairMealPlanMealCount(parsed.meals, targetMealCount);
+    if (mealReport.changed) {
+      console.warn(
+        `[generateMealPlan] v183 meal-count repair (${mealReport.action}): ${mealReport.detail} → now ${parsed.meals.length}/${targetMealCount} meals`
+      );
+    }
+  }
+
+  // ─── v149 — ممیزی قطعی ممنوعیت‌های غذایی (تیکت مالک: حذفیات واقعاً حذف شوند) ───
+  // قبل از محاسبهٔ جمع‌ها اجرا می‌شود تا کالری/درشت‌مغذی از آیتم‌های باقی‌مانده درست دربیاید.
+  if (extras?.redesignConstraints) {
+    const mealExReport = enforceMealExclusions(parsed, extras.redesignConstraints);
+    if (mealExReport.removed.length > 0) {
+      console.warn(
+        `[generateMealPlan] v149 meal exclusion enforce: ${mealExReport.removed.length} item(s) → ` +
+          [...new Set(mealExReport.removed.map((r) => r.from))].slice(0, 8).join(", ")
+      );
+    }
+  }
+
+  // Helper to coerce glycemicIndex to a valid value
+  const coerceGI = (v: any): "low" | "medium" | "high" | undefined => {
+    if (v === "low" || v === "medium" || v === "high") return v;
+    return undefined;
+  };
+
+  // Calculate totals & enrich — handle main items + alternatives
+  const meals = (parsed.meals || []).map((m: any) => {
+    const items = (m.items || []).map((it: any, i: number) => ({
+      ...it,
+      id: `food_${Math.random().toString(36).slice(2, 9)}`,
+      imageUrl: "",
+      done: false,
+      // ─── L8: coerce عددی هر قلم — اگر AI رشته (حتی با ارقام فارسی «۲۱۰») برگرداند،
+      // جمع‌های وعده رشته‌ای می‌شد و insert با MealPlan.totalCal (Int) می‌شکست.
+      calories: toSafeNumber(it.calories),
+      protein: toSafeNumber(it.protein),
+      carbs: toSafeNumber(it.carbs),
+      fat: toSafeNumber(it.fat),
+      // NEW: professional enrichment fields
+      glycemicIndex: coerceGI(it.glycemicIndex),
+      antiInflammatory: typeof it.antiInflammatory === "boolean" ? it.antiInflammatory : undefined,
+      micronutrients: Array.isArray(it.micronutrients) ? it.micronutrients.map((n: any) => String(n)) : undefined,
+      prepTip: typeof it.prepTip === "string" && it.prepTip.trim() ? it.prepTip.trim() : undefined,
+    }));
+    // Enrich alternatives
+    const alternatives = Array.isArray(m.alternatives) ? m.alternatives.map((alt: any, ai: number) => {
+      const altItems = (alt.items || []).map((it: any, i: number) => ({
+        ...it,
+        id: `food_alt_${ai}_${Math.random().toString(36).slice(2, 9)}`,
+        imageUrl: "",
+        done: false,
+        // L8: coerce عددی مثل آیتم‌های اصلی
+        calories: toSafeNumber(it.calories),
+        protein: toSafeNumber(it.protein),
+        carbs: toSafeNumber(it.carbs),
+        fat: toSafeNumber(it.fat),
+        glycemicIndex: coerceGI(it.glycemicIndex),
+        antiInflammatory: typeof it.antiInflammatory === "boolean" ? it.antiInflammatory : undefined,
+        micronutrients: Array.isArray(it.micronutrients) ? it.micronutrients.map((n: any) => String(n)) : undefined,
+        prepTip: typeof it.prepTip === "string" && it.prepTip.trim() ? it.prepTip.trim() : undefined,
+      }));
+      return {
+        combination: alt.combination || "",
+        items: altItems,
+        totalCalories: altItems.reduce((s: number, x: any) => s + (Number(x.calories) || 0), 0),
+      };
+    }) : undefined;
+
+    return {
+      ...m,
+      items,
+      combination: m.combination || items.map((it: any) => it.name).join(" + "),
+      alternatives,
+      timingNote: typeof m.timingNote === "string" && m.timingNote.trim() ? m.timingNote.trim() : undefined,
+      micronutrientHighlights: Array.isArray(m.micronutrientHighlights)
+        ? m.micronutrientHighlights.map((h: any) => String(h))
+        : undefined,
+      totalCalories: items.reduce((s: number, x: any) => s + (Number(x.calories) || 0), 0),
+      totalProtein: items.reduce((s: number, x: any) => s + (Number(x.protein) || 0), 0),
+      totalCarbs: items.reduce((s: number, x: any) => s + (Number(x.carbs) || 0), 0),
+      totalFat: items.reduce((s: number, x: any) => s + (Number(x.fat) || 0), 0),
+    };
+  });
+
+  // Coerce prePostWorkoutNutrition if present
+  let prePostWorkoutNutrition: MealPlanContent["prePostWorkoutNutrition"] = undefined;
+  if (parsed.prePostWorkoutNutrition && typeof parsed.prePostWorkoutNutrition === "object") {
+    const p = parsed.prePostWorkoutNutrition;
+    prePostWorkoutNutrition = {
+      preWorkout: String(p.preWorkout || ""),
+      postWorkout: String(p.postWorkout || ""),
+      note: typeof p.note === "string" && p.note.trim() ? p.note.trim() : undefined,
+    };
+  }
+
+  return {
+    meals,
+    // L8: جمع کل باید عدد صحیح امن باشد — مستقیم داخل MealPlan.totalCal (Int) insert می‌شود
+    totalCalories: Math.min(2_000_000, Math.round(meals.reduce((s, m) => s + (Number(m.totalCalories) || 0), 0))),
+    totalProtein: meals.reduce((s, m) => s + (Number(m.totalProtein) || 0), 0),
+    totalCarbs: meals.reduce((s, m) => s + (Number(m.totalCarbs) || 0), 0),
+    totalFat: meals.reduce((s, m) => s + (Number(m.totalFat) || 0), 0),
+    waterLiters: Number(parsed.waterLiters) || Number(waterGoalLiters) || 2.5,
+    notes: parsed.notes || "در طول روز منظم آب بنوشید.",
+    // v75 — گیت پلن: مکمل فقط standard+ — برای اقتصادی صریحاً حذف (لایهٔ دوم پرامپت)
+    supplements: getCapabilities(planName ?? null).supplementsPlan && Array.isArray(parsed.supplements) && parsed.supplements.length > 0
+      ? parsed.supplements.map((s: any, i: number) => ({
+          name: String(s.name || `مکمل ${i + 1}`),
+          dose: String(s.dose || ""),
+          timing: String(s.timing || ""),
+          note: s.note ? String(s.note) : undefined,
+        }))
+      : undefined,
+    // NEW: professional enrichment fields
+    hydrationSchedule: Array.isArray(parsed.hydrationSchedule)
+      ? parsed.hydrationSchedule.map((h: any) => ({
+          time: String(h.time || ""),
+          amountMl: Number(h.amountMl) || 0,
+          note: typeof h.note === "string" && h.note.trim() ? h.note.trim() : undefined,
+        }))
+      : undefined,
+    antiInflammatoryFoods: Array.isArray(parsed.antiInflammatoryFoods)
+      ? parsed.antiInflammatoryFoods.map((s: any) => String(s))
+      : undefined,
+    prePostWorkoutNutrition,
+    foodPrepTips: Array.isArray(parsed.foodPrepTips)
+      ? parsed.foodPrepTips.map((s: any) => String(s))
+      : undefined,
+    micronutrientHighlights: Array.isArray(parsed.micronutrientHighlights)
+      ? parsed.micronutrientHighlights.map((s: any) => String(s))
+      : undefined,
+    // ─── WORKOUT-PLAN-PRO: فیلدهای حرفه‌ای جدید برنامه غذایی ───
+    // تفکیک دقیق محاسبه TDEE و درشت‌مغذی‌ها (محاسبه‌شده با Mifflin-St Jeor)
+    tdeeBreakdown: {
+      bmr: tdeeData.bmr,
+      tdee: tdeeData.tdee,
+      targetCalories: tdeeData.targetCalories,
+      calorieAdjustment: tdeeData.calorieAdjustment,
+      proteinG: tdeeData.proteinG,
+      carbsG: tdeeData.carbsG,
+      fatG: tdeeData.fatG,
+      proteinPerKg: tdeeData.proteinPerKg,
+      carbsPerKg: tdeeData.carbsPerKg,
+      fatPerKg: tdeeData.fatPerKg,
+    },
+    // جایگزین‌های رژیمی — وگان، کتو، کم‌کربوهیدرات، بدون گلوتن
+    // اگر AI آرایه‌ای ارائه داد از آن استفاده کن، در غیر این صورت ۴ جایگزین پیش‌فرض
+    dietAlternatives: Array.isArray(parsed.dietAlternatives) && parsed.dietAlternatives.length > 0
+      ? parsed.dietAlternatives.map((d: any) => ({
+          diet: String(d.diet || ""),
+          description: String(d.description || ""),
+          sampleMeals: Array.isArray(d.sampleMeals)
+            ? d.sampleMeals.map((m: any) => String(m))
+            : [],
+        }))
+      : [
+          {
+            diet: "وگان (Vegan)",
+            description: "جایگزین کاملاً گیاهی — بدون هیچ محصول حیوانی",
+            sampleMeals: [
+              "عدس با برنج قهوه‌ای + سالاد",
+              "توفو скандوبل با کینوا",
+              "اسموتی بول با شیر بادام + پروتئین گیاهی",
+            ],
+          },
+          {
+            diet: "کتوژنیک (Keto)",
+            description: "کربوهیدرات زیر ۵۰ گرم، چربی بالا",
+            sampleMeals: [
+              "تخم‌مرغ + آووکادو + کره بادام",
+              "سینه مرغ + کره + بروکلی",
+              "ماهی سالمون + روغن نارگیل + اسفناج",
+            ],
+          },
+          {
+            diet: "کم‌کربوهیدرات (Low-Carb)",
+            description: "کربوهیدرات زیر ۱۰۰ گرم برای کنترل قند خون",
+            sampleMeals: [
+              "سینه مرغ + سالاد سبزیجات",
+              "تخم‌مرغ + پنیر + گوجه",
+              "ماهی + سبزیجات بخارپز",
+            ],
+          },
+          {
+            diet: "بدون گلوتن (Gluten-Free)",
+            description: "برای حساسیت به گلوتن یا سلیاک",
+            sampleMeals: [
+              "برنج قهوه‌ای + مرغ",
+              "کینوا + سبزیجات",
+              "سیب‌زمینی + ماهی",
+            ],
+          },
+        ],
+    // استک مکمل پیشرفته — فقط پلن‌های standard+ (v75 — گیت پلن برگشت)
+    supplementStack: getCapabilities(planName ?? null).supplementsPlan && Array.isArray(parsed.supplementStack) && parsed.supplementStack.length > 0
+      ? parsed.supplementStack.map((s: any) => ({
+          category: (s.category === "base" || s.category === "advanced" || s.category === "targeted")
+            ? s.category
+            : "base",
+          name: String(s.name || ""),
+          dose: String(s.dose || ""),
+          timing: String(s.timing || ""),
+          note: typeof s.note === "string" && s.note.trim() ? s.note.trim() : undefined,
+          contraindicatedFor: Array.isArray(s.contraindicatedFor)
+            ? s.contraindicatedFor.map((c: any) => String(c))
+            : undefined,
+        }))
+      : undefined,
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * v71 دیرکتیو مالک (تاریخی): «تحلیل عکس‌ها و ویدیوها جدا از متن» — پس در چت با فیتاپ:
+ *   ۱) تحلیل رسانه (عکس/فریم‌های ویدیو) یک کال مستقل بینایی است (analyzeChatMedia)
+ *      و متنِ تحلیلش در DB کش می‌شود (ChatMessage.mediaAnalysis).
+ *   ۲) «نوشتن پاسخ نهایی» همیشه مدل متنی است (aiChat) — تحلیل بینایی به‌صورت متن
+ *      تزریق می‌شود تا پاسخ‌های متنی همیشه یکدست از یک مدل باشند.
+ * v93 — به‌روزرسانی دیرکتیو مالک: تحلیل رسانه هم روی deepseek-v4.1-flash است
+ *      (بینایی بومی V4.1 Flash — کل سیستم به‌جز تولید عکس/STT یک مدل).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+const CHAT_MEDIA_ANALYSIS_SYSTEM_PROMPT = `تو «چشم مربی فیتاپ» هستی — یک تحلیل‌گر بینایی دقیق و فنی. وظیفهٔ تو فقط یک چیز است: تحلیل محتوای تصاویر/فریم‌های ویدیویی که کاربر در چت با مربی فرستاده است. پاسخ تو به کاربر نشان داده نمی‌شود؛ به‌عنوان گزارش ورودی به مربی هوشمند (مدل متنی) داده می‌شود تا پاسخ نهایی را بنویسد. پس فارسی، خلاصه، دقیق و ساختارمند بنویس (حداکثر ~۲۰۰ کلمه):
+
+- عکس غذا: همهٔ خوراکی‌های قابل تشخیص، تخمین حجم هر آیتم، تخمین کالری و درشت‌مغذی، نکات ظاهری (روغن، نان، نوشیدنی و…).
+- عکس بدن/پیشرفت: ترکیب بدنی ظاهری، توزیع چربی، فرم و وضعیت بدن، وضعیت عضلات، هر تغییر قابل‌مشاهده.
+- عکس/فریم‌های تمرین: نام حرکت (در صورت تشخیص)، فرم اجرا در هر فریم (برای ویدیو به ترتیب زمانی از شروع تا پایان)، دامنهٔ حرکتی، وضعیت زانو/کمر/ستون فقرات، خطاهای تکنیکی، کیفیت زاویهٔ دوربین.
+- هر چیز دیگر: دقیقاً گزارش کن تصویر چیست.
+
+اگر تصویر مبهم/تیره/ناقص است صادقانه و کوتاه بگو چه چیزی قابل تشخیص نیست، اما هرچه قابل تشخیص است را کامل گزارش کن. هیچ توصیهٔ نهایی به کاربر نده، هیچ سلام و مقدمهٔ چت ننویس و هیچ سوال از کاربر نپرس؛ فقط گزارش تحلیلی خالص.`;
+
+/**
+ * v92 — گارد «تحلیل کور» (ریشهٔ باگ اساسی گزارش مالک) — v94 تقویت شد.
+ * وقتی بلاک تصویر به مدل نمی‌رسد (گیت‌وی AvalAI آن را بی‌صدا حذف می‌کند — کشف
+ * پروب زندهٔ v73، رگرسیون تولیدی v91 و پرب زندهٔ v94)، مدل 200 با «متن» برمی‌گرداند
+ * و کد آن را «تحلیل موفق» می‌پنداشت → تحلیل جعلی کش می‌شد + سهمیهٔ کاربر کسر می‌شد +
+ * مربیِ بی‌خبر می‌گفت «ویدیویی به من نرسیده». این اعتبارسنج هر پاسخی را که صریحاً
+ * بگوید رسانه را نمی‌بیند/نرسیده/پیوست نشده رد می‌کند → مثل خطا retry و بعد مسیر
+ * بعدی/فال‌بک مدل ویژن اجرا می‌شود. گزارش تحلیلِ واقعی (که فریم‌ها را توصیف می‌کند)
+ * هرگز این عبارت‌ها را ندارد — پس ریسک خطای مثبت عملاً صفر است.
+ *
+ * v94 — الگوهای جدید از پاسخ‌های کور واقعیِ پرب زنده (که از گارد v92 فرار کرده
+ * بودند): «هیچ تصویری در پیام شما پیوست نشده است»، «هیچ تصویری … ارسال نشده است»،
+ * «فریم‌ها به این مدل نرسیده‌اند»، «ورودی بصری قابل بازیابی نیست»،
+ * «عدم بارگذاری موفق فایل» — کلمهٔ «فریم» هم به اسم‌های رسانه اضافه شد.
+ *
+ * v95 — ریشهٔ قطعیِ گزارش مالک («ویدیو تحلیل نشد ولی سهمیه کم شد و مربی پرونده را
+ * تحلیل کرد»): پرب زندهٔ v95 عین پاسخ کور جدید بومی را ثبت کرد که از گارد v94
+ * «فرار می‌کرد»: «هیچ فریم یا تصویری در ورودی این پیام به من ارائه نشده است …
+ * محتوای بصری قابل تشخیص نیست … دادهٔ بصری به تحلیل‌گر نرسیده است». چنین پاسخی
+ * «تحلیل موفق» پنداشته می‌شد → کش مسموم + کسر سهمیه + مربیِ بی‌خبر. الگوهای ⑤/⑨/⑩/⑪
+ * عین همین فرارها را می‌گیرند (تست رجکس v95: ۲۲/۲۲).
+ */
+export function rejectBlindMediaResponse(text: string): string | null {
+  // اسم رسانه — «ویدیو/ویدیوی/ویدیویی»، «عکس/عکسی»، «تصویر/تصویری»، فایل، رسانه، لینک، فریم
+  // (نکته: پسوند یی فارسی دوتایی است — «ویدیویی?» فقط حرف آخر را اختیاری می‌کند؛
+  //  به همین دلیل از (?:یی|ی)? استفاده می‌شود تا هر سه شکل پوشش داده شود.)
+  const N = "(?:ویدیو|عکس|تصویر|فایل|رسانه|لینک|فریم)(?:یی|ی)?";
+  const blind = new RegExp(
+    // ① رسانه «به من/به این مدل/به دستم/به دست من نرسید/نرسیده/دریافت نشد» — تحلیل واقعی هرگز این را نمی‌گوید
+    //    (v99-b — واریانت «به دست من» عین جملهٔ مالک: «فایل به دست من نرسیده است»)
+    `${N} ?(?:به من |به دستم |به دست من )?(?:نرسید|نرسیده|دریافت نشد|دریافت نشده|دریافت نکردم|نگرفتم)` +
+    // ①-b (v94) رسانه + فاصلهٔ کوتاه + «به این مدل نرسیده» — عین پاسخ کور بومی v94
+    // («فریم‌ها به این مدل نرسیده‌اند»)
+    `|${N}[^.\n]{0,25}به (?:این )?مدل نرسید` +
+    // ② «تصویری/ویدیویی/عکسی نمی‌بینم» — علامت کلاسیک بلاک حذف‌شدهٔ تصویر (پروب زندهٔ v73)
+    `|${N} نمی‌?بینم` +
+    // ③ «نمی‌توانم ویدیو/عکس/رسانه را ببینم یا مشاهده کنم»
+    `|نمی‌[ ‌]?توانم (?:هیچ )?${N}[^.]{0,12}(?:ببینم|مشاهده کنم)` +
+    // ④ «دسترسی به ویدیو/عکس/… ندارم» — با گارد منفی «پرونده» تا خط سالمِ
+    //     «دسترسی به تصویر پرونده‌ات داشتم» (تحلیل واقعی) خطا گرفته نشود
+    `|دسترسی به (?:تصویر|عکس|ویدیو|رسانه|فایل)(?! ?پرونده)` +
+    // ⑤ (v94/v95) «هیچ تصویری/ویدیویی/فریمی … پیوست/ارسال/ضمیمه/ارائه/تحویل/بارگذاری
+    //     نشده» — عین پاسخ‌های کور زندهٔ بومی (v95: «هیچ فریم یا تصویری در ورودی این
+    //     پیام به من ارائه نشده است»). «نشد» داخل «نشده» هم مچ می‌شود.
+    `|${N}[^.\n]{0,40}(?:پیوست|ارسال|ضمیمه|ارائه|تحویل|بارگذاری) نشد` +
+    // ⑥ (v94) «ورودی بصری قابل بازیابی نیست» — عین پاسخ کور بومی v94
+    `|ورودی بصری|قابل بازیابی نیست` +
+    // ⑦ (v94) «عدم بارگذاری موفق فایل/ویدیو/…» — عین پاسخ کور بومی v94
+    `|عدم (?:بارگذاری|دریافت) (?:موفق )?(?:فایل|تصویر|ویدیو|رسانه|فریم)` +
+    // ⑨ (v95) «محتوای بصری قابل تشخیص نیست» — عین پاسخ کور زندهٔ v95
+    //     (دنبالهٔ منفی الزامی است تا تحلیل واقعیِ «محتوای بصری ویدیو نشان می‌دهد…» خراب نشود)
+    `|محتوای بصری[^.\n]{0,30}قابل (?:تشخیص|بازیابی|مشاهده) نیست` +
+    // ⑩ (v95) «دادهٔ بصری به تحلیل‌گر/من نرسیده» — عین پاسخ کور زندهٔ v95
+    `|داده[ٔ‌]? ?بصری[^.\n]{0,25}نرسید` +
+    // ⑪ (v95) «به من/به تحلیل‌گر ارائه نشد» — عین پاسخ کور زندهٔ v95
+    `|به (?:من|تحلیل[‌ـ]?گر|این مدل) ارائه نشد` +
+    // ⑫ (v99-b) «بدون فایل/عکس/… رسید/رسیده» — عین ادعای کورِ زندهٔ مربی در پرب
+    //     تولیدی 2026-09-14 («این پیام هم بدون فایل رسیده») که از گارد v95 فرار می‌کرد
+    `|بدون ${N}[^.\n]{0,12}(?:رسید|رسیده)` +
+    // ⑬ (v99-b) «عکس/ویدیویی همراهش نیامده» — عین ادعای زندهٔ همان پرب
+    //     («عکس یا ویدیویی همراهش نیامده که بتوانم تحلیلش کنم»)
+    `|${N}[^.\n]{0,20}(?:همراهش|با خودش|در پیام)[^.。\n]{0,8}نیامد` +
+    // ⑭ (v99-b) «نه عکسی، نه ویدیویی» — انکار دوگانهٔ رسانه (عین ادعای زندهٔ پرب)
+    `|نه ${N}[،,] ?نه ${N}` +
+    // ⑮ (v99-b) «عکسی/فایلی همراه پیام نبود/نیست» — واریانت‌های محتمل بعدی
+    `|${N}[^.\n]{0,15}همراه (?:پیام|درخواست)[^.。\n]{0,8}(?:نبود|نیست)` +
+    // ⑯ (v100) «فایل … به دست(ِ) من نمی‌رسد» — زمان حال (عین جملهٔ زندهٔ e2e سرور:
+    //     «فایل از سمت تو ارسال می‌شود ولی به دست من نمی‌رسد») — الگوی ① فقط
+    //     صیغهٔ گذشته را می‌گرفت. فاصلهٔ بعد از «دست» اختیاری تا «به دستم» هم
+    //     پوشش داده شود؛ فعل حتماً «نمی» دارد تا «به دستم برسد/می‌رسد» سالم بماند
+    `|${N}[^.\n]{0,60}به دست ?(?:من|م) نمی[‌ـ]?(?:رسد|رسه|رسید|آمد)` +
+    // ⑰ (v100) «ارسال … کامل/درست/موفق نشد» — عین جملهٔ زندهٔ دوم e2e سرور:
+    //     «احتمالاً ارسال از سمت برنامه کامل نشده» (بدون ذکر مستقیم رسانه کنار فعل)
+    `|ارسال[^.،,\n]{0,20}(?:کامل|درست|موفق) نشد` +
+    // ⑧ انگلیسی — فقط با ذکر صریح رسانه (بدون خطای مثبت روی تحلیل واقعی)
+    `|cannot (?:see|view) (?:the |any |your )?(?:image|video|media|attachment|frame)` +
+    `|(?:unable|not able) to (?:see|view|open|process) (?:the |any |your )?(?:image|video|media|attachment|frame)` +
+    `|no (?:image|video|media|frames?) (?:was|were|is|are) (?:received|attached|found|visible|provided)` +
+    `|no (?:image|video|media|attachment) frames? (?:was|were|is|are) (?:received|attached|found|visible|provided)` +
+    `|(?:the )?(?:image|video|media|attachment|frame)s? (?:was|were|is|are) not (?:received|attached|found|visible|available|provided)` +
+    `|(?:the )?(?:image|video|media|attachment) frames? (?:was|were|is|are) not (?:received|attached|found|visible|available|provided)`,
+    "i"
+  );
+  return blind.test(text)
+    ? "پاسخ مدل نشانهٔ «کور بودن» است (رسانه به مدل نرسیده) — نامعتبر رد شد (v100)"
+    : null;
+}
+
+/**
+ * v100 — برچسب ممیزیِ سبک برای لاگ ترمینال مالک: آیا این متن ادعای کوری دارد؟
+ * (همان گارد rejectBlindMediaResponse ولی خروجی بولی — برای لاگ‌های [chat] coach reply)
+ */
+export function hasBlindMediaClaim(text: string): boolean {
+  return rejectBlindMediaResponse(text) !== null;
+}
+
+/**
+ * v71 — تحلیل رسانهٔ چت با فیتاپ (فقط تحلیل). v93: VISION_MODEL = deepseek-v4.1-flash
+ * (دیرکتیو مالک: کل سیستم به‌جز تولید عکس/STT روی V4.1 Flash — بینایی بومی دو‌مسیرهٔ ضدکور — بلاک VISION_MODEL).
+ * خروجی: متن گزارش تحلیلی که (۱) در ChatMessage.mediaAnalysis کش می‌شود و
+ * (۲) به aiChat (دیپ‌سیک) تزریق می‌شود. فال‌بک خودکار: FALLBACK_VISION_MODEL.
+ * v92 — از سپر createResilientCompletion با اعتبارسنج «تحلیل کور» استفاده می‌کند:
+ * پاسخ کور (مدل بلاک تصویر را ندیده) مثل خطا retry/fallback می‌شود و هرگز به‌عنوان
+ * تحلیلِ موفق کش/مصرف سهمیه نمی‌شود.
+ */
+export async function analyzeChatMedia(
+  kind: "image" | "video-frames",
+  dataUrls: string[],
+  caption?: string,
+  userId?: string | null
+): Promise<string> {
+  const userText = caption?.trim()
+    ? `متن همراه کاربر: «${caption.trim()}»\n\nتحلیل فنی رسانهٔ بالا را طبق دستور سیستم تولید کن.`
+    : kind === "video-frames"
+      ? "کاربر ویدیو فرستاده است؛ فریم‌های بالا به ترتیب زمانی از شروع تا پایان حرکت‌اند. تحلیل فنی توالی را طبق دستور سیستم تولید کن."
+      : "کاربر عکس فرستاده است. تحلیل فنی آن را طبق دستور سیستم تولید کن.";
+  const content: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    { type: "text", text: userText },
+    ...dataUrls.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+  ];
+  return await createResilientCompletion(
+    {
+      model: VISION_MODEL,
+      messages: [
+        { role: "system", content: CHAT_MEDIA_ANALYSIS_SYSTEM_PROMPT },
+        { role: "user", content },
+      ],
+      // سقف خروجی تحلیل — گزارش ۲۰۰ کلمه‌ای کافی است (کنترل هزینه/زمان)
+      max_tokens: 1200,
+    } as any,
+    {
+      logTag: "aiChat-media-analysis",
+      maxAttempts: 3,
+      // v99 — سقف زمانی هر تلاش (هم‌ترازِ ویژن‌های سالم مثل analyze-body-progress):
+      // بدون این، SDK تا ۱۰ دقیقه منتظر می‌ماند و گیت‌وی ~۱۲۰s وسط راه اتصال را
+      // می‌کشد → خطای مبهم «fetch failed» → تحلیل هرگز کامل نمی‌شود.
+      timeoutMs: 120_000,
+      userId: userId ?? undefined,
+      // v92 — گارد ضد «تحلیل کور» (توضیح بالا)
+      validateContent: rejectBlindMediaResponse,
+    }
+  );
+}
+
+// AI chat - streaming not needed, return full message
+export async function aiChat(
+  data: OnboardingData | null,
+  history: { role: string; content: string }[],
+  userMessage: string,
+  planName?: Plan | null,
+  mediaAnalysis?: string | null,
+  userId?: string | null,
+  /** v77 — یادداشت سیستمی (وضعیت بازتولید برنامه) — در پرامپت سیستم تزریق می‌شود */
+  systemNote?: string | null
+): Promise<string> {
+  // ─── v79 — دانش زندهٔ سایت: پس از پرامپت (پیش‌فرض یا دیتابیس) تزریق می‌شود؛ مالک با ویرایش
+  // ردیف "site_knowledge" در جدول AiConfig آن را زنده به‌روز می‌کند (کامنت بلوک DEFAULT_SITE_KNOWLEDGE).
+  const systemPrompt = withSiteKnowledge(
+    withBrandDirective(await getAiConfig("chat_system_prompt", DEFAULT_CHAT_PROMPT)),
+    await getAiConfig("site_knowledge", DEFAULT_SITE_KNOWLEDGE)
+  );
+
+  const contextPart = data
+    ? `\n\nاطلاعات کاربر فعلی:\n${buildUserContext(data, planName)}\n\nپاسخ‌هایت را بر اساس این اطلاعات شخصی‌سازی کن.`
+    : "";
+
+  // محدودیت بر اساس پلن: اگر Basic/Standard، فقط پاسخ محدود به برنامه تمرین/تغذیه
+  const caps = getCapabilities(planName ?? null);
+  const planNote = !caps.aiChatQuestions
+    ? "\n\nتوجه: این کاربر به چت کامل دسترسی ندارد و فقط پاسخ محدود درباره برنامه موجود می‌بیند. اگر سوال خارج از برنامه پرسید، به خرید پلن Advanced دعوت کن."
+    : "";
+
+  // ─── v71 معماری دومرحله‌ای (v73 به‌روزرسانی): مدل بینایی تحلیل می‌کند، نویسندهٔ متن می‌نویسد ───
+  // مدیا هرگز مستقیم به این کال پیوست نمی‌شود (کال چت، کال «متن» است — تحلیل رسانه
+  // یک‌بار جداگانه با VISION_MODEL انجام و کش می‌شود؛ صرفه‌جویی در کال تکراری).
+  // گزارش تحلیلی رسانه در «پیام سیستم» تزریق می‌شود (بالاترین وزن تبعیت — تست واقعی
+  // نشان داد تزریق داخل پیام کاربر گاهی توسط مدل نادیده گرفته می‌شود و «دسترسی ندارم»
+  // می‌گفت) تا مربی «بداند» کاربر چه عکس/ویدیویی فرستاده و پاسخ سینک‌شده بنویسد.
+  const mediaSystemNote = mediaAnalysis?.trim()
+    ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nگزارش بینایی رسانه (منبع: مدل بینایی فیتاپ — گزارش واقعی و معتبر):\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${mediaAnalysis.trim()}\n\n⚠️ دستور الزامی: گزارش بالا توصیف دقیق رسانهٔ (عکس/ویدیوی) ارسالی کاربر است. تو از طریق همین گزارش رسانه را «می‌بینی». هرگز و تحت هیچ شرایطی نگو که به عکس/ویدیو دسترسی نداری یا نمی‌توانی آن را ببینی — بر اساس گزارش بالا پاسخ کامل و دقیق بده.`
+    : "";
+
+  // ─── v77 — قاعدهٔ صداقت دربارهٔ تغییر برنامه (همیشه فعال — مستقل از پرامپت ذخیره‌شدهٔ دیتابیس) ───
+  // ریشهٔ تیکت مالک (سجاد لطفی): مدل در چت «ثبت شد ✅» می‌گفت بدون اینکه هیچ تغییری در
+  // برنامهٔ رسمی اعمال شود؛ حتی به کاربر می‌گفت اپ را حذف و نصب کند!
+  // وقتی بازتولید خودکار شروع شده باشد، وضعیت واقعی از طریق systemNote (پارامتر بالا)
+  // جداگانه تزریق می‌شود و اولویت بر این قاعدهٔ عمومی دارد.
+  const honestyDirective =
+    `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nقاعدهٔ صداقت دربارهٔ برنامهٔ رسمی (الزامی — در همهٔ حالت‌ها):\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n- برنامهٔ رسمی کاربر (تب‌های تمرین/تغذیه/مکمل) فقط با موتور تولید فیتاپ ساخته و به‌روز می‌شود. تو هیچ ابزار مستقیمی برای ویرایش آن نداری، مگر اینکه «پیام سیستمیِ وضعیت بازتولید» صریحاً وضعیت را به تو گزارش کرده باشد.\n- هرگز و تحت هیچ شرایطی ادعا نکن که تغییری را در برنامهٔ رسمی «ثبت کردی»، «اعمال کردی» یا «ذخیره کردی» مگر پیام سیستمی صریحاً تأییدش کرده باشد.\n- v149 — ممنوعیت مطلق پیشنهاد فعالانهٔ بازنویسی: هرگز و تحت هیچ شرایطی خودت پیشنهاد «بازنویسی/بازطراحی/تغییر کامل برنامه» نده و قابلیت آن را تبلیغ نکن (مثلاً نگو «می‌تونم برنامه‌تو بازنویسی کنم»). فقط وقتی کاربر خودش صریحاً درخواست تغییر کامل برنامه کرده یا پیام سیستمی بازطراحی فعال است، دربارهٔ آن صحبت کن.\n- هرگز ادعا نکن که تصمیم پیش‌نیازها (مثل «آپلود نمی‌کنم» آزمایش خون یا ویدیو) را در سیستم ثبت کرده‌ای — این انتخاب فقط با دکمه‌های خود پنل کاربر ثبت می‌شود؛ اگر کاربر گفت «آپلود نمی‌کنم»، او را به تب داشبورد برای زدن همان دکمه راهنمایی کن.\n- اگر کاربر خواست برنامهٔ کاملش با درخواست‌هایش عوض شود: سیستم فیتاپ بازتولید خودکار را پشتیبانی می‌کند — او را مطمئن کن درخواستش قابل اعمال است، بدون توضیح فنی دروغ.\n- v111 — وقتی «پیام سیستمیِ بازطراحی برنامه» از تو خواست لیست تغییرات را نشان بدهی و تایید نهایی بگیری، پیامت را دقیقاً با تگ [PLAN_CHANGE_PROPOSAL summary=\"خلاصهٔ یک‌خطی تغییرات توافق‌شده\"] تمام کن (فقط پس از نمایش لیست تغییرات، فقط «یک» تگ) تا کارت تایید برای کاربر نمایش داده شود. خودت هیچ‌وقت ادعای شروع/ساخت/ثبت برنامه نکن — ساخت فقط پس از تایید کاربر (دکمهٔ کارت یا پیام متنی «تایید نهایی») توسط سیستم انجام می‌شود و نتیجه (خلاصهٔ برنامهٔ جدید و نسخهٔ آن) بعداً در همین چت نوشته می‌شود.\n- هرگز به کاربر نگو اپلیکیشن را حذف و نصب کند تا برنامه عوض شود — این کار برنامه را عوض نمی‌کند و وقت کاربر تلف می‌شود.`
+      + (systemNote?.trim() ? `\n\n[وضعیت به‌روزِ همین گفت‌وگو]:${systemNote.trim()}` : "");
+
+  const historyMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = history.slice(-40).map((m) => ({
+    role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user",
+    content: m.content,
+  }));
+
+  // ─── v85 — دیرکتیوهای همیشه‌فعال چت (مستقل از پرامپت ذخیره‌شدهٔ دیتابیس —
+  // مثل honestyDirective در کد تزریق می‌شود تا هیچ override‌ای نتواند حذفش کند):
+  // ① پاسخ کوتاه و مفید (گزارش مالک: «مفصل و حوصله‌سربر» بود) ② ممنوعیت خطوط
+  // تزئینی ---------- ③ بولد نکات مهم ④ لینک درون‌برنامه‌ای دقیق ⑤ حافظهٔ قوی ───
+  const coachStyleDirective = `
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+سبک پاسخ‌گویی فیتاپ (الزامی — v85):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- پاسخ‌هایت «کوتاه، مفید و بدون حاشیه» باشد — معمولاً ۳۰ تا ۱۲۰ کلمه. فقط وقتی کاربر صریحاً جزئیات کامل خواست (مثلاً «کامل توضیح بده» یا برنامهٔ غذایی مفصل)، بلندتر بنویس. مقدمه و تکرار و تعارف اضافه ممنوع؛ مستقیم به جواب برو.
+- ⚠️ هرگز خط تزئینی نکش: هیچ خطی ساخته نشده از کاراکترهای تکراری مثل «----------» ، «========» ، «******» یا «————» در پاسخت نباشد. برای جداسازی از تیتر کوتاه یا ایموجی استفاده کن.
+- نکات مهم و کلیدی (عدد، دوز، نام حرکت، قانون طلایی) را با **بولد** مارک‌داون بنویس تا کاربر سریع ببیند — ولی هر جمله را بولد نکن.
+- از جدول مارک‌داون فقط وقتی واقعاً کاربردی است استفاده کن (مقایسه چندگزینه‌ای)؛ برای جواب‌های کوتاه لیست ساده کافی است.
+- حافظهٔ تو قوی است: کل تاریخچهٔ اخیر گفتگو + پروندهٔ ورزشی کامل کاربر (برنامهٔ تمرینی با تک‌تک روزها و حرکات، برنامهٔ غذایی با وعده‌ها، مکمل‌ها، وزن‌ها، چکاپ‌ها و رکوردها) در پیام سیستم برایت تزریق شده است. هرگز و تحت هیچ شرایطی نگو «به برنامه‌ات/اطلاعات تو دسترسی ندارم» یا «پرونده‌ات را نمی‌بینم» — تو به همه‌چیز دسترسی داری و باید دقیق جواب بدهی (مثلاً اگر پرسید «حرکت سوم روز شنبه چیست؟» از برنامهٔ تمرینی تزریق‌شده جواب بده).
+- وقتی لازم است کاربر به بخشی از فیتاپ برود، فقط و فقط از لینک درون‌برنامه‌ای زیر استفاده کن (کاربر با کلیک، همان‌جا می‌رود):
+  [متن لینک](action:مقصد)
+  مقصدهای مجاز (فقط همین‌ها):
+  • dashboard → داشبورد • programs → برنامه‌ها • workouts → تمرین امروز/حالت باشگاه • nutrition → تغذیه و دستیار غذا • progress → پیشرفت و گالری • chat → همین چت • referral → معرفی به دوستان • support → پشتیبانی و تیکت
+  • plans → مشاهده و خرید پلن‌ها • tool-tdee → محاسبه‌گر کالری • tool-exercises → بانک حرکات با ویدیو • tool-foods → جدول کالری غذاها • articles → مقالات
+  مثال درست: «برای ثبت وزنت برو به [داشبورد](action:dashboard)» — مثال غلط: دادن URL یا آدرس اینترنتی (هرگز URL خارجی نده). هر پیام حداکثر ۲ لینک.
+- v86 — پاسخت با هیچ خط directive انتهایی تمام نشود؛ اگر قدم بعدی عملی داری، آن را داخل خود متنِ پاسخ (یک جملهٔ کوتاه) بگو.`;
+
+  // ─── v218 — دیرکتیو مالک: حذف CTA غلط «برای آنالیز ویدیو فرم بدن برو تو این لینک» ───
+  // بعد از ارسال ویدیوی حرکت در چت، مدل چون «آنالیز هوشمند: ویدیو بدن» را در بخش
+  // قابلیت‌ها دیده بود، کاربر را به صفحهٔ «آنالیز ویدیویی بدن/فرم بدن» ارجاع می‌داد
+  // (حتی با لینک درون‌برنامه‌ای که به‌صورت دکمهٔ کلیک‌خور زیر پیام رندر می‌شد).
+  // این دو اشتباه بود: ① آنالیز فرم حرکات دقیقاً همین‌جا در همین چت انجام می‌شود
+  // ② آنالیز ویدیویی فرم بدن فقط پیش‌نیازِ یک‌بارِ شروع پلن حرفه‌ای است که در
+  // ابتدای همان پلن ثبت شده — «دیگه نیازی به آوردنش نیست».
+  // مثل honestyDirective در کد تزریق می‌شود تا هیچ overrideِ پرامپت دیتابیس نتواند حذفش کند.
+  const movementVideoDirective = `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nقاعدهٔ ویدیوی حرکات (الزامی — در همهٔ حالت‌ها):\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n- آنالیز فرم حرکات با ویدیو «دقیقاً همین‌جا در همین چت» انجام می‌شود: کاربر ویدیوی اجرای حرکت می‌فرستد، فریم‌هایش تحلیل شده و تحلیل/اصلاح تکنیک در همین پاسخ به او می‌رسد. وقتی کاربر ویدیوی تمرین فرستاده، مستقیماً بر اساس گزارش بینایی رسانه (تزریق‌شده در پیام سیستم) فرم اجرا را تحلیل و اصلاح کن — همین پاسخ، تحلیلِ نهایی اوست.\n- هرگز و تحت هیچ شرایطی کاربر را برای آنالیز ویدیو (چه ویدیوی حرکت، چه «آنالیز ویدیویی بدن»، چه «آنالیز فرم بدن») به صفحه، تب، ابزار یا لینک دیگری نفرست — نه لینک درون‌برنامه‌ای [متن](action:…) برای این کار بساز و نه عبارت‌هایی مثل «برای آنالیز ویدیو فرم بدن برو به این لینک/بخش» بنویس.\n- «آنالیز ویدیویی فرم بدن» فقط پیش‌نیازِ یک‌بارِ شروع پلن حرفه‌ای است که در همان ابتدای پلن انجام و ثبت شده — دیگر نیازی به ارجاع یا یادآوری آن نیست. فقط اگر خود کاربر صریحاً دربارهٔ همان پیش‌نیاز پرسید، توضیح بده.`;
+
+  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      // v99-b — mediaSystemNote از پرامپت عظیم سیستم خارج شد (وسط ~۱۵هزار نویسهٔ
+      // کانتکست گم می‌شد و مدل به‌خاطر الگوی تاریخچهٔ آلوده به آن اعتنا نمی‌کرد —
+      // اثبات زندهٔ پرب تولیدی 2026-09-14: تحلیل بینایی تزریق شده بود ولی مربی
+      // «بدون فایل رسیده» می‌گفت). حالا به‌صورت پیام سیستم جداگانه «درست‌موقع»
+      // بلافاصله قبل از پیام کاربر تزریق می‌شود — بیشترین وزن توجه.
+      content: systemPrompt + contextPart + planNote + honestyDirective + coachStyleDirective + movementVideoDirective,
+    },
+    ...historyMessages,
+    // v99-b — گزارش بینایی بلافاصله قبل از پیام نهایی کاربر
+    ...(mediaSystemNote
+      ? [{ role: "system" as const, content: mediaSystemNote }]
+      : []),
+    { role: "user", content: userMessage },
+  ];
+
+  try {
+    let content = await createChatCompletionWithRetry({
+      // v73 دیریکتیو مالک: نویسندهٔ پاسخ چت روی deepseek-v4.1-flash با تفکر low
+      // (حتی برای پیام‌های بعد از عکس/ویدیو — سینک از طریق متنِ تحلیل رسانه
+      // انجام می‌شود نه پیوست مدیا).
+      // فال‌بک صریح: اگر deepseek نشد → gemini-3.8-flash (TEXT_MODEL).
+      model: TEXT_TASK_MODEL,
+      fallback_model: TEXT_MODEL,
+      // v72 حسابداری — سقف خروجی پاسخ چت (پاسخ مربی هرگز طولانی‌تر از این نیست)
+      max_tokens: 4096,
+      messages,
+      // چت متنی: تفکر low (پاسخ سریع — دیریکتیو کاربر).
+      reasoning_effort: "low",
+    } as any, "aiChat", 3, { userId });
+
+    // ─── v100 — گارد ضدکورِ «پاسخ مربی» (حلقهٔ آخرِ زنجیره) ───
+    // تا v99 گارد rejectBlindMediaResponse فقط روی «تحلیل بینایی» اعمال می‌شد؛
+    // اما پرب تولیدی و e2e سرور اثبات کرد خودِ مدل متن هم بعد از تزریق گزارش
+    // بینایی می‌تواند ادعای کوری بگوید («این پیام هم بدون فایل رسید» — مخصوصاً
+    // وقتی تاریخچه قبلاً مسموم است). سه لایهٔ دفاعی:
+    //   لایه ۱: ری‌تای با «تزریق مضاعف» — گزارش هم در پیام کاربر (بالاترین وزن توجه)
+    //   لایه ۲: اگر باز کور بود → جایگزینی با پاسخِ مستند به گزارش بینایی واقعی
+    //           (کاربر هرگز ادعای کور نمی‌بیند؛ متنِ جایگزین صداقت است نه دروغ)
+    if (mediaAnalysis?.trim()) {
+      const blindReason = rejectBlindMediaResponse(content);
+      if (blindReason) {
+        console.warn(
+          `[aiChat] ⚠️ پاسخ مربی ادعای کوری داشت (تلاش ۱) → ری‌تای با تزریق مضاعف گزارش بینایی (v100) — reason=${blindReason} head=${content.slice(0, 120).replace(/\s+/g, " ")}`
+        );
+        const reinforcedUserMessage =
+          `${userMessage}\n\n` +
+          `[پیام سیستمیِ الزامی — v100]: رسانهٔ (عکس/ویدیوی) این پیام با موفقیت به سرور فیتاپ رسیده، ذخیره شده و توسط مدل بینایی تحلیل شده است. گزارش رسمی تحلیل:\n` +
+          `${mediaAnalysis.trim()}\n\n` +
+          `⚠️ پاسخ تو باید بر اساس همین گزارش باشد. هرگونه جملهٔ «فایل/عکس/ویدیو به من نرسیده یا دریافت نشده» مطلقاً ممنوع و خلاف واقع است — رسانه هست و تحلیلش بالاست.`;
+        content = await createChatCompletionWithRetry(
+          {
+            model: TEXT_TASK_MODEL,
+            fallback_model: TEXT_MODEL,
+            max_tokens: 4096,
+            // پیام آخر کاربر با نسخهٔ تقویت‌شده جایگزین می‌شود (نه پیام اضافه —
+            // ساختار system + history + media-system + user حفظ می‌شود)
+            messages: [
+              ...messages.slice(0, -1),
+              { role: "user" as const, content: reinforcedUserMessage },
+            ],
+            reasoning_effort: "low",
+          } as any,
+          "aiChat-blind-retry",
+          2,
+          { userId }
+        );
+        if (rejectBlindMediaResponse(content)) {
+          console.error(
+            `[aiChat] 🚨 پاسخ مربی بعد از ری‌تای هم کور بود → جایگزینی با پاسخِ مستند به گزارش بینایی واقعی (کاربر هرگز ادعای کور نمی‌بیند — v100)`
+          );
+          content =
+            `✅ رسانه‌ات را دریافت کردم و مدل بینایی فیتاپ تحلیلش کرد:\n\n` +
+            `${mediaAnalysis.trim()}\n\n` +
+            `اگر سؤال مشخصی دربارهٔ همین رسانه داری بپرس تا دقیق‌تر راهنمایی‌ات کنم.`;
+        } else {
+          console.log(`[aiChat] ✅ ری‌تای ضدکور موفق — پاسخ دوم سالم است (v100)`);
+        }
+      }
+    }
+
+    // ─── v112 — اصلاح تایپوگرافی فارسی روی خروجی نهایی چت (دیرکتیو مالک:
+    // «مهرهها، بهنظر، کنترلشده…» نباید به کاربر برسند) — در همین نقطهٔ
+    // چوک‌پوینت همهٔ مسیرهای پاسخ (متن/رسانه/ری‌تای) پاک‌سازی می‌شوند و
+    // متن تمیز در DB هم ذخیره می‌شود.
+    return fixPersianTypographySafe(content) || "متأسفم، پاسخی دریافت نشد. دوباره تلاش کنید.";
+  } catch (err) {
+    // v216 — ریشه‌یابی شواهد 2026-10-06: تا قبل از این، علت واقعی (502/Connection error/…)
+    // اینجا بلعیده می‌شد و ErrorLog ادمین فقط پیام فارسی دوستانه را می‌دید — بدون هیچ
+    // ردی از علت. حالا ریشه به انتهای پیام (فقط برای ErrorLog؛ کاربر هرگز این پیام را
+    // نمی‌بیند — apiError همیشه پیام عمومی می‌دهد) پیوند می‌خورد.
+    console.error("[aiChat] AvalAI error:", err);
+    const rootCause = String((err as Error)?.message || err).slice(0, 200);
+    throw new Error(`خطا در ارتباط با مربی هوشمند. لطفاً کمی بعد دوباره تلاش کنید. [ریشه: ${rootCause}]`);
+  }
+}
+
+/** چت نیکا — دستیار فروش و راهنما (هیچ برنامه‌ای تجویز نمی‌کند) */
+// v46: کش ۵ دقیقه‌ای لیست مقالات برای پرامپت نیکا (کاهش توکن هر تماس)
+const nikaArticlesCache: { value: { title: string; slug: string; category: string; excerpt: string | null }[] | null; at: number } = {
+  value: null,
+  at: 0,
+};
+
+// v70 حسابداری: کش ۵ دقیقه‌ای قیمت‌های زنده — قبلاً در «هر» پیام نیکا کوئری DB
+// + ساخت رشته قیمت تکرار می‌شد؛ محتوای آن مثل مقالات هر ۵ دقیقه یک‌بار کافی است.
+const nikaPricingCache: { value: string | null; at: number } = { value: null, at: 0 };
+
+/**
+ * Task 2-d — دیرکتیو سبک نیکا (غیرقابل override توسط پرامپت دیتابیس):
+ * نسخهٔ قدیمی (v86) سقف سفت «۲۰ تا ۹۰ کلمه» داشت که با دیرکتیو جدید مالک
+ * «کامل و جامع تحلیل کن، AI بدون سقف» در تضاد بود و نیکا را ناقص جواب‌می‌داد.
+ * اکنون: طول وابسته به اهمیت سؤال است — ساده = کوتاه، مهم/فنی = کامل و جامع.
+ */
+const NIKA_STYLE_DIRECTIVE = `
+
+[سبک پاسخ — اجباری]
+- طول پاسخ را با اهمیت سؤال تنظیم کن: سؤال ساده = کوتاه و مستقیم؛ سؤال مهم/فنی/تحلیلی = کامل و جامع با بولت/بخش‌بندی — هرگز ناقص یا گیج‌کننده جواب نده.
+- مستقیم به جواب؛ بدون مقدمهٔ طولانی، بدون جمع‌بندی تکراری، بدون خط تزئینی (----).
+- نکات کلیدی را **بولد** کن.
+- در پایان حداکثر یک اقدام مشخص پیشنهاد بده (مثلاً لینک درون‌برنامه‌ای یا رفتن به صفحه پلن‌ها).`;
+
+export async function nikaChat(
+  history: { role: string; content: string }[],
+  userMessage: string,
+  userPlan: Plan | null,
+  userInfo?: { name: string | null; mobile: string | null; planName: string | null; planExpiresAt: string | null; walletBalance: number },
+  userId?: string | null,
+  // Task 2-d — بلوک «وضعیت فعلی کاربر» (فقط مسیر لاگین‌شدهٔ chat می‌سازد؛
+  // مسیر مهمان این پارامتر را نمی‌فرستد — پس امضا backward-compatible است)
+  liveUserContext?: string
+): Promise<string> {
+  // ─── v79 — دانش زندهٔ سایت: پس از پرامپت نیکا (پیش‌فرض یا دیتابیس) تزریق می‌شود؛ نیکا هم
+  // همیشه ساختار زندهٔ سایت را می‌داند (کامنت بلوک DEFAULT_SITE_KNOWLEDGE).
+  const systemPrompt = withSiteKnowledge(
+    withBrandDirective(await getAiConfig("nika_system_prompt", DEFAULT_NIKA_PROMPT)),
+    await getAiConfig("site_knowledge", DEFAULT_SITE_KNOWLEDGE)
+  ) + NIKA_STYLE_DIRECTIVE; // v86 — سبک کوتاه‌نویسی نیکا
+
+  // اضافه کردن اطلاعات پلن کاربر برای راهنمایی هدفمند
+  const planInfo = userPlan
+    ? `\n\nوضعیت پلن کاربر: ${userPlan === "basic" ? "اقتصادی (بدون چت مربی)" : userPlan === "standard" ? "استاندارد (بدون چت مربی)" : userPlan === "advanced" ? "پیشرفته (چت مربی فعال)" : "حرفه‌ای (چت مربی فعال + آنالیز ویدیو/آزمایش خون + پشتیبانی اختصاصی)"}`
+    : "\n\nوضعیت پلن کاربر: مهمان (بدون ثبت‌نام)";
+
+  // ─── اطلاعات کاربر (برای شناخت کاربر) ───
+  // نیکا باید کاربر را بشناسد — نام، شماره موبایل، پلن فعلی، تاریخ انقضا، موجودی کیف پول
+  let userInfoContext = "";
+  if (userInfo && userInfo.name) {
+    userInfoContext = `\n\n👤 اطلاعات کاربر:\n- نام: ${userInfo.name}\n- موبایل: ${userInfo.mobile}\n- پلن فعلی: ${userInfo.planName || "ندارد"}\n- تاریخ انقضای پلن: ${userInfo.planExpiresAt ? new Date(userInfo.planExpiresAt).toLocaleDateString("fa-IR", { timeZone: "Asia/Tehran" }) : "—"}\n- موجودی کیف پول: ${userInfo.walletBalance.toLocaleString("en-US")} تومان\n`;
+    userInfoContext += `\n⚠️ این کاربر را با نام صدا بزن و شخصی‌سازی پاسخ بده.`;
+  }
+
+  const upsellHint =
+    !userPlan || userPlan === "basic" || userPlan === "standard"
+      ? "\n\nیادآوری: این کاربر هنوز به چت مربی هوشمند دسترسی ندارد. او را به خرید پلن پیشرفته یا حرفه‌ای ترغیب کن."
+      : "";
+
+  // ─── قیمت‌های زنده پلن‌ها (آپدیت خودکار) ───
+  // تا وقتی ادمین قیمت‌ها را تغییر می‌دهد، نیکا همیشه قیمت‌های جدید را بداند.
+  // 🩹 v70: کش ۵ دقیقه‌ای در-حافظه (هم‌الگوی کش مقالات) — قبلاً کوئری DB و ساخت
+  // رشته قیمت در هر پیام تکرار می‌شد.
+  let livePricing = "";
+  try {
+    const now = Date.now();
+    if (!nikaPricingCache.value || now - nikaPricingCache.at > 5 * 60 * 1000) {
+      const { getActivePlans } = await import("@/lib/fitness/pricing");
+      const plans = await getActivePlans();
+      let block = `\n\n💰 قیمت‌های فعلی پلن‌ها (همیشه به‌روز — این قیمت‌ها را به کاربر بگو):\n`;
+      for (const p of plans) {
+        block += `- ${p.label}: ${p.price.toLocaleString("en-US")} تومان (${p.durationDays} روزه)\n`;
+      }
+      block += `\n⚠️ مهم: فقط و فقط این قیمت‌های به‌روز را به کاربر بگو. قیمت‌های داخل پرامپت اولیه ممکن است قدیمی باشند — همیشه از این قیمت‌های زنده استفاده کن.`;
+      nikaPricingCache.value = block;
+      nikaPricingCache.at = now;
+    }
+    livePricing = nikaPricingCache.value ?? "";
+  } catch {
+    // اگر DB در دسترس نبود، از قیمت‌های پیش‌فرض استفاده می‌شود
+  }
+
+  // ─── اشراف نیکا به مقالات سایت (آپدیت خودکار) ───
+  // هر بار که نیکا فراخوانی می‌شود، لیست مقالات منتشرشده از DB خوانده می‌شود
+  // تا نیکا همیشه به آخرین مقالات دسترسی داشته باشد
+  // 🩹 v46: کش ۵ دقیقه‌ای در-حافظه — قبلاً این کوئری + ~۱.۵K توکن پرامپت
+  // در «هر» پیام نیکا تکرار می‌شد؛ محتوای مقالات هر ۵ دقیقه یک‌بار کافی است.
+  let articlesContext = "";
+  try {
+    const now = Date.now();
+    if (!nikaArticlesCache.value || now - nikaArticlesCache.at > 5 * 60 * 1000) {
+      const articles = await db.article.findMany({
+        where: { status: "published" },
+        select: { title: true, slug: true, category: true, excerpt: true },
+        orderBy: { createdAt: "desc" },
+        take: 30,
+      });
+      nikaArticlesCache.value = articles;
+      nikaArticlesCache.at = now;
+    }
+    const articles = nikaArticlesCache.value;
+    if (articles && articles.length > 0) {
+      articlesContext = `\n\n📄 مقالات منتشرشده فیتاپ (${articles.length} مقاله — همیشه به‌روز):\n`;
+      articlesContext += articles
+        .map((a) => `- "${a.title}" (دسته: ${a.category}) — ${a.excerpt?.substring(0, 80) || ""}`)
+        .join("\n");
+      articlesContext += `\n\nمی‌توانی کاربران را به خواندن این مقالات دعوت کنی با فرمت: [عنوان مقاله](action:articles)`;
+    }
+  } catch {
+    // DB may not be available
+  }
+
+  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+    // Task 2-d — liveUserContext (وضعیت زندهٔ پنل کاربر) بلافاصله بعد از userInfo تزریق می‌شود
+    { role: "system", content: systemPrompt + planInfo + userInfoContext + (liveUserContext || "") + upsellHint + livePricing + articlesContext },
+    ...history.slice(-10).map((m) => ({
+      role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user",
+      content: m.content,
+    })),
+    { role: "user", content: userMessage },
+  ];
+
+  try {
+    const content = await createChatCompletionWithRetry({
+      // v58 — دیریکتیو مالک: چت نیکا با deepseek-v4-flash (همان کلید AvalAI)
+      model: NIKA_MODEL,
+      messages,
+      reasoning_effort: "low", // چت با نیکا: تفکر low (پاسخ سریع برای تجربه کاربری بهتر)
+      // v58 — فال‌بک صریح: اگر deepseek نشد → همان مدل متن قبلی (gemini-3.8-flash)
+      fallback_model: TEXT_MODEL,
+      // v72 حسابداری — سقف خروجی پاسخ نیکا
+      max_tokens: 2048,
+    } as any, "nikaChat", 3, { userId });
+    return content || "متأسفم، پاسخی دریافت نشد. دوباره تلاش کنید.";
+  } catch (err) {
+    // v216 — ریشه‌یابی شواهد 2026-10-06: تا قبل از این، علت واقعی (502/Connection error/…)
+    // اینجا بلعیده می‌شد و ErrorLog ادمین فقط پیام فارسی دوستانه را می‌دید — بدون هیچ
+    // ردی از علت. حالا ریشه به انتهای پیام می‌چسبد (فقط ErrorLog؛ کاربر این پیام را
+    // نمی‌بیند — apiError همیشه پیام عمومی می‌دهد و مسیر مدیا پیام دوستانه خودش را دارد).
+    console.error("[nikaChat] AvalAI error:", err);
+    const rootCause = String((err as Error)?.message || err).slice(0, 200);
+    throw new Error(`خطا در ارتباط با نیکا. لطفاً کمی بعد دوباره تلاش کنید. [ریشه: ${rootCause}]`);
+  }
+}
+
+/** چت دستیار هوشمند پنل مدیریت — تحلیل آمار، پیشنهاد استراتژی، کمک در تولید محتوا */
+export async function adminCopilotChat(
+  history: { role: string; content: string }[],
+  userMessage: string,
+  context: { totalUsers: number; totalRevenue: number; activeSubs: number; pendingPrograms: number }
+): Promise<string> {
+  const systemPrompt = withSystemDirectives(`تو «دستیار مدیر» فیتاپ هستی — مشاور ارشد هوش مصنوعی برای مدیران پلتفرم فیتاپ. تو به تمام ساختار سایت، همه قسمت‌ها، همه امکانات، همه پلن‌ها، همه APIها و تمام جزئیات فنی و ظاهری سایت اشراف کامل داری.
+
+## درباره فیتاپ
+فیتاپ (FitUp) پلتفرم هوشمند برنامه‌ریزی تمرین و تغذیه است که با هوش مصنوعی اختصاصی، برنامه ورزشی، غذایی و مکمل کاملاً شخصی‌سازی‌شده برای هر کاربر می‌سازد. شعار فیتاپ: «هر بدنی فیتاپ میخواد». دامنه: fittup.ir
+
+## ساختار سایت و URLها
+### صفحات عمومی:
+- صفحه اصلی: /
+- مقالات: /articles
+- تماس با ما: /contact
+- قوانین: /terms
+- ورود/ثبت‌نام: /?screen=auth
+- پنل ورزشکار: /?screen=panel
+
+### ابزارهای رایگان:
+- ماشین حساب TDEE: /tdee
+- بانک حرکات (+۲۶۰ حرکت): /exercises
+- بانک کالری غذاها (+۱۰۰۰ غذا): /foods
+
+### صفحات پویا:
+- مقاله اختصاصی: /article/<slug>
+- حرکت اختصاصی: /exercise/<id>
+- غذا اختصاصی: /food/<id>
+
+## پنل مدیریت (۱۸ بخش)
+۱. داشبورد — آمار کلی، KPIها
+۲. کاربران — مدیریت، مشاهده جزئیات، لغو اشتراک
+۳. مالی و تراکنش‌ها — پرداخت‌ها، استرداد
+۴. حسابداری مدیریت — تحلیل درآمد، مقایسه بازه‌ها
+۵. کدهای تخفیف — ساخت/ویرایش
+۶. صف برنامه‌ها — برنامه‌های در انتظار/تولید
+۷. چکاپ‌ها — بررسی چکاپ‌های دوره‌ای
+۸. مقالات — CRUD، انتشار، زمان‌بندی
+۹. کدهای تحلیلی — تزریق کد head/body
+۱۰. قوانین — ویرایش شرایط و قوانین
+۱۱. تیکت‌ها — پشتیبانی کاربران
+۱۲. نظرسنجی‌ها — تحلیل نظرات
+۱۳. دستیار هوشمند (تو) — کمک به مدیر
+۱۴. مدیریت ادمین‌ها — ساخت/ویرایش ادمین
+۱۵. دامنه و رکوردها — تنظیمات DNS
+۱۶. سئو هوشمند — تولید خودکار مقاله
+۱۷. لاگ خطاها — بررسی خطاها
+۱۸. تنظیمات سایت — پیکربندی
+
+## پلن‌ها و قابلیت‌ها
+| پلن | قیمت | مدت | قابلیت‌ها |
+|-----|------|-----|----------|
+| اقتصادی (basic) | ۳۵۰٬۰۰۰ ت | ۴۵ روز | برنامه تمرین+تغذیه، ردیابی وزن، تاریخچه |
+| استاندارد (standard) | ۸۰۰٬۰۰۰ ت | ۴۵ روز | + برنامه مکمل، ۳ چکاپ دوره‌ای، داشبورد پیشرفته، مموری |
+| پیشرفته (advanced) | ۱٬۲۰۰٬۰۰۰ ت | ۴۵ روز | + چت هوشمند (متن+عکس)، آنالیز عکس غذا/بدن، حالت باشگاه، دستیار تغذیه |
+| حرفه‌ای (ultimate) | ۱٬۸۰۰٬۰۰۰ ت | ۴۵ روز | + آنالیز ویدیویی (۱۰x)، آزمایش خون (۱x)، اصلاح تکنیک، چت ویدیویی |
+
+مهم: کیفیت برنامه/مکمل/تغذیه در همه پلن‌ها یکسان است. تفاوت فقط در قابلیت‌هاست.
+
+## مدل‌های هوش مصنوعی (v73+)
+- متن: deepseek-v4.1-flash (همهٔ وظایف متنی؛ تفکر low — فال‌بک gemini-3.8-flash)
+- تولید برنامه: همان deepseek-v4.1-flash با تفکر max (بودجهٔ خروجی 65536) — فال‌بک gemini-3.8-flash تفکر high
+- ویژن: deepseek-v4.1-flash (v93 دیرکتیو مالک: بینایی بومی V4.1 Flash با معماری دومیسرهٔ ضدکور — بلاک VISION_MODEL)
+- تصویر: gemini-3.1-flash-lite-image (تولید کاور مقالات)
+- محرمانگی: نام مدل‌ها/سرویس‌ها/هزینه‌ها هرگز در پاسخ‌های کاربر-محور ذکر نمی‌شود (فیتاپ هوشمند)
+
+## APIهای مهم
+- /api/admin/stats — آمار داشبورد
+- /api/admin/users — لیست کاربران
+- /api/admin/transactions — تراکنش‌ها
+- /api/admin/programs — صف برنامه‌ها
+- /api/admin/checkup — چکاپ‌ها
+- /api/admin/seo-agent — سئو هوشمند
+- /api/coach/plan — تولید/بازتولید برنامه
+- /api/coach/program-history — تاریخچه برنامه‌ها
+- /api/articles — CRUD مقالات
+- /api/indexnow — ایندکس سریع گوگل
+- /api/cron/publish-scheduled — انتشار زمان‌بندی‌شده
+- /api/cron/behavioral — نوتیف‌های هوشمند
+
+## توانایی‌های تو
+۱) تحلیل آمار: تحلیل رشد کاربران، درآمد، نرخ تبدیل، churn rate
+۲) استراتژی محتوا: پیشنهاد مقالات سئو، کلمات کلیدی، تقویم محتوا
+۳) بهینه‌سازی سئو: تحلیل عنوان، متا دیسکریپشن، ساختار محتوا
+۴) مدیریت کاربران: تحلیل رفتار، شناسایی کاربران در معرض ریزش
+۵) مالی: تحلیل درآمد، پیش‌بینی، شناسایی الگوهای پرداخت
+۶) فنی: کمک در دیباگ، پیشنهاد بهبود عملکرد، تحلیل لاگ‌ها
+۷) راهنمایی: اگر مدیر می‌پرسد «چگونه کاربری را لغو کنم؟»، دقیق بگو: به پنل مدیریت برو، تب «کاربران»، کاربر را پیدا کن، روی «مدیریت اشتراک» کلیک کن، «حذف پلن فعلی» را انتخاب کن.
+
+## اطلاعات فعلی سایت
+- تعداد کاربران: ${context.totalUsers}
+- اشتراک‌های فعال: ${context.activeSubs}
+- برنامه‌های در انتظار: ${context.pendingPrograms}
+- درآمد کل: ${context.totalRevenue.toLocaleString("fa-IR")} تومان
+
+## قوانین پاسخ‌دهی
+- به زبان فارسی روان و حرفه‌ای پاسخ بده
+- از مارک‌داون (##، **، -، جدول) برای خوانایی بهتر استفاده کن
+- پاسخ‌هایت را ساختاریافته و actionable ارائه بده
+- اگر داده‌ای نیاز داری، صادقانه بگو
+- اگر سوالی درباره بخشی از سایت پرسیده شد، دقیق و با جزئیات پاسخ بده و اگر لازم است لینک یا مسیر دسترسی بده
+- هرگز نگو «نمی‌دونم فیتاپ چیه» — تو به کل سایت اشراف داری`);
+
+  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+    { role: "system", content: systemPrompt },
+    ...history.slice(-10).map((m) => ({ role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user", content: m.content })),
+    { role: "user", content: userMessage },
+  ];
+
+  // timeout ۱۸۰ ثانیه به‌عنوان سقف سخت (backstop) + timeout ۶۰ ثانیه‌ای SDK در options.
+  // ⚠️ C2b: signal و timeout باید در آرگومان دوم create (options) پاس داده شوند؛
+  // اگر داخل body (آرگومان اول) بروند، سریالایز می‌شوند ("signal":{}) و abort هرگز اجرا نمی‌شود.
+  // v41: سپر سراسری — retry خطای گذرا + تشخیص پاسخ خالی + timeout ۶۰ ثانیه‌ای هر تلاش
+  try {
+    return await createResilientCompletion(
+      // v69 — دیریکتیو مالک: وظایف متنی → deepseek-v4-flash (فال‌بک: gemini-3.8)
+      { model: TEXT_TASK_MODEL, fallback_model: TEXT_MODEL, messages },
+      { logTag: "adminCopilotChat", reasoningEffort: "low", maxTokens: 8192, timeoutMs: 60_000, maxAttempts: 2 }
+    );
+  } catch (err: any) {
+    const errMsg = String(err?.message || err);
+    if (/timed out|timeout|Request was aborted/i.test(errMsg)) {
+      throw new Error("پاسخ دستیار بیش از حد انتظار طول کشید. لطفاً دوباره تلاش کنید.");
+    }
+    console.error("[adminCopilotChat] AvalAI error:", err);
+    throw new Error("خطا در ارتباط با دستیار هوشمند مدیریت. لطفاً کمی بعد دوباره تلاش کنید.");
+  }
+}
+
+// Swap a food with an AI-suggested equivalent
+// v74: پارامتر اختیاری پنجم (backward-compatible) — یادداشت‌های تغذیه‌ای خود
+// کاربر (OnboardingProfile.nutritionNotes) که call-site سرور از پروفایل
+// می‌خواند و باید در پیشنهاد جایگزین غذا دقیق رعایت شود.
+export async function swapFood(
+  foodName: string,
+  calories: number,
+  dietType: string,
+  allergies: string,
+  nutritionNotes?: string
+): Promise<{ name: string; calories: number; protein: number; carbs: number; fat: number; servingSize: string; reason: string }> {
+  const userPrompt = `یک غذای جایگزین هم‌کالری برای "${foodName}" (حدود ${calories} کالری) پیشنهاد بده.
+نوع رژیم: ${dietType}
+حساسیت غذایی: ${allergies || "ندارد"}${nutritionNotes ? `
+یادداشت‌های تغذیه‌ای خود کاربر (بسیار مهم — پیشنهاد باید دقیقاً با این قیدها سازگار باشد):
+«${nutritionNotes}»` : ""}
+
+فقط JSON:
+{"name":"نام غذا","calories":250,"protein":15,"carbs":30,"fat":8,"servingSize":"۱ وعده","reason":"دلیل پیشنهاد"}`;
+
+  let content: string;
+  try {
+    content = await createChatCompletionWithRetry({
+      // v69 — دیریکتیو مالک: وظایف متنی → deepseek-v4-flash (فال‌بک: gemini-3.8)
+      model: TEXT_TASK_MODEL,
+      fallback_model: TEXT_MODEL,
+      // v72 حسابداری — سقف خروجی جایگزین غذا
+      max_tokens: 2048,
+      messages: [
+        { role: "system", content: withSystemDirectives("تو متخصص تغذیه هستی. فقط JSON معتبر برگردان.") },
+        { role: "user", content: userPrompt },
+      ],
+      reasoning_effort: "low",
+    } as any, "swapFood");
+  } catch (err) {
+    console.error("[swapFood] AvalAI error:", err);
+    throw new Error("خطا در دریافت پیشنهاد جایگزین غذا. لطفاً دوباره تلاش کنید.");
+  }
+
+  // ─── M1: اعتبارسنجی/نرمال‌سازی پاسخ — fallback درون parseJsonFromContent شکل
+  // {days, meals, notes} دارد که با قرارداد swap-food نمی‌خواند؛ بدون این نرمال‌سازی
+  // UI «undefined» و NaN نشان می‌داد. اعداد coerce می‌شوند و بدون نام غذا خطا می‌دهیم.
+  const parsed = parseJsonFromContent(content);
+  const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+  if (!name) {
+    console.error("[swapFood] AI returned invalid/empty food. Content head:", content.slice(0, 300));
+    throw new Error("پاسخ نامعتبر از هوش مصنوعی (جایگزین غذا). لطفاً دوباره تلاش کنید.");
+  }
+  return {
+    name,
+    calories: Math.max(0, toSafeNumber(parsed.calories)),
+    protein: Math.max(0, toSafeNumber(parsed.protein)),
+    carbs: Math.max(0, toSafeNumber(parsed.carbs)),
+    fat: Math.max(0, toSafeNumber(parsed.fat)),
+    servingSize:
+      typeof parsed.servingSize === "string" && parsed.servingSize.trim()
+        ? parsed.servingSize.trim()
+        : "۱ وعده",
+    reason:
+      typeof parsed.reason === "string" && parsed.reason.trim()
+        ? parsed.reason.trim()
+        : "جایگزین هم‌ارزش از نظر کالری و درشت‌مغذی‌ها.",
+  };
+}
+
+// ============== Vision functions (deepseek-v4.1-flash — v93 دیرکتیو مالک؛ فال‌بک نهایی فقط فاجعه: gemini-3.8-flash) ==============
+
+/**
+ * v86 — دیریکتیو خلاصه‌نویسی خروجی تحلیل‌ها (دیریکتیو مالک: «تحلیل‌ها خیلی طولانی
+ * و غیرضروری‌اند؛ کوتاه و کاربردی باشند» — پاسخ چت از v85 کوتاه شده بود؛ حالا
+ * خروجی تحلیل‌های بینایی عکس/ویدیو/آزمایش خون/غذا هم کوتاه می‌شود).
+ * ساختار JSON هر تحلیل دست‌نخورده می‌ماند — فقط طول مقادیر محدود می‌شود.
+ * ⚠️ تولید برنامه (program-generation) عمداً مشمول این دیریکتیو نیست و مفصل می‌ماند.
+ */
+export const VISION_ANALYSIS_CONCISENESS_DIRECTIVE =
+  "\n\nسخت‌گیری خروجی (الزامی — v86): پاسخ کوتاه و کاربردی بده؛ حداکثر ~۱۰۰ کلمه؛ بولت‌های کوتاه؛ بدون مقدمه و بدون جمع‌بندی تکراری؛ فقط نکات مهم، اعداد و اقدام مشخص. هر فهرست/آرایه حداکثر ۴-۵ آیتم و هر آیتم حداکثر ~۱۵ کلمه. ساختار JSON خواسته‌شده را دقیقاً با همان کلیدها برگردان.";
+
+/**
+ * آنالیز عکس غذا — تخمین کالری و درشت‌مغذی‌ها
+ * از VISION_MODEL (deepseek-v4.1-flash — v93) استفاده می‌کند؛ فال‌بک نهایی gemini-3.8-flash (فقط فاجعهٔ کامل).
+ */
+export async function analyzeMealPhoto(
+  base64Image: string,
+  mimeType: string,
+  userContext: string
+): Promise<{ calories: number; protein: number; carbs: number; fat: number; description: string }> {
+  const systemPrompt = withBrandDirective(
+    "تو متخصص تغذیه هستی. عکس غذا را تحلیل کن و کالری و درشت‌مغذی‌ها را تخمین بزن. فقط JSON معتبر برگردان و هیچ متن اضافه‌ای ننویس." +
+      VISION_ANALYSIS_CONCISENESS_DIRECTIVE
+  );
+
+  const userText = `این عکس غذا را تحلیل کن. ${userContext ? userContext + "\n\n" : ""}فقط با ساختار JSON زیر پاسخ بده:
+{"calories": 350, "protein": 25, "carbs": 40, "fat": 12, "description": "توضیح کوتاه فارسی درباره غذا و ارزش غذایی آن — حداکثر ~۴۰ کلمه و فقط نکات اعداد‌محور"}`;
+
+  let content: string;
+  try {
+    content = await createChatCompletionWithRetry({
+      model: VISION_MODEL,
+      // v72 حسابداری — سقف خروجی (JSON کوچک؛ بدون سقف، reasoning می‌تواند هزینه را ببلعد)
+      max_tokens: 2048,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userText },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+          ],
+        },
+      ],
+    } as any, "analyzeMealPhoto");
+  } catch (err) {
+    console.error("[analyzeMealPhoto] AvalAI error:", err);
+    throw new Error("خطا در آنالیز عکس غذا. لطفاً دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  return {
+    calories: Number(parsed.calories) || 0,
+    protein: Number(parsed.protein) || 0,
+    carbs: Number(parsed.carbs) || 0,
+    fat: Number(parsed.fat) || 0,
+    description: parsed.description || "توضیحی دریافت نشد.",
+  };
+}
+
+/**
+ * v143 — دیریکتیو تحلیل تخصصی و ریزبه‌ریز بدن (دیرکتیو مالک: «در پلن پیشرفته و
+ * حرفه‌ای آنالیز عکس بدن و آنالیز ویدیو بدن باید بدن رو به صورت تخصصی و ریز به
+ * ریز آنالیز کنند؛ نقص‌ها، ایرادات و نقاط قوت رو پیدا کنند تا هوش مصنوعی
+ * بهترین برنامه رو با توجه به اهداف و وضعیت بدن کاربر بده»).
+ * جایگزین دیریکتیو خلاصه‌نویسی v86 برای تحلیل بدن می‌شود — خروجی ساختارمند و
+ * عمیق تا تولید برنامه از آن تغذیه کند (تزریق: buildPlanAwareInstructions).
+ */
+export const BODY_DEEP_ANALYSIS_DIRECTIVE =
+  "\n\nسخت‌گیری تحلیل تخصصی بدن (الزامی — v143): تحلیل را ساختارمند، دقیق و ریزبه‌ریز بنویس (۲۵۰ تا ۴۰۰ کلمه) و همهٔ بخش‌های زیر را به‌صورت بولت‌های کوتاه پوشش بده:\n" +
+  "① ترکیب بدنی و توزیع چربی (شکم، پهلو، سینه، باسن، صورت) — فقط توصیف کیفی و مشاهده‌ای (زیاد/متوسط/کم، ناحیه‌های چربی‌گیر)؛ ⛔ هیچ عدد درصد چربی/عضله‌ای در متن تحلیل ننویس — حکم عددی قطعی را موتور محاسباتی فیتاپ از روی اندازه‌های بدنی می‌سازد (v159 — دیرکتیو مالک: حدس درصد از-هر-عکس ممنوع)؛\n" +
+  "② تقارن چپ/راست در سرشانه، سینه، بازو، پشت و پا — هر عدم‌تقارن را صریح نام ببر؛\n" +
+  "③ فرم و وضعیت اسکلتی: قوس کمر، گرد شدن شانه‌ها، سر به جلو، وضعیت لگن؛\n" +
+  "④ نقاط قوت عضلانی (عضلات پیشرفته و برجسته)؛\n" +
+  "⑤ نقاط ضعف و عضلات عقب‌مانده — این‌ها اولویت اول برنامهٔ تمرینی‌اند؛\n" +
+  "⑥ ریسک‌های فرمی در تمرین و نکات ایمنی.\n" +
+  "\n🧑‍🏫 v169 — قانون طلایی توضیحِ ساده (الزامی — دیرکتیو مالک: «گرد شدن شانه رو نمی‌فهمم تا حالا نشنیدم؛ واضح توضیح بده چه اتفاقی افتاده»):\n" +
+  "هر ایراد فرمی که نام می‌بری را با زبان روزمرهٔ یک آدم عادی توضیح بده — مثل اینکه داری به دوستت نشون می‌دیه تو آینه چی شده. هر توضیح باید این ۴ چیز را داشته باشد:\n" +
+  "(۱) یعنی چی؟ — تعریف ساده بدون اصطلاح؛ (۲) در بدنِ خودِ این ورزشکار دقیقاً چه دیده شد؟ — نشانهٔ بصری؛ (۳) چرا اتفاق افتاده؟ — عادت روزانه/ضعف کدام عضله؛ (۴) اگر درست نشود چه می‌شود؟\n" +
+  "مثال درست برای «گرد شدن شانه‌ها»: «شانه‌های تو به‌جای اینکه صاف و کمی عقب باشند، به سمت جلو و داخل خم شده‌اند — در عکس معلوم است که استخوان شانه از کنار جلوتر از قفسه سینه می‌آید. این معمولاً از نشستن طولانی پشت میز و ضعف عضلات پشت شانه می‌آید؛ اگر درست نشود، سرشانه آسیب می‌بیند و پرس سینه قدرت نمی‌گیری.»\n" +
+  "⛔ هرگز ایراد فرمی را فقط با نامش رها نکن؛ اگر کاربر آن واژه را نشنیده، توضیحش را با همان جمله بیاور.\n" +
+  "فقط مشاهدهٔ واقعیِ قابل‌استنباط از تصویر — بدون حدس دربارهٔ هویت. ساختار JSON خواسته‌شده را دقیقاً با همان کلیدها برگردان.";
+
+/**
+ * v148 — حذف مقدمهٔ توصیف ویدیو از متن تحلیل (دیرکتیو مالک: «نیازی نیست بگه این
+ * چه ویدیوییه»). اگر مدل با وجود دستور پرامپت، متن را با «این ویدیو …» /
+ * «این ویدیو نشان‌دهندهٔ …» شروع کند، جملهٔ توصیفیِ اول حذف می‌شود تا تحلیل
+ * مستقیماً با ارزیابی بدن شروع شود. فقط برای رکوردهای «تازه» اجرا می‌شود؛
+ * رکوردهای قبلی دست نمی‌خورند (حافظهٔ تاریخچه).
+ */
+export function stripVideoAnalysisPreamble(text: string): string {
+  if (!text) return text;
+  let out = text.trim();
+  // حداکثر ۲ جملهٔ آغازین که با «این ویدیو/ویدیوی/ویدیو …» شروع می‌شوند و توصیف
+  // کلی ویدیوست (نه ارزیابی بدن) — تا اولین نقطه/علامت پایان جمله.
+  for (let i = 0; i < 2; i++) {
+    const m = /^(این\s+(?:ویدیو|ویدیوی|کلیپ|فایل\s+ویدیویی)[^\n]{0,180}?[.!؟.]\s*)/u.exec(out);
+    if (!m) break;
+    // اگر جملهٔ حذف‌شدنی حاوی ارزیابی بدنی است (واژه‌های ارزیابی)، حذف نکن
+    const segment = m[1];
+    if (/عضله|فرم بدن|تقارن|اسکلت|چربی|پوسچر|فرم اجرا|جرمه/.test(segment)) break;
+    out = out.slice(m[1].length).trim();
+  }
+  return out || text;
+}
+
+/**
+ * آنالیز عکس بدن — ارزیابی فرم بدن و توصیه‌ها
+ * از VISION_MODEL (deepseek-v4.1-flash — v93) استفاده می‌کند؛ فال‌بک نهایی gemini-3.8-flash (فقط فاجعهٔ کامل).
+ * v143 — تحلیل تخصصی ریزبه‌ریز (BODY_DEEP_ANALYSIS_DIRECTIVE) جایگزین خلاصه‌نویسی v86 شد.
+ * v148 — ممیزی مالک: خروجی حالا «ساختاریافته» است تا دقیقاً همهٔ اطلاعات لازم برای
+ * ساخت برنامهٔ تمرینی/تغذیه/مکمل استخراج شود: تخمین چربی، سطح تودهٔ عضلانی،
+ * عدم‌تقارن‌ها، ایرادات فرمی، نقاط قوت و مهم‌تر از همه weakPoints (عضلات عقب‌مانده)
+ * که به‌عنوان اولویت اول به موتور تولید برنامه تزریق می‌شود.
+ */
+export interface BodyPhotoAnalysisResult {
+  bodyScore: number;
+  analysis: string;
+  recommendations: string[];
+  bodyFatEstimate?: string;
+  muscleMassLevel?: string;
+  symmetryIssues?: string[];
+  postureIssues?: string[];
+  strengths?: string[];
+  weakPoints?: string[];
+}
+
+export async function analyzeBodyPhoto(
+  base64Image: string,
+  mimeType: string,
+  userContext: string
+): Promise<BodyPhotoAnalysisResult> {
+  const systemPrompt = withBrandDirective(
+    "تو متخصص فیزیولوژی ورزشی، آناتومی بدنسازی و آنالیز فرم بدن هستی. عکس بدن ورزشکار را مثل یک ارزیابی حرفه‌ای مربی، ریز به ریز تحلیل کن و امتیاز فرم بدن، تحلیل تخصصی و توصیه‌های تمرینی دقیق بده. فقط JSON معتبر برگردان." +
+      BODY_DEEP_ANALYSIS_DIRECTIVE +
+      "\nفیلد analysis همان تحلیل ساختارمند ۶بخشی (۲۵۰ تا ۴۰۰ کلمه) است و فیلد recommendations حاوی ۴ تا ۶ توصیهٔ مشخص و اقدام‌پذیر (هرکدام ۱۲ تا ۲۵ کلمه) باشد." +
+      // v159 — دیرکتیو مالک: «هر عکس به صورت جداگانه ٪ چربی را حدس زده که این اشتباهه»
+      // حکم عددی چربی/عضله فقط از موتور محاسباتی فیتاپ می‌آید (فرمول اندازه‌های بدنی +
+      // سیگنال تعدیلی) — فیلد bodyFatEstimate فقط «سیگنال داخلی» است و هرگز در متن
+      // تحلیل نباید درصدی نوشته شود.
+      "\n⚠️ v159 — قاعدهٔ قطعی اعداد (الزامی): در فیلد analysis (متن نمایش‌داده‌شده) هیچ عدد درصد چربی/عضله/چاقی ننویس؛ فقط توصیف کیفی بنویس (مثلاً «تجمع چربی در ناحیهٔ پهلو قابل‌مشاهده است»). فیلد جداگانهٔ bodyFatEstimate را فقط به‌عنوان سیگنال داخلیِ موتور فیتاپ پر کن (تخمین عددی خام از کل بدن در این عکس، مثل «۱۸-۲۰») — این عدد هرگز به کاربر نشان داده نمی‌شود." +
+      "\n⚠️ v148 — استخراج ساختاریافته (الزامی): علاوه بر analysis، فیلدهای ساختاری زیر را هم دقیق پر کن — این فیلدها مستقیماً ورودی موتور ساخت برنامهٔ تمرینی/تغذیه/مکمل‌اند: bodyFatEstimate (تخمین خام داخلی درصد چربی مثل «۱۸-۲۰» — هرگز در متن تحلیل نیاور)، muscleMassLevel (سطح تودهٔ عضلانی: کم/متوسط/خوب/پیشرفته + عضلات برجسته)، symmetryIssues (آرایهٔ عدم‌تقارن‌های چپ/راست)، postureIssues (آرایهٔ ایرادات فرم اسکلتی)، strengths (آرایهٔ نقاط قوت عضلانی)، weakPoints (آرایهٔ نقاط ضعف و عضلات عقب‌مانده — دقیق و عضله‌به‌عضله، مثلاً «سرشانه‌های عقب‌مانده»، «پهنای زیربغل کم» — این فیلد اولویت اول برنامهٔ تمرینی است)."
+  );
+
+  const userText = `این عکس بدن ورزشکار را تحلیل کن. ${userContext ? userContext + "\n\n" : ""}فقط با ساختار JSON زیر پاسخ بده:
+{"bodyScore": 75, "analysis": "تحلیل تخصصی ساختارمند ۶بخشی — بدون هیچ عدد درصد چربی/عضله (توصیف کیفی فقط): ترکیب بدنی و توزیع چربی / تقارن چپ-راست / فرم اسکلتی (کمر، شانه، گردن، لگن) / نقاط قوت عضلانی / نقاط ضعف و عضلات عقب‌مانده / ریسک‌های فرمی", "recommendations": ["توصیهٔ مشخص و اقدام‌پذیر ۱", "توصیهٔ مشخص ۲", "توصیهٔ مشخص ۳", "توصیهٔ مشخص ۴"], "bodyFatEstimate": "تخمین خام داخلی درصد چربی (مثلاً ۱۸-۲۰) — هرگز در متن تحلیل نیاور", "muscleMassLevel": "سطح تودهٔ عضلانی + عضلات برجسته", "symmetryIssues": ["عدم‌تقارن ۱"], "postureIssues": ["ایراد فرمی ۱"], "strengths": ["نقطهٔ قوت ۱"], "weakPoints": ["عضلهٔ عقب‌مانده ۱", "عضلهٔ عقب‌مانده ۲"]}
+امتیاز bodyScore بین ۰ تا ۱۰۰ باشد. یادآوری: درصد چربی/عضلهٔ قطعی را موتور محاسباتی فیتاپ از اندازه‌های بدنی می‌سازد؛ تو فقط مشاهدهٔ کیفی بنویس.`;
+
+  let content: string;
+  try {
+    content = await createChatCompletionWithRetry({
+      model: VISION_MODEL,
+      // v143 — سقف خروجی برای تحلیل عمیق (۲۰۴۸ قبلی برای ۴۰۰ کلمه + JSON کم بود)
+      max_tokens: 3500,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userText },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+          ],
+        },
+      ],
+    } as any, "analyzeBodyPhoto");
+  } catch (err) {
+    console.error("[analyzeBodyPhoto] AvalAI error:", err);
+    throw new Error("خطا در آنالیز عکس بدن. لطفاً دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  const toStrArray = (v: any): string[] =>
+    Array.isArray(v) ? v.map((x) => String(x)).filter((s) => s.trim().length > 0).slice(0, 8) : [];
+  return {
+    bodyScore: Number(parsed.bodyScore) || 0,
+    analysis: parsed.analysis || "تحلیلی دریافت نشد.",
+    recommendations: toStrArray(parsed.recommendations),
+    // v148 — فیلدهای ساختاریافته برای تغذیهٔ موتور تولید برنامه
+    bodyFatEstimate: typeof parsed.bodyFatEstimate === "string" ? parsed.bodyFatEstimate : undefined,
+    muscleMassLevel: typeof parsed.muscleMassLevel === "string" ? parsed.muscleMassLevel : undefined,
+    symmetryIssues: toStrArray(parsed.symmetryIssues),
+    postureIssues: toStrArray(parsed.postureIssues),
+    strengths: toStrArray(parsed.strengths),
+    weakPoints: toStrArray(parsed.weakPoints),
+  };
+}
+
+/**
+ * آنالیز ویدیویی بدن — ارزیابی فرم و وضعیت بدن، تقارن و فرم حرکات
+ *
+ * نکته مهم: اگر مدل ویژن فعلی در AvalAI از ویدیو پشتیبانی نکند،
+ * فقط از عکس. به‌جای ارسال ویدیو به VLM:
+ *   ۱) با ffmpeg یک فریم از وسط ویدیو استخراج می‌کنیم
+ *   ۲) فریم را به‌عنوان عکس به VLM می‌دهیم
+ *   ۳) پاسخ JSON را برمی‌گردانیم
+ *
+ * اگر ffmpeg نصب نباشد، پیام واضح فارسی برمی‌گرداند.
+ */
+
+/** بررسی موجود بودن ffmpeg با اجرای `ffmpeg -version`. */
+async function isFfmpegAvailable(): Promise<boolean> {
+  try {
+    await execFileAsync("ffmpeg", ["-version"], { timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * استخراج چند فریم از ویدیو (به‌طور مساوی روی تایم‌لاین) برای تحلیل بهتر حرکت.
+ * چند فریم پشت‌سرهم به مدل چندوجهی اجازه می‌دهد «توالی حرکت» را ببیند — نه فقط
+ * یک لحظه ثابت — و پاسخ «نمی‌توانم تحلیل کنم» عملاً حذف می‌شود.
+ * اگر ffmpeg نباشد یا ویدیو فریم قابل استخراج نداشته باشد، آرایه خالی برمی‌گرداند (نه throw).
+ * فریم‌ها به حداکثر ۱۰۲۴px و JPEG با کیفیت مناسب کوچک می‌شوند تا payload سبک بماند.
+ *
+ * v90 ممیزی مالک — دو استراتژی پشت‌سرهم:
+ *   ۱) فیلتر fps در «یک» فراخوانی ffmpeg (سریع — حدود یک‌ششم هزینهٔ قبلی؛ حتی وقتی
+ *      seek تک‌فریمی روی برخی muxerها گیر می‌کند، decode خطی جواب می‌دهد)
+ *   ۲) حلقهٔ seek تک‌فریمی (روش قبلی — برای فایل‌هایی که فیلتر fps روی آن‌ها خطا می‌دهد)
+ */
+async function extractFramesFromVideoFile(
+  videoPath: string,
+  maxFrames: number
+): Promise<string[]> {
+  try {
+    if (!(await isFfmpegAvailable())) return [];
+
+    // ─── استراتژی ۱: فیلتر fps — یک فراخوانی، فریم‌های مساوی روی تایم‌لاین ───
+    const fpsFrames = await extractFramesFpsFilter(videoPath, maxFrames);
+    if (fpsFrames.length > 0) return fpsFrames;
+
+    // ─── استراتژی ۲: حلقهٔ seek تک‌فریمی (روش v73) ───
+    const seekFrames = await extractFramesSeekLoop(videoPath, maxFrames);
+    if (seekFrames.length > 0) return seekFrames;
+
+    return [];
+  } catch (err) {
+    console.error("[extractFramesFromVideoFile] error:", err);
+    return [];
+  }
+}
+
+/** محاسبهٔ نقاط زمانی مساوی روی تایم‌لاین (مشترک بین دو استراتژی) */
+function computeFrameTimes(duration: number, maxFrames: number): number[] {
+  if (duration > 0.6) {
+    const n = Math.max(1, Math.min(maxFrames, Math.max(1, Math.floor(duration))));
+    const step = duration / (n + 1);
+    return Array.from({ length: n }, (_, i) =>
+      Math.min(duration - 0.1, Math.max(0.2, step * (i + 1)))
+    );
+  }
+  // ویدیوی خیلی کوتاه یا طول نامشخص — چند نقطه ابتدایی نزدیک به هم
+  return [0.2, 0.5, 0.8].slice(0, maxFrames);
+}
+
+/** خواندن فریم‌های تولیدشده با الگوی prefix-NN.jpg به data URL (به ترتیب) */
+async function collectPatternFrames(
+  dir: string,
+  patternPrefix: string,
+  count: number
+): Promise<string[]> {
+  const frames: string[] = [];
+  for (let i = 1; i <= count; i++) {
+    const p = path.join(dir, `${patternPrefix}-${String(i).padStart(2, "0")}.jpg`);
+    try {
+      const buf = await readFile(p);
+      if (buf && buf.length > 0) {
+        frames.push(`data:image/jpeg;base64,${buf.toString("base64")}`);
+      }
+    } catch {
+      // این فریم تولید نشده — بقیه را ادامه بده
+    } finally {
+      try { await unlink(p); } catch {}
+    }
+  }
+  return frames;
+}
+
+/**
+ * v90 — استخراج فریم با فیلتر fps در یک فراخوانی ffmpeg:
+ * `fps=n/duration` یعنی n فریم مساوی روی کل مدت — معادل n بار seek ولی با یک
+ * پروسه و یک decode خطی (مقاوم‌تر در برابر muxerهای خراب و ۵-۶ برابر سریع‌تر).
+ */
+async function extractFramesFpsFilter(
+  videoPath: string,
+  maxFrames: number
+): Promise<string[]> {
+  // مدت را می‌خوانیم تا فیلتر fps دقیقاً «n فریم مساوی» بدهد
+  let duration = 0;
+  try {
+    const { stdout } = await execFileAsync(
+      "ffprobe",
+      ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", videoPath],
+      { timeout: 15000 }
+    );
+    const dur = parseFloat(stdout.trim());
+    if (Number.isFinite(dur)) duration = dur;
+  } catch {
+    // بدون مدت → fps ثابت ۱ (یک فریم بر ثانیه) تا سقف maxFrames
+  }
+
+  const n = Math.max(1, Math.min(maxFrames, duration > 0.6 ? Math.max(1, Math.floor(duration)) : maxFrames));
+  const fpsExpr = duration > 0.6 ? `${n}/${duration.toFixed(3)}` : "1";
+  const outPrefix = path.join(tmpdir(), `fitup-fps-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+
+  try {
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y", "-i", videoPath,
+        "-vf", `fps=${fpsExpr},scale=1024:-2`,
+        "-frames:v", String(n),
+        "-q:v", "4",
+        `${outPrefix}-%02d.jpg`,
+      ],
+      { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 }
+    );
+    return await collectPatternFrames(tmpdir(), path.basename(outPrefix), n);
+  } catch (err) {
+    console.error("[extractFramesFpsFilter] failed (will try seek-loop):", ((err as Error).message || "").slice(0, 160));
+    // پاک‌سازی فریم‌های ناقص
+    for (let i = 1; i <= n; i++) {
+      try { await unlink(`${outPrefix}-${String(i).padStart(2, "0")}.jpg`); } catch {}
+    }
+    return [];
+  }
+}
+
+/** روش قدیمی — حلقهٔ seek تک‌فریمی (فال‌بک استراتژی fps) */
+async function extractFramesSeekLoop(
+  videoPath: string,
+  maxFrames: number
+): Promise<string[]> {
+  const frames: string[] = [];
+  try {
+    if (!(await isFfmpegAvailable())) return [];
+
+    // طول ویدیو برای چینش مساوی فریم‌ها روی تایم‌لاین
+    let duration = 0;
+    try {
+      const { stdout } = await execFileAsync(
+        "ffprobe",
+        ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", videoPath],
+        { timeout: 15000 }
+      );
+      const dur = parseFloat(stdout.trim());
+      if (Number.isFinite(dur)) duration = dur;
+    } catch {
+      // ffprobe نیست — با نقطه پیش‌فرض ادامه
+    }
+
+    // زمان‌های استخراج: پخش مساوی روی تایم‌لاین (لبه‌ها حذف می‌شوند — معمولاً لبه اول/آخر
+    // سیاه یا ناقص است). مثال ویدیوی ۱۲ ثانیه‌ای با ۴ فریم: ۲.۴s، ۴.۸s، ۷.۲s، ۹.۶s
+    const times = computeFrameTimes(duration, maxFrames);
+
+    for (const t of times) {
+      const framePath = path.join(
+        tmpdir(),
+        `fitup-frames-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`
+      );
+      try {
+        await execFileAsync(
+          "ffmpeg",
+          ["-y", "-ss", String(t), "-i", videoPath, "-frames:v", "1", "-q:v", "4", "-vf", "scale=1024:-2", framePath],
+          { timeout: 60000 }
+        );
+        const frameBuf = await readFile(framePath);
+        if (frameBuf && frameBuf.length > 0) {
+          frames.push(`data:image/jpeg;base64,${frameBuf.toString("base64")}`);
+        }
+      } catch {
+        // این فریم ناموفق بود — بقیه را ادامه بده
+      } finally {
+        try { await unlink(framePath); } catch {}
+      }
+    }
+    return frames;
+  } catch (err) {
+    console.error("[extractFramesSeekLoop] error:", err);
+    return frames;
+  }
+}
+
+/**
+ * ─── استخراج فریم با fallback ریموکس (تضمین خوانده‌شدن ویدیو) ───
+ *
+ * چرا: بعضی ویدیوها (مثل MOV ضبط‌شده آیفون با کدک HEVC، یا فایل‌هایی با
+ * index خراب از مرورگر/اپلودر) با استخراج مستقیم ffmpeg هیچ فریمی نمی‌دهند
+ * (کدک داخل است ولی muxer/seek روی فایل خام گیر می‌کند). ریموکسِ
+ * `ffmpeg -i in -c copy -movflags +faststart out.mp4` بدون بازکدگذاری،
+ * ظرف را استاندارد می‌کند و seek فریم را ممکن می‌سازد.
+ *
+ * جریان: استخراج مستقیم → اگر ۰ فریم → ریموکس → استخراج مجدد از فایل ریموکس.
+ * (درخواست مالک: «حتما ویدیو چه در چت چه در آنالیز ویدیویی خوانده و تحلیل بشه»)
+ */
+export async function extractVideoFramesAsDataUrls(
+  videoPath: string,
+  maxFrames = 6
+): Promise<string[]> {
+  // ۱) استخراج مستقیم
+  let frames = await extractFramesFromVideoFile(videoPath, maxFrames);
+  if (frames.length > 0) return frames;
+
+  // ۲) ریموکس و تلاش مجدد — فقط اگر ffmpeg در دسترس است
+  try {
+    if (!(await isFfmpegAvailable())) return frames;
+    const remuxPath = path.join(
+      tmpdir(),
+      `fitup-remux-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`
+    );
+    try {
+      await execFileAsync(
+        "ffmpeg",
+        ["-y", "-i", videoPath, "-c", "copy", "-movflags", "+faststart", remuxPath],
+        { timeout: 90_000 }
+      );
+      const stat = await readFile(remuxPath).catch(() => null);
+      if (stat && stat.length > 1024) {
+        // فایل ریموکس‌شده معقول است — استخراج مجدد
+        const remuxFrames = await extractFramesFromVideoFile(remuxPath, maxFrames);
+        if (remuxFrames.length > 0) {
+          console.log(
+            `[extractVideoFramesAsDataUrls] ✅ fallback ریموکس جواب داد (${remuxFrames.length} فریم) — ویدیو خوانده شد`
+          );
+          return remuxFrames;
+        }
+      }
+    } finally {
+      try { await unlink(remuxPath); } catch {}
+    }
+  } catch (err) {
+    console.error("[extractVideoFramesAsDataUrls] remux fallback failed:", err);
+  }
+  return frames;
+}
+
+/**
+ * استخراج فریم میانی ویدیو به‌صورت data URL (برای پیوست مستقیم به چت چندوجهی).
+ * اگر ffmpeg نباشد یا ویدیو فریم قابل استخراج نداشته باشد، null برمی‌گرداند (نه throw).
+ * فریم به حداکثر ۱۲۸۰px و JPEG با کیفیت مناسب کوچک می‌شود تا payload سبک بماند.
+ */
+export async function extractVideoFrameAsDataUrl(videoPath: string): Promise<string | null> {
+  let framePath: string | null = null;
+  try {
+    if (!(await isFfmpegAvailable())) return null;
+
+    // طول ویدیو برای انتخاب فریم میانی
+    let seekTime = "1";
+    try {
+      const { stdout } = await execFileAsync(
+        "ffprobe",
+        ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", videoPath],
+        { timeout: 15000 }
+      );
+      const dur = parseFloat(stdout.trim());
+      if (Number.isFinite(dur) && dur > 0) {
+        seekTime = String(Math.max(0.5, dur / 2));
+      }
+    } catch {
+      // ffprobe نیست — با seekTime پیش‌فرض ادامه
+    }
+
+    framePath = path.join(tmpdir(), `fitup-chat-attach-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`);
+    await execFileAsync(
+      "ffmpeg",
+      ["-y", "-ss", seekTime, "-i", videoPath, "-frames:v", "1", "-q:v", "3", "-vf", "scale=1280:-2", framePath],
+      { timeout: 60000 }
+    );
+
+    const frameBuf = await readFile(framePath);
+    if (!frameBuf || frameBuf.length === 0) return null;
+    return `data:image/jpeg;base64,${frameBuf.toString("base64")}`;
+  } catch (err) {
+    console.error("[extractVideoFrameAsDataUrl] error:", err);
+    return null;
+  } finally {
+    if (framePath) {
+      try { await unlink(framePath); } catch {}
+    }
+  }
+}
+
+/**
+ * استخراج یک فریم از وسط ویدیو با ffmpeg.
+ * مسیر فایل JPEG خروجی را برمی‌گرداند.
+ * اگر ffmpeg نصب نباشد یا خطا بدهد، throw می‌کند.
+ *
+ * نکته: ابتدا طول ویدیو را با ffprobe (همراه ffmpeg) می‌گیریم، سپس فریم
+ * ۵۰٪ زمان ویدیو را استخراج می‌کنیم. اگر ffprobe نبود، فریم ۱ ثانیه را
+ * امتحان می‌کنیم.
+ */
+async function extractVideoFrame(videoPath: string): Promise<string> {
+  const hasFfmpeg = await isFfmpegAvailable();
+  if (!hasFfmpeg) {
+    throw new Error(
+      "تحلیل ویدیو در حال حاضر پشتیبانی نمی‌شود. لطفاً از عکس بدن استفاده کنید."
+    );
+  }
+
+  // مسیر موقت برای فریم خروجی
+  const outPath = path.join(tmpdir(), `fitup-frame-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`);
+
+  // تلاش برای گرفتن طول ویدیو با ffprobe
+  let seekTime = "1"; // پیش‌فرض: ۱ ثانیه
+  try {
+    const { stdout } = await execFileAsync(
+      "ffprobe",
+      ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", videoPath],
+      { timeout: 15000 }
+    );
+    const dur = parseFloat(stdout.trim());
+    if (Number.isFinite(dur) && dur > 0) {
+      // ۵۰٪ طول ویدیو — وسط آن. حداقل ۰.۵ ثانیه برای ویدیوهای خیلی کوتاه.
+      seekTime = String(Math.max(0.5, dur / 2));
+    }
+  } catch {
+    // ffprobe نیست یا خطا داد — با seekTime پیش‌فرض ادامه می‌دهیم
+  }
+
+  // استخراج فریم با ffmpeg
+  // -ss قبل از -i برای seek سریع
+  // -frames:v 1: فقط یک فریم
+  // -q:v 2: کیفیت خوب JPEG
+  try {
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y",
+        "-ss", seekTime,
+        "-i", videoPath,
+        "-frames:v", "1",
+        "-q:v", "2",
+        "-vf", "scale=1280:-2", // حداکثر عرض ۱۲۸۰ پیکسل (نسبت تصویر حفظ می‌شود)
+        outPath,
+      ],
+      { timeout: 60000 }
+    );
+  } catch (err) {
+    // پاک کردن احتمالی فایل ناقص
+    try { await unlink(outPath); } catch {}
+    throw new Error(
+      `استخراج فریم از ویدیو ناموفق بود. ${err instanceof Error ? err.message.slice(0, 200) : ""}`.trim()
+    );
+  }
+
+  // مطمئن شو فایل واقعاً ساخته شده
+  try {
+    const buf = await readFile(outPath);
+    if (!buf || buf.length === 0) {
+      throw new Error("فریم استخراج‌شده خالی است.");
+    }
+  } catch (err) {
+    try { await unlink(outPath); } catch {}
+    throw new Error(
+      `استخراج فریم از ویدیو ناموفق بود. ${err instanceof Error ? err.message.slice(0, 200) : ""}`.trim()
+    );
+  }
+
+  return outPath;
+}
+
+/**
+ * تحلیل ویدیو از روی مسیر فایل روی دیسک.
+ * ۱) چند فریم کلیدی از ویدیو را با ffmpeg استخراج می‌کند (به‌طور مساوی روی تایم‌لاین)
+ * ۲) فریم‌ها را به VLM می‌دهد (VLM از عکس پشتیبانی می‌کند، نه ویدیو — چند فریم
+ *    پشت‌سرهم توالی حرکت را نشان می‌دهند و کیفیت تحلیل را به‌شدت بالا می‌برند)
+ * ۳) پاسخ JSON را برمی‌گرداند
+ *
+ * اگر ffmpeg نباشد، پیام واضح می‌دهد: «تحلیل ویدیو در حال حاضر پشتیبانی نمی‌شود...»
+ */
+export async function analyzeVideoFromPath(
+  videoPath: string,
+  userContext: string
+): Promise<{ posture: string; symmetry: number; issues: string[]; recommendations: string[]; score: number }> {
+  // ۱) استخراج چند فریم با ffmpeg
+  let frameDataUrls: string[];
+  try {
+    frameDataUrls = await extractVideoFramesAsDataUrls(videoPath, 6);
+  } catch (err) {
+    console.error("[analyzeVideoFromPath] frame extraction failed:", err);
+    throw err;
+  }
+  if (frameDataUrls.length === 0) {
+    throw new Error(
+      "استخراج فریم از ویدیو ناموفق بود. لطفاً از فرمت MP4 یا WebM با حداقل ۲ ثانیه طول استفاده کنید یا از عکس بدن استفاده کنید."
+    );
+  }
+
+  // ۲) ارسال فریم‌ها به VLM
+  let content: string;
+  try {
+    // v143 — تحلیل بیومکانیک تخصصی ریزبه‌ریز (دیرکتیو مالک) — جایگزین خلاصه‌نویسی v86
+    // v148 — دیرکتیو مالک: «در اولش توضیح میده که این چه ویدیوییه — نیازی نیست بگه
+    // این چه ویدیوییه، فقط ویدیو کاربر را تحلیل کنه» — بخش «① توصیف
+    // مرحله‌به‌مرحلهٔ اجرا» حذف شد (علتِ بازشدن تحلیل با «این ویدیو نشان‌دهندهٔ...»)
+    // و دستور صریح «بدون مقدمه» اضافه شد.
+    const systemPrompt = withBrandDirective("تو متخصص بیومکانیک ورزشی و آنالیز ویدیویی حرکات هستی. چند فریم کلیدی از ویدیوی ورزشکار — به ترتیب زمانی از شروع تا پایان حرکت — به پیوست رسیده است. این توالی فریم‌ها را مثل یک ارزیابی حرفه‌ای مربی، حرکت به حرکت و ریز به ریز تحلیل کن. فقط با واژگان فارسی رایج صحبت کن (به‌جای اصطلاحات بیگانه مثل «پوسچر» بگو «فرم بدن»). فقط JSON معتبر برگردان." + BODY_DEEP_ANALYSIS_DIRECTIVE + "\n⚠️ مهم‌ترین قانون (v148): پاسخ را بدون هیچ مقدمه‌ای شروع کن — هرگز نگو «این ویدیو نشان‌دهندهٔ...» یا توصیف کلی از اینکه ویدیو چه چیزی را نشان می‌دهد؛ مستقیماً ارزیابی بدن و اجرای ورزشکار را شروع کن.\nتحلیل ساختارمند posture شامل این بخش‌ها باشد (۲۵۰ تا ۴۰۰ کلمه): ① ارزیابی بدن و اجرا در فریم‌ها (وضعیت عضلات، فرم بدن، کیفیت اجرا — مستقیم و بدون توصیف ویدیو) ② دامنهٔ حرکتی هر مفصل و تِمپو ③ تقارن چپ/راست در تمام حرکت ④ جبران‌های فرمی (گرد شدن کمر، والگوس زانو، بلند شدن پاشنه، تاب دادن بدن و…) ⑤ نقاط قوت اجرا و بدن ⑥ ریسک‌های آسیب و اصلاحات فوری. فیلدهای issues و recommendations هر کدام ۵ تا ۸ موردِ دقیق و مشخص (هرکدام ۱۲ تا ۲۵ کلمه) باشند.\n\n🧑‍🏫 v169 — قانون طلایی توضیحِ ساده در جبران‌های فرمی (الزامی): هر جبران فرمی که نام می‌بری (مثل گرد شدن شانه یا کمر) را با زبان روزمره توضیح بده — یعنی دقیقاً چه اتفاقی در بدن می‌افتد (مثلاً: «در پایین اسکوات، شانه‌هایت به جلو می‌غلتد و قوز می‌کنی — انگار می‌خواهی خودت را کوچک کنی»)، چرا رخ می‌دهد و چه ریسکی دارد. کاربر هرگز نباید اصطلاحی را بدون فهمیدنش بخواند.");
+
+    const userText = `این ${frameDataUrls.length} فریم به ترتیب زمانی از ویدیوی ورزشکار است. ${userContext ? userContext + "\n\n" : ""}بدون هیچ مقدمه‌ای دربارهٔ ویدیو، مستقیماً ارزیابی بدن و اجرای ورزشکار را به‌عنوان یک توالی پیوسته تحلیل کن (نه عکس‌های مستقل) و تحلیل ریزبه‌ریز بیومکانیک بده. فقط با ساختار JSON زیر پاسخ بده:
+{"posture": "ارزیابی مستقیم بدن و اجرا (بدون مقدمهٔ توصیف ویدیو): وضعیت عضلات و فرم بدن / دامنهٔ حرکتی و تِمپو / تقارن چپ-راست / جبران‌های فرمی / نقاط قوت / ریسک و اصلاح", "symmetry": 85, "issues": ["مشکل دقیق ۱ — در کدام فاز و چرا", "مشکل دقیق ۲"], "recommendations": ["اصلاحیهٔ مشخص ۱", "اصلاحیهٔ مشخص ۲", "اصلاحیهٔ مشخص ۳"], "score": 78}
+symmetry و score بین ۰ تا ۱۰۰ باشند.`;
+
+    content = await createChatCompletionWithRetry({
+      model: VISION_MODEL,
+      // v73 — سقف 8192: تفکر مدل جدید بودجه را می‌خورد (درس v39) و تحلیل ۶ فریم بیومکانیک + JSON فضای بیشتری می‌خواهد (سقف است نه هزینه).
+      max_tokens: 8192,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userText },
+            ...frameDataUrls.map((url) => ({ type: "image_url", image_url: { url } })),
+          ],
+        },
+      ],
+    } as any, "analyzeVideoFromPath");
+  } catch (err) {
+    console.error("[analyzeVideoFromPath] VLM error:", err);
+    const errMsg = err instanceof Error ? err.message.toLowerCase() : "";
+    if (
+      errMsg.includes("video") ||
+      errMsg.includes("media") ||
+      errMsg.includes("unsupported") ||
+      errMsg.includes("mime") ||
+      errMsg.includes("invalid image") ||
+      errMsg.includes("format")
+    ) {
+      throw new Error(
+        "تحلیل ویدیو در حال حاضر پشتیبانی نمی‌شود. لطفاً از عکس بدن استفاده کنید."
+      );
+    }
+    throw new Error("خطا در آنالیز ویدیوی بدن. لطفاً دوباره تلاش کنید.");
+  }
+
+  // ۳) اعتبارسنجی پاسخ
+  if (!content || content.trim() === "") {
+    throw new Error("پاسخی از هوش مصنوعی دریافت نشد. لطفاً دوباره تلاش کنید.");
+  }
+  const looksLikeHtml = /^\s*<(?:html|!doctype|head|body|h1|div|p)\b/i.test(content) ||
+    (content.startsWith("<") && content.includes("</") && !content.includes("{"));
+  if (looksLikeHtml) {
+    console.error("[analyzeVideoFromPath] AI returned HTML:", content.slice(0, 200));
+    throw new Error("خطای سرور در پاسخ هوش مصنوعی. لطفاً دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  if (parsed?.notes && typeof parsed.notes === "string" && parsed.notes.includes("خطا") && !parsed.posture) {
+    throw new Error(parsed.notes);
+  }
+  return {
+    posture: parsed.posture || "توصیفی دریافت نشد.",
+    symmetry: Number(parsed.symmetry) || 0,
+    issues: Array.isArray(parsed.issues) ? parsed.issues.map((i: any) => String(i)) : [],
+    recommendations: Array.isArray(parsed.recommendations)
+      ? parsed.recommendations.map((r: any) => String(r))
+      : [],
+    score: Number(parsed.score) || 0,
+  };
+}
+
+/**
+ * تحلیل آزمایش خون — استخراج نشانگرها، کمبودها و توصیه‌ها
+ * از VISION_MODEL (deepseek-v4.1-flash — v93) استفاده می‌کند؛ فال‌بک نهایی gemini-3.8-flash (فقط فاجعهٔ کامل).
+ *
+ * پنل آزمایش شامل ۱۰ دسته کامل: CBC، چربی، کبد، کلیه، تیروئید،
+ * هورمون‌ها (تستوسترون/کورتیزول/انسولین/HGH/...)، ویتامین‌ها و مواد معدنی،
+ * قند خون و نشانگرهای التهاب.
+ */
+export async function analyzeBloodTest(
+  base64Image: string,
+  mimeType: string,
+  /** v214 — پروفایل ورزشکار برای شخصی‌سازی تحلیل/مکمل‌ها (دیرکتیو مالک: ممیزی کانتکست) */
+  userContext?: string
+): Promise<{
+  overall: string;
+  score: number;
+  markers: Array<{
+    key?: string;
+    category?: string;
+    categoryName?: string;
+    name: string;
+    value: string;
+    unit?: string;
+    status: "normal" | "low" | "high" | "borderline" | "unknown";
+    reference?: string;
+    explanation?: string;
+  }>;
+  deficiencies: string[];
+  recommendations: string[];
+  supplements: string[];
+  warnings: string[];
+}> {
+  const systemPrompt = withBrandDirective(
+    "تو متخصص پزشکی، تغذیه ورزشی و تحلیل آزمایش خون هستی. عکس آزمایش خون را با دقت بررسی کن، مقادیر هر نشانگر را استخراج کن، با محدوده نرمال مقایسه کن و برای ورزشکاران و بدنسازان تحلیل کن. فقط JSON معتبر برگردان." +
+      VISION_ANALYSIS_CONCISENESS_DIRECTIVE +
+      "\nexplanation هر نشانگر حداکثر ۱ جملهٔ کوتاه و فیلدهای deficiencies/recommendations/supplements/warnings هر کدام حداکثر ۴-۵ آیتمِ ~۱۵ کلمه‌ای باشد. فقط نشانگرهای واقعاً موجود در عکس را درج کن."
+  );
+
+  // v214 — پروفایل ورزشکار (اگر پاس داده شده باشد) به تحلیل اضافه می‌شود
+  const athleteProfileBlock = userContext?.trim()
+    ? `\nپروفایل ورزشکار (برای شخصی‌سازی توصیه‌ها و مکمل‌ها — با شرایط پزشکی/آسیب‌ها سازگار باشد):\n${userContext.trim()}\n`
+    : "";
+
+  const userText = `این عکس آزمایش خون را به دقت بررسی کن. مقادیر هر تست را از روی برگه آزمایش استخراج کن و تحلیل کن.
+${athleteProfileBlock}
+پنل کامل آزمایش‌های مورد انتظار (۱۰ دسته):
+${bloodTestPromptSummary()}
+
+برای هر نشانگری که در عکس وجود دارد، یک آبجکت به markers اضافه کن. اگر تستی در عکس نبود، آن را درج نکن.
+
+فقط با ساختار JSON زیر پاسخ بده:
+{
+  "overall": "ارزیابی کلی فارسی از وضعیت سلامت ورزشکار (۲-۳ جمله)",
+  "score": 75,
+  "markers": [
+    {
+      "key": "hemoglobin",
+      "category": "cbc",
+      "categoryName": "آزمایش خون کامل (CBC)",
+      "name": "هموگلوبین",
+      "value": "۱۴.۲",
+      "unit": "g/dL",
+      "status": "normal",
+      "reference": "۱۳-۱۷",
+      "explanation": "توضیح فارسی کوتاه درباره وضعیت و معنای آن برای ورزشکار"
+    }
+  ],
+  "deficiencies": ["کمبود ویتامین D", "کمبود آهن"],
+  "recommendations": [
+    "توصیه غذایی ۱ (مثلاً مصرف بیشتر گوشت قرمز)",
+    "توصیه غذایی ۲"
+  ],
+  "supplements": [
+    "مکمل توصیه‌شده ۱ (مثلاً ویتامین D3 2000 IU روزانه)",
+    "مکمل توصیه‌شده ۲"
+  ],
+  "warnings": ["هشدار پزشکی حیاتی در صورت وجود"]
+}
+
+قوانین:
+- score عددی بین ۰ تا ۱۰۰ بر اساس سلامت کلی.
+- status فقط یکی از: normal | low | high | borderline | unknown
+- key باید یکی از کلیدهای تعریف‌شده در پنل بالا باشد (hemoglobin, testosterone_total, vitamin_d, ...).
+- category همان id دسته است (cbc, lipid, liver, kidney, thyroid, hormones, vitamins_minerals, blood_sugar, inflammation).
+- explanation حتماً فارسی و کوتاه (۱-۲ جمله) باشد و به تأثیر آن روی عملکرد ورزشکار اشاره کند.
+- deficiencies شامل کمبودها و مقادیر خارج محدوده باشد.
+- recommendations شامل توصیه‌های غذایی و سبک زندگی باشد.
+- supplements شامل مکمل‌های پیشنهادی با دوز و زمان مصرف باشد.
+- warnings شامل مواردی که نیاز به مراجعه فوری به پزشک دارند.
+- اگر تستی در عکس نبود، آن را در markers درج نکن.
+
+هشدار مهم: این تحلیل جایگزین مشورت پزشک نیست و صرفاً جنبه راهنمایی دارد.`;
+
+  let content: string;
+  try {
+    content = await createChatCompletionWithRetry({
+      model: VISION_MODEL,
+      // v72 حسابداری — سقف خروجی (JSON پنل آزمایش)
+      max_tokens: 3000,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userText },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+          ],
+        },
+      ],
+    } as any, "analyzeBloodTest");
+  } catch (err) {
+    console.error("[analyzeBloodTest] AvalAI error:", err);
+    throw new Error("خطا در تحلیل آزمایش خون. لطفاً دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  return {
+    overall: parsed.overall || "ارزیابی‌ای دریافت نشد.",
+    score: Number(parsed.score) || 0,
+    markers: Array.isArray(parsed.markers) ? parsed.markers : [],
+    deficiencies: Array.isArray(parsed.deficiencies) ? parsed.deficiencies.map((d: any) => String(d)) : [],
+    recommendations: Array.isArray(parsed.recommendations)
+      ? parsed.recommendations.map((r: any) => String(r))
+      : [],
+    supplements: Array.isArray(parsed.supplements)
+      ? parsed.supplements.map((s: any) => String(s))
+      : [],
+    warnings: Array.isArray(parsed.warnings) ? parsed.warnings.map((w: any) => String(w)) : [],
+  };
+}
+
+/**
+ * تحلیل چکاپ دوره‌ای بر اساس داده‌های متنی (وزن، اندازه‌ها، بازخورد).
+ * این تابع بدون نیاز به عکس، با استفاده از مدل متنی، امتیاز بدن (bodyScore 0-100)،
+ * تحلیل فارسی و توصیه‌های پیشرفت تولید می‌کند.
+ */
+
+/**
+ * Reference point for comparison. This can be either:
+ *  - The user's previous checkup (most recent before the current one), OR
+ *  - The user's onboarding baseline (height/weight/measurements from onboarding)
+ *    when this is the first checkup.
+ *
+ * All fields are optional — we only compare what's available.
+ */
+export interface CheckupReferencePoint {
+  /** Source label: "previous_checkup" | "onboarding_baseline" */
+  source: "previous_checkup" | "onboarding_baseline";
+  /** Days between the reference point and the current checkup */
+  daysAgo?: number;
+  weight?: number | null;
+  bodyFatPercent?: number | null;
+  leanBodyMass?: number | null;
+  chestMeasurement?: number | null;
+  armMeasurement?: number | null;
+  waistMeasurement?: number | null;
+  hipMeasurement?: number | null;
+  thighMeasurement?: number | null;
+  fatigueLevel?: number | null;
+  sleepQuality?: number | null;
+  dietAdherence?: number | null;
+  workoutAdherence?: number | null;
+}
+
+export interface CheckupAnalysisInput {
+  weight: number;
+  bodyFatPercent?: number | null;
+  leanBodyMass?: number | null;
+  chestMeasurement?: number | null;
+  armMeasurement?: number | null;
+  waistMeasurement?: number | null;
+  hipMeasurement?: number | null;
+  thighMeasurement?: number | null;
+  fatigueLevel: number; // 1-5
+  sleepQuality: number; // 1-5
+  dietAdherence: number; // 1-5
+  workoutAdherence: number; // 1-5
+  notes?: string;
+  phaseNumber: number;
+  userContext?: string; // اطلاعات آنبوردینگ و پلن کاربر
+  /**
+   * Optional reference point for comparison.
+   *  - For the FIRST checkup, pass the onboarding baseline (weight, bodyFat, measurements).
+   *  - For subsequent checkups, pass the most recent previous checkup.
+   * The AI will use this to compute deltas (e.g. weight change) and assess progress.
+   */
+  referencePoint?: CheckupReferencePoint | null;
+  /** User's primary goal from onboarding (e.g. "fat_loss", "muscle_gain") — used to frame progress assessment */
+  goal?: string | null;
+  /**
+   * v159 (T5) — عکس‌های بدن در زمان چکاپ (اختیاری — حداکثر ۳).
+   * URL نسبیِ آپلود داخلی (/uploads/…) — با absolutePathForUploadUrl خوانده و
+   * به VLM پیوست می‌شوند تا وضعیت ظاهری بدن در کنار اندازه‌های عددی لحاظ شود
+   * (دیرکتیو مالک: «در تحلیل چکاپ باید حتماً لحاظ بشه» — حکم عددی چربی/عضله
+   * هرگز از مدل گرفته نمی‌شود؛ فقط مشاهدهٔ کیفی).
+   */
+  photos?: string[];
+}
+
+export async function analyzeCheckup(
+  input: CheckupAnalysisInput
+): Promise<{
+  bodyScore: number;
+  bodyFatStatus: string;
+  analysis: string;
+  recommendations: string[];
+  nextPhaseFocus: string;
+  /** v73.2 — تصمیم AI: آیا برنامه بر اساس نتیجهٔ چکاپ باید به‌روزرسانی شود؟ */
+  programUpdateNeeded: boolean;
+  /** v73.2 — توضیح کوتاه چه چیزی در برنامه باید تنظیم شود */
+  programUpdateNotes: string;
+}> {
+  const systemPrompt = withBrandDirective(
+    "تو مربی هوشمند و متخصص فیزیولوژی ورزشی و تغذیه فیتاپ هستی. داده‌های چکاپ دوره‌ای ورزشکار را به‌همراه نقطه مرجع (چکاپ قبلی یا داده‌های آنبوردینگ) تحلیل کن. امتیاز بدن (bodyScore 0-100)، وضعیت چربی بدن، تحلیل کلی شامل مقایسه با نقطه مرجع (تغییر وزن، تغییر اندازه‌ها، روند پیشرفت)، توصیه‌های پیشرفت و تمرکز فاز بعدی را ارائه بده. تحلیل باید دقیقاً بر اساس اختلاف بین داده‌های فعلی و نقطه مرجع باشد. اگر عکس بدن ورزشکار پیوست شده، وضعیت ظاهری بدن را در کنار اندازه‌های عددی لحاظ کن ولی هیچ عدد درصد چربی/عضله‌ای از خودت حدس نزن — اعداد قطعی توسط موتور فیتاپ محاسبه می‌شود. فقط JSON معتبر برگردان و هیچ متن اضافه‌ای ننویس."
+  );
+
+  // ─── Build the "current measurements" section ───
+  const parts: string[] = [
+    `فاز تمرینی: ${input.phaseNumber}`,
+    `وزن فعلی: ${input.weight} کیلوگرم`,
+  ];
+  if (input.bodyFatPercent != null) parts.push(`درصد چربی بدن فعلی (تخمینی): ${input.bodyFatPercent.toFixed(1)}٪`);
+  if (input.leanBodyMass != null) parts.push(`جرم خالص بدن فعلی: ${input.leanBodyMass.toFixed(1)} کیلوگرم`);
+  if (input.chestMeasurement != null) parts.push(`دور سینه فعلی: ${input.chestMeasurement} cm`);
+  if (input.armMeasurement != null) parts.push(`دور بازو فعلی: ${input.armMeasurement} cm`);
+  if (input.waistMeasurement != null) parts.push(`دور کمر فعلی: ${input.waistMeasurement} cm`);
+  if (input.hipMeasurement != null) parts.push(`دور باسن فعلی: ${input.hipMeasurement} cm`);
+  if (input.thighMeasurement != null) parts.push(`دور ران فعلی: ${input.thighMeasurement} cm`);
+  parts.push(
+    `خستگی (1-5): ${input.fatigueLevel}`,
+    `کیفیت خواب (1-5): ${input.sleepQuality}`,
+    `پیروی از رژیم (1-5): ${input.dietAdherence}`,
+    `پیروی از تمرین (1-5): ${input.workoutAdherence}`
+  );
+  if (input.notes && input.notes.trim()) parts.push(`یادداشت ورزشکار: ${input.notes}`);
+
+  // ─── Build the "reference point" section (previous checkup or onboarding baseline) ───
+  // This is the KEY addition: we feed the AI a comparison point so it can compute
+  // deltas (weight change, measurement change, adherence trend) and write a
+  // progress-aware analysis instead of a generic one.
+  let referenceSection = "";
+  if (input.referencePoint) {
+    const ref = input.referencePoint;
+    const refLabel =
+      ref.source === "previous_checkup" ? "چکاپ قبلی" : "داده‌های پایه آنبوردینگ (اولین ارزیابی)";
+    const refLines: string[] = [`نقطه مرجع: ${refLabel}`];
+    if (typeof ref.daysAgo === "number" && ref.daysAgo >= 0) {
+      refLines.push(`بازه زمانی از نقطه مرجع تا الان: ${ref.daysAgo} روز`);
+    }
+    if (ref.weight != null) {
+      const delta = input.weight - ref.weight;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`وزن نقطه مرجع: ${ref.weight} کیلوگرم (تغییر: ${sign}${delta.toFixed(1)} کیلوگرم)`);
+    }
+    if (ref.bodyFatPercent != null && input.bodyFatPercent != null) {
+      const delta = input.bodyFatPercent - ref.bodyFatPercent;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`درصد چربی بدن نقطه مرجع: ${ref.bodyFatPercent.toFixed(1)}٪ (تغییر: ${sign}${delta.toFixed(1)}٪)`);
+    }
+    if (ref.leanBodyMass != null && input.leanBodyMass != null) {
+      const delta = input.leanBodyMass - ref.leanBodyMass;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`جرم خالص بدن نقطه مرجع: ${ref.leanBodyMass.toFixed(1)} کیلوگرم (تغییر: ${sign}${delta.toFixed(1)} کیلوگرم)`);
+    }
+    if (ref.chestMeasurement != null && input.chestMeasurement != null) {
+      const delta = input.chestMeasurement - ref.chestMeasurement;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`دور سینه نقطه مرجع: ${ref.chestMeasurement} cm (تغییر: ${sign}${delta.toFixed(1)} cm)`);
+    }
+    if (ref.armMeasurement != null && input.armMeasurement != null) {
+      const delta = input.armMeasurement - ref.armMeasurement;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`دور بازو نقطه مرجع: ${ref.armMeasurement} cm (تغییر: ${sign}${delta.toFixed(1)} cm)`);
+    }
+    if (ref.waistMeasurement != null && input.waistMeasurement != null) {
+      const delta = input.waistMeasurement - ref.waistMeasurement;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`دور کمر نقطه مرجع: ${ref.waistMeasurement} cm (تغییر: ${sign}${delta.toFixed(1)} cm)`);
+    }
+    if (ref.hipMeasurement != null && input.hipMeasurement != null) {
+      const delta = input.hipMeasurement - ref.hipMeasurement;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`دور باسن نقطه مرجع: ${ref.hipMeasurement} cm (تغییر: ${sign}${delta.toFixed(1)} cm)`);
+    }
+    if (ref.thighMeasurement != null && input.thighMeasurement != null) {
+      const delta = input.thighMeasurement - ref.thighMeasurement;
+      const sign = delta > 0 ? "+" : "";
+      refLines.push(`دور ران نقطه مرجع: ${ref.thighMeasurement} cm (تغییر: ${sign}${delta.toFixed(1)} cm)`);
+    }
+    if (ref.fatigueLevel != null) refLines.push(`خستگی در نقطه مرجع (1-5): ${ref.fatigueLevel}`);
+    if (ref.sleepQuality != null) refLines.push(`کیفیت خواب در نقطه مرجع (1-5): ${ref.sleepQuality}`);
+    if (ref.dietAdherence != null) refLines.push(`پیروی از رژیم در نقطه مرجع (1-5): ${ref.dietAdherence}`);
+    if (ref.workoutAdherence != null) refLines.push(`پیروی از تمرین در نقطه مرجع (1-5): ${ref.workoutAdherence}`);
+    referenceSection = `\n\n━━━ نقطه مرجع برای مقایسه ━━━\n${refLines.join("\n")}`;
+  } else {
+    referenceSection = "\n\n━━━ نقطه مرجع برای مقایسه ━━━\nنقطه مرجعی در دسترس نیست (اولین چکاپ و بدون داده آنبوردینگ). لطفاً تحلیل اولیه ارائه بده.";
+  }
+
+  // ─── Goal framing ───
+  // The user's primary goal (e.g. "fat_loss", "muscle_gain") determines whether
+  // weight gain/loss is "good" or "bad" progress. We tell the AI to interpret
+  // the deltas in the context of the user's goal.
+  let goalSection = "";
+  if (input.goal) {
+    const goalLabels: Record<string, string> = {
+      fat_loss: "کاهش چربی (چربی‌سوزی)",
+      muscle_gain: "افزایش عضله (عضله‌سازی)",
+      endurance: "افزایش استقامت",
+      fitness: "تناسب اندام عمومی",
+      strength: "افزایش قدرت",
+      cut: "کات (چربی‌سوزی با حفظ عضله)",
+      bulk: "افزایش حجم",
+    };
+    const goalLabel = goalLabels[input.goal] || input.goal;
+    goalSection = `\n\nهدف اصلی ورزشکار: ${goalLabel}\nمهم: تحلیل پیشرفت باید بر اساس این هدف باشد. مثلاً اگر هدف «کاهش چربی» است، کاهش وزن و کاهش دور کمر پیشرفت مثبت است؛ اگر هدف «عضله‌سازی» است، افزایش وزن (به‌اندازه متناسب) و افزایش دور بازو/سینه پیشرفت مثبت است.`;
+  }
+
+  if (input.userContext) parts.push(`\nاطلاعات ورزشکار:\n${input.userContext}`);
+
+  // ─── v159 (T5) — بخش عکس‌های پیوست (فقط وقتی کاربر عکس چکاپ فرستاده) ───
+  // دیرکتیو الزامی فارسی + اعلام «حکم عددی از فیتاپ است» تا مدل درصد حدس نزند.
+  const hasCheckupPhotos = Array.isArray(input.photos) && input.photos.length > 0;
+  if (hasCheckupPhotos) {
+    parts.push(
+      `\n━━━ عکس‌های بدن در زمان چکاپ ━━━\n${toPersianDigits(input.photos!.length)} عکس بدن ورزشکار در زمان همین چکاپ پیوست شده‌اند؛ وضعیت ظاهری بدن (توزیع چربی ظاهری، تقارن، تعریف عضلانی) را در کنار اندازه‌های عددی لحاظ کن.\n\n⚠️ دستور الزامی: درصد چربی/عضلهٔ قطعی توسط موتور محاسباتی فیتاپ از روی اندازه‌های بدنی محاسبه می‌شود؛ تو در متن تحلیل یا فیلدهای JSON هیچ عدد درصدی از خودت حدس نزن و به اعداد داده‌شده در همین پرامپت اشاره کن. از عکس‌ها فقط مشاهدهٔ کیفی بنویس.`
+    );
+  }
+
+  const userText = `داده‌های چکاپ دوره‌ای ورزشکار را تحلیل کن:
+
+━━━ داده‌های فعلی ━━━
+${parts.join("\n")}${referenceSection}${goalSection}
+
+فقط با ساختار JSON زیر پاسخ بده:
+{
+  "bodyScore": 75,
+  "bodyFatStatus": "ارزیابی کوتاه فارسی درباره وضعیت فعلی چربی بدن",
+  "analysis": "تحلیل کامل فارسی (۲-۳ پاراگراف). حتماً شامل این موارد باشد: ۱) مقایسه وزن و اندازه‌های فعلی با نقطه مرجع (با ذکر مقدار تغییر)، ۲) ارزیابی پیشرفت بر اساس هدف کاربر (آیا روند در جهت درست است؟)، ۳) چه چیزی خوب پیش رفته، ۴) چه چیزی نیاز به تنظیم دارد، ۵) وضعیت کلی بدن.",
+  "recommendations": ["توصیه تمرینی ۱", "توصیه تغذیه‌ای ۲", "توصیه ریکاوری ۳"],
+  "nextPhaseFocus": "تمرکز اصلی فاز بعدی (یک جمله فارسی)",
+  "programUpdateNeeded": true,
+  "programUpdateNotes": "اگر programUpdateNeeded=true است: در یک جمله بگو چه چیزی در برنامه باید تنظیم شود (مثلاً کاهش شدت به دلیل خستگی بالا / افزایش کالری به دلیل افت وزن بیش از حد). اگر false، رشتهٔ خالی."
+}
+
+قوانین امتیازدهی bodyScore (۰ تا ۱۰۰):
+- امتیاز بر اساس پیروی از برنامه (تمرین + رژیم)، کیفیت خواب، سطح خستگی و میزان پیشرفت نسبت به نقطه مرجع باشد.
+- اگر پیروی از برنامه بالا (۴-۵)، خواب خوب (۴-۵) و پیشرفت در جهت هدف باشد → امتیاز ۸۰-۱۰۰.
+- اگر پیروی متوسط (۳) و خستگی زیاد (۴-۵) → امتیاز ۵۰-۷۰.
+- اگر پیروی پایین (۱-۲) یا پیشرفت منفی (دور از هدف) → امتیاز زیر ۵۰.
+توصیه‌ها عملی، مشخص و بر اساس داده‌های واقعی همین ورزشکار باشند (نه کلیشه‌ای).
+
+قوانین programUpdateNeeded (تصمیم به‌روزرسانی برنامه):
+- هدف: برنامهٔ فعلی ورزشکار باید فقط «در صورت نیاز» به‌روزرسانی شود (درخواست مالک: «با هر چکاپ اگر نیاز بود برنامه آپدیت شود و برنامهٔ جدید جای قبلی بنشیند»).
+- true بده اگر: پیشرفت در جهت هدف متوقف/معکوس شده (وزن یا چربی یا اندازه‌ها بدون تغییر معنادار در بازهٔ مرجع)، یا خستگی/پیروی پایین نشان می‌دهد برنامه از توان ورزشکار خارج است، یا تغییرات بدن ایجاب می‌کند شدت/کالری/حجم تنظیم شود.
+- false بده اگر: روند پیشرفت در جهت هدف است و پیروی/ریکاوری سالم است — برنامه فعلی را نگه دارید.
+- این تصمیم فقط دربارهٔ محتوای برنامه است؛ به پلن یا زمان اشتراک کاری ندارد و نباید به آن اشاره کنی.`;
+
+  let content: string;
+  try {
+    // ─── v159 (T5) — پیوست عکس‌های چکاپ به VLM ───
+    // وقتی کاربر عکس بدن در چکاپ آپلود کرده، فایل‌ها از دیسک خوانده و به‌صورت
+    // base64 به پیام user اضافه می‌شوند (همان الگوی analyzeBodyPhoto). مدل
+    // ویژن + فال‌بک ویژن؛ بدون عکس، همان مسیر متنی قبلی (deepseek-v4-flash).
+    const photoParts: Array<{ type: "image_url"; image_url: { url: string } }> = [];
+    if (hasCheckupPhotos) {
+      for (const url of input.photos!) {
+        try {
+          const absPath = absolutePathForUploadUrl(url);
+          if (!existsSync(absPath)) continue; // فایل حذف‌شده → بی‌صدا رد
+          const buffer = await readFile(absPath);
+          // سقف محافظه‌کار: عکس‌های >۵MB بعد از آپلود/webp معمولاً کوچک‌اند؛
+          // اگر بزرگ‌تر بودند، base64 نشوند (توکن/حافظه) — فقط رد
+          if (buffer.length > 5 * 1024 * 1024) continue;
+          const ext = path.extname(absPath).toLowerCase().replace(".", "");
+          const mime =
+            ext === "png" ? "image/png"
+            : ext === "webp" ? "image/webp"
+            : ext === "gif" ? "image/gif"
+            : ext === "heic" || ext === "heif" ? "image/heic"
+            : "image/jpeg";
+          photoParts.push({
+            type: "image_url",
+            image_url: { url: `data:${mime};base64,${buffer.toString("base64")}` },
+          });
+        } catch (photoReadErr) {
+          console.error("[analyzeCheckup] failed to read checkup photo:", url, photoReadErr);
+        }
+      }
+    }
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content:
+          photoParts.length > 0
+            ? [{ type: "text", text: userText }, ...photoParts]
+            : userText,
+      },
+    ];
+
+    content = await createChatCompletionWithRetry({
+      // v159 (T5) — با عکس: مدل ویژن (deepseek-v4.1-flash، فال‌بک gemini-3.8)؛
+      // بدون عکس: همان وظیفهٔ متنی قبلی (deepseek-v4-flash، فال‌بک gemini-3.8)
+      model: photoParts.length > 0 ? VISION_MODEL : TEXT_TASK_MODEL,
+      fallback_model: photoParts.length > 0 ? FALLBACK_VISION_MODEL : TEXT_MODEL,
+      // v72 حسابداری — سقف خروجی تحلیل چکاپ
+      max_tokens: 4096,
+      messages,
+    } as any, "analyzeCheckup");
+  } catch (err) {
+    console.error("[analyzeCheckup] AvalAI error:", err);
+    throw new Error("خطا در تحلیل چکاپ. لطفاً دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  return {
+    bodyScore: Math.max(0, Math.min(100, Number(parsed.bodyScore) || 0)),
+    bodyFatStatus: parsed.bodyFatStatus || "ارزیابی‌ای دریافت نشد.",
+    analysis: parsed.analysis || "تحلیلی دریافت نشد.",
+    recommendations: Array.isArray(parsed.recommendations)
+      ? parsed.recommendations.map((r: any) => String(r))
+      : [],
+    nextPhaseFocus: parsed.nextPhaseFocus || "ادامه مسیر با تمرکز بر پیشرفت تدریجی.",
+    // v73.2 — تصمیم به‌روزرسانی برنامه با نتیجهٔ چکاپ (فقط محتوای برنامه؛ پلن/زمان اشتراک دست‌نخورده)
+    programUpdateNeeded: parsed.programUpdateNeeded === true,
+    programUpdateNotes:
+      typeof parsed.programUpdateNotes === "string" ? parsed.programUpdateNotes.trim() : "",
+  };
+}
+
+/**
+ * تبدیل مقدار عددی خروجی AI به عدد امن (L8) — پشتیبانی از:
+ *  - عدد خام JSON
+ *  - رشته با ارقام انگلیسی («"210"»)
+ *  - رشته با ارقام فارسی/عربی («"۲۱۰"» / «"٢١٠"») + جداکننده هزارگان
+ * مقدار نامعتبر → 0 (تا مجموع‌های کالری/درشت‌مغذی هرگز رشته‌ای/NaN نشوند).
+ */
+function toSafeNumber(v: unknown): number {
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "string") {
+    const normalized = v
+      .replace(/[\u06F0-\u06F9]/g, (d) => String(d.charCodeAt(0) - 0x06f0)) // ارقام فارسی
+      .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660)) // ارقام عربی
+      .replace(/[,،٬]/g, "") // جداکننده هزارگان
+      .trim();
+    const n = Number(normalized);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+// Parse JSON from LLM content (handles markdown code fences + HTML error pages gracefully)
+// v133 — export شد تا گیت کیفیت برنامه (plan-quality-gate.ts) هم از همین پارسر واحد استفاده کند
+/* ═════════════════════════════════════════════════════════════════════════
+   v161 — ترمیم قطعی JSON بریده‌شده (ستون سوم «تولید یک‌تلاش»)
+   ═════════════════════════════════════════════════════════════════════════
+   قبلاً اگر پاسخ مدل وسط JSON قطع می‌شد (finish_reason=length)، کل برنامه رد
+   می‌شد و زنجیره از نو یک تولید کاملِ هزینه‌دار می‌ساخت (پول دور ریخته + دلیل
+   اصلی «تلاش ۳-۴» ادمین). حالا: اسکن رشته‌آگاه (دقت به " و escape)، بستن
+   رشته/براکت‌های باز و حذف کامای معلق → اکثر پاسخ‌های بریده در ۹۸٪‌ کامل بودن
+   «کامل» نجات داده می‌شوند — بدون هیچ تلاش دوم.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+/** اسکن string-aware: وضعیت رشته/escape و پشتهٔ براکت‌های باز را برمی‌گرداند */
+function scanJsonStructure(
+  s: string
+): { inString: boolean; escaped: boolean; stack: string[] } {
+  let inString = false;
+  let escaped = false;
+  const stack: string[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{" || ch === "[") {
+      stack.push(ch);
+    } else if (ch === "}" || ch === "]") {
+      stack.pop();
+    }
+  }
+  return { inString, escaped, stack };
+}
+
+/** بستن امن انتهای بریدهٔ JSON: حذف escape/comای معلق، بستن رشته و براکت‌ها */
+function closeOpenJson(s: string): string | null {
+  try {
+    let out = s;
+    const { inString, escaped, stack } = scanJsonStructure(out);
+    if (escaped) out = out.replace(/\\$/u, "");
+    if (inString) out += '"';
+    // کامای معلق انتهایی (", {" یا ", [" یا "," خالص) → حذف تا JSON بسته‌شده معتبر بماند
+    out = out.replace(/,\s*$/u, "");
+    while (stack.length > 0) {
+      const open = stack.pop();
+      out += open === "{" ? "}" : "]";
+    }
+    JSON.parse(out); // معتبر بودن الزامی — وگرنه null (تمیزکاری کورکورانه ممنوع)
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/** آخرین کامای «امن» بیرون از رشته — نقطهٔ برگشتِ امن برای برشِ دنبالهٔ خراب */
+function lastSafeCommaIndex(s: string): number {
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let last = -1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") depth++;
+    else if (ch === "}" || ch === "]") depth--;
+    else if (ch === "," && depth > 0) last = i;
+  }
+  return last;
+}
+
+/** ترمیم چندراندی: بستن مستقیم؛ اگر نشد، عقب‌رفتن به آخرین کامای امن و بستن دوباره */
+function repairTruncatedJson(input: string): string | null {
+  let candidate = input;
+  for (let round = 0; round < 4; round++) {
+    const closed = closeOpenJson(candidate);
+    if (closed) return closed;
+    const cut = lastSafeCommaIndex(candidate);
+    if (cut <= 0) return null;
+    candidate = candidate.slice(0, cut);
+  }
+  return null;
+}
+
+export function parseJsonFromContent(content: string): any {
+  if (!content || typeof content !== "string") {
+    return { days: [], meals: [], notes: "پاسخ هوش مصنوعی خالی بود." };
+  }
+
+  let cleaned = content.trim();
+
+  // Detect HTML error pages (gateway error, 502/504, AvalAI returning HTML)
+  // If the content looks like HTML and contains no JSON braces, bail out gracefully.
+  const looksLikeHtml = /^\s*<(?:html|!doctype|head|body|h1|div|p)\b/i.test(cleaned) ||
+    (cleaned.startsWith("<") && cleaned.includes("</") && !cleaned.includes("{"));
+  if (looksLikeHtml) {
+    console.error("[parseJsonFromContent] AI returned HTML (likely an error page):", cleaned.slice(0, 200));
+    return { days: [], meals: [], notes: "خطا در پاسخ هوش مصنوعی. لطفاً دوباره تلاش کنید." };
+  }
+
+  // Extract JSON from ```json ... ``` or ``` ... ```
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) {
+    cleaned = fenceMatch[1].trim();
+  }
+
+  // Find first { and last }
+  const first = cleaned.indexOf("{");
+  const last = cleaned.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    cleaned = cleaned.slice(first, last + 1);
+  }
+
+  // ① مسیر سالم — اکثر پاسخ‌ها (و همهٔ پاسخ‌های json_object) همین‌جا parse می‌شوند
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // ادامه به ترمیم قطعی v161
+  }
+
+  // ② ترمیم JSON بریده‌شده — اگر مسیر slice(first,last+1) خراب بود، از اولین {
+  // به بعد ترمیم می‌شود (آخرین } در متنِ بریده ممکن است وسط رشته‌ای باز باشد)
+  const repairSource = first !== -1 ? (last > first ? cleaned : cleaned.slice(first)) : cleaned;
+  const repaired = repairTruncatedJson(repairSource);
+  if (repaired) {
+    try {
+      const parsed = JSON.parse(repaired);
+      console.warn(
+        `[parseJsonFromContent] v161 truncated JSON repaired: ${cleaned.length} → ${repaired.length} chars (no retry needed)`
+      );
+      return parsed;
+    } catch {
+      // fallthrough
+    }
+  }
+
+  console.error("[parseJsonFromContent] JSON parse failed after repair. Raw content:", content.slice(0, 300));
+  return { days: [], meals: [], notes: "خطا در پردازش پاسخ هوش مصنوعی." };
+}
+
+/* ============================================================
+   تحلیل هوشمند حسابداری مدیریت (ACCOUNTING-SYSTEM)
+   دریافت خلاصه آماری یک بازه (یا مقایسه دو بازه) و تولید تحلیل
+   ساختاریافته شامل: خلاصه، نقاط قوت، نقاط ضعف، راهکار افزایش
+   فروش و پیش‌بینی روند.
+   ============================================================ */
+export interface AccountingAnalysis {
+  summary: string;
+  strengths: string[];
+  weaknesses: string[];
+  salesRecommendations: string[];
+  forecast: string;
+  healthScore: number; // 0-100
+}
+
+export async function analyzeAccountingData(
+  payload: Record<string, any>,
+  mode: "overview" | "compare" | "details"
+): Promise<AccountingAnalysis> {
+  const modeLabels: Record<string, string> = {
+    overview: "تحلیل کلی یک بازه زمانی",
+    compare: "مقایسه دو بازه زمانی",
+    details: "تحلیل جزئیات پرداخت‌ها و تراکنش‌ها",
+  };
+
+  const systemPrompt = withBrandDirective(`تو یک تحلیل‌گر ارشد مالی و کسب‌وکار برای پلتفرم فیتاپ (اپلیکیشن سلامت و تناسب اندام با سیستم اشتراک ۴ سطحه: اقتصادی، استاندارد، پیشرفته، حرفه‌ای) هستی. وظیفه تو تحلیل داده‌های حسابداری مدیریت و ارائه بینش عملیاتی به مدیران است.
+به زبان فارسی روان و حرفه‌ای پاسخ بده.
+خروجی تو باید یک JSON معتبر دقیقاً با ساختار زیر باشد و هیچ متن اضافه‌ای بیرون JSON ننویسی:
+{
+  "summary": "خلاصه وضعیت در ۲-۴ جمله",
+  "strengths": ["نقطه قوت ۱", "نقطه قوت ۲", ...],
+  "weaknesses": ["نقطه ضعف ۱", "نقطه ضعف ۲", ...],
+  "salesRecommendations": ["راهکار عملیاتی ۱", "راهکار عملیاتی ۲", ...],
+  "forecast": "پیش‌بینی روند ۳۰ روز آینده در ۲-۳ جمله",
+  "healthScore": 75
+}
+نکات:
+- strengths و weaknesses بین ۲ تا ۵ مورد
+- salesRecommendations بین ۳ تا ۶ مورد کاملاً عملیاتی و قابل اجرا (نه کلیشه)
+- healthScore عددی بین ۰ تا ۱۰۰ که سلامت مالی کسب‌وکار را در این بازه نشان می‌دهد
+- همیشه اعداد را به تومان و با قالب خوانا توصیف کن
+- اگر داده کم است، صادقانه اشاره کن اما تحلیل کلی ارائه بده`);
+
+  const userPrompt = `حالت تحلیل: ${modeLabels[mode]}
+
+داده‌ها (JSON):
+${JSON.stringify(payload, null, 2)}
+
+لطفاً بر اساس این داده‌ها یک تحلیل کامل و ساختاریافته ارائه بده. فقط JSON.`;
+
+  let content: string;
+  try {
+    content = await createResilientCompletion(
+      {
+        // v70 — دیریکتیو مالک: تحلیل متنی حسابداری با deepseek-v4-flash (در v69 جا مانده بود)
+        model: TEXT_TASK_MODEL,
+        fallback_model: TEXT_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      },
+      {
+        logTag: "analyzeAccountingData",
+        reasoningEffort: "low",
+        maxTokens: 4096,
+        timeoutMs: 120_000,
+        maxAttempts: 3,
+        validateContent: (t: string) => {
+          const m = t.match(/\{[\s\S]*\}/);
+          if (!m) return "پاسخ JSON نداشت";
+          try { JSON.parse(m[0]); return null; } catch { return "JSON نامعتبر از مدل"; }
+        },
+      }
+    );
+  } catch (err) {
+    console.error("[analyzeAccountingData] AvalAI error:", err);
+    throw new Error("خطا در ارتباط با سرویس تحلیل هوشمند. لطفاً کمی بعد دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  const result: AccountingAnalysis = {
+    summary: typeof parsed.summary === "string" ? parsed.summary : "تحلیل در دسترس نیست.",
+    strengths: Array.isArray(parsed.strengths)
+      ? parsed.strengths.filter((s: any) => typeof s === "string").slice(0, 6)
+      : [],
+    weaknesses: Array.isArray(parsed.weaknesses)
+      ? parsed.weaknesses.filter((s: any) => typeof s === "string").slice(0, 6)
+      : [],
+    salesRecommendations: Array.isArray(parsed.salesRecommendations)
+      ? parsed.salesRecommendations.filter((s: any) => typeof s === "string").slice(0, 8)
+      : [],
+    forecast: typeof parsed.forecast === "string" ? parsed.forecast : "پیش‌بینی در دسترس نیست.",
+    healthScore:
+      typeof parsed.healthScore === "number" && !isNaN(parsed.healthScore)
+        ? Math.max(0, Math.min(100, Math.round(parsed.healthScore)))
+        : 50,
+  };
+  return result;
+}
+
+/* ============================================================
+   تحلیل هوشمند جامع سئو (SEO-SMART-ANALYSIS) — درخواست مالک
+   «تحلیل هوشمند» تب سئو: تصویر صفر تا صد سایت — تمام مقالات
+   منتشرشده، دیتای سرچ‌کنسول (تا ۲۰۰۰ ردیف)، استراتژی‌های اجراشده،
+   رتبه‌ها و مسیر فروش — در یک خروجی ساختاریافته.
+   الگوی پیاده‌سازی: analyzeAccountingData (STRICT JSON + سپر سراسری)
+   ============================================================ */
+export interface SeoSmartAnalysisSection {
+  headline: string;
+  points: string[];
+}
+
+export interface SeoSmartAnalysis {
+  /** امتیاز سلامت سئو — ۰ تا ۱۰۰ */
+  healthScore: number;
+  /** خلاصهٔ اجرایی کل وضعیت */
+  summary: string;
+  /** موجودی مقالات */
+  articleInventory: SeoSmartAnalysisSection;
+  /** عملکرد سرچ‌کنسول */
+  gscPerformance: SeoSmartAnalysisSection;
+  /** وضعیت استراتژی‌ها */
+  strategyStatus: SeoSmartAnalysisSection;
+  /** رتبه‌ها و فرصت‌ها */
+  rankings: SeoSmartAnalysisSection;
+  /** بردهای سریع (اقدام فوری کم‌هزینه) */
+  quickWins: string[];
+  /** توصیه‌های اولویت‌دار */
+  recommendations: string[];
+  /** ایده‌های محتوایی جدید */
+  contentIdeas: string[];
+  /** مسیر فروش و درآمدزایی */
+  monetization: string[];
+}
+
+/** تبدیل دفاعی یک سکشن {headline, points} از پاسخ مدل */
+function coerceSeoSection(v: unknown): SeoSmartAnalysisSection {
+  const obj = (v && typeof v === "object" ? v : {}) as Record<string, unknown>;
+  return {
+    headline: typeof obj.headline === "string" && obj.headline.trim() ? obj.headline : "",
+    points: Array.isArray(obj.points)
+      ? obj.points.filter((p): p is string => typeof p === "string" && !!p.trim()).slice(0, 8)
+      : [],
+  };
+}
+
+export async function analyzeSeoComprehensive(context: Record<string, any>): Promise<SeoSmartAnalysis> {
+  const systemPrompt = withBrandDirective(`تو استراتژیست ارشد سئو و رشد کسب‌وکار پلتفرم فیتاپ (fittup.ir — سایت محتوایی بدنسازی، تناسب اندام و تغذیه با اپلیکیشن اشتراکی ۴ سطحه) هستی.
+تمام داده‌های سایت به تو داده می‌شود: موجودی مقالات (تعداد، دسته، کیفیت فیلدهای سئو، بازدیدها)، داده‌های واقعی Google Search Console (کوئری‌ها، کلیک، نمایش، CTR، جایگاه — تا ۲۰۰۰ ردیف)، گزارش آپلودشدهٔ سرچ‌کنسول (در صورت وجود)، استراتژی فعال سئو (پیلارها، کلمات کلیدی هدف و امتیاز فرصت)، صف مقالات برنامه‌ریزی‌شده، تاریخچه اجراهای ایجنت و ساختار سایت (حرکات ورزشی، مواد غذایی، ابزارها).
+وظیفه تو یک تحلیل جامعِ صفر تا صد است: همهٔ این داده‌ها را با هم تلاقی بده و تصویر کامل وضعیت فعلی + نقشهٔ راه رشد و فروش ارائه کن.
+به زبان فارسی روان و حرفه‌ای پاسخ بده. هر ادعا باید مستند به همین داده‌ها باشد (عدد دقیق بیاور)، نه حدس کلی.
+
+خروجی تو باید یک JSON معتبر دقیقاً با ساختار زیر باشد و هیچ متن اضافه‌ای بیرون JSON ننویسی:
+{
+  "healthScore": 75,
+  "summary": "خلاصهٔ اجرایی کل وضعیت سئو در ۳-۵ جمله — تصویر بزرگ: کجا ایستاده‌ای و مهم‌ترین گلوگاه چیست",
+  "articleInventory": { "headline": "یک جملهٔ قوی دربارهٔ موجودی محتوا", "points": ["نکتهٔ مستند به عدد — نقطه قوت/ضعف، کیفیت فیلدهای سئو، کندانس انتشار", ...] },
+  "gscPerformance": { "headline": "یک جملهٔ قوی دربارهٔ عملکرد سرچ‌کنسول", "points": ["روند کلیک/نمایش/CTR/جایگاه با عدد", ...] },
+  "strategyStatus": { "headline": "یک جمله دربارهٔ وضعیت استراتژی فعال", "points": ["پیلارها/کلمات/پوشش صف — مستند به عدد", ...] },
+  "rankings": { "headline": "یک جمله دربارهٔ رتبه‌ها و فرصت‌ها", "points": ["کوئری‌های فرصت‌دار با جایگاه دقیق (۴ تا ۲۰ = فاصلهٔ ضربه‌ای تا صفحه اول)", ...] },
+  "quickWins": ["اقدام فوری کم‌هزینه با اثر سریع — مستند به داده", ...],
+  "recommendations": ["توصیهٔ اولویت‌دار و قابل‌اجرا به‌ترتیب اهمیت", ...],
+  "contentIdeas": ["ایدهٔ مقالهٔ جدید با کلمهٔ کلیدی هدف — مستند به کوئری‌های واقعی یا شکاف محتوایی", ...],
+  "monetization": ["اقدام درآمدزایی: اتصال محتوای پربازدید به پلن‌های اشتراک فیتاپ (اقتصادی/استاندارد/پیشرفته/حرفه‌ای)", ...]
+}
+نکات:
+- healthScore عددی بین ۰ تا ۱۰۰ — سلامت کلی سئوی سایت را صادقانه نشان بده
+- هر section بین ۲ تا ۵ نکته؛ quickWins بین ۳ تا ۶؛ recommendations بین ۴ تا ۷؛ contentIdeas بین ۴ تا ۷؛ monetization بین ۳ تا ۵
+- کلمات نزدیک به خرید (برنامه/مربی/قیمت/اپلیکیشن) در monetization و اولویت‌ها بالاتر بیاور
+- اگر داده‌ای کم یا صفر است، صادقانه بگو چه چیزی نبود و چه چیزی باید راه‌اندازی شود — اما تحلیل کامل ارائه بده`);
+
+  const userPrompt = `داده‌های کامل سایت فیتاپ (JSON):
+
+${JSON.stringify(context, null, 2)}
+
+لطفاً بر اساس این داده‌ها تحلیل جامع صفر تا صد خواسته‌شده را تولید کن. فقط JSON.`;
+
+  let content: string;
+  try {
+    content = await createResilientCompletion(
+      {
+        // v70 — دیریکتیو مالک: تحلیل متنی سئو با deepseek-v4-flash (در v69 جا مانده بود —
+        // پرامپت حاوی JSON کامل مقالات + تا ۲۰۰۰ ردیف GSC است، گران‌ترین پرامپت ادمین)
+        model: TEXT_TASK_MODEL,
+        fallback_model: TEXT_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      },
+      {
+        logTag: "analyzeSeoComprehensive",
+        maxTokens: 8000,
+        timeoutMs: 180_000,
+        maxAttempts: 3,
+        validateContent: (t: string) => {
+          const m = t.match(/\{[\s\S]*\}/);
+          if (!m) return "پاسخ JSON نداشت";
+          try {
+            JSON.parse(m[0]);
+            return null;
+          } catch {
+            return "JSON نامعتبر از مدل";
+          }
+        },
+      }
+    );
+  } catch (err) {
+    console.error("[analyzeSeoComprehensive] AvalAI error:", err);
+    throw new Error("خطا در ارتباط با سرویس تحلیل هوشمند. لطفاً کمی بعد دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  const strArr = (v: unknown, cap: number): string[] =>
+    Array.isArray(v) ? v.filter((s: any) => typeof s === "string" && s.trim()).slice(0, cap) : [];
+
+  const result: SeoSmartAnalysis = {
+    healthScore:
+      typeof parsed.healthScore === "number" && !isNaN(parsed.healthScore)
+        ? Math.max(0, Math.min(100, Math.round(parsed.healthScore)))
+        : 50,
+    summary: typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary : "تحلیل در دسترس نیست.",
+    articleInventory: coerceSeoSection(parsed.articleInventory),
+    gscPerformance: coerceSeoSection(parsed.gscPerformance),
+    strategyStatus: coerceSeoSection(parsed.strategyStatus),
+    rankings: coerceSeoSection(parsed.rankings),
+    quickWins: strArr(parsed.quickWins, 8),
+    recommendations: strArr(parsed.recommendations, 8),
+    contentIdeas: strArr(parsed.contentIdeas, 8),
+    monetization: strArr(parsed.monetization, 6),
+  };
+  return result;
+}
+
+/* ============================================================
+   تحلیل هوشمند نظرسنجی‌ها (SURVEY-SYSTEM)
+   دریافت خلاصه آماری نظرسنجی‌های یک بازه/پلن و تولید تحلیل
+   ساختاریافته شامل: خلاصه وضعیت، نقاط قوت، نقاط ضعف، راهکار
+   بهبود و میانگین رضایت کلی.
+   ============================================================ */
+export interface SurveyAnalysis {
+  summary: string;
+  strengths: string[];
+  weaknesses: string[];
+  recommendations: string[];
+  overallSatisfaction: number; // 0-5
+  sentiment: "very_positive" | "positive" | "neutral" | "negative" | "very_negative";
+}
+
+/**
+ * تحلیل هوشمند نظرسنجی‌های پایان پلن با AI.
+ *
+ * @param payload داده‌های تجمیعی نظرسنجی (stats + sample comments)
+ */
+export async function analyzeSurveys(
+  payload: Record<string, any>
+): Promise<SurveyAnalysis> {
+  const systemPrompt = withBrandDirective(`تو یک تحلیل‌گر ارشد تجربه کاربری و محصول برای پلتفرم فیتاپ (اپلیکیشن سلامت و تناسب اندام) هستی. وظیفه تو تحلیل نظرسنجی‌های کاربران پایان پلن و ارائه بینش عملیاتی به تیم محصول است.
+به زبان فارسی روان و حرفه‌ای پاسخ بده.
+خروجی تو باید یک JSON معتبر دقیقاً با ساختار زیر باشد و هیچ متن اضافه‌ای بیرون JSON ننویسی:
+{
+  "summary": "خلاصه وضعیت نظرات کاربران در ۲-۴ جمله",
+  "strengths": ["نقطه قوت ۱", "نقطه قوت ۲", ...],
+  "weaknesses": ["نقطه ضعف ۱", "نقطه ضعف ۲", ...],
+  "recommendations": ["راهکار بهبود ۱", "راهکار بهبود ۲", ...],
+  "overallSatisfaction": 4.2,
+  "sentiment": "positive"
+}
+نکات:
+- strengths و weaknesses بین ۲ تا ۶ مورد، بر اساس نمرات واقعی و نظرات کاربران
+- recommendations بین ۳ تا ۶ راهکار کاملاً عملیاتی و قابل اجرا برای بهبود محصول
+- overallSatisfaction میانگین رضایت کلی (عدد اعشاری بین ۰ تا ۵) بر اساس تمام نمرات
+- sentiment یکی از مقادیر: very_positive, positive, neutral, negative, very_negative
+- به نمرات پایین (۱ و ۲) و نظرات منفی به‌طور ویژه توجه کن
+- اگر نظرات کاربران را می‌بینی، الگوهای تکراری را استخراج کن`);
+
+  const userPrompt = `داده‌های نظرسنجی (JSON):
+${JSON.stringify(payload, null, 2)}
+
+لطفاً بر اساس این داده‌ها یک تحلیل کامل و ساختاریافته ارائه بده. فقط JSON.`;
+
+  let content: string;
+  try {
+    content = await createResilientCompletion(
+      {
+        // v70 — دیریکتیو مالک: تحلیل متنی نظرسنجی با deepseek-v4-flash
+        // (کامنت v69 مدعی انتقال آن بود ولی عملاً انجام نشده بود)
+        model: TEXT_TASK_MODEL,
+        fallback_model: TEXT_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      },
+      {
+        logTag: "analyzeSurveys",
+        reasoningEffort: "low",
+        maxTokens: 4096,
+        timeoutMs: 120_000,
+        maxAttempts: 3,
+        validateContent: (t: string) => {
+          const m = t.match(/\{[\s\S]*\}/);
+          if (!m) return "پاسخ JSON نداشت";
+          try { JSON.parse(m[0]); return null; } catch { return "JSON نامعتبر از مدل"; }
+        },
+      }
+    );
+  } catch (err) {
+    console.error("[analyzeSurveys] AvalAI error:", err);
+    throw new Error("خطا در ارتباط با سرویس تحلیل هوشمند. لطفاً کمی بعد دوباره تلاش کنید.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  const validSentiments: SurveyAnalysis["sentiment"][] = [
+    "very_positive", "positive", "neutral", "negative", "very_negative",
+  ];
+
+  let sentiment: SurveyAnalysis["sentiment"] = "neutral";
+  if (typeof parsed.sentiment === "string" && validSentiments.includes(parsed.sentiment as any)) {
+    sentiment = parsed.sentiment as SurveyAnalysis["sentiment"];
+  }
+
+  let overall: number =
+    typeof parsed.overallSatisfaction === "number" && !isNaN(parsed.overallSatisfaction)
+      ? parsed.overallSatisfaction
+      : 0;
+  overall = Math.max(0, Math.min(5, Math.round(overall * 10) / 10));
+
+  const result: SurveyAnalysis = {
+    summary: typeof parsed.summary === "string" ? parsed.summary : "تحلیل در دسترس نیست.",
+    strengths: Array.isArray(parsed.strengths)
+      ? parsed.strengths.filter((s: any) => typeof s === "string").slice(0, 6)
+      : [],
+    weaknesses: Array.isArray(parsed.weaknesses)
+      ? parsed.weaknesses.filter((s: any) => typeof s === "string").slice(0, 6)
+      : [],
+    recommendations: Array.isArray(parsed.recommendations)
+      ? parsed.recommendations.filter((s: any) => typeof s === "string").slice(0, 8)
+      : [],
+    overallSatisfaction: overall,
+    sentiment,
+  };
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  تحلیل فاز صفر (Baseline) — اندازه‌های اولیه بدن (v15)
+// ═══════════════════════════════════════════════════════════════
+/**
+ * تحلیل کوتاه (۲-۳ خط) برای فاز صفر — همان لحظه‌ای که کاربر اولین‌بار
+ * اندازه‌های بدنش را وارد می‌کند (درخواست مالک: «فاز صفر هر وقت اولین بار
+ * اندازه‌ها وارد شد انجام بشه و در حد دو سه خط تحلیل هوش مصنوعی بشه و در
+ * فاز صفر نوشته بشه»).
+ *
+ * خروجی JSON سبک:
+ *   { analysis: "۲-۳ خط تحلیل اولیه", recommendations: ["توصیه کوتاه ۱", ...] }
+ */
+export async function analyzeBaselineMeasurements(input: {
+  gender: "male" | "female";
+  age?: number | null;
+  height?: number | null;
+  weight?: number | null;
+  targetWeight?: number | null;
+  goal?: string | null;
+  waist?: number | null;
+  neck?: number | null;
+  hip?: number | null;
+  chest?: number | null;
+  arm?: number | null;
+  thigh?: number | null;
+  bodyFatPercent?: number | null;
+}): Promise<{ analysis: string; recommendations: string[] }> {
+  const systemPrompt = withBrandDirective(
+    "تو مربی هوشمند فیتاپ هستی. اندازه‌های اولیه (فاز صفر — پیش از شروع تمرین) ورزشکار را می‌بینی. یک تحلیل اولیه «کوتاه» (دقیقاً ۲ تا ۳ خط، حداکثر ~۶۰ کلمه) به فارسی محاوره‌ای و انگیزشی بنویس که وضعیت فعلی بدن را در یک نگاه توصیف کند و جهت مسیر را مشخص کند. طولانی ننویس — این متن در یک کارت کوچک نمایش داده می‌شود. فقط JSON معتبر برگردان."
+  );
+
+  const goalLabels: Record<string, string> = {
+    fat_loss: "کاهش چربی",
+    muscle_gain: "افزایش عضله",
+    endurance: "افزایش استقامت",
+    fitness: "تناسب اندام عمومی",
+    strength: "افزایش قدرت",
+    cut: "کات",
+    bulk: "افزایش حجم",
+  };
+
+  const lines: string[] = [];
+  lines.push(`جنسیت: ${input.gender === "male" ? "مرد" : "زن"}`);
+  if (input.age != null) lines.push(`سن: ${input.age}`);
+  if (input.height != null) lines.push(`قد: ${input.height} cm`);
+  if (input.weight != null) lines.push(`وزن: ${input.weight} kg`);
+  if (input.targetWeight != null) lines.push(`وزن هدف: ${input.targetWeight} kg`);
+  if (input.goal) lines.push(`هدف: ${goalLabels[input.goal] || input.goal}`);
+  if (input.bodyFatPercent != null) lines.push(`درصد چربی تخمینی (US Navy): ${input.bodyFatPercent.toFixed(1)}٪`);
+  if (input.waist != null) lines.push(`دور کمر: ${input.waist} cm`);
+  if (input.neck != null) lines.push(`دور گردن: ${input.neck} cm`);
+  if (input.hip != null) lines.push(`دور باسن: ${input.hip} cm`);
+  if (input.chest != null) lines.push(`دور سینه: ${input.chest} cm`);
+  if (input.arm != null) lines.push(`دور بازو: ${input.arm} cm`);
+  if (input.thigh != null) lines.push(`دور ران: ${input.thigh} cm`);
+
+  const userText = `اندازه‌های اولیه بدن ورزشکار (فاز صفر — شروع مسیر):
+
+${lines.join("\n")}
+
+با ساختار JSON زیر پاسخ بده:
+{
+  "analysis": "۲ تا ۳ خط تحلیل اولیه فارسی — وضعیت فعلی بدن + نقطه شروع مسیر + یک جمله انگیزشی کوتاه. حتماً کوتاه باشد.",
+  "recommendations": ["۱ توصیه کوتاه و عملی برای شروع", "۱ توصیه تغذیه‌ای کوتاه"]
+}`;
+
+  let content: string;
+  try {
+    content = await createChatCompletionWithRetry({
+      // v69 — دیریکتیو مالک: وظایف متنی → deepseek-v4-flash (فال‌بک: gemini-3.8)
+      model: TEXT_TASK_MODEL,
+      fallback_model: TEXT_MODEL,
+      // v72 حسابداری — سقف خروجی تحلیل فاز صفر
+      max_tokens: 4096,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userText },
+      ],
+    } as any, "analyzeBaselineMeasurements");
+  } catch (err) {
+    console.error("[analyzeBaselineMeasurements] AvalAI error:", err);
+    throw new Error("خطا در تحلیل اندازه‌های اولیه.");
+  }
+
+  const parsed = parseJsonFromContent(content);
+  return {
+    analysis: typeof parsed.analysis === "string" ? parsed.analysis : "",
+    recommendations: Array.isArray(parsed.recommendations)
+      ? parsed.recommendations.map((r: any) => String(r)).slice(0, 3)
+      : [],
+  };
+}
