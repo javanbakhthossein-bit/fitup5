@@ -1,0 +1,467 @@
+import { NextRequest } from "next/server";
+import { db } from "@/lib/db";
+import { requireAuth, apiError } from "@/lib/fitness/auth";
+import { logWeightChangeIfChanged } from "@/lib/fitness/active-weight";
+import type { BodyShapeKey, Discipline, InjuryAreaKey, MedicalConditionKey, OnboardingData, SmokingHabitKey } from "@/lib/fitness/types";
+import { BODY_SHAPE_LABELS_FA, DISCIPLINE_LABELS, INJURY_AREA_LABELS_FA, SMOKING_HABIT_LABELS_FA } from "@/lib/fitness/types";
+// v159 (T6) — «ارزیابی اولیه» ترکیب بدن (کارت مشکی داشبورد + نمودار ٪ چربی/٪ عضله)
+import { computeBodyCompositionVerdict } from "@/lib/fitness/body-verdict";
+
+// Allowed medical condition keys — anything else is filtered out.
+const ALLOWED_MEDICAL_CONDITIONS: ReadonlySet<MedicalConditionKey> = new Set([
+  "diabetes", "hypertension", "thyroid", "heart", "back_pain", "knee_pain", "shoulder_issues",
+]);
+
+function coerceMedicalConditions(raw: unknown): MedicalConditionKey[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((c) => String(c))
+    .filter((c): c is MedicalConditionKey => ALLOWED_MEDICAL_CONDITIONS.has(c as MedicalConditionKey));
+}
+
+/** v75 — اعتبارسنجی رشتهٔ ورزشی (فقط مقادیر شناخته‌شده پذیرفته می‌شوند) */
+const ALLOWED_DISCIPLINES = new Set(Object.keys(DISCIPLINE_LABELS));
+function coerceDiscipline(raw: unknown): Discipline | undefined {
+  const v = typeof raw === "string" ? raw.trim() : "";
+  return ALLOWED_DISCIPLINES.has(v) ? (v as Discipline) : undefined;
+}
+
+// ─── v162 — کوئرسازی فیلدهای جدید (فرم بدن/دخانیات/نواحی آسیب/سایر مشکلات) ───
+const ALLOWED_BODY_SHAPES = new Set(Object.keys(BODY_SHAPE_LABELS_FA));
+function coerceBodyShape(raw: unknown): BodyShapeKey | undefined {
+  const v = typeof raw === "string" ? raw.trim() : "";
+  return ALLOWED_BODY_SHAPES.has(v) ? (v as BodyShapeKey) : undefined;
+}
+
+const ALLOWED_SMOKING = new Set(Object.keys(SMOKING_HABIT_LABELS_FA));
+function coerceSmokingHabit(raw: unknown): SmokingHabitKey | undefined {
+  const v = typeof raw === "string" ? raw.trim() : "";
+  return ALLOWED_SMOKING.has(v) ? (v as SmokingHabitKey) : undefined;
+}
+
+const ALLOWED_INJURY_AREAS = new Set(Object.keys(INJURY_AREA_LABELS_FA));
+function coerceInjuryAreas(raw: unknown): InjuryAreaKey[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((c) => String(c))
+    .filter((c, i, arr): c is InjuryAreaKey => ALLOWED_INJURY_AREAS.has(c as InjuryAreaKey) && arr.indexOf(c) === i);
+}
+
+// ─── v202 ممیزی (M9) — سقف نرم رشته‌ها (بدون رد سخت — صفر شکستگی) ───
+// متن‌های آزاد کاربر حداکثر ۲۰۰۰ نویسه (trim + برش بی‌صدا). فیلدهای enum-مانند
+// (goal/activityLevel/dietType/gender/trainingExperience) هر رشته‌ای را می‌پذیرند
+// ولی trim + سقف ۱۰۰ نویسه می‌شوند — whitelist-reject عمداً انجام نمی‌شود تا
+// مقادیر کلاینت‌های موجود نشکنند (کلاینت مقدارهای مشخص می‌فرستد).
+const FREE_TEXT_CAP = 2000;
+const ENUM_TEXT_CAP = 100;
+function capStr(v: unknown, n: number): string {
+  const s = v == null ? "" : typeof v === "string" ? v : String(v);
+  return s.trim().slice(0, n);
+}
+function capStrOpt(v: unknown, n: number): string | undefined {
+  const s = capStr(v, n);
+  return s || undefined;
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const user = await requireAuth();
+    const body = (await req.json()) as Partial<OnboardingData>;
+
+    // Validate required fields
+    // v81 — trainingExperience هم الزامی شد (دیرکتیو مالک: «سطح ورزشی» سؤالِ
+    // اجباری آنبوردینگ است — تا حالا فقط سمت کلاینت گیت داشت و از API مستقیم
+    // قابل دورزدن بود)
+    const required = ["firstName", "lastName", "gender", "age", "height", "weight", "goal", "activityLevel", "workoutDays", "workoutPlace", "dietType", "trainingExperience"];
+    for (const k of required) {
+      if (body[k as keyof OnboardingData] === undefined || body[k as keyof OnboardingData] === null || body[k as keyof OnboardingData] === "") {
+        return Response.json({ error: `فیلد ${k} الزامی است.` }, { status: 400 });
+      }
+    }
+
+    const data: OnboardingData = {
+      // v202 ممیزی (M9) — همهٔ رشته‌های آزاد با capStr/capStrOpt سقف ۲۰۰۰ نویسه دارند
+      firstName: capStr(body.firstName, FREE_TEXT_CAP),
+      lastName: capStr(body.lastName, FREE_TEXT_CAP),
+      // enum-مانند: هر رشته‌ای پذیرفته می‌شود ولی trim + سقف ۱۰۰ نویسه (بدون whitelist)
+      gender: capStr(body.gender, ENUM_TEXT_CAP) as OnboardingData["gender"],
+      age: Number(body.age),
+      height: Number(body.height),
+      weight: Number(body.weight),
+      targetWeight: body.targetWeight ? Number(body.targetWeight) : undefined,
+      goal: capStr(body.goal, ENUM_TEXT_CAP) as OnboardingData["goal"],
+      activityLevel: capStr(body.activityLevel, ENUM_TEXT_CAP) as OnboardingData["activityLevel"],
+      workoutDays: Number(body.workoutDays),
+      workoutDaysList: body.workoutDaysList || [],
+      workoutPlace: body.workoutPlace!,
+      equipment: body.equipment || [],
+      diseases: capStr(body.diseases, FREE_TEXT_CAP),
+      injuries: capStr(body.injuries, FREE_TEXT_CAP),
+      allergies: capStr(body.allergies, FREE_TEXT_CAP),
+      dietType: capStr(body.dietType, ENUM_TEXT_CAP) as OnboardingData["dietType"],
+      // v81 — تعداد وعده‌های رغبتی کاربر (۳-۶) — قبلاً دور ریخته می‌شد
+      mealCount: body.mealCount ? Math.max(2, Math.min(8, Math.round(Number(body.mealCount)))) : undefined,
+      trainingExperience: capStr(body.trainingExperience, ENUM_TEXT_CAP) as OnboardingData["trainingExperience"],
+      previousTrainingType: capStrOpt(body.previousTrainingType, FREE_TEXT_CAP),
+      drugAllergies: body.drugAllergies,
+      currentMedications: capStrOpt(body.currentMedications, FREE_TEXT_CAP),
+      maxLifts: capStrOpt(body.maxLifts, FREE_TEXT_CAP),
+      // Optional baseline measurements (cm) — may be null/undefined
+      chestMeasurement: body.chestMeasurement ? Number(body.chestMeasurement) : undefined,
+      armMeasurement: body.armMeasurement ? Number(body.armMeasurement) : undefined,
+      waistMeasurement: body.waistMeasurement ? Number(body.waistMeasurement) : undefined,
+      hipMeasurement: body.hipMeasurement ? Number(body.hipMeasurement) : undefined,
+      thighMeasurement: body.thighMeasurement ? Number(body.thighMeasurement) : undefined,
+      // NEW (BODY-COMPOSITION-PRO): اندازه‌های اضافی برای محاسبه چربی بدن
+      neckMeasurement: body.neckMeasurement ? Number(body.neckMeasurement) : undefined,
+      shoulderMeasurement: body.shoulderMeasurement ? Number(body.shoulderMeasurement) : undefined,
+      calfMeasurement: body.calfMeasurement ? Number(body.calfMeasurement) : undefined,
+      // NEW: comprehensive professional fields (ONBOARDING-PLAN-UPGRADE)
+      bodyFrame: body.bodyFrame,
+      sleepHours: body.sleepHours ? Number(body.sleepHours) : undefined,
+      stressLevel: body.stressLevel ? Number(body.stressLevel) : undefined,
+      waterHabit: body.waterHabit != null ? Number(body.waterHabit) : undefined,
+      targetDate: body.targetDate || undefined,
+      workoutTime: body.workoutTime,
+      medicalConditions: coerceMedicalConditions(body.medicalConditions),
+      currentSupplements: capStrOpt(body.currentSupplements, FREE_TEXT_CAP),
+      dislikedFoods: capStrOpt(body.dislikedFoods, FREE_TEXT_CAP),
+      preferredCuisine: body.preferredCuisine,
+      // v60 — شرایط/نیاز/هدف خاص کاربر (متن آزاد برای هوش مصنوعی)
+      specialConditions: body.specialConditions ? String(body.specialConditions).trim().slice(0, 600) || undefined : undefined,
+      // v75 — رشتهٔ ورزشی (فیزیک کلاسیک/بادی‌بیلدینگ/فیتنس/... — شامل گزینه‌های بانوان)
+      discipline: coerceDiscipline(body.discipline),
+      // v162 — فرم بدن (اجباری سمت کلاینت) + دخانیات + نواحی آسیب + سایر مشکلات
+      bodyShape: coerceBodyShape(body.bodyShape),
+      smokingHabit: coerceSmokingHabit(body.smokingHabit),
+      injuryAreas: coerceInjuryAreas(body.injuryAreas),
+      otherHealthIssues: body.otherHealthIssues ? String(body.otherHealthIssues).trim().slice(0, 600) || undefined : undefined,
+      // Auto-calculate daily water goal: weight (kg) × 35 ml + activity-based adjustment
+      waterGoalMl: (() => {
+        const w = Number(body.weight) || 70;
+        const baseMl = Math.round(w * 35);
+        let adj = 0;
+        const al = body.activityLevel;
+        if (al === "active" || al === "very_active") adj = 500;
+        else if (al === "moderate") adj = 250;
+        return baseMl + adj;
+      })(),
+    };
+
+    /**
+   * v76 — اعتبارسنجی بازهٔ فیلدهای بدنی — مثل مسیر پروفایل.
+   * وزن/قد/سن خارج از بازهٔ منطقی به‌عنوان دادهٔ مبنا به هوش مصنوعی نمی‌رود.
+   */
+  const bodyRanges: Array<{ key: keyof OnboardingData; min: number; max: number; label: string }> = [
+    { key: "weight", min: 25, max: 300, label: "وزن" },
+    { key: "height", min: 100, max: 250, label: "قد" },
+    // v81 — سقف سن ۱۰۰ شد تا با گارد کلاینت (۱۲ تا ۱۰۰) هم‌خوان باشد؛
+    // قبلاً کاربرِ ۹۱-۱۰۰ ساله کل آنبوردینگ را می‌رفت و در submit نهایی
+    // با خطای ۴۰۰ بن‌بست می‌شد (ممیزی آنبوردینگ v81)
+    { key: "age", min: 8, max: 100, label: "سن" },
+  ];
+  for (const r of bodyRanges) {
+    const v = data[r.key] as unknown as number;
+    if (v == null || !Number.isFinite(v) || v < r.min || v > r.max) {
+      return Response.json(
+        { error: `${r.label} واردشده خارج از بازهٔ مجاز (${r.min} تا ${r.max}) است. لطفاً اصلاح کنید.` },
+        { status: 400 }
+      );
+    }
+  }
+  if (data.targetWeight != null && (data.targetWeight < 25 || data.targetWeight > 300)) {
+    return Response.json(
+      { error: "وزن هدف واردشده خارج از بازهٔ مجاز (۲۵ تا ۳۰۰) است. لطفاً اصلاح کنید." },
+      { status: 400 }
+    );
+  }
+
+  // v76 — وزن قبلی پروفایل (برای تشخیص تغییر وزن در ذخیرهٔ مجدد آنبوردینگ)
+  const existingProfile = await db.onboardingProfile.findUnique({
+    where: { userId: user.id },
+    select: { weight: true },
+  });
+
+  // Upsert onboarding profile
+    await db.onboardingProfile.upsert({
+      where: { userId: user.id },
+      create: {
+        userId: user.id,
+        gender: data.gender,
+        age: data.age,
+        height: data.height,
+        weight: data.weight,
+        targetWeight: data.targetWeight ?? null,
+        goal: data.goal,
+        activityLevel: data.activityLevel,
+        workoutDays: data.workoutDays,
+        workoutDaysList: JSON.stringify(data.workoutDaysList || []),
+        workoutPlace: data.workoutPlace,
+        equipment: JSON.stringify(data.equipment),
+        diseases: data.diseases,
+        injuries: data.injuries,
+        allergies: data.allergies,
+        dietType: data.dietType,
+        mealCount: data.mealCount ?? null,
+        trainingExperience: data.trainingExperience ?? null,
+        previousTrainingType: data.previousTrainingType ?? null,
+        drugAllergies: data.drugAllergies ?? null,
+        currentMedications: data.currentMedications ?? null,
+        maxLifts: data.maxLifts ?? null,
+        // NEW: comprehensive professional fields
+        bodyFrame: data.bodyFrame ?? null,
+        sleepHours: data.sleepHours ?? null,
+        stressLevel: data.stressLevel ?? null,
+        waterHabit: data.waterHabit ?? null,
+        targetDate: data.targetDate ?? null,
+        workoutTime: data.workoutTime ?? null,
+        medicalConditions: data.medicalConditions && data.medicalConditions.length > 0
+          ? JSON.stringify(data.medicalConditions)
+          : null,
+        currentSupplements: data.currentSupplements ?? null,
+        dislikedFoods: data.dislikedFoods ?? null,
+        preferredCuisine: data.preferredCuisine ?? null,
+        // v60 — شرایط خاص کاربر
+        specialConditions: data.specialConditions ?? null,
+        // v75 — رشتهٔ ورزشی
+        discipline: data.discipline ?? null,
+        // v162 — فرم بدن + دخانیات + نواحی آسیب + سایر مشکلات
+        bodyShape: data.bodyShape ?? null,
+        smokingHabit: data.smokingHabit ?? null,
+        injuryAreas: data.injuryAreas && data.injuryAreas.length > 0
+          ? JSON.stringify(data.injuryAreas)
+          : null,
+        otherHealthIssues: data.otherHealthIssues ?? null,
+        // NEW (BODY-COMPOSITION-PRO): اندازه‌های اضافی
+        neckMeasurement: data.neckMeasurement ?? null,
+        shoulderMeasurement: data.shoulderMeasurement ?? null,
+        calfMeasurement: data.calfMeasurement ?? null,
+        // اندازه‌های پایه (SCHEMA-DRIFT-FIX): این فیلدها در data ساخته می‌شدند ولی
+        // در upsert جا افتاده بودند و هرگز ذخیره نمی‌شدند (کمر الزامی هم!
+        chestMeasurement: data.chestMeasurement ?? null,
+        armMeasurement: data.armMeasurement ?? null,
+        waistMeasurement: data.waistMeasurement ?? null,
+        hipMeasurement: data.hipMeasurement ?? null,
+        thighMeasurement: data.thighMeasurement ?? null,
+        // v76 — زمان آخرین تغییر وزن پروفایل (رزولور مرکزی وزن)
+        weightUpdatedAt: new Date(),
+      },
+      update: {
+        gender: data.gender,
+        age: data.age,
+        height: data.height,
+        weight: data.weight,
+        targetWeight: data.targetWeight ?? null,
+        goal: data.goal,
+        activityLevel: data.activityLevel,
+        workoutDays: data.workoutDays,
+        workoutDaysList: JSON.stringify(data.workoutDaysList || []),
+        workoutPlace: data.workoutPlace,
+        equipment: JSON.stringify(data.equipment),
+        diseases: data.diseases,
+        injuries: data.injuries,
+        allergies: data.allergies,
+        dietType: data.dietType,
+        // v81 — ذخیرهٔ تعداد وعده‌ها در مسیر به‌روزرسانی هم
+        mealCount: data.mealCount ?? null,
+        trainingExperience: data.trainingExperience ?? null,
+        previousTrainingType: data.previousTrainingType ?? null,
+        drugAllergies: data.drugAllergies ?? null,
+        currentMedications: data.currentMedications ?? null,
+        maxLifts: data.maxLifts ?? null,
+        // NEW: comprehensive professional fields
+        bodyFrame: data.bodyFrame ?? null,
+        sleepHours: data.sleepHours ?? null,
+        stressLevel: data.stressLevel ?? null,
+        waterHabit: data.waterHabit ?? null,
+        targetDate: data.targetDate ?? null,
+        workoutTime: data.workoutTime ?? null,
+        medicalConditions: data.medicalConditions && data.medicalConditions.length > 0
+          ? JSON.stringify(data.medicalConditions)
+          : null,
+        currentSupplements: data.currentSupplements ?? null,
+        dislikedFoods: data.dislikedFoods ?? null,
+        preferredCuisine: data.preferredCuisine ?? null,
+        // v60 — شرایط خاص کاربر
+        specialConditions: data.specialConditions ?? null,
+        // v75 — رشتهٔ ورزشی
+        discipline: data.discipline ?? null,
+        // v162 — فرم بدن + دخانیات + نواحی آسیب + سایر مشکلات
+        bodyShape: data.bodyShape ?? null,
+        smokingHabit: data.smokingHabit ?? null,
+        injuryAreas: data.injuryAreas && data.injuryAreas.length > 0
+          ? JSON.stringify(data.injuryAreas)
+          : null,
+        otherHealthIssues: data.otherHealthIssues ?? null,
+        // NEW (BODY-COMPOSITION-PRO): اندازه‌های اضافی
+        neckMeasurement: data.neckMeasurement ?? null,
+        shoulderMeasurement: data.shoulderMeasurement ?? null,
+        calfMeasurement: data.calfMeasurement ?? null,
+        // اندازه‌های پایه (SCHEMA-DRIFT-FIX): در create اضافه شدند — اینجا هم
+        chestMeasurement: data.chestMeasurement ?? null,
+        armMeasurement: data.armMeasurement ?? null,
+        waistMeasurement: data.waistMeasurement ?? null,
+        hipMeasurement: data.hipMeasurement ?? null,
+        thighMeasurement: data.thighMeasurement ?? null,
+        // v76 — ذخیرهٔ مجدد آنبوردینگ با وزن متفاوت = تغییر وزن اعلامی
+        weightUpdatedAt: existingProfile && Math.abs(existingProfile.weight - data.weight) < 0.05
+          ? undefined
+          : new Date(),
+        // Clear cached AI analysis when profile changes
+        aiAnalysis: null,
+      },
+    });
+
+    // v76 — ذخیرهٔ مجدد آنبوردینگ با وزن متفاوت → WeightLog جدید.
+    // قبلاً فقط «وزن اولیه» ثبت می‌شد و اصلاحِ وزن در ذخیرهٔ مجدد، لاگ جدید
+    // نمی‌ساخت → تولید برنامه وزنِ کهنه‌ی لاگ را می‌گرفت (ریشهٔ تیکت ۴۶/۹۷).
+    if (existingProfile) {
+      await logWeightChangeIfChanged(
+        user.id,
+        data.weight,
+        existingProfile.weight,
+        "به‌روزرسانی وزن (ذخیرهٔ مجدد آنبوردینگ)"
+      ).catch((e) => console.error("[onboarding] failed to log weight change:", e));
+    }
+
+    // Log initial weight — فقط بار اول (L5): هر ذخیره/ویرایش مجدد آنبوردینگ
+    // نباید رکورد تکراری «وزن اولیه» بسازد (نمودار پیشرفت شلوغ و چند نقطه
+    // همان‌روز می‌شد). «وزن اولیه» یعنی نقطه شروع — باید ثابت بماند.
+    const INITIAL_WEIGHT_NOTE = "وزن اولیه (آنبوردینگ)";
+    const existingInitialWeightLog = await db.weightLog.findFirst({
+      where: { userId: user.id, note: INITIAL_WEIGHT_NOTE },
+      select: { id: true },
+    });
+    if (!existingInitialWeightLog) {
+      await db.weightLog.create({
+        data: { userId: user.id, weight: data.weight, note: INITIAL_WEIGHT_NOTE },
+      });
+    }
+
+    // Create an initial baseline checkup so we have a "starting point" to compare future checkups against.
+    // Body measurements come from the optional onboarding fields (cm); if absent, they stay null
+    // and the user can fill them in their first real checkup.
+    const existingCheckup = await db.checkup.findFirst({ where: { userId: user.id, phaseNumber: 0 } });
+    if (!existingCheckup) {
+      await db.checkup.create({
+        data: {
+          userId: user.id,
+          phaseNumber: 0, // 0 = baseline (before any training)
+          isFinalCheckup: false,
+          status: "approved",
+          weight: data.weight,
+          chestMeasurement: data.chestMeasurement ?? null,
+          armMeasurement: data.armMeasurement ?? null,
+          waistMeasurement: data.waistMeasurement ?? null,
+          hipMeasurement: data.hipMeasurement ?? null,
+          thighMeasurement: data.thighMeasurement ?? null,
+          neckMeasurement: data.neckMeasurement ?? null,
+          bodyFatPercent: null,
+          leanBodyMass: null,
+          fatigueLevel: 3,
+          sleepQuality: 3,
+          dietAdherence: 3,
+          workoutAdherence: 3,
+          phaseCompleted: true,
+          notes: "چکاپ اولیه — وضعیت شروع ورزشکار قبل از تمرین",
+          aiAnalysis: null,
+          coachNotes: null,
+        },
+      });
+    } else {
+      // اگر چکاپ اولیه از قبل وجود دارد و کاربر اندازه‌ها را فراهم کرده، به‌روزرسانی کن
+      const hasNewMeasurements =
+        data.chestMeasurement != null ||
+        data.armMeasurement != null ||
+        data.waistMeasurement != null ||
+        data.hipMeasurement != null ||
+        data.thighMeasurement != null ||
+        data.neckMeasurement != null;
+      if (hasNewMeasurements) {
+        await db.checkup.update({
+          where: { id: existingCheckup.id },
+          data: {
+            chestMeasurement: data.chestMeasurement ?? existingCheckup.chestMeasurement,
+            armMeasurement: data.armMeasurement ?? existingCheckup.armMeasurement,
+            waistMeasurement: data.waistMeasurement ?? existingCheckup.waistMeasurement,
+            hipMeasurement: data.hipMeasurement ?? existingCheckup.hipMeasurement,
+            thighMeasurement: data.thighMeasurement ?? existingCheckup.thighMeasurement,
+            neckMeasurement: data.neckMeasurement ?? existingCheckup.neckMeasurement,
+            weight: data.weight,
+          },
+        });
+      }
+    }
+
+    // ─── v159 (T6) — «ارزیابی اولیه» ترکیب بدن (دیرکتیو مالک) ───
+    // «برای کاربران اقتصادی فقط از تولید برنامه‌های اولیه» — نقطهٔ initial برای
+    // «همهٔ» کاربران همین‌جا (تکمیل آنبوردینگ) ساخته می‌شود تا کارت مشکی داشبورد
+    // و نمودار ٪ چربی/٪ عضله از روز اول داده داشته باشند. کاربران استاندارد+
+    // بعداً با چکاپ/تحلیل بدن نقطه‌های تازه می‌گیرند. اگر قبلاً نقطه‌ای بوده،
+    // هیچ‌چیز بازنویسی نمی‌شود (نقطهٔ initial تاریخچه است، نه «آخرین وضعیت»).
+    try {
+      const hasAnyComposition = await db.bodyComposition.findFirst({
+        where: { userId: user.id },
+        select: { id: true },
+      });
+      if (!hasAnyComposition) {
+        const initialVerdict = computeBodyCompositionVerdict({
+          gender: (data.gender as "male" | "female") ?? "male",
+          height: data.height ?? null,
+          weight: data.weight ?? null,
+          age: data.age ?? null,
+          waist: data.waistMeasurement ?? null,
+          hip: data.hipMeasurement ?? null,
+          neck: data.neckMeasurement ?? null,
+          activityLevel: data.activityLevel ?? null,
+        });
+        if (initialVerdict) {
+          await db.bodyComposition.create({
+            data: {
+              userId: user.id,
+              fatPercent: initialVerdict.fatPercent,
+              musclePercent: initialVerdict.musclePercent,
+              source: "initial",
+            },
+          });
+          await db.onboardingProfile.update({
+            where: { userId: user.id },
+            data: {
+              bodyFatPercent: initialVerdict.fatPercent,
+              musclePercent: initialVerdict.musclePercent,
+              bodyCompositionAt: new Date(),
+            },
+          }).catch(() => {});
+          console.log(`[onboarding] initial body composition for user ${user.id}: fat=${initialVerdict.fatPercent}% muscle=${initialVerdict.musclePercent}% (method=${initialVerdict.method})`);
+        }
+      }
+    } catch (compErr) {
+      console.error("[onboarding] initial body composition failed:", compErr);
+    }
+
+    // Mark onboarding done + save user's full name (firstName + lastName)
+    const fullName = `${data.firstName} ${data.lastName}`.trim();
+
+    await db.user.update({
+      where: { id: user.id },
+      data: {
+        onboardingDone: true,
+        // v32: زمان دقیق تکمیل — سناریوی پیامک ۴۶۱۲۹۱ (۲۴ ساعت بعد بدون خرید)
+        onboardingCompletedAt: new Date(),
+        name: fullName || user.name,
+      },
+    });
+
+    // ─── v12.3: نوتیف «نصب اپ موبایل» بعد از آنبوردینگ حذف شد (درخواست مالک) ───
+
+    return Response.json({ ok: true, message: "اطلاعات با موفقیت ذخیره شد." });
+  } catch (e) {
+    return apiError(e);
+  }
+}
+
+// NOTE: The previous PUT method that eagerly generated workout + meal plans here
+// has been removed — it was dead code (never called from the client). Plan
+// generation now happens lazily after a successful payment in
+// /api/payment/verify/route.ts, so users only get a plan once they've actually
+// purchased a subscription.
